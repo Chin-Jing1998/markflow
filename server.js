@@ -3,19 +3,24 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
-const wordConverter = require('./converters/word');
-const urlConverter = require('./converters/url');
-const textConverter = require('./converters/text');
+const wordConverter = require('./converters/legacy/word');
+const urlConverter = require('./converters/legacy/url');
+const textConverter = require('./converters/legacy/text');
+
+// 新通用转换调度 + SSE 任务管理
+const converter = require('./converters');
+const jobs = require('./server/jobs');
+const { decodeUtf8Filename } = require('./converters/ir/util');
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT, 10) || 3000;
 
 // 中间件
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.static(__dirname)); // 服务前端静态文件
 
-// 文件上传配置
+// 文件上传配置 —— 旧 Word 端点专用（仅 .docx）
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
@@ -26,6 +31,12 @@ const upload = multer({
             cb(new Error('仅支持 .docx 格式的 Word 文件'));
         }
     }
+});
+
+// 新统一上传配置 —— /api/convert 用，接受任意类型，按扩展名在调度器中分发
+const uploadAny = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 100 * 1024 * 1024 }, // 100MB（PPTX/PDF 可能更大）
 });
 // 判断是否在 Electron 打包环境中运行（asar 内无法写入文件）
 const isPackaged = __dirname.includes('app.asar');
@@ -191,6 +202,153 @@ app.post('/api/save', async (req, res) => {
         console.error('保存失败:', err);
         res.status(500).json({ success: false, error: err.message });
     }
+});
+
+// ============================================================
+// 新统一转换 API（P0 起步，与旧端点并存，零回归）
+// ============================================================
+
+/**
+ * 能力矩阵 + 平台依赖探测结果
+ * GET /api/formats
+ */
+app.get('/api/formats', (req, res) => {
+    // P1 接入 electron printToPDF 探测；P2 接入 soffice 探测
+    res.json({
+        success: true,
+        ...converter.getCapabilities({
+            sofficeAvailable: false,
+            electronPrintToPdf: false,
+        }),
+    });
+});
+
+/**
+ * 统一转换入口
+ * POST /api/convert
+ *
+ * multipart/form-data：
+ *   files[]   多个文件
+ *   manifest  JSON.stringify({ items:[{idx,inputType,outputFormat,options?}], commonOutputDir })
+ *
+ * application/json：
+ *   { items:[{idx,inputType,outputFormat,source,options?}], commonOutputDir }
+ *
+ * 立即返回 { jobId }，转换异步推进；客户端通过 SSE 订阅进度。
+ */
+app.post(
+    '/api/convert',
+    (req, res, next) => {
+        const ct = (req.headers['content-type'] || '').toLowerCase();
+        if (ct.startsWith('multipart/form-data')) {
+            uploadAny.array('files', 50)(req, res, next);
+        } else {
+            next();
+        }
+    },
+    async (req, res) => {
+        try {
+            let items;
+            let commonOutputDir;
+
+            if (req.files && req.files.length > 0) {
+                // multipart 模式
+                const manifestStr = req.body && req.body.manifest;
+                if (!manifestStr) {
+                    return res.status(400).json({ success: false, error: '缺少 manifest 字段' });
+                }
+                let manifest;
+                try {
+                    manifest = JSON.parse(manifestStr);
+                } catch (e) {
+                    return res.status(400).json({ success: false, error: 'manifest JSON 解析失败' });
+                }
+                if (!manifest || !Array.isArray(manifest.items)) {
+                    return res.status(400).json({ success: false, error: 'manifest.items 必须是数组' });
+                }
+                items = manifest.items.map((it) => {
+                    const file = req.files[it.idx];
+                    return {
+                        ...it,
+                        name: file ? decodeUtf8Filename(file.originalname) : it.name,
+                        source: file ? file.buffer : it.source,
+                        file: file || null,
+                    };
+                });
+                commonOutputDir = manifest.commonOutputDir;
+            } else {
+                // JSON 模式
+                const body = req.body || {};
+                if (!Array.isArray(body.items)) {
+                    return res.status(400).json({ success: false, error: '缺少 items 数组' });
+                }
+                items = body.items;
+                commonOutputDir = body.commonOutputDir;
+            }
+
+            const dir = getOutputDir(commonOutputDir);
+            const job = jobs.createJob(items);
+
+            // 异步执行，立即返回 jobId，进度通过 SSE 推送
+            jobs.runJob(
+                job.id,
+                async (item, reportProgress) => {
+                    return converter.convert({
+                        inputType: item.inputType,
+                        outputFormat: item.outputFormat,
+                        source: item.source,
+                        name: item.name,
+                        options: item.options || {},
+                        outputDir: dir,
+                        reportProgress,
+                    });
+                },
+                { concurrency: 2 },
+            ).catch((err) => {
+                console.error(`Job ${job.id} 运行异常:`, err);
+            });
+
+            res.json({
+                success: true,
+                jobId: job.id,
+                items: job.items.map((it) => ({ idx: it.idx, status: it.status })),
+            });
+        } catch (err) {
+            console.error('/api/convert 失败:', err);
+            res.status(500).json({ success: false, error: err.message });
+        }
+    },
+);
+
+/**
+ * 任务状态轮询（SSE 兜底）
+ * GET /api/jobs/:id
+ */
+app.get('/api/jobs/:id', (req, res) => {
+    const job = jobs.getJob(req.params.id);
+    if (!job) {
+        return res.status(404).json({ success: false, error: '任务不存在或已过期' });
+    }
+    res.json({
+        success: true,
+        jobId: job.id,
+        status: job.status,
+        items: job.items.map((it) => ({
+            idx: it.idx,
+            status: it.status,
+            result: it.result,
+            error: it.error,
+        })),
+        summary: job.summary,
+    });
+});
+
+/**
+ * 任务进度 SSE 流
+ * GET /api/jobs/:id/events
+ */
+app.get('/api/jobs/:id/events', (req, res) => {
+    jobs.subscribe(req.params.id, res);
 });
 
 // 启动服务（支持 Electron 嵌入和独立运行两种模式）
