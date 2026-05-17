@@ -10,6 +10,7 @@ const textConverter = require('./converters/legacy/text');
 // 新通用转换调度 + SSE 任务管理
 const converter = require('./converters');
 const jobs = require('./server/jobs');
+const pdfRenderer = require('./converters/renderers/pdf');
 const { decodeUtf8Filename } = require('./converters/ir/util');
 
 const app = express();
@@ -213,12 +214,12 @@ app.post('/api/save', async (req, res) => {
  * GET /api/formats
  */
 app.get('/api/formats', (req, res) => {
-    // P1 接入 electron printToPDF 探测；P2 接入 soffice 探测
+    // P2 接入 soffice 探测
     res.json({
         success: true,
         ...converter.getCapabilities({
             sofficeAvailable: false,
-            electronPrintToPdf: false,
+            electronPrintToPdf: pdfRenderer.isAvailable(),
         }),
     });
 });

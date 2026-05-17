@@ -6,9 +6,11 @@ const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes } = require('../ir/schema');
 
 async function render(doc) {
-    const { unified, remarkRehype, rehypeStringify } = await loadUnified();
+    const { unified, remarkRehype, remarkGfm, rehypeStringify } = await loadUnified();
     const downgraded = downgradeCustomNodes(doc.ir);
+    // remark-gfm 给 mdast 添加 GFM 表格/任务列表识别，确保 table 节点能转换为 hast
     const hast = await unified()
+        .use(remarkGfm)
         .use(remarkRehype, { allowDangerousHtml: true })
         .run(downgraded);
     const html = unified()

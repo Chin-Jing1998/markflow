@@ -13,14 +13,18 @@ async function loadUnified() {
     const [
         unifiedMod,
         remarkParseMod,
+        remarkStringifyMod,
         remarkRehypeMod,
+        remarkGfmMod,
         rehypeStringifyMod,
         rehypeParseMod,
         mdastToMarkdownMod,
     ] = await Promise.all([
         import('unified'),
         import('remark-parse'),
+        import('remark-stringify'),
         import('remark-rehype'),
+        import('remark-gfm'),
         import('rehype-stringify'),
         import('rehype-parse'),
         import('mdast-util-to-markdown'),
@@ -29,7 +33,9 @@ async function loadUnified() {
     cache = {
         unified: unifiedMod.unified,
         remarkParse: remarkParseMod.default,
+        remarkStringify: remarkStringifyMod.default,
         remarkRehype: remarkRehypeMod.default,
+        remarkGfm: remarkGfmMod.default,
         rehypeStringify: rehypeStringifyMod.default,
         rehypeParse: rehypeParseMod.default,
         toMarkdown: mdastToMarkdownMod.toMarkdown,

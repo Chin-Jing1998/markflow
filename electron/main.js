@@ -166,6 +166,16 @@ ipcMain.handle('open-in-finder', async (event, folderPath) => {
     shell.showItemInFolder(folderPath);
 });
 
+// PDF 打印 IPC：渲染进程 → 主进程隐藏窗口 printToPDF
+const pdfPrinter = require('./pdf-printer');
+ipcMain.handle('print-to-pdf', async (event, { html, options } = {}) => {
+    if (!pdfPrinter.isAvailable()) {
+        throw new Error('PDF 打印功能不可用');
+    }
+    const buf = await pdfPrinter.printToPdf(html, options);
+    return buf; // Buffer 经 IPC 自动转 Uint8Array
+});
+
 // ===== Electron 应用生命周期 =====
 app.whenReady().then(async () => {
     await startBackend();

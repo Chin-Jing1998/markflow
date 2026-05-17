@@ -1,6 +1,8 @@
 /**
  * IR → Markdown
- * mdast-util-to-markdown 直接序列化；扩展节点先降级为 H1/H2/thematicBreak
+ *
+ * 用 remark-stringify + remark-gfm 链支持 GFM 表格/删除线等扩展；
+ * 扩展节点（slideBreak/sheetSection）先降级为 H1/H2/thematicBreak。
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes } = require('../ir/schema');
@@ -17,9 +19,13 @@ const MD_OPTIONS = {
 };
 
 async function render(doc) {
-    const { toMarkdown } = await loadUnified();
+    const { unified, remarkStringify, remarkGfm } = await loadUnified();
     const downgraded = downgradeCustomNodes(doc.ir);
-    return toMarkdown(downgraded, MD_OPTIONS);
+    const result = unified()
+        .use(remarkGfm)
+        .use(remarkStringify, MD_OPTIONS)
+        .stringify(downgraded);
+    return String(result);
 }
 
 module.exports = { render };

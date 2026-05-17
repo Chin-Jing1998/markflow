@@ -22,17 +22,25 @@
 
 const path = require('path');
 
-// === Parser/Renderer 注册表（P1/P2 增量添加） ===
+// === Parser/Renderer 注册表（P2 增量添加 doc/xls/ppt + xlsx/pptx 反向写） ===
 const parsers = {
     md: require('./parsers/md'),
     html: require('./parsers/html'),
     json: require('./parsers/json'),
+    docx: require('./parsers/docx'),
+    url: require('./parsers/url'),
+    text: require('./parsers/text'),
+    pdf: require('./parsers/pdf'),
+    xlsx: require('./parsers/xlsx'),
+    pptx: require('./parsers/pptx'),
 };
 
 const renderers = {
     md: require('./renderers/md'),
     html: require('./renderers/html'),
     json: require('./renderers/json'),
+    docx: require('./renderers/docx'),
+    pdf: require('./renderers/pdf'),
 };
 
 // === Legacy 快路径（仅当 outputFormat=md 时启用，保证零回归） ===
@@ -42,26 +50,29 @@ const legacyConverters = {
     text: require('./legacy/text'),
 };
 
-// === 能力矩阵 ===
+// === 能力矩阵（根据运行时能力动态生成） ===
 function getCapabilities({ sofficeAvailable = false, electronPrintToPdf = false } = {}) {
+    const textOutputs = ['md', 'html', 'json', 'docx'];
+    const documentOutputs = electronPrintToPdf ? [...textOutputs, 'pdf'] : textOutputs;
+    const legacyBinaryOutputs = sofficeAvailable ? ['md', 'html', 'json'] : [];
+
     return {
         capabilities: { sofficeAvailable, electronPrintToPdf },
         matrix: {
-            // P0: legacy 三条通路只支持 → md（docx/url/text → html/json 待 P1 实现 parser）
-            docx: ['md'],
-            url: ['md'],
-            text: ['md'],
-            // P0: 标记文档间的互转
-            md: ['md', 'html', 'json'],
-            html: ['md', 'html', 'json'],
-            json: ['md', 'html', 'json'],
-            // P1/P2 占位
-            pdf: [],
-            xlsx: [],
-            pptx: [],
-            doc: [],
-            xls: [],
-            ppt: [],
+            // 已接入的输入
+            docx: documentOutputs,
+            url: documentOutputs,
+            text: documentOutputs,
+            md: documentOutputs,
+            html: documentOutputs,
+            json: documentOutputs,
+            pdf: ['md', 'html', 'json'],
+            xlsx: ['md', 'html', 'json'],
+            pptx: ['md', 'html', 'json'],
+            // P2 接入（依赖 soffice CLI）
+            doc: legacyBinaryOutputs,
+            xls: legacyBinaryOutputs,
+            ppt: legacyBinaryOutputs,
         },
     };
 }
@@ -130,6 +141,7 @@ async function convertWithIR({ inputType, outputFormat, source, name, options, o
     reportProgress && reportProgress('parsing', 20);
     const doc = await parser.parse(source, {
         sourceName: name,
+        outputDir,
         ...options,
     });
 
@@ -138,14 +150,15 @@ async function convertWithIR({ inputType, outputFormat, source, name, options, o
 
     reportProgress && reportProgress('writing', 80);
 
-    // 写文件
+    // 写文件 —— folderName 优先用 parser 已经决定的（保证多格式共享一个目录）
     const { sanitizeFolderName, ensureOutputFolder, writeOutputFile } = require('./ir/util');
     const title =
         (doc.meta && doc.meta.title) ||
         extractTitleFromIR(doc.ir) ||
         stripExt(name) ||
         '未命名文档';
-    const folderName = sanitizeFolderName(title);
+    const folderName =
+        (doc.meta && doc.meta.folderName) || sanitizeFolderName(title);
     const { outputFolder } = ensureOutputFolder(outputDir, folderName, false);
     const outputPath = writeOutputFile(outputFolder, folderName, outputFormat, content);
 
