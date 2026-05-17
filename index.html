@@ -36,43 +36,102 @@
             <!-- 左侧：输入与控制区 -->
             <section class="control-panel panel-glass">
                 <div class="tabs">
-                    <button class="tab-btn active" data-tab="tab-word">
-                        <i class="ph ph-file-doc"></i> Word文档
+                    <button class="tab-btn active" data-tab="tab-office">
+                        <i class="ph ph-files"></i> 办公文档
+                    </button>
+                    <button class="tab-btn" data-tab="tab-markup">
+                        <i class="ph ph-brackets-angle"></i> 标记文档
                     </button>
                     <button class="tab-btn" data-tab="tab-link">
-                        <i class="ph ph-link"></i> 网页/微信
+                        <i class="ph ph-link"></i> 网页链接
                     </button>
                     <button class="tab-btn" data-tab="tab-text">
-                        <i class="ph ph-text-T"></i> 粘贴文本
+                        <i class="ph ph-text-t"></i> 粘贴文本
                     </button>
                     <div class="tab-indicator"></div>
                 </div>
 
                 <div class="tab-content-container">
-                    <!-- Word 上传面板（支持批量） -->
-                    <div class="tab-content active" id="tab-word">
-                        <div class="upload-area" id="drop-zone">
+                    <!-- 办公文档 tab：docx/pdf/xlsx/pptx/doc/xls/ppt -->
+                    <div class="tab-content active" id="tab-office">
+                        <div class="upload-area" id="drop-zone-office">
                             <i class="ph ph-upload-simple upload-icon"></i>
-                            <h3>拖拽 Word 文件至此</h3>
-                            <p>支持 .docx 格式，可批量上传多个文件</p>
-                            <button class="btn btn-secondary">浏览文件</button>
-                            <input type="file" id="file-input" accept=".docx" multiple hidden>
+                            <h3>拖拽办公文档至此</h3>
+                            <p>支持 .docx / .pdf / .xlsx / .pptx / .doc / .xls / .ppt</p>
+                            <button class="btn btn-secondary" data-trigger="file-input-office">浏览文件</button>
+                            <input type="file" id="file-input-office" accept=".docx,.pdf,.xlsx,.pptx,.doc,.xls,.ppt" multiple hidden>
                         </div>
-                        <div class="file-list" id="file-list"></div>
+                        <div class="file-list" id="file-list-office"></div>
+                        <div class="format-selector" id="format-selector-office">
+                            <span class="format-label">输出格式</span>
+                            <div class="format-chips" data-tab="tab-office">
+                                <button class="format-chip active" data-format="md" title="Markdown"><i class="ph ph-file-text"></i>MD</button>
+                                <button class="format-chip" data-format="html" title="HTML"><i class="ph ph-file-html"></i>HTML</button>
+                                <button class="format-chip" data-format="json" title="JSON"><i class="ph ph-brackets-curly"></i>JSON</button>
+                                <button class="format-chip" data-format="docx" title="DOCX"><i class="ph ph-file-doc"></i>DOCX</button>
+                                <button class="format-chip" data-format="pdf" title="PDF"><i class="ph ph-file-pdf"></i>PDF</button>
+                                <button class="format-chip" data-format="xlsx" title="XLSX"><i class="ph ph-file-xls"></i>XLSX</button>
+                                <button class="format-chip" data-format="pptx" title="PPTX"><i class="ph ph-file-ppt"></i>PPTX</button>
+                            </div>
+                        </div>
                     </div>
 
-                    <!-- 链接面板（支持批量） -->
+                    <!-- 标记文档 tab：md/html/json → 任意 -->
+                    <div class="tab-content" id="tab-markup">
+                        <div class="upload-area" id="drop-zone-markup">
+                            <i class="ph ph-brackets-angle upload-icon"></i>
+                            <h3>拖拽 Markdown / HTML / JSON 至此</h3>
+                            <p>反向转换：标记文档 → DOCX / PDF / XLSX / PPTX 等</p>
+                            <button class="btn btn-secondary" data-trigger="file-input-markup">浏览文件</button>
+                            <input type="file" id="file-input-markup" accept=".md,.markdown,.html,.htm,.json" multiple hidden>
+                        </div>
+                        <div class="file-list" id="file-list-markup"></div>
+                        <div class="format-selector" id="format-selector-markup">
+                            <span class="format-label">输出格式</span>
+                            <div class="format-chips" data-tab="tab-markup">
+                                <button class="format-chip active" data-format="html"><i class="ph ph-file-html"></i>HTML</button>
+                                <button class="format-chip" data-format="md"><i class="ph ph-file-text"></i>MD</button>
+                                <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
+                                <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
+                                <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
+                                <button class="format-chip" data-format="xlsx"><i class="ph ph-file-xls"></i>XLSX</button>
+                                <button class="format-chip" data-format="pptx"><i class="ph ph-file-ppt"></i>PPTX</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 网页链接 tab -->
                     <div class="tab-content" id="tab-link">
                         <div class="input-group">
                             <label>文章链接 <span class="hint">（每行一个，支持批量）</span></label>
                             <textarea class="url-textarea" id="url-input" placeholder="https://mp.weixin.qq.com/s/...&#10;https://zhuanlan.zhihu.com/p/...&#10;支持微信公众号、知乎、CSDN等" rows="5"></textarea>
                         </div>
+                        <div class="format-selector" id="format-selector-link">
+                            <span class="format-label">输出格式</span>
+                            <div class="format-chips" data-tab="tab-link">
+                                <button class="format-chip active" data-format="md"><i class="ph ph-file-text"></i>MD</button>
+                                <button class="format-chip" data-format="html"><i class="ph ph-file-html"></i>HTML</button>
+                                <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
+                                <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
+                                <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
+                            </div>
+                        </div>
                     </div>
 
-                    <!-- 文本面板 -->
+                    <!-- 粘贴文本 tab -->
                     <div class="tab-content" id="tab-text">
                         <div class="input-group full-height">
-                            <textarea placeholder="在此处粘贴您的文本内容..." id="raw-text-input"></textarea>
+                            <textarea placeholder="在此处粘贴您的文本或 HTML 内容..." id="raw-text-input"></textarea>
+                        </div>
+                        <div class="format-selector" id="format-selector-text">
+                            <span class="format-label">输出格式</span>
+                            <div class="format-chips" data-tab="tab-text">
+                                <button class="format-chip active" data-format="md"><i class="ph ph-file-text"></i>MD</button>
+                                <button class="format-chip" data-format="html"><i class="ph ph-file-html"></i>HTML</button>
+                                <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
+                                <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
+                                <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -97,6 +156,7 @@
                 <div class="preview-header">
                     <div class="preview-title">
                         <i class="ph ph-eye"></i> 预览 & 编辑
+                        <span class="preview-kind-tag" id="preview-kind-tag"></span>
                     </div>
                     <div class="preview-toggles">
                         <button class="toggle-btn active" data-view="split">分屏</button>
@@ -110,10 +170,13 @@
                         <button class="btn btn-small btn-primary" id="save-btn">
                             <i class="ph ph-floppy-disk"></i> 保存
                         </button>
+                        <button class="btn btn-small btn-primary" id="export-btn" hidden>
+                            <i class="ph ph-export"></i> 导出
+                        </button>
                     </div>
                 </div>
 
-                <!-- 工具栏 -->
+                <!-- 工具栏（仅 MD 预览有效） -->
                 <div class="editor-toolbar" id="editor-toolbar">
                     <button class="toolbar-btn" data-action="bold" title="加粗 (Ctrl+B)"><i class="ph ph-text-bolder"></i></button>
                     <button class="toolbar-btn" data-action="italic" title="斜体 (Ctrl+I)"><i class="ph ph-text-italic"></i></button>
@@ -134,17 +197,42 @@
                     <span class="toolbar-divider"></span>
                     <button class="toolbar-btn" data-action="hr" title="分割线"><i class="ph ph-minus"></i></button>
                 </div>
-                
-                <div class="preview-body view-split" id="preview-body">
-                    <!-- 编辑区 -->
+
+                <div class="preview-body view-split kind-md" id="preview-body">
+                    <!-- 编辑区（md/html/json 通用） -->
                     <div class="editor-pane">
-                        <textarea id="markdown-editor" spellcheck="false" placeholder="Markdown 源码将在这里显示，您可以直接修改..."></textarea>
+                        <textarea id="markdown-editor" spellcheck="false" placeholder="转换后的源码将在此显示，可直接修改..."></textarea>
                     </div>
-                    <!-- 渲染区 -->
-                    <div class="render-pane" id="markdown-render">
-                        <div class="empty-state">
-                            <i class="ph ph-magic-wand"></i>
-                            <p>转换后的内容将在此预览</p>
+                    <!-- 渲染区根容器，根据 kind-* 切换内部显示 -->
+                    <div class="render-pane" id="render-pane">
+                        <!-- MD 渲染 -->
+                        <div class="render-md" id="markdown-render">
+                            <div class="empty-state">
+                                <i class="ph ph-magic-wand"></i>
+                                <p>转换后的内容将在此预览</p>
+                            </div>
+                        </div>
+                        <!-- HTML 渲染（iframe 沙盒） -->
+                        <iframe class="render-html" id="html-preview-frame" sandbox="allow-same-origin" srcdoc=""></iframe>
+                        <!-- JSON 渲染（折叠树） -->
+                        <pre class="render-json" id="json-preview"></pre>
+                        <!-- 二进制结果卡 -->
+                        <div class="binary-result-card" id="binary-result-card">
+                            <div class="binary-card-icon">
+                                <i class="ph ph-file-archive" id="binary-icon"></i>
+                            </div>
+                            <div class="binary-card-meta">
+                                <h4 id="binary-filename">已生成文件</h4>
+                                <p id="binary-info">路径与大小信息</p>
+                            </div>
+                            <div class="binary-card-actions">
+                                <button class="btn btn-secondary btn-small" id="binary-open-folder">
+                                    <i class="ph ph-folder-open"></i> 打开目录
+                                </button>
+                                <button class="btn btn-secondary btn-small" id="binary-save-as">
+                                    <i class="ph ph-floppy-disk"></i> 另存为
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -157,7 +245,7 @@
         <div class="modal-card panel-glass">
             <div class="spinner"></div>
             <h3 id="loading-title">正在转换</h3>
-            <p id="loading-desc">正在解析文档格式并提取图片...</p>
+            <p id="loading-desc">正在解析文档...</p>
             <div class="progress-bar-wrapper" id="batch-progress" style="display:none">
                 <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
                 <span class="progress-text" id="progress-text">0/0</span>
@@ -191,7 +279,7 @@
                 <!-- 输出目录 -->
                 <div class="settings-group">
                     <label class="settings-label">输出目录</label>
-                    <p class="settings-hint">转换后的 Markdown 文件和图片将保存在此目录下，以文章标题命名子文件夹。</p>
+                    <p class="settings-hint">所有转换产物按 <span class="dim">文章标题</span> 建子文件夹累加多种格式（.md / .html / .json / .docx / .pdf / .xlsx / .pptx 共存）。</p>
                     <div class="settings-input-row">
                         <div class="input-wrapper">
                             <i class="ph ph-folder-open input-icon"></i>
@@ -200,7 +288,29 @@
                     </div>
                     <div class="settings-path-preview" id="path-preview">
                         <i class="ph ph-tree-structure"></i>
-                        <code><span id="preview-dir"></span>/<span class="dim">文章标题</span>/<br>&nbsp;&nbsp;├── <span class="dim">文章标题</span>.md<br>&nbsp;&nbsp;└── images/<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── image_1.png<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── ...</code>
+                        <code><span id="preview-dir"></span>/<span class="dim">文章标题</span>/<br>&nbsp;&nbsp;├── <span class="dim">文章标题</span>.md / .html / .json / .docx / ...<br>&nbsp;&nbsp;└── images/</code>
+                    </div>
+                </div>
+                <hr class="settings-divider">
+                <!-- 能力探测 -->
+                <div class="settings-group">
+                    <label class="settings-label">运行能力</label>
+                    <div class="capability-row">
+                        <span class="capability-name"><i class="ph ph-file-pdf"></i> PDF 输出（Electron 内嵌 Chromium）</span>
+                        <span class="capability-status" id="cap-pdf">检测中...</span>
+                    </div>
+                    <div class="capability-row">
+                        <span class="capability-name"><i class="ph ph-file-doc"></i> 旧二进制 DOC/XLS/PPT（LibreOffice）</span>
+                        <span class="capability-status" id="cap-soffice">检测中...</span>
+                    </div>
+                    <p class="settings-hint" id="soffice-hint" hidden></p>
+                </div>
+                <hr class="settings-divider">
+                <!-- 最近转换 -->
+                <div class="settings-group">
+                    <label class="settings-label">最近转换</label>
+                    <div class="history-list" id="recent-conversions-list">
+                        <p class="empty-state-mini">暂无记录</p>
                     </div>
                 </div>
             </div>

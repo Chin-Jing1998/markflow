@@ -1,18 +1,52 @@
-document.addEventListener('DOMContentLoaded', () => {
+/**
+ * MarkFlow 前端（P2 重构版）
+ *
+ * 4 tab：tab-office / tab-markup / tab-link / tab-text
+ * 每 tab 内有输出格式 chip 组（根据 /api/formats matrix 动态启用/禁用）
+ * 转换走 POST /api/convert（统一） + SSE 进度订阅
+ * 预览状态机：kind-md / kind-html / kind-json / kind-binary
+ */
+
+// ============================================================
+// 全局状态
+// ============================================================
+const FILE_TABS = ['tab-office', 'tab-markup'];
+const filesByTab = { 'tab-office': [], 'tab-markup': [] };
+
+let currentOutputDir = '';
+let currentResult = null; // 最近一次成功结果（来自 SSE done）
+let currentFolderName = '';
+let currentFormat = 'md';
+let formatMatrix = null;
+let sofficeHint = '';
+let isElectron = !!(window.electronAPI && window.electronAPI.isElectron);
+
+const HISTORY_KEY = 'markflow-history';
+const HISTORY_MAX = 20;
+const THEME_KEY = 'markflow-theme';
+
+// ============================================================
+// 入口
+// ============================================================
+document.addEventListener('DOMContentLoaded', async () => {
     initTabs();
-    initDragAndDrop();
+    initDropZones();
+    initFormatChips();
     initPreviewToggles();
-    initMarkdownEditor();
+    initEditor();
     initConversion();
     initSettings();
     initToolbar();
     initKeyboardShortcuts();
+    initBinaryCard();
+
+    // 异步加载能力矩阵，决定 chip 启用/禁用
+    await loadCapabilities();
 });
 
-// 当前上传的文件列表（支持批量）
-let currentFiles = [];
-
-// ===================== Tab 切换 =====================
+// ============================================================
+// Tab 切换
+// ============================================================
 function initTabs() {
     const tabs = document.querySelectorAll('.tab-btn');
     const contents = document.querySelectorAll('.tab-content');
@@ -26,167 +60,270 @@ function initTabs() {
 
     const activeTab = document.querySelector('.tab-btn.active');
     if (activeTab) updateIndicator(activeTab);
-
     window.addEventListener('resize', () => {
         const at = document.querySelector('.tab-btn.active');
         if (at) updateIndicator(at);
     });
 
-    tabs.forEach(tab => {
+    tabs.forEach((tab) => {
         tab.addEventListener('click', () => {
-            tabs.forEach(t => t.classList.remove('active'));
-            contents.forEach(c => c.classList.remove('active'));
+            tabs.forEach((t) => t.classList.remove('active'));
+            contents.forEach((c) => c.classList.remove('active'));
             tab.classList.add('active');
             document.getElementById(tab.getAttribute('data-tab')).classList.add('active');
             updateIndicator(tab);
+            // tab 切换时刷新 chip 启用状态
+            refreshChipAvailability();
         });
     });
 }
 
-// ===================== 拖拽上传（批量） =====================
-function initDragAndDrop() {
-    const dropZone = document.getElementById('drop-zone');
-    const fileInput = document.getElementById('file-input');
-    const fileList = document.getElementById('file-list');
-    const browseBtn = dropZone.querySelector('.btn-secondary');
-
-    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(e =>
-        dropZone.addEventListener(e, ev => { ev.preventDefault(); ev.stopPropagation(); }, false)
-    );
-    ['dragenter', 'dragover'].forEach(e =>
-        dropZone.addEventListener(e, () => dropZone.classList.add('dragover'), false)
-    );
-    ['dragleave', 'drop'].forEach(e =>
-        dropZone.addEventListener(e, () => dropZone.classList.remove('dragover'), false)
-    );
-
-    dropZone.addEventListener('drop', e => handleFiles(e.dataTransfer.files), false);
-    browseBtn.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', function () { handleFiles(this.files); });
-
-    function handleFiles(files) {
-        if (files.length === 0) return;
-        const newFiles = Array.from(files).filter(f => f.name.endsWith('.docx'));
-        if (newFiles.length === 0) {
-            showToast('请上传 .docx 格式的 Word 文档', 'error');
-            return;
-        }
-        newFiles.forEach(f => {
-            if (!currentFiles.find(c => c.name === f.name && c.size === f.size)) {
-                currentFiles.push(f);
-            }
-        });
-        renderFileList();
-    }
-
-    function renderFileList() {
-        if (currentFiles.length === 0) {
-            fileList.innerHTML = '';
-            dropZone.style.display = 'flex';
-            return;
-        }
-        dropZone.style.display = 'none';
-        fileList.innerHTML = currentFiles.map((f, i) => `
-            <div class="file-item" data-index="${i}">
-                <div class="file-item-info">
-                    <i class="ph ph-file-doc file-item-icon"></i>
-                    <div>
-                        <span class="file-item-name">${f.name}</span>
-                        <span class="file-item-size">${formatFileSize(f.size)}</span>
-                    </div>
-                </div>
-                <button class="icon-btn" onclick="removeFile(${i})" title="移除"><i class="ph ph-x"></i></button>
-            </div>
-        `).join('') + `
-            <button class="btn btn-secondary full-width" onclick="document.getElementById('file-input').click()" style="margin-top: 8px">
-                <i class="ph ph-plus"></i> 添加更多文件
-            </button>
-        `;
-    }
-
-    window.removeFile = function (index) {
-        currentFiles.splice(index, 1);
-        renderFileList();
-    };
-
-    window.resetUpload = function () {
-        currentFiles = [];
-        renderFileList();
-        fileInput.value = '';
-    };
+// ============================================================
+// 上传区（office / markup 两个）
+// ============================================================
+function initDropZones() {
+    setupZone('tab-office', 'drop-zone-office', 'file-input-office', 'file-list-office', 'ph-file-doc');
+    setupZone('tab-markup', 'drop-zone-markup', 'file-input-markup', 'file-list-markup', 'ph-brackets-angle');
 }
 
-// ===================== 预览视图切换 =====================
-function initPreviewToggles() {
-    const toggles = document.querySelectorAll('.toggle-btn');
-    const previewBody = document.getElementById('preview-body');
-    toggles.forEach(btn => {
-        btn.addEventListener('click', () => {
-            toggles.forEach(t => t.classList.remove('active'));
-            btn.classList.add('active');
-            const viewType = btn.getAttribute('data-view');
-            previewBody.classList.remove('view-split', 'view-edit', 'view-render');
-            previewBody.classList.add(`view-${viewType}`);
+function setupZone(tabId, zoneId, inputId, listId, iconClass) {
+    const zone = document.getElementById(zoneId);
+    const input = document.getElementById(inputId);
+    const list = document.getElementById(listId);
+    if (!zone || !input || !list) return;
+
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach((e) =>
+        zone.addEventListener(e, (ev) => { ev.preventDefault(); ev.stopPropagation(); }, false),
+    );
+    ['dragenter', 'dragover'].forEach((e) =>
+        zone.addEventListener(e, () => zone.classList.add('dragover'), false),
+    );
+    ['dragleave', 'drop'].forEach((e) =>
+        zone.addEventListener(e, () => zone.classList.remove('dragover'), false),
+    );
+
+    zone.addEventListener('drop', (e) => handleFiles(tabId, e.dataTransfer.files), false);
+    input.addEventListener('change', function () { handleFiles(tabId, this.files); });
+
+    // "浏览文件"按钮触发
+    const browseBtns = zone.querySelectorAll('[data-trigger]');
+    browseBtns.forEach((b) => {
+        b.addEventListener('click', (e) => {
+            e.preventDefault();
+            document.getElementById(b.dataset.trigger).click();
         });
     });
 }
 
-// ===================== Markdown 编辑与渲染 =====================
-function initMarkdownEditor() {
-    const editor = document.getElementById('markdown-editor');
-
-    if (typeof marked === 'undefined') {
-        console.warn('marked.js 未加载');
+function handleFiles(tabId, files) {
+    if (!files || files.length === 0) return;
+    const accepted = filterByTab(tabId, Array.from(files));
+    if (accepted.length === 0) {
+        showToast('文件类型不受当前 tab 支持', 'error');
         return;
     }
-
-    editor.addEventListener('input', () => renderMarkdown(editor.value));
-
-    document.getElementById('copy-btn').addEventListener('click', () => {
-        if (editor.value.trim() === '') return;
-        navigator.clipboard.writeText(editor.value).then(() => {
-            const btn = document.getElementById('copy-btn');
-            const orig = btn.innerHTML;
-            btn.innerHTML = '<i class="ph ph-check"></i> 已复制';
-            btn.style.background = '#34C759'; btn.style.color = '#fff';
-            setTimeout(() => { btn.innerHTML = orig; btn.style.background = ''; btn.style.color = ''; }, 2000);
-        });
+    accepted.forEach((f) => {
+        if (!filesByTab[tabId].find((c) => c.name === f.name && c.size === f.size)) {
+            filesByTab[tabId].push(f);
+        }
     });
+    renderFileList(tabId);
+    refreshChipAvailability();
+}
 
-    document.getElementById('save-btn').addEventListener('click', async () => {
-        if (editor.value.trim() === '') { showToast('没有可保存的内容', 'warning'); return; }
-        await saveMarkdown(editor.value);
+function filterByTab(tabId, files) {
+    const officeExt = ['.docx', '.pdf', '.xlsx', '.pptx', '.doc', '.xls', '.ppt'];
+    const markupExt = ['.md', '.markdown', '.html', '.htm', '.json'];
+    const allowed = tabId === 'tab-office' ? officeExt : markupExt;
+    return files.filter((f) => allowed.some((ext) => f.name.toLowerCase().endsWith(ext)));
+}
+
+function renderFileList(tabId) {
+    const list = document.getElementById(`file-list-${tabId.replace('tab-', '')}`);
+    const zone = document.getElementById(`drop-zone-${tabId.replace('tab-', '')}`);
+    const files = filesByTab[tabId];
+    if (!list || !zone) return;
+
+    if (files.length === 0) {
+        list.innerHTML = '';
+        zone.style.display = 'flex';
+        return;
+    }
+    zone.style.display = 'none';
+    list.innerHTML = files
+        .map(
+            (f, i) => `
+        <div class="file-item" data-tab="${tabId}" data-index="${i}">
+            <div class="file-item-info">
+                <i class="ph ${fileTypeIcon(f.name)} file-item-icon"></i>
+                <div>
+                    <span class="file-item-name">${escapeHtml(f.name)}</span>
+                    <span class="file-item-size">${formatFileSize(f.size)}</span>
+                </div>
+            </div>
+            <button class="icon-btn" onclick="removeFile('${tabId}', ${i})" title="移除"><i class="ph ph-x"></i></button>
+        </div>`,
+        )
+        .join('') +
+        `<button class="btn btn-secondary full-width" onclick="document.getElementById('file-input-${tabId.replace('tab-', '')}').click()" style="margin-top: 8px">
+            <i class="ph ph-plus"></i> 添加更多文件
+        </button>`;
+}
+
+window.removeFile = (tabId, idx) => {
+    filesByTab[tabId].splice(idx, 1);
+    renderFileList(tabId);
+    refreshChipAvailability();
+};
+
+function fileTypeIcon(name) {
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.pdf')) return 'ph-file-pdf';
+    if (lower.match(/\.(xlsx|xls)$/)) return 'ph-file-xls';
+    if (lower.match(/\.(pptx|ppt)$/)) return 'ph-file-ppt';
+    if (lower.match(/\.(docx|doc)$/)) return 'ph-file-doc';
+    if (lower.match(/\.(md|markdown)$/)) return 'ph-file-text';
+    if (lower.match(/\.(html|htm)$/)) return 'ph-file-html';
+    if (lower.endsWith('.json')) return 'ph-brackets-curly';
+    return 'ph-file';
+}
+
+// ============================================================
+// 输出格式 chip
+// ============================================================
+function initFormatChips() {
+    document.querySelectorAll('.format-chips').forEach((group) => {
+        group.addEventListener('click', (e) => {
+            const chip = e.target.closest('.format-chip');
+            if (!chip || chip.disabled) return;
+            group.querySelectorAll('.format-chip').forEach((c) => c.classList.remove('active'));
+            chip.classList.add('active');
+        });
     });
 }
 
-let currentFolderName = '';
+async function loadCapabilities() {
+    try {
+        const res = await fetch('/api/formats');
+        const data = await res.json();
+        formatMatrix = data.matrix || {};
+        sofficeHint = data.sofficeHint || '';
 
-/**
- * 渲染 Markdown 到预览区（图片路径映射）
- */
-function renderMarkdown(text) {
-    const renderPane = document.getElementById('markdown-render');
-    if (text.trim() === '') {
-        renderPane.innerHTML = `<div class="empty-state"><i class="ph ph-magic-wand"></i><p>转换后的内容将在此预览</p></div>`;
-    } else {
-        let html = marked.parse(text);
-        if (currentFolderName) {
-            html = html.replace(/src="images\//g, `src="/output-files/${encodeURIComponent(currentFolderName)}/images/`);
-        }
-        renderPane.innerHTML = html;
+        // 设置弹窗能力探测显示
+        renderCapabilityStatus(data.capabilities || {}, data.sofficeHint);
+        refreshChipAvailability();
+    } catch (e) {
+        console.warn('加载能力矩阵失败:', e);
     }
 }
 
-// ===================== 转换逻辑（支持批量） =====================
+function renderCapabilityStatus(caps, hint) {
+    const pdf = document.getElementById('cap-pdf');
+    const sof = document.getElementById('cap-soffice');
+    if (pdf) {
+        pdf.textContent = caps.electronPrintToPdf ? '可用' : '需 Electron 模式';
+        pdf.className = 'capability-status ' + (caps.electronPrintToPdf ? 'ok' : 'fail');
+    }
+    if (sof) {
+        sof.textContent = caps.sofficeAvailable ? '已检测到' : '未安装';
+        sof.className = 'capability-status ' + (caps.sofficeAvailable ? 'ok' : 'fail');
+    }
+    const hintEl = document.getElementById('soffice-hint');
+    if (hintEl) {
+        if (!caps.sofficeAvailable && hint) {
+            hintEl.textContent = hint;
+            hintEl.hidden = false;
+        } else {
+            hintEl.hidden = true;
+        }
+    }
+}
+
+function refreshChipAvailability() {
+    if (!formatMatrix) return;
+    const activeTab = document.querySelector('.tab-content.active');
+    if (!activeTab) return;
+    const tabId = activeTab.id;
+
+    // 推断当前 tab 的输入类型集合（取交集决定可用输出）
+    let inputTypes = [];
+    if (tabId === 'tab-office' || tabId === 'tab-markup') {
+        const files = filesByTab[tabId];
+        if (files.length > 0) {
+            inputTypes = Array.from(new Set(files.map((f) => detectInputType(f.name)))).filter(Boolean);
+        } else {
+            // 没文件时按 tab 的全部支持类型联合（让用户能看到可能性）
+            inputTypes = tabId === 'tab-office'
+                ? ['docx', 'pdf', 'xlsx', 'pptx', 'doc', 'xls', 'ppt']
+                : ['md', 'html', 'json'];
+        }
+    } else if (tabId === 'tab-link') {
+        inputTypes = ['url'];
+    } else if (tabId === 'tab-text') {
+        inputTypes = ['text'];
+    }
+
+    // 输出可用 = 所有 input 类型的支持输出的交集
+    let allowedOutputs = null;
+    for (const t of inputTypes) {
+        const supported = new Set(formatMatrix[t] || []);
+        allowedOutputs = allowedOutputs ? intersect(allowedOutputs, supported) : supported;
+    }
+    allowedOutputs = allowedOutputs || new Set();
+
+    const group = activeTab.querySelector('.format-chips');
+    if (!group) return;
+    let activeStillValid = false;
+    group.querySelectorAll('.format-chip').forEach((chip) => {
+        const fmt = chip.dataset.format;
+        const allowed = allowedOutputs.has(fmt);
+        chip.disabled = !allowed;
+        if (chip.classList.contains('active') && allowed) activeStillValid = true;
+    });
+    // 当前激活 chip 失效时，自动切到第一个可用的
+    if (!activeStillValid) {
+        const firstAvail = group.querySelector('.format-chip:not([disabled])');
+        if (firstAvail) {
+            group.querySelectorAll('.format-chip').forEach((c) => c.classList.remove('active'));
+            firstAvail.classList.add('active');
+        }
+    }
+}
+
+function intersect(setA, setB) {
+    const out = new Set();
+    for (const x of setA) if (setB.has(x)) out.add(x);
+    return out;
+}
+
+function detectInputType(filename) {
+    const lower = filename.toLowerCase();
+    if (lower.endsWith('.pdf')) return 'pdf';
+    if (lower.endsWith('.xlsx')) return 'xlsx';
+    if (lower.endsWith('.xls')) return 'xls';
+    if (lower.endsWith('.pptx')) return 'pptx';
+    if (lower.endsWith('.ppt')) return 'ppt';
+    if (lower.endsWith('.docx')) return 'docx';
+    if (lower.endsWith('.doc')) return 'doc';
+    if (lower.match(/\.(md|markdown)$/)) return 'md';
+    if (lower.match(/\.(html|htm)$/)) return 'html';
+    if (lower.endsWith('.json')) return 'json';
+    return null;
+}
+
+function getActiveFormat() {
+    const activeTab = document.querySelector('.tab-content.active');
+    const chip = activeTab.querySelector('.format-chip.active:not([disabled])');
+    return chip ? chip.dataset.format : 'md';
+}
+
+// ============================================================
+// 转换入口（统一）
+// ============================================================
 function initConversion() {
     document.getElementById('convert-btn').addEventListener('click', async () => {
-        const activeTabId = document.querySelector('.tab-content.active').id;
         try {
-            switch (activeTabId) {
-                case 'tab-word': await convertWord(); break;
-                case 'tab-link': await convertUrl(); break;
-                case 'tab-text': await convertText(); break;
-            }
+            await runConvert();
         } catch (err) {
             showLoading(false);
             showToast(`转换失败：${err.message}`, 'error');
@@ -194,129 +331,548 @@ function initConversion() {
     });
 }
 
-async function convertWord() {
-    if (currentFiles.length === 0) { showToast('请先上传 Word 文件', 'warning'); return; }
+async function runConvert() {
+    const activeTab = document.querySelector('.tab-content.active');
+    if (!activeTab) return;
+    const tabId = activeTab.id;
+    const outputFormat = getActiveFormat();
+    currentFormat = outputFormat;
 
-    if (currentFiles.length === 1) {
-        // 单文件转换
-        showLoading(true, '正在转换', '正在解析 Word 文档并提取图片...');
-        const formData = new FormData();
-        formData.append('file', currentFiles[0]);
-        const response = await fetch('/api/convert/word', { method: 'POST', body: formData });
-        const result = await response.json();
-        showLoading(false);
-        if (result.success) { displayResult(result.data); showToast(`转换成功！提取了 ${result.data.imagesCount} 张图片`, 'success'); }
-        else showToast(`转换失败：${result.error}`, 'error');
-    } else {
-        // 批量转换
-        showBatchProgress(true, currentFiles.length);
-        let successCount = 0;
-        let lastResult = null;
-        for (let i = 0; i < currentFiles.length; i++) {
-            updateProgress(i, currentFiles.length, currentFiles[i].name);
-            const formData = new FormData();
-            formData.append('file', currentFiles[i]);
-            try {
-                const response = await fetch('/api/convert/word', { method: 'POST', body: formData });
-                const result = await response.json();
-                if (result.success) { successCount++; lastResult = result.data; }
-                // 标记文件状态
-                const el = document.querySelector(`.file-item[data-index="${i}"]`);
-                if (el) {
-                    const statusEl = document.createElement('span');
-                    statusEl.className = 'file-item-status';
-                    statusEl.innerHTML = result.success ? '<i class="ph ph-check-circle" style="color:#34C759"></i>' : '<i class="ph ph-x-circle" style="color:#FF3B30"></i>';
-                    el.appendChild(statusEl);
-                }
-            } catch (e) { console.error(e); }
+    let body, headers;
+    const manifest = { items: [], commonOutputDir: currentOutputDir };
+
+    if (tabId === 'tab-office' || tabId === 'tab-markup') {
+        const files = filesByTab[tabId];
+        if (files.length === 0) {
+            showToast('请先添加文件', 'warning');
+            return;
         }
-        showBatchProgress(false);
-        if (lastResult) displayResult(lastResult);
-        showToast(`批量转换完成！成功 ${successCount}/${currentFiles.length}`, successCount === currentFiles.length ? 'success' : 'warning');
-    }
-}
-
-async function convertUrl() {
-    const urlInput = document.getElementById('url-input');
-    const text = urlInput.value.trim();
-    if (!text) { showToast('请输入文章链接', 'warning'); return; }
-
-    // 按行分割获取所有链接
-    const urls = text.split('\n').map(u => u.trim()).filter(u => u && u.startsWith('http'));
-    if (urls.length === 0) { showToast('未检测到有效链接', 'warning'); return; }
-
-    if (urls.length === 1) {
-        showLoading(true, '正在提取', '正在抓取网页内容并下载图片...');
-        const response = await fetch('/api/convert/url', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: urls[0] })
+        const fd = new FormData();
+        files.forEach((f, i) => {
+            const inputType = detectInputType(f.name);
+            if (!inputType) {
+                showToast(`未识别文件类型：${f.name}`, 'warning');
+                return;
+            }
+            fd.append('files', f);
+            manifest.items.push({ idx: i, inputType, outputFormat });
         });
-        const result = await response.json();
-        showLoading(false);
-        if (result.success) { displayResult(result.data); showToast(`提取成功！下载了 ${result.data.imagesCount} 张图片`, 'success'); }
-        else showToast(`提取失败：${result.error}`, 'error');
-    } else {
-        // 批量链接转换
-        showBatchProgress(true, urls.length);
-        let successCount = 0;
-        let lastResult = null;
-        for (let i = 0; i < urls.length; i++) {
-            updateProgress(i, urls.length, urls[i].substring(0, 60));
-            try {
-                const response = await fetch('/api/convert/url', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: urls[i] })
-                });
-                const result = await response.json();
-                if (result.success) { successCount++; lastResult = result.data; }
-            } catch (e) { console.error(e); }
+        if (manifest.items.length === 0) return;
+        fd.append('manifest', JSON.stringify(manifest));
+        body = fd;
+    } else if (tabId === 'tab-link') {
+        const text = document.getElementById('url-input').value.trim();
+        const urls = text.split('\n').map((u) => u.trim()).filter((u) => u && u.startsWith('http'));
+        if (urls.length === 0) {
+            showToast('未检测到有效链接', 'warning');
+            return;
         }
-        showBatchProgress(false);
-        if (lastResult) displayResult(lastResult);
-        showToast(`批量提取完成！成功 ${successCount}/${urls.length}`, successCount === urls.length ? 'success' : 'warning');
+        manifest.items = urls.map((u, i) => ({ idx: i, inputType: 'url', outputFormat, source: u }));
+        body = JSON.stringify(manifest);
+        headers = { 'Content-Type': 'application/json' };
+    } else if (tabId === 'tab-text') {
+        const text = document.getElementById('raw-text-input').value.trim();
+        if (!text) {
+            showToast('请输入或粘贴内容', 'warning');
+            return;
+        }
+        manifest.items = [{ idx: 0, inputType: 'text', outputFormat, source: text }];
+        body = JSON.stringify(manifest);
+        headers = { 'Content-Type': 'application/json' };
     }
+
+    // 提交任务
+    showLoading(true, '正在转换', '提交任务...');
+    if (manifest.items.length > 1) showBatchProgressUI(manifest.items.length);
+
+    const res = await fetch('/api/convert', { method: 'POST', body, headers });
+    const data = await res.json();
+    if (!data.success) {
+        showLoading(false);
+        showToast(`提交失败：${data.error}`, 'error');
+        return;
+    }
+
+    subscribeJob(data.jobId, manifest.items.length);
 }
 
-async function convertText() {
-    const textInput = document.getElementById('raw-text-input');
-    const text = textInput.value.trim();
-    if (!text) { showToast('请输入或粘贴文本内容', 'warning'); return; }
+function subscribeJob(jobId, totalItems) {
+    let lastResult = null;
+    let successCount = 0;
+    let failCount = 0;
 
-    showLoading(true, '正在转换', '正在格式化文本内容...');
-    const response = await fetch('/api/convert/text', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text })
+    const es = new EventSource(`/api/jobs/${jobId}/events`);
+
+    es.addEventListener('hello', () => {});
+
+    es.addEventListener('progress', (e) => {
+        const d = JSON.parse(e.data);
+        if (totalItems > 1) {
+            updateProgress(successCount + failCount, totalItems, d.name);
+            document.getElementById('loading-desc').textContent =
+                `第 ${d.idx + 1} 项 · ${d.phase} · ${d.name}`;
+        } else {
+            document.getElementById('loading-desc').textContent = `${d.phase}...`;
+        }
     });
-    const result = await response.json();
-    showLoading(false);
-    if (result.success) { displayResult(result.data); showToast('文本转换成功', 'success'); }
-    else showToast(`转换失败：${result.error}`, 'error');
+
+    es.addEventListener('item', (e) => {
+        const d = JSON.parse(e.data);
+        if (d.success) {
+            successCount++;
+            lastResult = d.data;
+        } else {
+            failCount++;
+        }
+        markFileStatus(d.idx, d.success);
+        if (totalItems > 1) {
+            updateProgress(successCount + failCount, totalItems, '');
+        }
+    });
+
+    es.addEventListener('done', (e) => {
+        const d = JSON.parse(e.data);
+        es.close();
+        showLoading(false);
+        if (lastResult) {
+            currentResult = lastResult;
+            displayResult(lastResult);
+            saveToHistory(lastResult);
+        }
+        const total = d.summary.total;
+        const ok = d.summary.success;
+        if (ok === total) {
+            showToast(`转换完成 ${ok}/${total}`, 'success');
+        } else if (ok > 0) {
+            showToast(`部分成功 ${ok}/${total}`, 'warning');
+        } else {
+            showToast(`全部失败 ${total}/${total}`, 'error');
+        }
+    });
+
+    es.onerror = () => {
+        es.close();
+        showLoading(false);
+    };
 }
 
-async function saveMarkdown(markdown) {
-    if (!currentFolderName) { showToast('请先进行转换', 'warning'); return; }
-    try {
-        const response = await fetch('/api/save', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ markdown, folderName: currentFolderName })
-        });
-        const result = await response.json();
-        if (result.success) showToast('保存成功', 'success');
-        else showToast(`保存失败：${result.error}`, 'error');
-    } catch (err) { showToast(`保存失败：${err.message}`, 'error'); }
+function markFileStatus(idx, success) {
+    const item = document.querySelector(`.file-item[data-index="${idx}"]`);
+    if (!item) return;
+    let status = item.querySelector('.file-item-status');
+    if (!status) {
+        status = document.createElement('span');
+        status.className = 'file-item-status';
+        item.appendChild(status);
+    }
+    status.innerHTML = success
+        ? '<i class="ph ph-check-circle" style="color:#34C759"></i>'
+        : '<i class="ph ph-x-circle" style="color:#FF3B30"></i>';
 }
 
+// ============================================================
+// 预览状态机 + 结果展示
+// ============================================================
 function displayResult(data) {
-    const editor = document.getElementById('markdown-editor');
     currentFolderName = data.folderName;
-    editor.value = data.markdown;
-    renderMarkdown(data.markdown);
+    currentFormat = data.format;
+
+    const body = document.getElementById('preview-body');
+    body.classList.remove('kind-md', 'kind-html', 'kind-json', 'kind-binary');
+
+    const editor = document.getElementById('markdown-editor');
+    const tag = document.getElementById('preview-kind-tag');
+    const exportBtn = document.getElementById('export-btn');
+    const saveBtn = document.getElementById('save-btn');
+
+    tag.textContent = (data.format || '').toUpperCase();
+
+    if (data.format === 'md') {
+        body.classList.add('kind-md');
+        editor.value = data.content || '';
+        renderMarkdownToPane(data.content || '');
+        if (exportBtn) exportBtn.hidden = false;
+        if (saveBtn) saveBtn.hidden = false;
+    } else if (data.format === 'html') {
+        body.classList.add('kind-html');
+        editor.value = data.content || '';
+        const frame = document.getElementById('html-preview-frame');
+        frame.srcdoc = data.content || '';
+        if (exportBtn) exportBtn.hidden = false;
+        if (saveBtn) saveBtn.hidden = false;
+    } else if (data.format === 'json') {
+        body.classList.add('kind-json');
+        const pretty = data.content
+            ? JSON.stringify(JSON.parse(data.content), null, 2)
+            : '';
+        editor.value = pretty;
+        document.getElementById('json-preview').textContent = pretty;
+        if (exportBtn) exportBtn.hidden = false;
+        if (saveBtn) saveBtn.hidden = false;
+    } else {
+        // binary：docx / pdf / xlsx / pptx
+        body.classList.add('kind-binary');
+        document.getElementById('binary-icon').className = `ph ${formatIcon(data.format)}`;
+        document.getElementById('binary-filename').textContent =
+            data.outputPath ? data.outputPath.split('/').pop() : `${data.format}`;
+        document.getElementById('binary-info').textContent = data.outputPath || '';
+        if (exportBtn) exportBtn.hidden = true;
+        if (saveBtn) saveBtn.hidden = true;
+    }
+
+    // 切回分屏
     document.querySelector('[data-view="split"]').click();
     const label = document.getElementById('output-path-label');
     if (label) label.textContent = `${currentOutputDir}/${data.folderName}/`;
 }
 
-// ===================== 主题切换（在设置弹窗中） =====================
+function formatIcon(format) {
+    return {
+        docx: 'ph-file-doc',
+        pdf: 'ph-file-pdf',
+        xlsx: 'ph-file-xls',
+        pptx: 'ph-file-ppt',
+    }[format] || 'ph-file-archive';
+}
+
+function renderMarkdownToPane(text) {
+    const pane = document.getElementById('markdown-render');
+    if (!text.trim()) {
+        pane.innerHTML = `<div class="empty-state"><i class="ph ph-magic-wand"></i><p>转换后的内容将在此预览</p></div>`;
+        return;
+    }
+    if (typeof marked === 'undefined') {
+        pane.textContent = text;
+        return;
+    }
+    let html = marked.parse(text);
+    if (currentFolderName) {
+        html = html.replace(
+            /src="images\//g,
+            `src="/output-files/${encodeURIComponent(currentFolderName)}/images/`,
+        );
+    }
+    pane.innerHTML = html;
+}
+
+// ============================================================
+// Binary card 操作（打开目录 / 另存为）
+// ============================================================
+function initBinaryCard() {
+    document.getElementById('binary-open-folder').addEventListener('click', () => {
+        if (!currentResult || !currentResult.outputPath) return;
+        if (isElectron && window.electronAPI && window.electronAPI.openInFinder) {
+            window.electronAPI.openInFinder(currentResult.outputPath);
+        } else {
+            showToast('请在 Electron 模式下使用，或前往: ' + currentResult.outputPath, 'info');
+        }
+    });
+
+    document.getElementById('binary-save-as').addEventListener('click', async () => {
+        if (!currentResult || !currentResult.outputPath) return;
+        if (isElectron && window.electronAPI && window.electronAPI.saveAs) {
+            const defaultName = currentResult.outputPath.split('/').pop();
+            try {
+                const p = await window.electronAPI.saveAs(currentResult.outputPath, defaultName);
+                if (p) showToast(`已保存到 ${p}`, 'success');
+            } catch (e) {
+                showToast(`另存为失败：${e.message || e}`, 'error');
+            }
+        } else {
+            // Web 模式：链接下载
+            const folder = currentResult.folderName;
+            const filename = currentResult.outputPath.split('/').pop();
+            const a = document.createElement('a');
+            a.href = `/output-files/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        }
+    });
+}
+
+// ============================================================
+// 预览视图切换
+// ============================================================
+function initPreviewToggles() {
+    const toggles = document.querySelectorAll('.toggle-btn');
+    const body = document.getElementById('preview-body');
+    toggles.forEach((btn) => {
+        btn.addEventListener('click', () => {
+            toggles.forEach((t) => t.classList.remove('active'));
+            btn.classList.add('active');
+            const v = btn.getAttribute('data-view');
+            body.classList.remove('view-split', 'view-edit', 'view-render');
+            body.classList.add(`view-${v}`);
+        });
+    });
+}
+
+// ============================================================
+// 编辑器（保存 / 复制 / 导出）
+// ============================================================
+function initEditor() {
+    const editor = document.getElementById('markdown-editor');
+    if (!editor) return;
+
+    editor.addEventListener('input', () => {
+        if (currentFormat === 'md') {
+            renderMarkdownToPane(editor.value);
+        } else if (currentFormat === 'html') {
+            document.getElementById('html-preview-frame').srcdoc = editor.value;
+        } else if (currentFormat === 'json') {
+            document.getElementById('json-preview').textContent = editor.value;
+        }
+    });
+
+    document.getElementById('copy-btn').addEventListener('click', () => {
+        if (!editor.value.trim()) return;
+        navigator.clipboard.writeText(editor.value).then(() => {
+            const btn = document.getElementById('copy-btn');
+            const orig = btn.innerHTML;
+            btn.innerHTML = '<i class="ph ph-check"></i> 已复制';
+            setTimeout(() => { btn.innerHTML = orig; }, 1500);
+        });
+    });
+
+    document.getElementById('save-btn').addEventListener('click', async () => {
+        if (!editor.value.trim()) { showToast('没有可保存内容', 'warning'); return; }
+        if (!currentFolderName) { showToast('请先进行一次转换', 'warning'); return; }
+        // 兼容旧 /api/save：format=md 走旧（原 markdown 字段），其它走新 /api/save 加 format
+        const body = currentFormat === 'md'
+            ? { markdown: editor.value, folderName: currentFolderName }
+            : { content: editor.value, folderName: currentFolderName, format: currentFormat };
+        try {
+            const res = await fetch('/api/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const r = await res.json();
+            if (r.success) showToast('保存成功', 'success');
+            else showToast(`保存失败：${r.error}`, 'error');
+        } catch (e) {
+            showToast(`保存失败：${e.message}`, 'error');
+        }
+    });
+
+    document.getElementById('export-btn').addEventListener('click', async () => {
+        if (!editor.value.trim() || !currentFolderName) {
+            showToast('没有可导出内容', 'warning');
+            return;
+        }
+        const target = await pickExportTarget();
+        if (!target) return;
+        showLoading(true, '正在导出', `${currentFormat.toUpperCase()} → ${target.toUpperCase()}`);
+        try {
+            const res = await fetch('/api/export', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    content: editor.value,
+                    sourceFormat: currentFormat,
+                    targetFormat: target,
+                    folderName: currentFolderName,
+                }),
+            });
+            const r = await res.json();
+            showLoading(false);
+            if (r.success) {
+                showToast(`已导出 ${r.filename}`, 'success');
+                // 更新 currentResult 让 binary-card 能用
+                currentResult = { format: target, folderName: currentFolderName, outputPath: r.path };
+            } else {
+                showToast(`导出失败：${r.error}`, 'error');
+            }
+        } catch (e) {
+            showLoading(false);
+            showToast(`导出失败：${e.message}`, 'error');
+        }
+    });
+}
+
+async function pickExportTarget() {
+    // 简单：弹出 prompt 让用户选择目标格式
+    const supported = ['html', 'md', 'json', 'docx', 'pdf', 'xlsx', 'pptx']
+        .filter((f) => f !== currentFormat);
+    const choice = window.prompt(`导出为哪种格式？\n可选: ${supported.join(' / ')}`, 'docx');
+    if (!choice) return null;
+    const t = choice.trim().toLowerCase();
+    if (!supported.includes(t)) {
+        showToast(`不支持的目标格式：${t}`, 'error');
+        return null;
+    }
+    return t;
+}
+
+// ============================================================
+// 历史记录（localStorage）
+// ============================================================
+function saveToHistory(result) {
+    try {
+        const list = loadHistory();
+        list.unshift({
+            ts: Date.now(),
+            folderName: result.folderName,
+            format: result.format,
+            title: result.title || result.folderName,
+            outputPath: result.outputPath,
+        });
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_MAX)));
+        renderHistoryList();
+    } catch (e) {}
+}
+
+function loadHistory() {
+    try {
+        return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+    } catch (e) { return []; }
+}
+
+function renderHistoryList() {
+    const list = document.getElementById('recent-conversions-list');
+    if (!list) return;
+    const items = loadHistory();
+    if (items.length === 0) {
+        list.innerHTML = '<p class="empty-state-mini">暂无记录</p>';
+        return;
+    }
+    list.innerHTML = items.map((it, i) => `
+        <div class="history-item" data-index="${i}">
+            <div class="history-item-info">
+                <div class="history-item-name">${escapeHtml(it.title || it.folderName)}</div>
+                <div class="history-item-meta">${new Date(it.ts).toLocaleString('zh-CN')}</div>
+            </div>
+            <span class="history-item-format">${escapeHtml(it.format)}</span>
+        </div>
+    `).join('');
+    list.querySelectorAll('.history-item').forEach((el) => {
+        el.addEventListener('click', () => {
+            const idx = parseInt(el.dataset.index, 10);
+            const it = items[idx];
+            if (!it) return;
+            // 简单：把信息回灌到 currentResult/folderName，让 binary card / save 能用
+            currentFolderName = it.folderName;
+            currentFormat = it.format;
+            currentResult = it;
+            const tag = document.getElementById('preview-kind-tag');
+            if (tag) tag.textContent = (it.format || '').toUpperCase();
+            showToast(`已恢复：${it.folderName}（点击"打开目录"或"另存为"操作产物）`, 'info');
+            document.getElementById('settings-modal').classList.remove('active');
+        });
+    });
+}
+
+// ============================================================
+// 设置弹窗
+// ============================================================
+function initSettings() {
+    const modal = document.getElementById('settings-modal');
+    const settingsBtn = document.getElementById('settingsBtn');
+    const closeBtn = document.getElementById('close-settings');
+    const saveBtn = document.getElementById('save-output-dir');
+    const resetBtn = document.getElementById('reset-output-dir');
+    const dirInput = document.getElementById('output-dir-input');
+    const previewDir = document.getElementById('preview-dir');
+
+    loadOutputDir();
+
+    // 主题
+    const savedTheme = localStorage.getItem(THEME_KEY);
+    if (savedTheme === 'dark') applyTheme('dark');
+    document.getElementById('theme-light').addEventListener('click', () => applyTheme('light'));
+    document.getElementById('theme-dark').addEventListener('click', () => applyTheme('dark'));
+
+    function open() {
+        dirInput.value = currentOutputDir;
+        previewDir.textContent = currentOutputDir;
+        renderHistoryList();
+        modal.classList.add('active');
+    }
+
+    settingsBtn.addEventListener('click', open);
+    closeBtn.addEventListener('click', () => modal.classList.remove('active'));
+    modal.addEventListener('click', (e) => { if (e.target === modal) modal.classList.remove('active'); });
+    dirInput.addEventListener('input', () => {
+        previewDir.textContent = dirInput.value || '/path/to/output';
+    });
+
+    if (isElectron) {
+        const inputWrapper = dirInput.closest('.settings-input-row');
+        const browseBtn = document.createElement('button');
+        browseBtn.className = 'btn btn-secondary';
+        browseBtn.innerHTML = '<i class="ph ph-folder-open"></i> 浏览';
+        browseBtn.style.marginTop = '8px';
+        browseBtn.addEventListener('click', async () => {
+            const dir = await window.electronAPI.selectDirectory();
+            if (dir) {
+                dirInput.value = dir;
+                previewDir.textContent = dir;
+            }
+        });
+        inputWrapper.appendChild(browseBtn);
+
+        if (window.electronAPI.onSetOutputDir) {
+            window.electronAPI.onSetOutputDir(async (dir) => {
+                dirInput.value = dir;
+                previewDir.textContent = dir;
+                await persistOutputDir(dir);
+            });
+        }
+    }
+
+    saveBtn.addEventListener('click', async () => {
+        const newDir = dirInput.value.trim();
+        if (!newDir) { showToast('路径不能为空', 'warning'); return; }
+        if (await persistOutputDir(newDir)) {
+            modal.classList.remove('active');
+            showToast('输出目录已更新', 'success');
+        }
+    });
+
+    resetBtn.addEventListener('click', async () => {
+        if (await persistOutputDir('./output')) {
+            dirInput.value = currentOutputDir;
+            previewDir.textContent = currentOutputDir;
+            showToast('已恢复默认', 'success');
+        }
+    });
+}
+
+async function persistOutputDir(dir) {
+    try {
+        const res = await fetch('/api/settings/output-dir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dir }),
+        });
+        const r = await res.json();
+        if (r.success) {
+            currentOutputDir = r.outputDir;
+            updatePathLabel();
+            return true;
+        }
+        showToast(r.error, 'error');
+    } catch (e) {
+        showToast(`保存失败：${e.message}`, 'error');
+    }
+    return false;
+}
+
+async function loadOutputDir() {
+    try {
+        const res = await fetch('/api/settings/output-dir');
+        const r = await res.json();
+        if (r.success) { currentOutputDir = r.outputDir; updatePathLabel(); }
+    } catch (e) { console.warn(e); }
+}
+
+function updatePathLabel() {
+    const label = document.getElementById('output-path-label');
+    if (label) label.textContent = currentOutputDir;
+}
+
 function applyTheme(theme) {
     if (theme === 'dark') {
         document.documentElement.setAttribute('data-theme', 'dark');
@@ -327,19 +883,19 @@ function applyTheme(theme) {
         document.getElementById('theme-light').classList.add('active');
         document.getElementById('theme-dark').classList.remove('active');
     }
-    localStorage.setItem('markflow-theme', theme);
+    localStorage.setItem(THEME_KEY, theme);
 }
 
-// ===================== Markdown 工具栏 =====================
+// ============================================================
+// Markdown 工具栏（仅 kind-md 有效）
+// ============================================================
 function initToolbar() {
     const toolbar = document.getElementById('editor-toolbar');
     const editor = document.getElementById('markdown-editor');
-
     toolbar.addEventListener('click', (e) => {
         const btn = e.target.closest('.toolbar-btn');
         if (!btn) return;
-        const action = btn.dataset.action;
-        applyToolbarAction(editor, action);
+        applyToolbarAction(editor, btn.dataset.action);
     });
 }
 
@@ -363,9 +919,7 @@ function applyToolbarAction(editor, action) {
         case 'code': before = '\n```\n'; after = '\n```'; insert = selected || '代码'; break;
         case 'link': before = '['; after = '](url)'; insert = selected || '链接文字'; break;
         case 'image': before = '!['; after = '](url)'; insert = selected || '图片描述'; break;
-        case 'table':
-            insert = '\n| 标题1 | 标题2 | 标题3 |\n| --- | --- | --- |\n| 内容 | 内容 | 内容 |\n';
-            break;
+        case 'table': insert = '\n| 标题1 | 标题2 | 标题3 |\n| --- | --- | --- |\n| 内容 | 内容 | 内容 |\n'; break;
         case 'hr': insert = '\n---\n'; break;
         default: return;
     }
@@ -373,198 +927,69 @@ function applyToolbarAction(editor, action) {
     const replacement = before + insert + (after || '');
     editor.value = text.substring(0, start) + replacement + text.substring(end);
     editor.focus();
-    const cursorPos = start + before.length + insert.length;
-    editor.setSelectionRange(start + before.length, cursorPos);
-    renderMarkdown(editor.value);
+    editor.setSelectionRange(start + before.length, start + before.length + insert.length);
+    if (currentFormat === 'md') renderMarkdownToPane(editor.value);
 }
 
-// ===================== 快捷键 =====================
+// ============================================================
+// 快捷键
+// ============================================================
 function initKeyboardShortcuts() {
     const editor = document.getElementById('markdown-editor');
-
     document.addEventListener('keydown', (e) => {
         const isCtrl = e.ctrlKey || e.metaKey;
-
-        // Ctrl+Enter 开始转换
         if (isCtrl && e.key === 'Enter') {
             e.preventDefault();
             document.getElementById('convert-btn').click();
             return;
         }
-
-        // Ctrl+S 保存
         if (isCtrl && e.key === 's') {
             e.preventDefault();
             document.getElementById('save-btn').click();
             return;
         }
-
-        // 编辑器内的快捷键
         if (document.activeElement !== editor) return;
-
-        if (isCtrl && e.key === 'b') {
-            e.preventDefault();
-            applyToolbarAction(editor, 'bold');
-        } else if (isCtrl && e.key === 'i') {
-            e.preventDefault();
-            applyToolbarAction(editor, 'italic');
-        } else if (isCtrl && e.key === 'k') {
-            e.preventDefault();
-            applyToolbarAction(editor, 'link');
-        } else if (isCtrl && e.key === '`') {
-            e.preventDefault();
-            applyToolbarAction(editor, 'code');
-        }
+        if (isCtrl && e.key === 'b') { e.preventDefault(); applyToolbarAction(editor, 'bold'); }
+        else if (isCtrl && e.key === 'i') { e.preventDefault(); applyToolbarAction(editor, 'italic'); }
+        else if (isCtrl && e.key === 'k') { e.preventDefault(); applyToolbarAction(editor, 'link'); }
+        else if (isCtrl && e.key === '`') { e.preventDefault(); applyToolbarAction(editor, 'code'); }
     });
 }
 
-// ===================== 设置弹窗 =====================
-let currentOutputDir = '';
-
-function initSettings() {
-    const modal = document.getElementById('settings-modal');
-    const settingsBtn = document.getElementById('settingsBtn');
-    const closeBtn = document.getElementById('close-settings');
-    const saveBtn = document.getElementById('save-output-dir');
-    const resetBtn = document.getElementById('reset-output-dir');
-    const dirInput = document.getElementById('output-dir-input');
-    const previewDir = document.getElementById('preview-dir');
-
-    loadOutputDir();
-
-    // 加载保存的主题
-    const savedTheme = localStorage.getItem('markflow-theme');
-    if (savedTheme === 'dark') applyTheme('dark');
-
-    // 打开设置
-    function open() {
-        dirInput.value = currentOutputDir;
-        previewDir.textContent = currentOutputDir;
-        modal.classList.add('active');
-    }
-
-    settingsBtn.addEventListener('click', open);
-    closeBtn.addEventListener('click', () => modal.classList.remove('active'));
-    modal.addEventListener('click', e => { if (e.target === modal) modal.classList.remove('active'); });
-    dirInput.addEventListener('input', () => { previewDir.textContent = dirInput.value || '/path/to/output'; });
-
-    // 主题切换按钮
-    document.getElementById('theme-light').addEventListener('click', () => applyTheme('light'));
-    document.getElementById('theme-dark').addEventListener('click', () => applyTheme('dark'));
-
-    // Electron 原生目录选择对话框
-    if (window.electronAPI && window.electronAPI.isElectron) {
-        // 在路径输入框后添加浏览按钮
-        const inputWrapper = dirInput.closest('.settings-input-row');
-        const browseBtn = document.createElement('button');
-        browseBtn.className = 'btn btn-secondary';
-        browseBtn.innerHTML = '<i class="ph ph-folder-open"></i> 浏览';
-        browseBtn.style.marginTop = '8px';
-        browseBtn.addEventListener('click', async () => {
-            const dir = await window.electronAPI.selectDirectory();
-            if (dir) {
-                dirInput.value = dir;
-                previewDir.textContent = dir;
-            }
-        });
-        inputWrapper.appendChild(browseBtn);
-
-        // 监听菜单触发的目录选择
-        window.electronAPI.onSetOutputDir(async (dir) => {
-            dirInput.value = dir;
-            previewDir.textContent = dir;
-            // 自动保存
-            try {
-                const res = await fetch('/api/settings/output-dir', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ dir })
-                });
-                const r = await res.json();
-                if (r.success) { currentOutputDir = r.outputDir; updatePathLabel(); showToast('输出目录已更新', 'success'); }
-            } catch (e) { /* 忽略 */ }
-        });
-    }
-
-    // 保存路径
-    saveBtn.addEventListener('click', async () => {
-        const newDir = dirInput.value.trim();
-        if (!newDir) { showToast('路径不能为空', 'warning'); return; }
-        try {
-            const res = await fetch('/api/settings/output-dir', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ dir: newDir })
-            });
-            const r = await res.json();
-            if (r.success) { currentOutputDir = r.outputDir; updatePathLabel(); modal.classList.remove('active'); showToast('输出目录已更新', 'success'); }
-            else showToast(r.error, 'error');
-        } catch (err) { showToast(`保存失败：${err.message}`, 'error'); }
-    });
-
-    // 恢复默认
-    resetBtn.addEventListener('click', async () => {
-        try {
-            const res = await fetch('/api/settings/output-dir', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ dir: './output' })
-            });
-            const r = await res.json();
-            if (r.success) {
-                currentOutputDir = r.outputDir;
-                dirInput.value = currentOutputDir;
-                previewDir.textContent = currentOutputDir;
-                updatePathLabel(); showToast('已恢复默认', 'success');
-            } else showToast(r.error, 'error');
-        } catch (err) { showToast(`操作失败：${err.message}`, 'error'); }
-    });
-}
-
-async function loadOutputDir() {
-    try {
-        const res = await fetch('/api/settings/output-dir');
-        const r = await res.json();
-        if (r.success) { currentOutputDir = r.outputDir; updatePathLabel(); }
-    } catch (err) { console.warn('获取输出目录失败:', err); }
-}
-
-function updatePathLabel() {
-    const label = document.getElementById('output-path-label');
-    if (label) label.textContent = currentOutputDir;
-}
-
-// ===================== UI 工具函数 =====================
+// ============================================================
+// 进度 UI / Toast / 文件大小
+// ============================================================
 function showLoading(show, title, desc) {
     const modal = document.getElementById('loading-modal');
-    const batchProgress = document.getElementById('batch-progress');
+    const batch = document.getElementById('batch-progress');
     if (show) {
         document.getElementById('loading-title').textContent = title || '正在转换';
         document.getElementById('loading-desc').textContent = desc || '请稍候...';
-        batchProgress.style.display = 'none';
+        batch.style.display = 'none';
         modal.classList.add('active');
     } else {
         modal.classList.remove('active');
     }
 }
 
-function showBatchProgress(show, total) {
+function showBatchProgressUI(total) {
     const modal = document.getElementById('loading-modal');
-    const batchProgress = document.getElementById('batch-progress');
-    if (show) {
-        document.getElementById('loading-title').textContent = '批量转换中';
-        document.getElementById('loading-desc').textContent = '准备中...';
-        batchProgress.style.display = 'flex';
-        document.getElementById('progress-fill').style.width = '0%';
-        document.getElementById('progress-text').textContent = `0/${total}`;
-        modal.classList.add('active');
-    } else {
-        modal.classList.remove('active');
-    }
+    const batch = document.getElementById('batch-progress');
+    document.getElementById('loading-title').textContent = '批量转换中';
+    document.getElementById('loading-desc').textContent = '准备中...';
+    batch.style.display = 'flex';
+    document.getElementById('progress-fill').style.width = '0%';
+    document.getElementById('progress-text').textContent = `0/${total}`;
+    modal.classList.add('active');
 }
 
-function updateProgress(current, total, name) {
-    const pct = ((current + 1) / total * 100);
-    document.getElementById('progress-fill').style.width = pct + '%';
-    document.getElementById('progress-text').textContent = `${current + 1}/${total}`;
-    document.getElementById('loading-desc').textContent = name || '';
+function updateProgress(done, total, name) {
+    const pct = total > 0 ? (done / total) * 100 : 0;
+    const fill = document.getElementById('progress-fill');
+    const text = document.getElementById('progress-text');
+    if (fill) fill.style.width = pct + '%';
+    if (text) text.textContent = `${done}/${total}`;
+    if (name) document.getElementById('loading-desc').textContent = name;
 }
 
 function showToast(message, type = 'info') {
@@ -573,7 +998,7 @@ function showToast(message, type = 'info') {
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
     const icons = { success: 'ph-check-circle', error: 'ph-x-circle', warning: 'ph-warning', info: 'ph-info' };
-    toast.innerHTML = `<i class="ph ${icons[type] || icons.info}"></i><span>${message}</span>`;
+    toast.innerHTML = `<i class="ph ${icons[type] || icons.info}"></i><span>${escapeHtml(message)}</span>`;
     document.body.appendChild(toast);
     requestAnimationFrame(() => toast.classList.add('show'));
     setTimeout(() => { toast.classList.remove('show'); setTimeout(() => toast.remove(), 300); }, 3000);
@@ -583,4 +1008,10 @@ function formatFileSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }

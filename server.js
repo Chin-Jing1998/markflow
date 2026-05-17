@@ -11,6 +11,7 @@ const textConverter = require('./converters/legacy/text');
 const converter = require('./converters');
 const jobs = require('./server/jobs');
 const pdfRenderer = require('./converters/renderers/pdf');
+const soffice = require('./server/soffice');
 const { decodeUtf8Filename } = require('./converters/ir/util');
 
 const app = express();
@@ -214,13 +215,13 @@ app.post('/api/save', async (req, res) => {
  * GET /api/formats
  */
 app.get('/api/formats', (req, res) => {
-    // P2 接入 soffice 探测
     res.json({
         success: true,
         ...converter.getCapabilities({
-            sofficeAvailable: false,
+            sofficeAvailable: soffice.isAvailable(),
             electronPrintToPdf: pdfRenderer.isAvailable(),
         }),
+        sofficeHint: soffice.isAvailable() ? null : soffice.getInstallHint(),
     });
 });
 
@@ -350,6 +351,82 @@ app.get('/api/jobs/:id', (req, res) => {
  */
 app.get('/api/jobs/:id/events', (req, res) => {
     jobs.subscribe(req.params.id, res);
+});
+
+/**
+ * 编辑后跨格式导出
+ * POST /api/export
+ * body: { content, sourceFormat, targetFormat, folderName, outputDir? }
+ *   - content: 当前编辑器内容（md/html/json 字符串）
+ *   - sourceFormat: 'md' | 'html' | 'json'
+ *   - targetFormat: 任意 renderer 支持的格式
+ *   - folderName: 复用之前转换的文件夹名（避免重算导致写到别处）
+ */
+app.post('/api/export', async (req, res) => {
+    try {
+        const {
+            content,
+            sourceFormat,
+            targetFormat,
+            folderName,
+            outputDir: customDir,
+        } = req.body || {};
+
+        if (!content || !sourceFormat || !targetFormat || !folderName) {
+            return res.status(400).json({
+                success: false,
+                error: '缺少必要参数：content/sourceFormat/targetFormat/folderName',
+            });
+        }
+
+        const reg = converter._registry;
+        const parser = reg.parsers[sourceFormat];
+        const renderer = reg.renderers[targetFormat];
+        if (!parser) {
+            return res.status(400).json({
+                success: false,
+                error: `不支持的源格式: ${sourceFormat}`,
+            });
+        }
+        if (!renderer) {
+            return res.status(400).json({
+                success: false,
+                error: `不支持的目标格式: ${targetFormat}`,
+            });
+        }
+
+        const dir = getOutputDir(customDir);
+        const outputFolder = path.join(dir, folderName);
+        fs.mkdirSync(outputFolder, { recursive: true });
+
+        // 解析（md/html/json 三类源格式的 parser 不需要 outputDir，但传上无害）
+        const doc = await parser.parse(content, {
+            outputDir: dir,
+            sourceName: folderName,
+        });
+        doc.meta = { ...(doc.meta || {}), folderName };
+
+        const output = await renderer.render(doc);
+
+        const { writeOutputFile } = require('./converters/ir/util');
+        const outputPath = writeOutputFile(
+            outputFolder,
+            folderName,
+            targetFormat,
+            output,
+        );
+
+        res.json({
+            success: true,
+            path: outputPath,
+            filename: path.basename(outputPath),
+            folderName,
+            format: targetFormat,
+        });
+    } catch (err) {
+        console.error('/api/export 失败:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // 启动服务（支持 Electron 嵌入和独立运行两种模式）

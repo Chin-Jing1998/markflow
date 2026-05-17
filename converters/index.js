@@ -22,7 +22,7 @@
 
 const path = require('path');
 
-// === Parser/Renderer 注册表（P2 增量添加 doc/xls/ppt + xlsx/pptx 反向写） ===
+// === Parser/Renderer 注册表 ===
 const parsers = {
     md: require('./parsers/md'),
     html: require('./parsers/html'),
@@ -33,6 +33,9 @@ const parsers = {
     pdf: require('./parsers/pdf'),
     xlsx: require('./parsers/xlsx'),
     pptx: require('./parsers/pptx'),
+    doc: require('./parsers/doc'),
+    xls: require('./parsers/xls'),
+    ppt: require('./parsers/ppt'),
 };
 
 const renderers = {
@@ -41,6 +44,8 @@ const renderers = {
     json: require('./renderers/json'),
     docx: require('./renderers/docx'),
     pdf: require('./renderers/pdf'),
+    xlsx: require('./renderers/xlsx'),
+    pptx: require('./renderers/pptx'),
 };
 
 // === Legacy 快路径（仅当 outputFormat=md 时启用，保证零回归） ===
@@ -54,25 +59,45 @@ const legacyConverters = {
 function getCapabilities({ sofficeAvailable = false, electronPrintToPdf = false } = {}) {
     const textOutputs = ['md', 'html', 'json', 'docx'];
     const documentOutputs = electronPrintToPdf ? [...textOutputs, 'pdf'] : textOutputs;
-    const legacyBinaryOutputs = sofficeAvailable ? ['md', 'html', 'json'] : [];
+    const spreadsheetOutputs = electronPrintToPdf
+        ? ['md', 'html', 'json', 'xlsx', 'pdf']
+        : ['md', 'html', 'json', 'xlsx'];
+    const presentationOutputs = electronPrintToPdf
+        ? ['md', 'html', 'json', 'pptx', 'pdf']
+        : ['md', 'html', 'json', 'pptx'];
+    const legacyBinaryOutputs = sofficeAvailable
+        ? electronPrintToPdf
+            ? ['md', 'html', 'json', 'docx', 'pdf']
+            : ['md', 'html', 'json', 'docx']
+        : [];
 
     return {
         capabilities: { sofficeAvailable, electronPrintToPdf },
         matrix: {
-            // 已接入的输入
+            // 文档类
             docx: documentOutputs,
             url: documentOutputs,
             text: documentOutputs,
-            md: documentOutputs,
-            html: documentOutputs,
-            json: documentOutputs,
+            md: [...documentOutputs, 'xlsx', 'pptx'],
+            html: [...documentOutputs, 'xlsx', 'pptx'],
+            json: [...documentOutputs, 'xlsx', 'pptx'],
+            // PDF（输入只读）
             pdf: ['md', 'html', 'json'],
-            xlsx: ['md', 'html', 'json'],
-            pptx: ['md', 'html', 'json'],
-            // P2 接入（依赖 soffice CLI）
+            // 表格 / 演示
+            xlsx: spreadsheetOutputs,
+            pptx: presentationOutputs,
+            // 旧二进制（依赖 soffice）
             doc: legacyBinaryOutputs,
-            xls: legacyBinaryOutputs,
-            ppt: legacyBinaryOutputs,
+            xls: sofficeAvailable
+                ? electronPrintToPdf
+                    ? ['md', 'html', 'json', 'xlsx', 'pdf']
+                    : ['md', 'html', 'json', 'xlsx']
+                : [],
+            ppt: sofficeAvailable
+                ? electronPrintToPdf
+                    ? ['md', 'html', 'json', 'pptx', 'pdf']
+                    : ['md', 'html', 'json', 'pptx']
+                : [],
         },
     };
 }

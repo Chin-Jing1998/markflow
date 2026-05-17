@@ -374,3 +374,110 @@ textarea:focus { border-color: var(--blue); }
     font-size: 11px; color: var(--text-secondary); opacity: 0.5; z-index: 50;
 }
 .shortcuts-hint span { background: var(--code-bg); padding: 3px 8px; border-radius: 4px; }
+
+/* ========== P2 新增：输出格式 chip 组 ========== */
+.format-selector {
+    margin-top: 14px; padding: 12px; border-radius: var(--radius-small);
+    background: var(--code-bg); display: flex; flex-direction: column; gap: 8px;
+}
+.format-label {
+    font-size: 12px; font-weight: 600; color: var(--text-secondary);
+    text-transform: uppercase; letter-spacing: 0.5px;
+}
+.format-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.format-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 6px 10px; border-radius: 999px;
+    background: var(--card-bg); border: 1px solid var(--divider);
+    color: var(--text-secondary); font-size: 12px; font-weight: 500;
+    font-family: var(--font-family); cursor: pointer;
+    transition: var(--transition); white-space: nowrap;
+}
+.format-chip i { font-size: 14px; }
+.format-chip:hover:not(:disabled) {
+    border-color: var(--blue); color: var(--blue);
+    transform: translateY(-1px);
+}
+.format-chip.active {
+    background: var(--blue); color: white; border-color: var(--blue);
+    box-shadow: 0 2px 8px rgba(0, 113, 227, 0.3);
+}
+.format-chip:disabled, .format-chip[disabled] {
+    opacity: 0.4; cursor: not-allowed;
+}
+
+/* ========== P2 新增：预览区 kind 状态机 ========== */
+.preview-kind-tag {
+    margin-left: 6px; padding: 2px 8px; border-radius: 999px;
+    background: var(--blue-light); color: var(--blue);
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+}
+
+/* 默认全部隐藏，由 kind-* 控制显示 */
+.render-md, .render-html, .render-json, .binary-result-card { display: none; height: 100%; width: 100%; box-sizing: border-box; }
+.render-pane > .render-md { padding: 0; }
+
+/* kind-md：MD 渲染（complete render-pane 行为兼容旧 #markdown-render） */
+.preview-body.kind-md .render-md { display: block; }
+
+/* kind-html：iframe 沙盒预览 */
+.preview-body.kind-html .render-html {
+    display: block; border: none; background: white;
+}
+
+/* kind-json：JSON 高亮 */
+.preview-body.kind-json .render-json {
+    display: block; padding: 20px; overflow: auto;
+    background: var(--render-bg); font-family: 'SFMono-Regular', Consolas, Menlo, monospace;
+    font-size: 12px; line-height: 1.6; color: var(--text-main); white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* kind-binary：结果卡 */
+.preview-body.kind-binary .binary-result-card {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; padding: 60px 32px; text-align: center;
+}
+.binary-card-icon i { font-size: 64px; color: var(--blue); opacity: 0.8; }
+.binary-card-meta h4 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+.binary-card-meta p { color: var(--text-secondary); font-size: 13px; word-break: break-all; max-width: 480px; }
+.binary-card-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+
+/* binary 模式下隐藏编辑器和工具栏（在 view-split 时仍想看编辑器无意义） */
+.preview-body.kind-binary .editor-pane { display: none; }
+.preview-body.kind-binary .render-pane { width: 100%; border-left: none; }
+
+/* ========== P2 新增：历史记录 / 能力探测 ========== */
+.history-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; margin-top: 8px; }
+.history-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 8px 12px; border-radius: var(--radius-small);
+    background: var(--code-bg); border: 1px solid transparent;
+    font-size: 13px; cursor: pointer; transition: var(--transition);
+}
+.history-item:hover { border-color: var(--blue); background: var(--blue-light); }
+.history-item-info { flex: 1; overflow: hidden; }
+.history-item-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-item-meta { font-size: 11px; color: var(--text-secondary); }
+.history-item-format {
+    padding: 2px 8px; border-radius: 999px; background: var(--blue-light);
+    color: var(--blue); font-size: 10px; font-weight: 600; text-transform: uppercase;
+}
+.empty-state-mini { font-size: 12px; color: var(--text-secondary); text-align: center; padding: 12px; }
+
+.capability-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 0; font-size: 13px;
+}
+.capability-name { display: flex; align-items: center; gap: 8px; color: var(--text-main); }
+.capability-name i { font-size: 16px; color: var(--blue); }
+.capability-status {
+    padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
+}
+.capability-status.ok { background: rgba(52, 199, 89, 0.15); color: var(--green); }
+.capability-status.fail { background: rgba(255, 59, 48, 0.15); color: var(--red); }
+.capability-status.detecting { background: var(--code-bg); color: var(--text-secondary); }
+
+/* dim 通用 */
+.dim { color: var(--blue); font-weight: 500; }
+

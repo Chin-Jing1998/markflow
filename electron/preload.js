@@ -13,6 +13,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onSetOutputDir: (callback) => ipcRenderer.on('set-output-dir', (event, dir) => callback(dir)),
     // HTML → PDF（通过主进程隐藏窗口 printToPDF）
     printToPdf: (html, options) => ipcRenderer.invoke('print-to-pdf', { html, options }),
+    // 另存为：把已生成文件复制到用户选择的位置
+    saveAs: (sourcePath, defaultName) => ipcRenderer.invoke('save-as', { sourcePath, defaultName }),
+    // 原生多文件选择对话框（可选体验）
+    selectFiles: (options) => ipcRenderer.invoke('select-files', options || {}),
     // 判断是否在 Electron 中运行
     isElectron: true
 });

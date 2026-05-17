@@ -176,6 +176,44 @@ ipcMain.handle('print-to-pdf', async (event, { html, options } = {}) => {
     return buf; // Buffer 经 IPC 自动转 Uint8Array
 });
 
+// 另存为：复制已生成的文件到用户选择的路径（用于 binary 输出"另存为副本"）
+ipcMain.handle('save-as', async (event, { sourcePath, defaultName } = {}) => {
+    if (!mainWindow) return null;
+    if (!sourcePath) throw new Error('save-as 需要 sourcePath');
+    const result = await dialog.showSaveDialog(mainWindow, {
+        defaultPath: defaultName || path.basename(sourcePath),
+        title: '另存为',
+    });
+    if (result.canceled || !result.filePath) return null;
+    require('fs').copyFileSync(sourcePath, result.filePath);
+    return result.filePath;
+});
+
+// 多文件选择（原生体验，可选；前端也可用 <input type="file">）
+ipcMain.handle('select-files', async (event, options = {}) => {
+    if (!mainWindow) return null;
+    const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ['openFile', 'multiSelections'],
+        title: options.title || '选择文件',
+        filters: options.filters || [
+            {
+                name: '所有支持的格式',
+                extensions: ['docx', 'pdf', 'xlsx', 'pptx', 'doc', 'xls', 'ppt', 'md', 'markdown', 'html', 'htm', 'json'],
+            },
+            { name: '办公文档', extensions: ['docx', 'pdf', 'xlsx', 'pptx', 'doc', 'xls', 'ppt'] },
+            { name: '标记文档', extensions: ['md', 'markdown', 'html', 'htm', 'json'] },
+            { name: '全部', extensions: ['*'] },
+        ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    const fs = require('fs');
+    return result.filePaths.map((p) => ({
+        path: p,
+        name: path.basename(p),
+        size: fs.statSync(p).size,
+    }));
+});
+
 // ===== Electron 应用生命周期 =====
 app.whenReady().then(async () => {
     await startBackend();
