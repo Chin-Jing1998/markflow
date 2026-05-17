@@ -5,8 +5,8 @@
 const { app, BrowserWindow, Menu, shell, dialog, ipcMain } = require('electron');
 const path = require('path');
 
-// 服务端口
-const PORT = 3000;
+// 服务端口（支持环境变量覆盖，方便与 server.js 联动）
+const PORT = parseInt(process.env.PORT, 10) || 3000;
 let mainWindow = null;
 let server = null;
 
@@ -22,7 +22,16 @@ function createWindow() {
         title: 'MarkFlow',
         titleBarStyle: 'hiddenInset',  // macOS 原生标题栏样式
         trafficLightPosition: { x: 16, y: 16 },
-        backgroundColor: '#F5F5F7',
+        // ===== Apple26 / Liquid Glass =====
+        // 注：transparent:true + vibrancy 在 Electron 35 + macOS Tahoe 下 drag region
+        // 偶发失效（GitHub known issue）。改用 transparent:false 让 OS 接管标题栏拖动，
+        // vibrancy 仍生效（macOS 原生模糊材质独立工作，不依赖 transparent）。
+        transparent: false,
+        vibrancy: 'sidebar',
+        visualEffectState: 'active',
+        backgroundColor: '#F5F5F7',         // vibrancy 失败时的浅色 fallback
+        roundedCorners: true,
+        backgroundMaterial: 'mica',         // Windows 11 等效（其他平台忽略）
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -141,9 +150,11 @@ function buildMenu() {
  */
 async function startBackend() {
     try {
+        // 把 PORT 传给 server（server.js 也读 process.env.PORT，保持一致）
+        process.env.PORT = String(PORT);
         const { startServer } = require(path.join(__dirname, '..', 'server'));
         server = await startServer(PORT);
-        console.log('✅ 后端服务已启动');
+        console.log('✅ 后端服务已启动 on port', PORT);
     } catch (err) {
         console.error('❌ 后端启动失败:', err);
         dialog.showErrorBox('启动失败', `无法启动后端服务：${err.message}`);

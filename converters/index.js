@@ -56,20 +56,12 @@ const legacyConverters = {
 };
 
 // === 能力矩阵（根据运行时能力动态生成） ===
+// 注：xlsx / html / ppt(含 pptx) 相关转换已按用户要求从矩阵中移除
+// 后端 parser/renderer 文件保留，将来可一行恢复
 function getCapabilities({ sofficeAvailable = false, electronPrintToPdf = false } = {}) {
-    const textOutputs = ['md', 'html', 'json', 'docx'];
+    const textOutputs = ['md', 'json', 'docx'];
     const documentOutputs = electronPrintToPdf ? [...textOutputs, 'pdf'] : textOutputs;
-    const spreadsheetOutputs = electronPrintToPdf
-        ? ['md', 'html', 'json', 'xlsx', 'pdf']
-        : ['md', 'html', 'json', 'xlsx'];
-    const presentationOutputs = electronPrintToPdf
-        ? ['md', 'html', 'json', 'pptx', 'pdf']
-        : ['md', 'html', 'json', 'pptx'];
-    const legacyBinaryOutputs = sofficeAvailable
-        ? electronPrintToPdf
-            ? ['md', 'html', 'json', 'docx', 'pdf']
-            : ['md', 'html', 'json', 'docx']
-        : [];
+    const legacyBinaryOutputs = sofficeAvailable ? documentOutputs : [];
 
     return {
         capabilities: { sofficeAvailable, electronPrintToPdf },
@@ -78,26 +70,18 @@ function getCapabilities({ sofficeAvailable = false, electronPrintToPdf = false 
             docx: documentOutputs,
             url: documentOutputs,
             text: documentOutputs,
-            md: [...documentOutputs, 'xlsx', 'pptx'],
-            html: [...documentOutputs, 'xlsx', 'pptx'],
-            json: [...documentOutputs, 'xlsx', 'pptx'],
+            md: documentOutputs,
+            json: documentOutputs,
             // PDF（输入只读）
-            pdf: ['md', 'html', 'json'],
-            // 表格 / 演示
-            xlsx: spreadsheetOutputs,
-            pptx: presentationOutputs,
-            // 旧二进制（依赖 soffice）
+            pdf: ['md', 'json'],
+            // 旧二进制 DOC（依赖 soffice）；xls/ppt 已禁用
             doc: legacyBinaryOutputs,
-            xls: sofficeAvailable
-                ? electronPrintToPdf
-                    ? ['md', 'html', 'json', 'xlsx', 'pdf']
-                    : ['md', 'html', 'json', 'xlsx']
-                : [],
-            ppt: sofficeAvailable
-                ? electronPrintToPdf
-                    ? ['md', 'html', 'json', 'pptx', 'pdf']
-                    : ['md', 'html', 'json', 'pptx']
-                : [],
+            // ===== 以下输入类型已禁用（保留后端文件，矩阵置空让前端 chip 自然全部 disabled）=====
+            html: [],
+            xlsx: [],
+            pptx: [],
+            xls: [],
+            ppt: [],
         },
     };
 }

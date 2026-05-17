@@ -12,7 +12,21 @@
     <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
-    <!-- 动态背景 -->
+    <!-- 窗口顶部全宽拖动条（fix Electron 35 + macOS Tahoe titleBarStyle:hiddenInset 下拖动区过窄）-->
+    <div class="window-drag-bar" aria-hidden="true"></div>
+
+    <!-- Apple26 / Liquid Glass: SVG 折射 filter（仅给关键容器引用） -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+        <defs>
+            <filter id="liquid-glass-edge" x="-2%" y="-2%" width="104%" height="104%" color-interpolation-filters="sRGB">
+                <feTurbulence type="fractalNoise" baseFrequency="0.012 0.018" numOctaves="2" seed="3" result="noise"/>
+                <feGaussianBlur in="noise" stdDeviation="1.2" result="softNoise"/>
+                <feDisplacementMap in="SourceGraphic" in2="softNoise" scale="2.5" xChannelSelector="R" yChannelSelector="G"/>
+            </filter>
+        </defs>
+    </svg>
+
+    <!-- 柔光背景（Apple26：保留两枚低饱和度 radial-gradient 增加灵动度，强度比旧版降低 60%） -->
     <div class="bg-shape bg-shape-1"></div>
     <div class="bg-shape bg-shape-2"></div>
 
@@ -45,57 +59,48 @@
                     <button class="tab-btn" data-tab="tab-link">
                         <i class="ph ph-link"></i> 网页链接
                     </button>
-                    <button class="tab-btn" data-tab="tab-text">
-                        <i class="ph ph-text-t"></i> 粘贴文本
-                    </button>
                     <div class="tab-indicator"></div>
                 </div>
 
                 <div class="tab-content-container">
-                    <!-- 办公文档 tab：docx/pdf/xlsx/pptx/doc/xls/ppt -->
+                    <!-- 办公文档 tab：docx / pdf / doc -->
                     <div class="tab-content active" id="tab-office">
                         <div class="upload-area" id="drop-zone-office">
                             <i class="ph ph-upload-simple upload-icon"></i>
                             <h3>拖拽办公文档至此</h3>
-                            <p>支持 .docx / .pdf / .xlsx / .pptx / .doc / .xls / .ppt</p>
+                            <p>支持 .docx / .pdf / .doc（旧二进制 .doc 需 LibreOffice）</p>
                             <button class="btn btn-secondary" data-trigger="file-input-office">浏览文件</button>
-                            <input type="file" id="file-input-office" accept=".docx,.pdf,.xlsx,.pptx,.doc,.xls,.ppt" multiple hidden>
+                            <input type="file" id="file-input-office" accept=".docx,.pdf,.doc" multiple hidden>
                         </div>
                         <div class="file-list" id="file-list-office"></div>
                         <div class="format-selector" id="format-selector-office">
                             <span class="format-label">输出格式</span>
                             <div class="format-chips" data-tab="tab-office">
                                 <button class="format-chip active" data-format="md" title="Markdown"><i class="ph ph-file-text"></i>MD</button>
-                                <button class="format-chip" data-format="html" title="HTML"><i class="ph ph-file-html"></i>HTML</button>
                                 <button class="format-chip" data-format="json" title="JSON"><i class="ph ph-brackets-curly"></i>JSON</button>
                                 <button class="format-chip" data-format="docx" title="DOCX"><i class="ph ph-file-doc"></i>DOCX</button>
                                 <button class="format-chip" data-format="pdf" title="PDF"><i class="ph ph-file-pdf"></i>PDF</button>
-                                <button class="format-chip" data-format="xlsx" title="XLSX"><i class="ph ph-file-xls"></i>XLSX</button>
-                                <button class="format-chip" data-format="pptx" title="PPTX"><i class="ph ph-file-ppt"></i>PPTX</button>
                             </div>
                         </div>
                     </div>
 
-                    <!-- 标记文档 tab：md/html/json → 任意 -->
+                    <!-- 标记文档 tab：md/json → docx/pdf -->
                     <div class="tab-content" id="tab-markup">
                         <div class="upload-area" id="drop-zone-markup">
                             <i class="ph ph-brackets-angle upload-icon"></i>
-                            <h3>拖拽 Markdown / HTML / JSON 至此</h3>
-                            <p>反向转换：标记文档 → DOCX / PDF / XLSX / PPTX 等</p>
+                            <h3>拖拽 Markdown / JSON 至此</h3>
+                            <p>反向转换：标记文档 → DOCX / PDF</p>
                             <button class="btn btn-secondary" data-trigger="file-input-markup">浏览文件</button>
-                            <input type="file" id="file-input-markup" accept=".md,.markdown,.html,.htm,.json" multiple hidden>
+                            <input type="file" id="file-input-markup" accept=".md,.markdown,.json" multiple hidden>
                         </div>
                         <div class="file-list" id="file-list-markup"></div>
                         <div class="format-selector" id="format-selector-markup">
                             <span class="format-label">输出格式</span>
                             <div class="format-chips" data-tab="tab-markup">
-                                <button class="format-chip active" data-format="html"><i class="ph ph-file-html"></i>HTML</button>
-                                <button class="format-chip" data-format="md"><i class="ph ph-file-text"></i>MD</button>
+                                <button class="format-chip active" data-format="md"><i class="ph ph-file-text"></i>MD</button>
                                 <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
                                 <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
                                 <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
-                                <button class="format-chip" data-format="xlsx"><i class="ph ph-file-xls"></i>XLSX</button>
-                                <button class="format-chip" data-format="pptx"><i class="ph ph-file-ppt"></i>PPTX</button>
                             </div>
                         </div>
                     </div>
@@ -110,7 +115,6 @@
                             <span class="format-label">输出格式</span>
                             <div class="format-chips" data-tab="tab-link">
                                 <button class="format-chip active" data-format="md"><i class="ph ph-file-text"></i>MD</button>
-                                <button class="format-chip" data-format="html"><i class="ph ph-file-html"></i>HTML</button>
                                 <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
                                 <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
                                 <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
@@ -118,22 +122,6 @@
                         </div>
                     </div>
 
-                    <!-- 粘贴文本 tab -->
-                    <div class="tab-content" id="tab-text">
-                        <div class="input-group full-height">
-                            <textarea placeholder="在此处粘贴您的文本或 HTML 内容..." id="raw-text-input"></textarea>
-                        </div>
-                        <div class="format-selector" id="format-selector-text">
-                            <span class="format-label">输出格式</span>
-                            <div class="format-chips" data-tab="tab-text">
-                                <button class="format-chip active" data-format="md"><i class="ph ph-file-text"></i>MD</button>
-                                <button class="format-chip" data-format="html"><i class="ph ph-file-html"></i>HTML</button>
-                                <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
-                                <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
-                                <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
-                            </div>
-                        </div>
-                    </div>
                 </div>
 
                 <!-- 底部操作与设置 -->
@@ -170,7 +158,7 @@
                         <button class="btn btn-small btn-primary" id="save-btn">
                             <i class="ph ph-floppy-disk"></i> 保存
                         </button>
-                        <button class="btn btn-small btn-primary" id="export-btn" hidden>
+                        <button class="btn btn-small btn-primary" id="export-btn">
                             <i class="ph ph-export"></i> 导出
                         </button>
                     </div>

@@ -132,8 +132,9 @@ function handleFiles(tabId, files) {
 }
 
 function filterByTab(tabId, files) {
-    const officeExt = ['.docx', '.pdf', '.xlsx', '.pptx', '.doc', '.xls', '.ppt'];
-    const markupExt = ['.md', '.markdown', '.html', '.htm', '.json'];
+    // 已禁用：xlsx / xls / pptx / ppt / html / htm（后端文件保留，UI 不暴露）
+    const officeExt = ['.docx', '.pdf', '.doc'];
+    const markupExt = ['.md', '.markdown', '.json'];
     const allowed = tabId === 'tab-office' ? officeExt : markupExt;
     return files.filter((f) => allowed.some((ext) => f.name.toLowerCase().endsWith(ext)));
 }
@@ -254,13 +255,11 @@ function refreshChipAvailability() {
         } else {
             // 没文件时按 tab 的全部支持类型联合（让用户能看到可能性）
             inputTypes = tabId === 'tab-office'
-                ? ['docx', 'pdf', 'xlsx', 'pptx', 'doc', 'xls', 'ppt']
-                : ['md', 'html', 'json'];
+                ? ['docx', 'pdf', 'doc']
+                : ['md', 'json'];
         }
     } else if (tabId === 'tab-link') {
         inputTypes = ['url'];
-    } else if (tabId === 'tab-text') {
-        inputTypes = ['text'];
     }
 
     // 输出可用 = 所有 input 类型的支持输出的交集
@@ -370,15 +369,6 @@ async function runConvert() {
         manifest.items = urls.map((u, i) => ({ idx: i, inputType: 'url', outputFormat, source: u }));
         body = JSON.stringify(manifest);
         headers = { 'Content-Type': 'application/json' };
-    } else if (tabId === 'tab-text') {
-        const text = document.getElementById('raw-text-input').value.trim();
-        if (!text) {
-            showToast('请输入或粘贴内容', 'warning');
-            return;
-        }
-        manifest.items = [{ idx: 0, inputType: 'text', outputFormat, source: text }];
-        body = JSON.stringify(manifest);
-        headers = { 'Content-Type': 'application/json' };
     }
 
     // 提交任务
@@ -465,9 +455,10 @@ function markFileStatus(idx, success) {
         status.className = 'file-item-status';
         item.appendChild(status);
     }
+    // 颜色由 CSS .file-item-status .ph-check-circle / .ph-x-circle 控制（token: --system-green/red）
     status.innerHTML = success
-        ? '<i class="ph ph-check-circle" style="color:#34C759"></i>'
-        : '<i class="ph ph-x-circle" style="color:#FF3B30"></i>';
+        ? '<i class="ph ph-check-circle"></i>'
+        : '<i class="ph ph-x-circle"></i>';
 }
 
 // ============================================================
@@ -638,11 +629,11 @@ function initEditor() {
 
     document.getElementById('save-btn').addEventListener('click', async () => {
         if (!editor.value.trim()) { showToast('没有可保存内容', 'warning'); return; }
-        if (!currentFolderName) { showToast('请先进行一次转换', 'warning'); return; }
-        // 兼容旧 /api/save：format=md 走旧（原 markdown 字段），其它走新 /api/save 加 format
+        // 没做过转换时，从编辑器内容自动派生 folderName
+        const folderName = currentFolderName || deriveFolderName(editor.value);
         const body = currentFormat === 'md'
-            ? { markdown: editor.value, folderName: currentFolderName }
-            : { content: editor.value, folderName: currentFolderName, format: currentFormat };
+            ? { markdown: editor.value, folderName }
+            : { content: editor.value, folderName, format: currentFormat };
         try {
             const res = await fetch('/api/save', {
                 method: 'POST',
@@ -650,20 +641,26 @@ function initEditor() {
                 body: JSON.stringify(body),
             });
             const r = await res.json();
-            if (r.success) showToast('保存成功', 'success');
-            else showToast(`保存失败：${r.error}`, 'error');
+            if (r.success) {
+                currentFolderName = folderName;   // 记住，便于后续多次保存/导出
+                showToast(`已保存到 ${folderName}/`, 'success');
+            } else {
+                showToast(`保存失败：${r.error}`, 'error');
+            }
         } catch (e) {
             showToast(`保存失败：${e.message}`, 'error');
         }
     });
 
     document.getElementById('export-btn').addEventListener('click', async () => {
-        if (!editor.value.trim() || !currentFolderName) {
-            showToast('没有可导出内容', 'warning');
+        if (!editor.value.trim()) {
+            showToast('编辑器没有内容', 'warning');
             return;
         }
         const target = await pickExportTarget();
         if (!target) return;
+        // 没做过转换时，从编辑器内容自动派生 folderName
+        const folderName = currentFolderName || deriveFolderName(editor.value);
         showLoading(true, '正在导出', `${currentFormat.toUpperCase()} → ${target.toUpperCase()}`);
         try {
             const res = await fetch('/api/export', {
@@ -673,15 +670,15 @@ function initEditor() {
                     content: editor.value,
                     sourceFormat: currentFormat,
                     targetFormat: target,
-                    folderName: currentFolderName,
+                    folderName,
                 }),
             });
             const r = await res.json();
             showLoading(false);
             if (r.success) {
+                currentFolderName = folderName;
+                currentResult = { format: target, folderName, outputPath: r.path };
                 showToast(`已导出 ${r.filename}`, 'success');
-                // 更新 currentResult 让 binary-card 能用
-                currentResult = { format: target, folderName: currentFolderName, outputPath: r.path };
             } else {
                 showToast(`导出失败：${r.error}`, 'error');
             }
@@ -692,9 +689,32 @@ function initEditor() {
     });
 }
 
+// 从编辑器内容派生 folderName（用户没做过转换时用）
+function deriveFolderName(content) {
+    const s = String(content || '');
+    // 1) 优先取第一个 ATX H1（# 标题）
+    const h1 = s.match(/^#\s+(.+)$/m);
+    if (h1) return sanitizeBasename(h1[1]);
+    // 2) 取第一行非空文本
+    const firstLine = s.split('\n').map((l) => l.trim()).find((l) => l);
+    if (firstLine) return sanitizeBasename(firstLine);
+    // 3) 兜底
+    return `untitled-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+}
+
+function sanitizeBasename(name) {
+    return String(name || '')
+        .replace(/^#+\s*/, '')
+        .replace(/[<>:"/\\|?*#]/g, '_')
+        .replace(/\s+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_|_$/g, '')
+        .substring(0, 60) || `untitled-${Date.now()}`;
+}
+
 async function pickExportTarget() {
     // 简单：弹出 prompt 让用户选择目标格式
-    const supported = ['html', 'md', 'json', 'docx', 'pdf', 'xlsx', 'pptx']
+    const supported = ['md', 'json', 'docx', 'pdf']
         .filter((f) => f !== currentFormat);
     const choice = window.prompt(`导出为哪种格式？\n可选: ${supported.join(' / ')}`, 'docx');
     if (!choice) return null;
