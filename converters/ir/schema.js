@@ -9,11 +9,16 @@
  * 顶层包装结构（MarkFlowDocument）：
  * {
  *   schemaVersion: 1,
- *   kind: 'document' | 'spreadsheet' | 'presentation',
+ *   kind: 'document' | 'workbook' | 'presentation',
  *   ir:   <mdast root>,
- *   data: <格式特有数据快照>,
- *   meta: { title, sourceType, sourceName, createdAt, ... }
+ *   data: <格式特有数据快照，无则 null>,
+ *   meta: { title?, sourceType, sourceName?, baseDir? },
+ *   assets:   [{ name: 'images/image_1.png', buffer, mime }],
+ *   warnings: [string],
  * }
+ *
+ * 本文件只保留有消费者的节点工厂；行内节点（strong/link/image 等）由 remark 解析生成，
+ * 不再提供手工工厂。
  */
 
 const SCHEMA_VERSION = 1;
@@ -22,21 +27,27 @@ const SCHEMA_VERSION = 1;
 // 顶层包装
 // ============================================================
 
-function createDocument({ kind = 'document', ir, data = null, meta = {} } = {}) {
+function createDocument({
+    kind = 'document',
+    ir,
+    data = null,
+    meta = {},
+    assets = [],
+    warnings = [],
+} = {}) {
     return {
         schemaVersion: SCHEMA_VERSION,
         kind,
         ir: ir || createRoot(),
         data,
-        meta: {
-            createdAt: new Date().toISOString(),
-            ...meta,
-        },
+        meta: { ...(meta || {}) },
+        assets: Array.isArray(assets) ? assets : [],
+        warnings: Array.isArray(warnings) ? warnings : [],
     };
 }
 
 // ============================================================
-// mdast 标准节点工厂
+// mdast 标准节点工厂（块级）
 // ============================================================
 
 function createRoot(children = []) {
@@ -52,70 +63,15 @@ function createParagraph(children) {
 }
 
 function createText(value) {
-    return { type: 'text', value: String(value || '') };
-}
-
-function createImage(url, alt = '', title = null) {
-    return { type: 'image', url, alt, title };
-}
-
-function createLink(url, children, title = null) {
-    return { type: 'link', url, title, children: normalizeChildren(children) };
-}
-
-function createStrong(children) {
-    return { type: 'strong', children: normalizeChildren(children) };
-}
-
-function createEmphasis(children) {
-    return { type: 'emphasis', children: normalizeChildren(children) };
-}
-
-function createDelete(children) {
-    return { type: 'delete', children: normalizeChildren(children) };
-}
-
-function createInlineCode(value) {
-    return { type: 'inlineCode', value: String(value || '') };
-}
-
-function createCode(value, lang = null) {
-    return { type: 'code', lang, value: String(value || '') };
+    return { type: 'text', value: String(value == null ? '' : value) };
 }
 
 function createBlockquote(children) {
     return { type: 'blockquote', children: normalizeChildren(children) };
 }
 
-function createList(ordered, children, start = null) {
-    return {
-        type: 'list',
-        ordered: !!ordered,
-        spread: false,
-        start: ordered ? (start || 1) : null,
-        children: normalizeChildren(children),
-    };
-}
-
-function createListItem(children, checked = null) {
-    return {
-        type: 'listItem',
-        spread: false,
-        checked,
-        children: normalizeChildren(children),
-    };
-}
-
 function createThematicBreak() {
     return { type: 'thematicBreak' };
-}
-
-function createBreak() {
-    return { type: 'break' };
-}
-
-function createHtml(value) {
-    return { type: 'html', value: String(value || '') };
 }
 
 function createTable(align, children) {
@@ -140,11 +96,7 @@ function createTableCell(children) {
 
 /**
  * 幻灯片分隔节点
- * 渲染策略：
- *   MD/HTML → 输出 H2(title) + thematicBreak
- *   DOCX    → 分页符 + 标题
- *   PDF     → 分页
- *   PPTX    → 新建 slide（这是它的"原生"语义）
+ * 渲染策略：MD/HTML → H2(title) + thematicBreak；DOCX/PDF → 分页 + 标题
  */
 function createSlideBreak({ title = '', index = 0, notes = '' } = {}) {
     return {
@@ -155,10 +107,7 @@ function createSlideBreak({ title = '', index = 0, notes = '' } = {}) {
 
 /**
  * 工作表段标记节点
- * 渲染策略：
- *   MD/HTML → 输出 H1(name)
- *   XLSX    → 新建 sheet（原生语义）
- *   DOCX/PDF → 标题 + 表格内容
+ * 渲染策略：MD/HTML → H1(name)；DOCX/PDF → 标题 + 表格内容
  */
 function createSheetSection({ name = '', index = 0 } = {}) {
     return {
@@ -178,8 +127,9 @@ function normalizeChildren(children) {
     return arr.map((c) => (typeof c === 'string' ? createText(c) : c));
 }
 
-// 自定义节点降级：在喂给 mdast-util-to-markdown / remark-rehype 前
-// 把 slideBreak/sheetSection 转换为标准 mdast 节点（H1/H2 + thematicBreak）
+// 自定义节点降级：在喂给 remark-stringify / remark-rehype 前
+// 把 slideBreak/sheetSection 转换为标准 mdast 节点（H1/H2 + thematicBreak）。
+// 不修改入参，返回新树。
 function downgradeCustomNodes(node) {
     if (!node || typeof node !== 'object') return node;
 
@@ -188,41 +138,30 @@ function downgradeCustomNodes(node) {
     }
 
     if (node.type === 'slideBreak') {
-        const result = [];
-        if (node.data && node.data.index > 0) {
-            result.push(createThematicBreak());
-        }
-        if (node.data && node.data.title) {
-            result.push(createHeading(2, node.data.title));
-        }
-        return result;
+        return downgradeSection(node.data, 2, node.data && node.data.title);
     }
 
     if (node.type === 'sheetSection') {
-        const result = [];
-        if (node.data && node.data.index > 0) {
-            result.push(createThematicBreak());
-        }
-        if (node.data && node.data.name) {
-            result.push(createHeading(1, node.data.name));
-        }
-        return result;
+        return downgradeSection(node.data, 1, node.data && node.data.name);
     }
 
     if (Array.isArray(node.children)) {
-        const newChildren = [];
-        for (const child of node.children) {
-            const downgraded = downgradeCustomNodes(child);
-            if (Array.isArray(downgraded)) {
-                newChildren.push(...downgraded);
-            } else {
-                newChildren.push(downgraded);
-            }
-        }
-        return { ...node, children: newChildren };
+        return { ...node, children: node.children.flatMap(downgradeCustomNodes) };
     }
 
     return node;
+}
+
+// 非首段前置分隔线，有标题则追加对应层级的 heading
+function downgradeSection(data, depth, title) {
+    const result = [];
+    if (data && data.index > 0) {
+        result.push(createThematicBreak());
+    }
+    if (title) {
+        result.push(createHeading(depth, title));
+    }
+    return result;
 }
 
 module.exports = {
@@ -233,19 +172,8 @@ module.exports = {
     createHeading,
     createParagraph,
     createText,
-    createImage,
-    createLink,
-    createStrong,
-    createEmphasis,
-    createDelete,
-    createInlineCode,
-    createCode,
     createBlockquote,
-    createList,
-    createListItem,
     createThematicBreak,
-    createBreak,
-    createHtml,
     createTable,
     createTableRow,
     createTableCell,

@@ -1,266 +1,159 @@
 /**
- * IR 层公共工具
- * 源自 converters/legacy/{word,url,text}.js 的共享函数
- * 注意：legacy 三文件保持原状不改写（P0 零行为保证），本文件供新 parsers/renderers 使用
+ * IR 层公共工具（全仓唯一一份）
+ *
+ * 只收纳与具体格式无关的纯函数与目录工具：
+ *   - 名称处理：sanitizeFolderName / stripExt / decodeUtf8Filename
+ *   - 文本收集：collectText
+ *   - 扩展名推断：getExtFromContentType / getExtFromUrl
+ *   - 目录：ensureDir
+ *
+ * Turndown 工厂与 HTML 表格转换已迁往 converters/ir/turndown.js；
+ * 产物落盘统一由 converters/output.js 负责。
  */
 const path = require('path');
-const fs = require('fs');
-const TurndownService = require('turndown');
+const fsp = require('fs').promises;
+
+// 文件夹名最大长度（按 Unicode 码点计数，避免截断代理对）
+const MAX_FOLDER_NAME_LENGTH = 100;
+// 各操作系统均不允许出现在文件名中的字符
+const ILLEGAL_FILENAME_CHARS_RE = /[\\/:*?"<>|]/g;
+// 控制字符（含 NUL 与 DEL）直接剔除
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/g;
+// 首尾的空白、点与下划线（前导点会生成隐藏目录，尾随点与空白在 Windows 上非法）
+const EDGE_TRIM_RE = /^[\s._]+|[\s._]+$/g;
+// 含 latin1 范围之外的字符，说明字符串已是正确的 utf8
+const BEYOND_LATIN1_RE = /[^\x00-\xff]/;
+
+const EXT_BY_CONTENT_TYPE = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/gif': '.gif',
+    'image/bmp': '.bmp',
+    'image/svg+xml': '.svg',
+    'image/webp': '.webp',
+    'image/tiff': '.tiff',
+    'image/x-emf': '.emf',
+    'image/x-wmf': '.wmf',
+    'image/emf': '.emf',
+    'image/wmf': '.wmf',
+};
+const DEFAULT_CONTENT_TYPE_EXT = '.png';
+
+const KNOWN_URL_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'];
+const DEFAULT_URL_IMAGE_EXT = '.jpg';
 
 // ============================================================
-// 文件/文件夹名清洗
+// 名称处理
 // ============================================================
 
-function sanitizeFolderName(name, defaultName = '未命名文档') {
-    return String(name || '')
-        .replace(/^#+\s*/, '')
-        .replace(/[<>:"/\\|?*#]/g, '_')
-        .replace(/\s+/g, '_')
+/**
+ * 把任意标题清洗为可安全落盘的文件夹名。
+ * 非法字符替换为 "_"（保留分词边界，避免 "a/b" 与 "ab" 撞名），
+ * 空白折叠为单个空格，去首尾空白与点，超长按码点截断，空结果回退到 fallback。
+ */
+function sanitizeFolderName(name, fallback = '未命名文档') {
+    const cleaned = String(name == null ? '' : name)
+        .replace(CONTROL_CHARS_RE, '')
+        .replace(ILLEGAL_FILENAME_CHARS_RE, '_')
         .replace(/_+/g, '_')
-        .replace(/^_|_$/g, '')
-        .substring(0, 100) || defaultName;
+        .replace(/\s+/g, ' ')
+        .replace(EDGE_TRIM_RE, '');
+    const truncated = Array.from(cleaned)
+        .slice(0, MAX_FOLDER_NAME_LENGTH)
+        .join('')
+        .replace(EDGE_TRIM_RE, '');
+    return truncated || fallback;
 }
 
-// multer 用 latin1 解析中文文件名，需要还原为 utf8（server.js:124 现有修复）
+// 去掉路径前缀与扩展名："/a/b/报告.docx" → "报告"
+function stripExt(name) {
+    if (!name) return '';
+    const str = String(name);
+    return path.basename(str, path.extname(str));
+}
+
+// multer 以 latin1 解析中文文件名，需要还原为 utf8；已是 utf8 的字符串原样返回
 function decodeUtf8Filename(name) {
+    if (typeof name !== 'string') return '';
+    // 重复解码会损坏已正确的 utf8 字符串
+    if (BEYOND_LATIN1_RE.test(name)) return name;
     return Buffer.from(name, 'latin1').toString('utf8');
 }
 
-// 根据 (outputDir, folderName) 创建输出文件夹 + images 子目录，返回路径
-function ensureOutputFolder(outputDir, folderName, withImages = true) {
-    const outputFolder = path.join(outputDir, folderName);
-    const imagesFolder = path.join(outputFolder, 'images');
-    if (withImages) {
-        fs.mkdirSync(imagesFolder, { recursive: true });
-    } else {
-        fs.mkdirSync(outputFolder, { recursive: true });
+// ============================================================
+// 文本收集
+// ============================================================
+
+// 递归拼接 mdast 节点的纯文本：value 节点取 value，容器节点拼接子节点
+function collectText(node) {
+    if (!node || typeof node !== 'object') return '';
+    if (node.value !== undefined && node.value !== null) return String(node.value);
+    if (Array.isArray(node.children)) {
+        return node.children.map(collectText).join('');
     }
-    return { outputFolder, imagesFolder };
+    return '';
 }
 
 // ============================================================
 // 扩展名推断
 // ============================================================
 
+// "image/jpeg; charset=binary" → ".jpg"；未知类型回退 ".png"
 function getExtFromContentType(contentType) {
-    const map = {
-        'image/png': '.png',
-        'image/jpeg': '.jpg',
-        'image/gif': '.gif',
-        'image/bmp': '.bmp',
-        'image/svg+xml': '.svg',
-        'image/webp': '.webp',
-        'image/tiff': '.tiff',
-        'image/x-emf': '.emf',
-        'image/x-wmf': '.wmf',
-        'image/emf': '.emf',
-        'image/wmf': '.wmf',
-    };
-    return map[contentType] || '.png';
+    const mime = String(contentType == null ? '' : contentType)
+        .split(';')[0]
+        .trim()
+        .toLowerCase();
+    return EXT_BY_CONTENT_TYPE[mime] || DEFAULT_CONTENT_TYPE_EXT;
 }
 
+// 从 URL 路径部分取图片扩展名；不可识别时回退 ".jpg"
 function getExtFromUrl(url) {
     try {
-        const pathname = new URL(url).pathname;
-        const ext = path.extname(pathname).toLowerCase().split('?')[0];
-        if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'].includes(ext)) {
-            return ext;
-        }
-    } catch (e) {}
-    return '.jpg';
+        const ext = path.extname(new URL(String(url)).pathname).toLowerCase();
+        if (KNOWN_URL_IMAGE_EXTS.includes(ext)) return ext;
+    } catch (err) {
+        // URL 非法：走默认扩展名
+    }
+    return DEFAULT_URL_IMAGE_EXT;
 }
 
 // ============================================================
-// Turndown 工厂（三种风格对应三种来源）
+// 目录
 // ============================================================
 
-// 基础版：text.js 风格，无表格无图片处理
-function createBasicTurndownService() {
-    const service = new TurndownService({
-        headingStyle: 'atx',
-        hr: '---',
-        bulletListMarker: '-',
-        codeBlockStyle: 'fenced',
-        emDelimiter: '*',
-        strongDelimiter: '**',
-    });
-    service.remove(['script', 'style', 'noscript']);
-    return service;
+// 递归创建目录（已存在时静默），返回传入的目录路径
+async function ensureDir(dir) {
+    if (typeof dir !== 'string' || !dir) {
+        throw new Error('ensureDir 需要非空的目录路径');
+    }
+    await fsp.mkdir(dir, { recursive: true });
+    return dir;
 }
 
-// Word 风格：基础 + 表格转 Markdown + 移除空 img
-function createWordTurndownService() {
-    const service = createBasicTurndownService();
-
-    service.addRule('table', {
-        filter: 'table',
-        replacement: (content, node) => convertTableToMarkdown(node),
-    });
-
-    service.addRule('emptyImg', {
-        filter: (node) =>
-            node.nodeName === 'IMG' &&
-            (!node.getAttribute('src') || node.getAttribute('src') === ''),
-        replacement: () => '',
-    });
-
-    return service;
-}
-
-// URL 风格：基础 + 内联样式识别 + figcaption + section 透传等（适配微信/知乎等）
-function createRichTurndownService() {
-    const service = new TurndownService({
-        headingStyle: 'atx',
-        hr: '---',
-        bulletListMarker: '-',
-        codeBlockStyle: 'fenced',
-        emDelimiter: '*',
-        strongDelimiter: '**',
-    });
-
-    service.addRule('lineBreak', {
-        filter: 'br',
-        replacement: () => '\n',
-    });
-
-    service.addRule('inlineBold', {
-        filter: (node) => {
-            if (!['SPAN', 'P', 'SECTION'].includes(node.nodeName)) return false;
-            const style = node.getAttribute('style') || '';
-            return /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i.test(style);
-        },
-        replacement: (c) => (c.trim() ? `**${c.trim()}**` : ''),
-    });
-
-    service.addRule('inlineItalic', {
-        filter: (node) => {
-            if (node.nodeName !== 'SPAN') return false;
-            const style = node.getAttribute('style') || '';
-            return /font-style\s*:\s*italic/i.test(style);
-        },
-        replacement: (c) => (c.trim() ? `*${c.trim()}*` : ''),
-    });
-
-    service.addRule('inlineStrikethrough', {
-        filter: (node) => {
-            const style = node.getAttribute('style') || '';
-            return /text-decoration\s*:\s*line-through/i.test(style);
-        },
-        replacement: (c) => (c.trim() ? `~~${c.trim()}~~` : ''),
-    });
-
-    service.addRule('delTag', {
-        filter: ['del', 's'],
-        replacement: (c) => (c.trim() ? `~~${c.trim()}~~` : ''),
-    });
-
-    service.addRule('mark', {
-        filter: 'mark',
-        replacement: (c) => (c.trim() ? `==${c.trim()}==` : ''),
-    });
-
-    service.addRule('figcaption', {
-        filter: 'figcaption',
-        replacement: (c) => (c.trim() ? `\n*${c.trim()}*\n` : ''),
-    });
-
-    service.addRule('figure', {
-        filter: 'figure',
-        replacement: (c) => `\n${c.trim()}\n`,
-    });
-
-    service.addRule('sectionPassthrough', {
-        filter: 'section',
-        replacement: (c) => c,
-    });
-
-    service.remove(['script', 'style', 'noscript', 'iframe', 'nav', 'footer', 'aside']);
-
-    return service;
-}
-
-// ============================================================
-// HTML 表格 → Markdown 表格（source: word.js:164）
-// ============================================================
-
-function convertTableToMarkdown(tableNode) {
-    const rows = tableNode.querySelectorAll
-        ? Array.from(tableNode.querySelectorAll('tr'))
-        : [];
-    if (rows.length === 0) return '';
-
-    let md = '\n\n';
-    rows.forEach((row, rowIndex) => {
-        const cells = Array.from(row.querySelectorAll('td, th'));
-        const cellTexts = cells.map((cell) => cell.textContent.trim());
-        md += '| ' + cellTexts.join(' | ') + ' |\n';
-        if (rowIndex === 0) {
-            md += '| ' + cellTexts.map(() => '---').join(' | ') + ' |\n';
-        }
-    });
-    md += '\n';
-    return md;
-}
-
-// ============================================================
-// Markdown 产物清理（source: word.js:101-110）
-// ============================================================
-
-function cleanupMarkdownArtifacts(markdown) {
-    return String(markdown || '')
-        .replace(/(?:!\[[^\]]*\]\(data:image\/[^)]+\))/g, '')
-        .replace(/[A-Za-z0-9+/=]{100,}/g, '')
-        .replace(/\n{3,}/g, '\n\n')
+/** 去除 HTML 标签（连同 script/style 内容与注释），并还原常见实体 */
+function stripHtml(value) {
+    return String(value || '')
+        .replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '')
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, '&')
         .trim();
 }
 
-// ============================================================
-// 输出文件名拼装
-// ============================================================
-
-function buildOutputFilename(folderName, format) {
-    const extMap = {
-        md: '.md',
-        html: '.html',
-        json: '.json',
-        docx: '.docx',
-        pdf: '.pdf',
-        xlsx: '.xlsx',
-        pptx: '.pptx',
-    };
-    return `${folderName}${extMap[format] || ''}`;
-}
-
-// ============================================================
-// 写出内容（统一 utf8 文本 / Buffer 二进制）
-// ============================================================
-
-function writeOutputFile(outputFolder, folderName, format, content, { useExportsSubdir = false } = {}) {
-    const filename = buildOutputFilename(folderName, format);
-    const targetDir = useExportsSubdir
-        ? path.join(outputFolder, 'exports')
-        : outputFolder;
-    fs.mkdirSync(targetDir, { recursive: true });
-    const targetPath = path.join(targetDir, filename);
-    if (Buffer.isBuffer(content)) {
-        fs.writeFileSync(targetPath, content);
-    } else {
-        fs.writeFileSync(targetPath, content, 'utf8');
-    }
-    return targetPath;
-}
-
 module.exports = {
+    stripHtml,
     sanitizeFolderName,
-    decodeUtf8Filename,
-    ensureOutputFolder,
+    stripExt,
+    collectText,
     getExtFromContentType,
     getExtFromUrl,
-    createBasicTurndownService,
-    createWordTurndownService,
-    createRichTurndownService,
-    convertTableToMarkdown,
-    cleanupMarkdownArtifacts,
-    buildOutputFilename,
-    writeOutputFile,
+    decodeUtf8Filename,
+    ensureDir,
 };

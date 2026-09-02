@@ -1,16 +1,47 @@
 /**
- * DOC (旧 Word 二进制) → IR
- * 通过 soffice 转为 .docx，再交给 parsers/docx
+ * DOC（旧 Word 二进制）→ IR
+ *
+ * 契约：parse({ path }, ctx)。经 soffice 把源文件转为 .docx 落到临时目录，
+ * 再交给 parsers/docx 解析；临时目录在 finally 中清理，对外无落盘副作用。
+ * meta.sourceName 始终保留原始文件名，不暴露中间产物名。
  */
-const { convertWithSoffice } = require('../../server/soffice');
+const fsp = require('fs').promises;
+const os = require('os');
+const path = require('path');
+const soffice = require('../../server/soffice');
 const docxParser = require('./docx');
 
-async function parse(buffer, meta = {}) {
-    if (!Buffer.isBuffer(buffer)) {
-        throw new Error('parsers/doc 期望 source 为 Buffer');
+/**
+ * @param {{ path: string }} input 源文件绝对路径
+ * @param {{ sourceName?: string, onProgress?: Function }} [ctx]
+ */
+async function parse(input, ctx = {}) {
+    const absPath = resolveInputPath(input);
+    const sourceName = ctx.sourceName || path.basename(absPath);
+
+    const outDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'markflow-doc-'));
+    try {
+        const convertedPath = await soffice.convertFile(absPath, 'docx', { outDir });
+        const doc = await docxParser.parse({ path: convertedPath }, { ...ctx, sourceName });
+        return { ...doc, meta: { ...doc.meta, sourceName } };
+    } finally {
+        await removeDir(outDir);
     }
-    const docxBuffer = await convertWithSoffice(buffer, 'doc', 'docx');
-    return await docxParser.parse(docxBuffer, meta);
+}
+
+function resolveInputPath(input) {
+    if (input && typeof input.path === 'string' && input.path) {
+        return path.resolve(input.path);
+    }
+    throw new Error('parsers/doc 需要 input.path（文件绝对路径）');
+}
+
+async function removeDir(dir) {
+    try {
+        await fsp.rm(dir, { recursive: true, force: true });
+    } catch (err) {
+        // 临时目录清理失败不影响解析结果
+    }
 }
 
 module.exports = { parse };

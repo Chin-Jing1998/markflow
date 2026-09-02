@@ -1,39 +1,31 @@
 /**
- * IR → PDF (Buffer)
+ * IR → PDF（Buffer）
  *
- * 路径：IR → renderers/html → HTML 字符串 → electron/pdf-printer 打印。
- * 在 Electron 主进程内运行（server.js 被 main.js require）；
- * 纯 Web 模式（node server.js）下抛错，前端应降级到 HTML 输出 + 用户浏览器打印。
+ * 路径：IR → renderers/html → HTML 字符串 → converters/pdf/backend 三级后端出图
+ * （Electron 主进程打印 → 独立 Electron 工作进程 → LibreOffice 以 DOCX 转 PDF）。
+ * soffice 路径需要 DOCX 输入，故以 getDocxBuffer 惰性提供 renderers/docx 的产物，
+ * 仅在真正走到该分支时才渲染 DOCX。
  */
 const htmlRenderer = require('./html');
-
-let pdfPrinter = null;
-function tryLoadPrinter() {
-    if (pdfPrinter !== null) return pdfPrinter;
-    try {
-        pdfPrinter = require('../../electron/pdf-printer');
-    } catch (e) {
-        pdfPrinter = false;
-    }
-    return pdfPrinter;
-}
+const docxRenderer = require('./docx');
+const backend = require('../pdf/backend');
 
 async function render(doc) {
-    const printer = tryLoadPrinter();
-    if (!printer || !printer.isAvailable()) {
-        throw new Error(
-            'PDF 输出不可用：需要在 Electron 桌面端运行。当前为 Web 模式，请改选 HTML 输出后在浏览器打印（Cmd/Ctrl+P → 另存为 PDF）。',
-        );
-    }
-
     const html = await htmlRenderer.render(doc);
-    const pdfOptions = (doc.meta && doc.meta.pdfOptions) || {};
-    return await printer.printToPdf(html, pdfOptions);
+    return backend.renderPdf({ html, getDocxBuffer: () => docxRenderer.render(doc) });
 }
 
+/**
+ * 同步能力探测（兼容 server.js 的同步调用）：仅覆盖 Electron 主进程与本地 electron 二进制两级，
+ * 以及此前 detect() 已缓存的成功结果；含 LibreOffice 的完整探测请用 detect()。
+ */
 function isAvailable() {
-    const printer = tryLoadPrinter();
-    return !!(printer && printer.isAvailable());
+    return backend.isAvailableSync();
 }
 
-module.exports = { render, isAvailable };
+/** 异步完整探测：{ name, available, hint } */
+function detect(opts) {
+    return backend.detect(opts);
+}
+
+module.exports = { render, isAvailable, detect };

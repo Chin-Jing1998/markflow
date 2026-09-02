@@ -1,18 +1,22 @@
 /**
  * XLSX → IR
  *
- * 用 exceljs 读取 workbook。每个 sheet 在 IR 里：
+ * 契约：parse({ path }, ctx) → MarkFlowDocument，按绝对路径读取、不写盘。
+ *
+ * 用 exceljs 的 readFile 直读磁盘。每个 sheet 在 IR 里：
  *   - 先输出一个 sheetSection 扩展节点（带 sheet 名）
  *   - 再输出一个 table 节点（行/列还原为 markdown 表格）
  *
  * data 字段同时保留 sheets 数组快照（{name, rows:[[...]]}），
- * 便于 JSON 输出与回灌。
+ * 便于 JSON 输出与 XLSX 反向写。
  *
- * P1 简化：
+ * 简化约定：
  *   - 不处理合并单元格（merged cells 输出为分散数据）
  *   - 公式取 result 值（不重算）
  *   - 富文本只取 text 字段
+ *   - 不提取内嵌图片，assets 恒为空数组
  */
+const fsp = require('fs').promises;
 const path = require('path');
 const {
     createDocument,
@@ -23,6 +27,7 @@ const {
     createTableCell,
     createText,
 } = require('../ir/schema');
+const { stripExt } = require('../ir/util');
 
 let ExcelJS = null;
 function loadExcelJS() {
@@ -30,14 +35,20 @@ function loadExcelJS() {
     return ExcelJS;
 }
 
-async function parse(buffer, meta = {}) {
-    if (!Buffer.isBuffer(buffer)) {
-        throw new Error('parsers/xlsx 期望 source 为 Buffer');
-    }
+/**
+ * @param {{ path: string }} input 源文件绝对路径
+ * @param {{ sourceName?: string, onProgress?: Function }} [ctx]
+ */
+async function parse(input, ctx = {}) {
+    const absPath = resolveInputPath(input);
+    const sourceName = ctx.sourceName || path.basename(absPath);
+
+    // exceljs 的 readFile 不校验存在性错误信息，先自行探一次给出可读提示
+    await fsp.access(absPath);
 
     const Excel = loadExcelJS();
     const wb = new Excel.Workbook();
-    await wb.xlsx.load(buffer);
+    await wb.xlsx.readFile(absPath);
 
     const sheetsData = [];
     const ir = createRoot();
@@ -51,10 +62,11 @@ async function parse(buffer, meta = {}) {
             rows.push(values);
         });
 
+        const columnCount = rows.reduce((m, r) => Math.max(m, r.length), 0);
         sheetsData.push({
             name: ws.name,
             rowCount: rows.length,
-            columnCount: rows.reduce((m, r) => Math.max(m, r.length), 0),
+            columnCount,
             rows,
         });
 
@@ -62,39 +74,45 @@ async function parse(buffer, meta = {}) {
         ir.children.push(createSheetSection({ name: ws.name, index: sheetIdx }));
 
         if (rows.length > 0) {
-            const colCount = sheetsData[sheetsData.length - 1].columnCount;
             const tableRows = rows.map((rowVals) => {
-                // 补齐列数
+                // 补齐列数，保证表格矩形
                 const padded = [...rowVals];
-                while (padded.length < colCount) padded.push('');
+                while (padded.length < columnCount) padded.push('');
                 return createTableRow(
-                    padded.map((v) =>
-                        createTableCell([createText(String(v ?? ''))]),
-                    ),
+                    padded.map((v) => createTableCell([createText(String(v ?? ''))])),
                 );
             });
             ir.children.push(createTable(null, tableRows));
         }
 
         sheetIdx++;
+        notify(ctx, 'parse', null);
     });
 
-    const title =
-        (wb.creator && `${stripExt(meta.sourceName)}` || '') ||
-        stripExt(meta.sourceName) ||
-        '未命名表格';
-
     return createDocument({
-        kind: 'spreadsheet',
+        kind: 'workbook',
         ir,
         data: { sheets: sheetsData },
         meta: {
+            title: stripExt(sourceName),
             sourceType: 'xlsx',
-            title,
+            sourceName,
             sheetCount: sheetsData.length,
-            ...meta,
         },
+        assets: [],
+        warnings: [],
     });
+}
+
+// ============================================================
+// 工具
+// ============================================================
+
+function resolveInputPath(input) {
+    if (input && typeof input.path === 'string' && input.path) {
+        return path.resolve(input.path);
+    }
+    throw new Error('parsers/xlsx 需要 input.path（文件绝对路径）');
 }
 
 function formatCell(v) {
@@ -116,9 +134,14 @@ function formatCell(v) {
     return v;
 }
 
-function stripExt(name) {
-    if (!name) return '';
-    return path.basename(name, path.extname(name));
+// 进度回调异常不得影响解析
+function notify(ctx, phase, pct) {
+    if (!ctx || typeof ctx.onProgress !== 'function') return;
+    try {
+        ctx.onProgress(phase, pct);
+    } catch (err) {
+        // 忽略调用方回调自身的异常
+    }
 }
 
 module.exports = { parse };
