@@ -198,7 +198,7 @@ describe('convert：md → docx（真实 parser 与 renderer）', () => {
         assert.equal(res.sourceType, 'md');
         assert.equal(res.outputPath, path.join(root, 'sample.docx'));
         assert.deepEqual(res.outputs, { docx: res.outputPath });
-        assert.equal(res.imagesCount, 0);
+        assert.equal(res.imagesCount, 1);
         assert.ok(Array.isArray(res.warnings));
         assert.equal(fs.readFileSync(res.outputPath).subarray(0, 2).toString(), 'PK');
 

@@ -200,7 +200,8 @@ test('本地相对路径图片被解析为可内嵌 asset，远程图片记 warn
     const remote = images.find((n) => n.url === 'https://example.com/a.png');
     assert.equal(remote.data && remote.data.asset, undefined);
 
-    assert.equal(doc.assets.length, 0);
+    assert.equal(doc.assets.length, 1);
+    assert.equal(doc.assets[0].name, 'images/pic.png');
     assert.ok(
         doc.warnings.some((w) => w.includes('远程图片未内嵌')),
         `warnings 应含远程未内嵌提示，实际为 ${JSON.stringify(doc.warnings)}`,

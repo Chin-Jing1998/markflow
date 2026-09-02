@@ -3,7 +3,7 @@
  *   GET  /api/formats             能力矩阵 + soffice / PDF 后端实时探测结果
  *   POST /api/convert             批量转换，NDJSON 流式回传 accepted/start/progress/item/done
  *   GET  /api/settings/output-dir 读取当前输出目录
- *   POST /api/settings/output-dir 设置输出目录（须为已存在且可写的绝对路径目录）
+ *   POST /api/settings/output-dir 设置输出目录（须为已存在且可写的绝对路径目录；dir 为空则恢复默认）
  * 静态资源仅开放 /、/css、/js、/assets；输出目录持久化于 ~/.markflow/settings.json。
  */
 const crypto = require('crypto');
@@ -159,7 +159,14 @@ function createApp(token, state) {
 
     app.post('/api/settings/output-dir', async (req, res, next) => {
         try {
-            const dir = await assertUsableDir((req.body || {}).dir);
+            const raw = (req.body || {}).dir;
+            if (raw == null || String(raw).trim() === '') {
+                // 恢复默认：删除持久化设置，回到环境变量或默认目录
+                fs.rmSync(settingsFile(), { force: true });
+                state.outputDir = resolveInitialOutputDir();
+                return res.json({ success: true, outputDir: state.outputDir });
+            }
+            const dir = await assertUsableDir(raw);
             persistOutputDir(dir);
             state.outputDir = dir;
             res.json({ success: true, outputDir: dir });

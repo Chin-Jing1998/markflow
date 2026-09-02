@@ -171,9 +171,16 @@ describe('/api/settings/output-dir', () => {
         assert.match(JSON.parse(res.text).error, /绝对路径/);
     });
 
-    test('POST 空值返回 400', async () => {
-        const res = await authed('POST', '/api/settings/output-dir', { body: {} });
-        assert.equal(res.status, 400);
+    test('POST 空值恢复默认目录并删除持久化设置', async () => {
+        process.env.MARKFLOW_OUTPUT_DIR = OUTPUT_DIR;
+        try {
+            const res = await authed('POST', '/api/settings/output-dir', { body: {} });
+            assert.equal(res.status, 200);
+            assert.deepEqual(JSON.parse(res.text), { success: true, outputDir: OUTPUT_DIR });
+            assert.equal(fs.existsSync(process.env.MARKFLOW_SETTINGS_FILE), false);
+        } finally {
+            delete process.env.MARKFLOW_OUTPUT_DIR;
+        }
     });
 
     test('POST 合法目录写入持久化文件，随后可恢复', async () => {

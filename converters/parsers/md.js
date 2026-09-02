@@ -11,7 +11,7 @@ const fsp = require('fs').promises;
 const path = require('path');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
-const { resolveImages } = require('../assets/md-images');
+const { resolveImages, collectImageNodes } = require('../assets/md-images');
 
 // 行首 1-6 个井号（半角或全角），且后面不再跟井号 —— 即构成合法 ATX 标题前缀
 const HEADING_PREFIX_RE = /^([#＃]{1,6})(?![#＃])/gm;
@@ -39,18 +39,20 @@ async function parse(input, ctx = {}) {
     });
     notify(ctx, 'parsing', 55);
 
-    const doc = createDocument({
+    // 已成功解析（可内嵌）的图片登记为 assets，供调度器统计 imagesCount；同一 url 只登记一次
+    const seen = new Set();
+    const assets = collectImageNodes(ir)
+        .filter((node) => node.data && node.data.asset && node.data.asset.buffer && !seen.has(node.url) && seen.add(node.url))
+        .map((node) => ({ name: node.url, buffer: node.data.asset.buffer, mime: node.data.asset.mime }));
+
+    return createDocument({
         kind: 'document',
         ir,
         data: null,
         meta: { title, sourceType: 'md', sourceName, baseDir },
-        assets: [],
+        assets,
         warnings,
     });
-    // createDocument 目前不透传 assets/warnings，此处补齐（其扩展后本赋值仍然幂等）
-    doc.assets = [];
-    doc.warnings = warnings;
-    return doc;
 }
 
 // ============================================================

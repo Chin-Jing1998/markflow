@@ -1,21 +1,22 @@
 <!DOCTYPE html>
+<!--
+    MarkFlow 桌面端主页面
+    结构：顶栏 → 左栏输入面板（办公文档 / 标记文档 / 网页链接）→ 右栏转换结果面板
+    资源全部本地加载（CSP 限定 'self'），图标来自 assets/icons.svg sprite
+-->
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MarkFlow - 知识库转换工具</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <script src="https://unpkg.com/@phosphor-icons/web"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
-    <!-- 窗口顶部全宽拖动条（fix Electron 35 + macOS Tahoe titleBarStyle:hiddenInset 下拖动区过窄）-->
+    <!-- 窗口顶部全宽拖动条（Electron 35 + macOS Tahoe titleBarStyle:hiddenInset 下拖动区过窄的补偿） -->
     <div class="window-drag-bar" aria-hidden="true"></div>
 
-    <!-- Apple26 / Liquid Glass: SVG 折射 filter（仅给关键容器引用） -->
+    <!-- Apple26 / Liquid Glass：SVG 折射 filter（仅给大容器引用） -->
     <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
         <defs>
             <filter id="liquid-glass-edge" x="-2%" y="-2%" width="104%" height="104%" color-interpolation-filters="sRGB">
@@ -26,7 +27,7 @@
         </defs>
     </svg>
 
-    <!-- 柔光背景（Apple26：保留两枚低饱和度 radial-gradient 增加灵动度，强度比旧版降低 60%） -->
+    <!-- 柔光背景（两枚低饱和度光斑，纯装饰） -->
     <div class="bg-shape bg-shape-1"></div>
     <div class="bg-shape bg-shape-2"></div>
 
@@ -39,202 +40,117 @@
                 <span class="logo-f">F</span><span class="logo-low">low</span>
             </div>
             <div class="topbar-actions">
-                <button class="icon-btn" title="设置" id="settingsBtn">
-                    <i class="ph ph-gear-six"></i>
+                <button class="icon-btn" type="button" id="settings-btn" title="设置" aria-label="设置">
+                    <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#gear-six"/></svg>
                 </button>
             </div>
         </header>
 
-        <!-- 主要内容区 -->
         <main class="main-content">
-            <!-- 左侧：输入与控制区 -->
-            <section class="control-panel panel-glass">
-                <div class="tabs">
-                    <button class="tab-btn active" data-tab="tab-office">
-                        <i class="ph ph-files"></i> 办公文档
+            <!-- 左栏：输入与控制 -->
+            <section class="control-panel panel-glass" aria-label="输入">
+                <div class="tabs" role="tablist">
+                    <button class="tab-btn active" type="button" role="tab" data-tab="office" aria-selected="true">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#files"/></svg> 办公文档
                     </button>
-                    <button class="tab-btn" data-tab="tab-markup">
-                        <i class="ph ph-brackets-angle"></i> 标记文档
+                    <button class="tab-btn" type="button" role="tab" data-tab="markup" aria-selected="false">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#brackets-angle"/></svg> 标记文档
                     </button>
-                    <button class="tab-btn" data-tab="tab-link">
-                        <i class="ph ph-link"></i> 网页链接
+                    <button class="tab-btn" type="button" role="tab" data-tab="link" aria-selected="false">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#link"/></svg> 网页链接
                     </button>
                     <div class="tab-indicator"></div>
                 </div>
 
                 <div class="tab-content-container">
-                    <!-- 办公文档 tab：docx / pdf / doc -->
-                    <div class="tab-content active" id="tab-office">
+                    <!-- 办公文档：docx / doc / xlsx / xls / pptx / ppt / pdf → Markdown 包 -->
+                    <div class="tab-content active" id="tab-office" role="tabpanel">
                         <div class="upload-area" id="drop-zone-office">
-                            <i class="ph ph-upload-simple upload-icon"></i>
+                            <svg class="icon upload-icon" aria-hidden="true"><use href="assets/icons.svg#upload-simple"/></svg>
                             <h3>拖拽办公文档至此</h3>
-                            <p>支持 .docx / .pdf / .doc（旧二进制 .doc 需 LibreOffice）</p>
-                            <button class="btn btn-secondary" data-trigger="file-input-office">浏览文件</button>
-                            <input type="file" id="file-input-office" accept=".docx,.pdf,.doc" multiple hidden>
+                            <p>支持 .docx / .xlsx / .pptx / .pdf；.doc / .xls / .ppt 需 LibreOffice</p>
+                            <button class="btn btn-secondary" type="button" data-trigger="file-input-office">浏览文件</button>
+                            <input type="file" id="file-input-office" accept=".docx,.doc,.xlsx,.xls,.pptx,.ppt,.pdf" multiple hidden>
                         </div>
                         <div class="file-list" id="file-list-office"></div>
-                        <div class="format-selector" id="format-selector-office">
-                            <span class="format-label">输出格式</span>
-                            <div class="format-chips" data-tab="tab-office">
-                                <button class="format-chip active" data-format="md" title="Markdown"><i class="ph ph-file-text"></i>MD</button>
-                                <button class="format-chip" data-format="json" title="JSON"><i class="ph ph-brackets-curly"></i>JSON</button>
-                                <button class="format-chip" data-format="docx" title="DOCX"><i class="ph ph-file-doc"></i>DOCX</button>
-                                <button class="format-chip" data-format="pdf" title="PDF"><i class="ph ph-file-pdf"></i>PDF</button>
-                            </div>
-                        </div>
                     </div>
 
-                    <!-- 标记文档 tab：md/json → docx/pdf -->
-                    <div class="tab-content" id="tab-markup">
+                    <!-- 标记文档：md / markdown → DOCX 或 PDF -->
+                    <div class="tab-content" id="tab-markup" role="tabpanel">
                         <div class="upload-area" id="drop-zone-markup">
-                            <i class="ph ph-brackets-angle upload-icon"></i>
-                            <h3>拖拽 Markdown / JSON 至此</h3>
-                            <p>反向转换：标记文档 → DOCX / PDF</p>
-                            <button class="btn btn-secondary" data-trigger="file-input-markup">浏览文件</button>
-                            <input type="file" id="file-input-markup" accept=".md,.markdown,.json" multiple hidden>
+                            <svg class="icon upload-icon" aria-hidden="true"><use href="assets/icons.svg#brackets-angle"/></svg>
+                            <h3>拖拽 Markdown 至此</h3>
+                            <p>支持 .md / .markdown，可拖入文件夹</p>
+                            <button class="btn btn-secondary" type="button" data-trigger="file-input-markup">浏览文件</button>
+                            <input type="file" id="file-input-markup" accept=".md,.markdown" multiple hidden>
                         </div>
                         <div class="file-list" id="file-list-markup"></div>
                         <div class="format-selector" id="format-selector-markup">
                             <span class="format-label">输出格式</span>
-                            <div class="format-chips" data-tab="tab-markup">
-                                <button class="format-chip active" data-format="md"><i class="ph ph-file-text"></i>MD</button>
-                                <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
-                                <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
-                                <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
+                            <div class="format-chips" id="format-chips-markup" role="group" aria-label="输出格式">
+                                <button class="format-chip active" type="button" data-format="docx" title="Word 文档" aria-pressed="true">
+                                    <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file-doc"/></svg>DOCX
+                                </button>
+                                <button class="format-chip" type="button" data-format="pdf" title="PDF 文档" aria-pressed="false">
+                                    <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file-pdf"/></svg>PDF
+                                </button>
                             </div>
                         </div>
                     </div>
 
-                    <!-- 网页链接 tab -->
-                    <div class="tab-content" id="tab-link">
+                    <!-- 网页链接：每行一个 URL → Markdown 包 -->
+                    <div class="tab-content" id="tab-link" role="tabpanel">
                         <div class="input-group">
-                            <label>文章链接 <span class="hint">（每行一个，支持批量）</span></label>
-                            <textarea class="url-textarea" id="url-input" placeholder="https://mp.weixin.qq.com/s/...&#10;https://zhuanlan.zhihu.com/p/...&#10;支持微信公众号、知乎、CSDN等" rows="5"></textarea>
+                            <label for="url-input">文章链接 <span class="hint">（每行一个，支持批量）</span></label>
+                            <textarea class="url-textarea" id="url-input" rows="6" spellcheck="false" placeholder="https://mp.weixin.qq.com/s/...&#10;https://zhuanlan.zhihu.com/p/...&#10;支持微信公众号、知乎、CSDN 等"></textarea>
                         </div>
-                        <div class="format-selector" id="format-selector-link">
-                            <span class="format-label">输出格式</span>
-                            <div class="format-chips" data-tab="tab-link">
-                                <button class="format-chip active" data-format="md"><i class="ph ph-file-text"></i>MD</button>
-                                <button class="format-chip" data-format="json"><i class="ph ph-brackets-curly"></i>JSON</button>
-                                <button class="format-chip" data-format="docx"><i class="ph ph-file-doc"></i>DOCX</button>
-                                <button class="format-chip" data-format="pdf"><i class="ph ph-file-pdf"></i>PDF</button>
-                            </div>
-                        </div>
+                        <p class="desktop-notice" id="desktop-notice-link" hidden>请使用 MarkFlow 桌面版</p>
                     </div>
-
                 </div>
 
-                <!-- 底部操作与设置 -->
+                <!-- 底部：输出目录摘要 + 转换按钮 -->
                 <div class="bottom-actions">
-                    <div class="settings-summary">
-                        <i class="ph ph-folder-open"></i>
-                        <span id="output-path-label">输出路径加载中...</span>
+                    <div class="settings-summary" title="当前输出目录">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#folder-open"/></svg>
+                        <span id="output-path-label">输出目录加载中...</span>
                     </div>
                     <div class="convert-btn-wrapper">
-                        <button class="btn btn-primary btn-convert" id="convert-btn">
-                            <i class="ph ph-lightning"></i>
+                        <button class="btn btn-primary btn-convert" type="button" id="convert-btn">
+                            <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#lightning"/></svg>
                             <span>开始转换</span>
                         </button>
                     </div>
                 </div>
             </section>
 
-            <!-- 右侧：预览与编辑区 -->
-            <section class="preview-panel panel-glass">
-                <div class="preview-header">
-                    <div class="preview-title">
-                        <i class="ph ph-eye"></i> 预览 & 编辑
-                        <span class="preview-kind-tag" id="preview-kind-tag"></span>
-                    </div>
-                    <div class="preview-toggles">
-                        <button class="toggle-btn active" data-view="split">分屏</button>
-                        <button class="toggle-btn" data-view="edit">源码</button>
-                        <button class="toggle-btn" data-view="render">效果</button>
-                    </div>
-                    <div class="preview-actions">
-                        <button class="btn btn-small btn-secondary" id="copy-btn">
-                            <i class="ph ph-copy"></i> 复制
-                        </button>
-                        <button class="btn btn-small btn-primary" id="save-btn">
-                            <i class="ph ph-floppy-disk"></i> 保存
-                        </button>
-                        <button class="btn btn-small btn-primary" id="export-btn">
-                            <i class="ph ph-export"></i> 导出
-                        </button>
-                    </div>
+            <!-- 右栏：转换结果 -->
+            <section class="results-panel panel-glass" id="results-panel" aria-label="转换结果">
+                <div class="results-header">
+                    <h2 class="results-title">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#list-checks"/></svg> 转换结果
+                        <span class="results-count" id="results-count" hidden>0</span>
+                    </h2>
+                    <button class="btn btn-small btn-secondary" type="button" id="results-clear-btn">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#trash"/></svg> 清空
+                    </button>
                 </div>
-
-                <!-- 工具栏（仅 MD 预览有效） -->
-                <div class="editor-toolbar" id="editor-toolbar">
-                    <button class="toolbar-btn" data-action="bold" title="加粗 (Ctrl+B)"><i class="ph ph-text-bolder"></i></button>
-                    <button class="toolbar-btn" data-action="italic" title="斜体 (Ctrl+I)"><i class="ph ph-text-italic"></i></button>
-                    <button class="toolbar-btn" data-action="strikethrough" title="删除线"><i class="ph ph-text-strikethrough"></i></button>
-                    <span class="toolbar-divider"></span>
-                    <button class="toolbar-btn" data-action="h1" title="一级标题">H1</button>
-                    <button class="toolbar-btn" data-action="h2" title="二级标题">H2</button>
-                    <button class="toolbar-btn" data-action="h3" title="三级标题">H3</button>
-                    <span class="toolbar-divider"></span>
-                    <button class="toolbar-btn" data-action="ul" title="无序列表"><i class="ph ph-list-bullets"></i></button>
-                    <button class="toolbar-btn" data-action="ol" title="有序列表"><i class="ph ph-list-numbers"></i></button>
-                    <button class="toolbar-btn" data-action="quote" title="引用"><i class="ph ph-quotes"></i></button>
-                    <button class="toolbar-btn" data-action="code" title="代码块 (Ctrl+`)"><i class="ph ph-code"></i></button>
-                    <span class="toolbar-divider"></span>
-                    <button class="toolbar-btn" data-action="link" title="插入链接 (Ctrl+K)"><i class="ph ph-link"></i></button>
-                    <button class="toolbar-btn" data-action="image" title="插入图片"><i class="ph ph-image"></i></button>
-                    <button class="toolbar-btn" data-action="table" title="插入表格"><i class="ph ph-table"></i></button>
-                    <span class="toolbar-divider"></span>
-                    <button class="toolbar-btn" data-action="hr" title="分割线"><i class="ph ph-minus"></i></button>
-                </div>
-
-                <div class="preview-body view-split kind-md" id="preview-body">
-                    <!-- 编辑区（md/html/json 通用） -->
-                    <div class="editor-pane">
-                        <textarea id="markdown-editor" spellcheck="false" placeholder="转换后的源码将在此显示，可直接修改..."></textarea>
-                    </div>
-                    <!-- 渲染区根容器，根据 kind-* 切换内部显示 -->
-                    <div class="render-pane" id="render-pane">
-                        <!-- MD 渲染 -->
-                        <div class="render-md" id="markdown-render">
-                            <div class="empty-state">
-                                <i class="ph ph-magic-wand"></i>
-                                <p>转换后的内容将在此预览</p>
-                            </div>
-                        </div>
-                        <!-- HTML 渲染（iframe 沙盒） -->
-                        <iframe class="render-html" id="html-preview-frame" sandbox="allow-same-origin" srcdoc=""></iframe>
-                        <!-- JSON 渲染（折叠树） -->
-                        <pre class="render-json" id="json-preview"></pre>
-                        <!-- 二进制结果卡 -->
-                        <div class="binary-result-card" id="binary-result-card">
-                            <div class="binary-card-icon">
-                                <i class="ph ph-file-archive" id="binary-icon"></i>
-                            </div>
-                            <div class="binary-card-meta">
-                                <h4 id="binary-filename">已生成文件</h4>
-                                <p id="binary-info">路径与大小信息</p>
-                            </div>
-                            <div class="binary-card-actions">
-                                <button class="btn btn-secondary btn-small" id="binary-open-folder">
-                                    <i class="ph ph-folder-open"></i> 打开目录
-                                </button>
-                                <button class="btn btn-secondary btn-small" id="binary-save-as">
-                                    <i class="ph ph-floppy-disk"></i> 另存为
-                                </button>
-                            </div>
-                        </div>
+                <div class="results-list" id="results-list">
+                    <div class="empty-state" id="results-empty">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#magic-wand"/></svg>
+                        <p>转换结果将在此显示</p>
                     </div>
                 </div>
             </section>
         </main>
     </div>
 
-    <!-- 转换进度弹窗 -->
-    <div class="modal-overlay" id="loading-modal">
+    <!-- 转换进度弹窗（轻量：当前项名称 + n/total + 进度条） -->
+    <div class="modal-overlay" id="loading-modal" role="dialog" aria-modal="true" aria-labelledby="loading-title">
         <div class="modal-card panel-glass">
-            <div class="spinner"></div>
+            <div class="spinner" aria-hidden="true"></div>
             <h3 id="loading-title">正在转换</h3>
-            <p id="loading-desc">正在解析文档...</p>
-            <div class="progress-bar-wrapper" id="batch-progress" style="display:none">
+            <p class="loading-name" id="loading-name">准备中...</p>
+            <div class="progress-bar-wrapper">
                 <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
                 <span class="progress-text" id="progress-text">0/0</span>
             </div>
@@ -242,73 +158,71 @@
     </div>
 
     <!-- 设置弹窗 -->
-    <div class="modal-overlay" id="settings-modal">
+    <div class="modal-overlay" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <div class="settings-card panel-glass">
             <div class="settings-header">
-                <h3><i class="ph ph-gear-six"></i> 设置</h3>
-                <button class="icon-btn" id="close-settings">
-                    <i class="ph ph-x"></i>
+                <h3 id="settings-title"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#gear-six"/></svg> 设置</h3>
+                <button class="icon-btn" type="button" id="close-settings" title="关闭" aria-label="关闭设置">
+                    <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#x"/></svg>
                 </button>
             </div>
             <div class="settings-body">
-                <!-- 外观主题 -->
+                <!-- 外观主题：跟随系统 / 浅色 / 深色 -->
                 <div class="settings-group">
-                    <label class="settings-label">外观主题</label>
-                    <div class="theme-switcher">
-                        <button class="theme-option active" data-theme="light" id="theme-light">
-                            <i class="ph ph-sun"></i> 浅色
+                    <span class="settings-label">外观主题</span>
+                    <div class="theme-switcher" id="theme-switcher" role="group" aria-label="外观主题">
+                        <button class="theme-option" type="button" data-scheme="system" aria-pressed="false">
+                            <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#monitor"/></svg> 跟随系统
                         </button>
-                        <button class="theme-option" data-theme="dark" id="theme-dark">
-                            <i class="ph ph-moon"></i> 深色
+                        <button class="theme-option" type="button" data-scheme="light" aria-pressed="false">
+                            <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#sun"/></svg> 浅色
+                        </button>
+                        <button class="theme-option" type="button" data-scheme="dark" aria-pressed="false">
+                            <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#moon"/></svg> 深色
                         </button>
                     </div>
                 </div>
                 <hr class="settings-divider">
                 <!-- 输出目录 -->
                 <div class="settings-group">
-                    <label class="settings-label">输出目录</label>
-                    <p class="settings-hint">所有转换产物按 <span class="dim">文章标题</span> 建子文件夹累加多种格式（.md / .html / .json / .docx / .pdf / .xlsx / .pptx 共存）。</p>
+                    <label class="settings-label" for="output-dir-input">输出目录</label>
+                    <p class="settings-hint">办公文档与网页 → <span class="dim">{名称}</span>/<span class="dim">{名称}</span>.md + .json + images/；标记文档 → <span class="dim">{名称}</span>.docx 或 .pdf</p>
                     <div class="settings-input-row">
                         <div class="input-wrapper">
-                            <i class="ph ph-folder-open input-icon"></i>
-                            <input type="text" id="output-dir-input" placeholder="/Users/you/Documents/知识库">
+                            <svg class="icon input-icon" aria-hidden="true"><use href="assets/icons.svg#folder-open"/></svg>
+                            <input type="text" id="output-dir-input" placeholder="/Users/you/Documents/MarkFlow" spellcheck="false">
                         </div>
+                        <button class="btn btn-secondary" type="button" id="pick-output-dir">
+                            <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#folder"/></svg> 选择目录
+                        </button>
                     </div>
-                    <div class="settings-path-preview" id="path-preview">
-                        <i class="ph ph-tree-structure"></i>
-                        <code><span id="preview-dir"></span>/<span class="dim">文章标题</span>/<br>&nbsp;&nbsp;├── <span class="dim">文章标题</span>.md / .html / .json / .docx / ...<br>&nbsp;&nbsp;└── images/</code>
+                    <div class="settings-path-preview">
+                        <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#tree-structure"/></svg>
+                        <code><span id="preview-dir"></span>/<br>&nbsp;&nbsp;├── <span class="dim">{名称}</span>/<span class="dim">{名称}</span>.md + .json + images/<br>&nbsp;&nbsp;└── <span class="dim">{名称}</span>.docx 或 .pdf</code>
                     </div>
                 </div>
                 <hr class="settings-divider">
-                <!-- 能力探测 -->
+                <!-- 运行能力 -->
                 <div class="settings-group">
-                    <label class="settings-label">运行能力</label>
+                    <span class="settings-label">运行能力</span>
                     <div class="capability-row">
-                        <span class="capability-name"><i class="ph ph-file-pdf"></i> PDF 输出（Electron 内嵌 Chromium）</span>
+                        <span class="capability-name"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file-pdf"/></svg> PDF 输出</span>
                         <span class="capability-status" id="cap-pdf">检测中...</span>
                     </div>
+                    <p class="settings-hint capability-hint" id="cap-pdf-hint" hidden></p>
                     <div class="capability-row">
-                        <span class="capability-name"><i class="ph ph-file-doc"></i> 旧二进制 DOC/XLS/PPT（LibreOffice）</span>
+                        <span class="capability-name"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#file-doc"/></svg> LibreOffice（.doc / .xls / .ppt）</span>
                         <span class="capability-status" id="cap-soffice">检测中...</span>
                     </div>
-                    <p class="settings-hint" id="soffice-hint" hidden></p>
-                </div>
-                <hr class="settings-divider">
-                <!-- 最近转换 -->
-                <div class="settings-group">
-                    <label class="settings-label">最近转换</label>
-                    <div class="history-list" id="recent-conversions-list">
-                        <p class="empty-state-mini">暂无记录</p>
-                    </div>
+                    <p class="settings-hint capability-hint" id="cap-soffice-hint" hidden></p>
                 </div>
             </div>
             <div class="settings-footer">
-                <button class="btn btn-secondary" id="reset-output-dir">恢复默认</button>
-                <button class="btn btn-primary" id="save-output-dir">保存设置</button>
+                <button class="btn btn-secondary" type="button" id="reset-output-dir">恢复默认</button>
+                <button class="btn btn-primary" type="button" id="save-output-dir">保存</button>
             </div>
         </div>
     </div>
-
 
     <script src="js/app.js"></script>
 </body>
