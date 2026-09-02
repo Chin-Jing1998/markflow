@@ -55,6 +55,22 @@ const EXT_BY_MIME = {
 const DEFAULT_MIME = 'application/octet-stream';
 const TEMP_SUBDIR = 'markflow-md-assets';
 const TEMP_HASH_LEN = 16;
+const STALE_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+// 模块加载时异步清理超过 1 天未修改的临时图片（上次运行残留），失败静默
+function cleanupStaleTempFiles() {
+    const dir = path.join(os.tmpdir(), TEMP_SUBDIR);
+    return fs.promises.readdir(dir).then(async (names) => {
+        const now = Date.now();
+        for (const name of names) {
+            const target = path.join(dir, name);
+            const stat = await fs.promises.stat(target).catch(() => null);
+            if (!stat || !stat.isFile() || now - stat.mtimeMs < STALE_TEMP_MAX_AGE_MS) continue;
+            await fs.promises.rm(target, { force: true }).catch(() => {});
+        }
+    }).catch(() => {});
+}
+cleanupStaleTempFiles();
 
 // ============================================================
 // 对外入口
@@ -327,4 +343,6 @@ function collectImageNodes(node, out = []) {
     return out;
 }
 
-module.exports = { resolveImages, collectImageNodes };
+module.exports = { resolveImages, collectImageNodes,
+    _cleanupStaleTempFiles: cleanupStaleTempFiles,
+};

@@ -1,251 +1,272 @@
 /**
  * MarkFlow - Electron 主进程
- * 将 Express 后端嵌入 Electron，作为桌面应用运行
+ * 职责：与 Chromium 初始化并行拉起内嵌后端（127.0.0.1 随机端口 + 每次启动生成的 token）；创建主窗口
+ * （跟随系统主题、深色启动不闪白、显示兜底、限制导航与外链）；提供本地路径类 IPC。
+ * 在普通 Node 进程中 require 本文件不产生任何副作用，仅通过 module.exports._internal 暴露纯逻辑供单元测试。
  */
-const { app, BrowserWindow, Menu, shell, dialog, ipcMain } = require('electron');
-const path = require('path');
+const path = require('node:path');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const crypto = require('node:crypto');
 
-// 服务端口（支持环境变量覆盖，方便与 server.js 联动）
-const PORT = parseInt(process.env.PORT, 10) || 3000;
+/** 普通 Node 进程里 require('electron') 得到的是可执行文件路径字符串（或抛错），此时返回 null */
+function loadElectron() {
+    try {
+        const mod = require('electron');
+        return mod && typeof mod === 'object' && mod.app ? mod : null;
+    } catch { return null; }
+}
+const electron = loadElectron();
+const { app, BrowserWindow, Menu, shell, dialog, ipcMain, nativeTheme, session } = electron || {};
+
+const HOST = '127.0.0.1';
+const SHOW_FALLBACK_MS = 1500;          // ready-to-show 迟迟不来时的显示兜底
+const BACKEND_CLOSE_TIMEOUT_MS = 1500;  // 退出时等待后端关闭的上限
+const THEMES = ['system', 'light', 'dark'];
+const MARKDOWN_EXTS = new Set(['.md', '.markdown']);
+const SKIP_DIRS = new Set(['node_modules', '.git']);
+const MAX_SCAN_DEPTH = 8;
+const MAX_SCAN_FILES = 500;
+
 let mainWindow = null;
-let server = null;
+let backend = null;   // startServer 返回的句柄 { server, port, token, close() }
+let apiToken = '';
+let isClosingBackend = false;
 
-/**
- * 创建主窗口
- */
-function createWindow() {
-    mainWindow = new BrowserWindow({
+// ===== 纯逻辑：不依赖 Electron，可独立测试 =====
+
+/** 主题值校验，非法值回退 'system' */
+function normalizeTheme(value) {
+    return THEMES.includes(value) ? value : 'system';
+}
+
+/** 读取主题文件；文件缺失、JSON 损坏或值非法时返回 'system' */
+function readThemeFile(file) {
+    try {
+        return normalizeTheme(JSON.parse(fs.readFileSync(file, 'utf8')).theme);
+    } catch { return 'system'; }
+}
+
+/** 写入主题文件（自动建目录），返回实际写入的规范值 */
+function writeThemeFile(file, value) {
+    const theme = normalizeTheme(value);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ theme }, null, 2));
+    return theme;
+}
+
+/** 递归收集目录下的 Markdown 文件到 out：跳过 node_modules、.git 与点开头目录，受深度与总数上限约束 */
+async function collectMarkdownFiles(dir, depth, out) {
+    if (depth > MAX_SCAN_DEPTH || out.length >= MAX_SCAN_FILES) return;
+    const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+        if (out.length >= MAX_SCAN_FILES) return;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue;
+            await collectMarkdownFiles(full, depth + 1, out);
+        } else if (entry.isFile() && MARKDOWN_EXTS.has(path.extname(entry.name).toLowerCase())) {
+            const stat = await fsp.stat(full).catch(() => null);
+            if (stat) out.push({ path: full, name: entry.name, size: stat.size });
+        }
+    }
+}
+
+/** 展开路径列表：文件原样返回，目录递归收集 .md/.markdown，不存在的路径忽略 */
+async function expandPaths(paths) {
+    const out = [];
+    for (const p of Array.isArray(paths) ? paths : []) {
+        if (out.length >= MAX_SCAN_FILES) break;
+        if (typeof p !== 'string' || p === '') continue;
+        const stat = await fsp.stat(p).catch(() => null);
+        if (!stat) continue;
+        if (stat.isFile()) out.push({ path: p, name: path.basename(p), size: stat.size });
+        else if (stat.isDirectory()) await collectMarkdownFiles(p, 0, out);
+    }
+    return out.slice(0, MAX_SCAN_FILES);
+}
+
+// ===== 后端：模块加载时即启动，与 Chromium 初始化并行 =====
+
+/** 启动内嵌后端；失败时在 ready 之后弹框并退出，返回 null（不抛出，避免 unhandledRejection） */
+async function startBackend() {
+    apiToken = crypto.randomBytes(24).toString('hex');
+    try {
+        const { startServer } = require(path.join(__dirname, '..', 'server'));
+        backend = await startServer({ host: HOST, port: 0, token: apiToken });
+        return backend;
+    } catch (err) {
+        console.error('后端启动失败:', err);
+        await app.whenReady();
+        dialog.showErrorBox('启动失败', `无法启动后端服务：${err.message}`);
+        app.quit();
+        return null;
+    }
+}
+
+/** before-quit：等待后端关闭（容错且有上限）后再真正退出，避免残留子进程与端口 */
+function closeBackendThenQuit(event) {
+    if (isClosingBackend || !backend) return;
+    isClosingBackend = true;
+    event.preventDefault();
+    const timeout = new Promise((resolve) => setTimeout(resolve, BACKEND_CLOSE_TIMEOUT_MS));
+    Promise.race([Promise.resolve().then(() => backend.close()), timeout])
+        .catch((err) => console.error('后端关闭失败:', err))
+        .finally(() => app.quit());
+}
+
+// ===== 主题：持久化到 userData/theme.json，并驱动 nativeTheme =====
+
+function themeFilePath() {
+    return path.join(app.getPath('userData'), 'theme.json');
+}
+
+// ===== 窗口 =====
+
+function createWindow(port) {
+    const origin = `http://${HOST}:${port}`;
+    const win = new BrowserWindow({
         width: 1440,
         height: 900,
         minWidth: 1024,
         minHeight: 680,
         title: 'MarkFlow',
-        titleBarStyle: 'hiddenInset',  // macOS 原生标题栏样式
+        titleBarStyle: 'hiddenInset',
         trafficLightPosition: { x: 16, y: 16 },
-        // ===== Apple26 / Liquid Glass =====
-        // 注：transparent:true + vibrancy 在 Electron 35 + macOS Tahoe 下 drag region
-        // 偶发失效（GitHub known issue）。改用 transparent:false 让 OS 接管标题栏拖动，
-        // vibrancy 仍生效（macOS 原生模糊材质独立工作，不依赖 transparent）。
+        // transparent:true + vibrancy 在 Electron 35 + macOS Tahoe 下拖动区域偶发失效，故保持 false
         transparent: false,
         vibrancy: 'sidebar',
         visualEffectState: 'active',
-        backgroundColor: '#F5F5F7',         // vibrancy 失败时的浅色 fallback
+        // 底色跟随当前主题，深色模式启动不闪白（也是 vibrancy 不可用时的回退色）
+        backgroundColor: nativeTheme.shouldUseDarkColors ? '#1c1c1e' : '#f5f5f7',
         roundedCorners: true,
-        backgroundMaterial: 'mica',         // Windows 11 等效（其他平台忽略）
+        backgroundMaterial: 'mica',
+        show: false,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
-            preload: path.join(__dirname, 'preload.js')
+            sandbox: true,
+            preload: path.join(__dirname, 'preload.js'),
+            additionalArguments: [`--markflow-port=${port}`, `--markflow-token=${apiToken}`],
         },
-        show: false, // 等加载完成再显示，避免白屏闪烁
     });
+    mainWindow = win;
 
-    // 加载 Express 提供的页面
-    mainWindow.loadURL(`http://localhost:${PORT}`);
+    // ready-to-show 与兜底计时器先到者显示窗口，且只显示一次
+    const showOnce = () => { if (!win.isDestroyed() && !win.isVisible()) win.show(); };
+    const fallback = setTimeout(showOnce, SHOW_FALLBACK_MS);
+    win.once('ready-to-show', () => { clearTimeout(fallback); showOnce(); });
+    win.on('closed', () => { clearTimeout(fallback); if (mainWindow === win) mainWindow = null; });
 
-    // 页面加载完成后平滑显示
-    mainWindow.once('ready-to-show', () => {
-        mainWindow.show();
-    });
-
-    // 窗口关闭
-    mainWindow.on('closed', () => {
-        mainWindow = null;
-    });
-
-    // 外部链接用系统浏览器打开
-    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-        shell.openExternal(url);
+    // 仅 http(s) 外链交给系统浏览器，其余一律拒绝；页面内导航只允许本地后端（url 已是规范化绝对地址）
+    win.webContents.setWindowOpenHandler(({ url }) => {
+        if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch((err) => console.error('打开外链失败:', err));
         return { action: 'deny' };
     });
+    win.webContents.on('will-navigate', (event, url) => { if (!url.startsWith(`${origin}/`)) event.preventDefault(); });
+    win.loadURL(origin);
 }
 
-/**
- * 构建应用菜单
- */
+// ===== 菜单与对话框 =====
+
+/** 原生目录选择对话框；取消时返回 null */
+async function pickOutputDir(parent) {
+    const result = await dialog.showOpenDialog(parent, { properties: ['openDirectory', 'createDirectory'], title: '选择输出目录' });
+    return result.canceled || result.filePaths.length === 0 ? null : result.filePaths[0];
+}
+
+async function sendOutputDirFromMenu() {
+    if (!mainWindow) return;
+    const dir = await pickOutputDir(mainWindow);
+    if (dir && mainWindow) mainWindow.webContents.send('set-output-dir', dir);
+}
+
+const SEP = { type: 'separator' };
+const roleItem = (role, label) => ({ role, label });
+
 function buildMenu() {
     const isMac = process.platform === 'darwin';
-
+    const appMenu = { label: 'MarkFlow', submenu: [
+        roleItem('about', '关于 MarkFlow'), SEP, roleItem('services', '服务'), SEP,
+        roleItem('hide', '隐藏 MarkFlow'), roleItem('hideOthers', '隐藏其他'), roleItem('unhide', '显示全部'), SEP,
+        roleItem('quit', '退出 MarkFlow'),
+    ] };
     const template = [
-        ...(isMac ? [{
-            label: 'MarkFlow',
-            submenu: [
-                { role: 'about', label: '关于 MarkFlow' },
-                { type: 'separator' },
-                { role: 'services', label: '服务' },
-                { type: 'separator' },
-                { role: 'hide', label: '隐藏 MarkFlow' },
-                { role: 'hideOthers', label: '隐藏其他' },
-                { role: 'unhide', label: '显示全部' },
-                { type: 'separator' },
-                { role: 'quit', label: '退出 MarkFlow' }
-            ]
-        }] : []),
-        {
-            label: '文件',
-            submenu: [
-                {
-                    label: '选择输出目录...',
-                    accelerator: 'CmdOrCtrl+Shift+O',
-                    click: async () => {
-                        if (!mainWindow) return;
-                        const result = await dialog.showOpenDialog(mainWindow, {
-                            properties: ['openDirectory', 'createDirectory'],
-                            title: '选择输出目录'
-                        });
-                        if (!result.canceled && result.filePaths.length > 0) {
-                            mainWindow.webContents.send('set-output-dir', result.filePaths[0]);
-                        }
-                    }
-                },
-                { type: 'separator' },
-                isMac ? { role: 'close', label: '关闭窗口' } : { role: 'quit', label: '退出' }
-            ]
-        },
-        {
-            label: '编辑',
-            submenu: [
-                { role: 'undo', label: '撤销' },
-                { role: 'redo', label: '重做' },
-                { type: 'separator' },
-                { role: 'cut', label: '剪切' },
-                { role: 'copy', label: '复制' },
-                { role: 'paste', label: '粘贴' },
-                { role: 'selectAll', label: '全选' }
-            ]
-        },
-        {
-            label: '视图',
-            submenu: [
-                { role: 'reload', label: '刷新' },
-                { role: 'forceReload', label: '强制刷新' },
-                { type: 'separator' },
-                { role: 'resetZoom', label: '重置缩放' },
-                { role: 'zoomIn', label: '放大' },
-                { role: 'zoomOut', label: '缩小' },
-                { type: 'separator' },
-                { role: 'togglefullscreen', label: '全屏' }
-            ]
-        },
-        {
-            label: '窗口',
-            submenu: [
-                { role: 'minimize', label: '最小化' },
-                ...(isMac ? [
-                    { role: 'zoom', label: '缩放' },
-                    { type: 'separator' },
-                    { role: 'front', label: '全部置前' }
-                ] : [
-                    { role: 'close', label: '关闭' }
-                ])
-            ]
-        }
+        ...(isMac ? [appMenu] : []),
+        { label: '文件', submenu: [
+            { label: '选择输出目录...', accelerator: 'CmdOrCtrl+Shift+O', click: sendOutputDirFromMenu }, SEP,
+            isMac ? roleItem('close', '关闭窗口') : roleItem('quit', '退出'),
+        ] },
+        { label: '编辑', submenu: [
+            roleItem('undo', '撤销'), roleItem('redo', '重做'), SEP,
+            roleItem('cut', '剪切'), roleItem('copy', '复制'), roleItem('paste', '粘贴'), roleItem('selectAll', '全选'),
+        ] },
+        { label: '视图', submenu: [
+            roleItem('reload', '刷新'), roleItem('forceReload', '强制刷新'), SEP,
+            roleItem('resetZoom', '重置缩放'), roleItem('zoomIn', '放大'), roleItem('zoomOut', '缩小'), SEP,
+            roleItem('togglefullscreen', '全屏'),
+        ] },
+        { label: '窗口', submenu: [
+            roleItem('minimize', '最小化'),
+            ...(isMac ? [roleItem('zoom', '缩放'), SEP, roleItem('front', '全部置前')] : [roleItem('close', '关闭')]),
+        ] },
     ];
-
     Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-/**
- * 启动内嵌的 Express 服务
- */
-async function startBackend() {
-    try {
-        // 把 PORT 传给 server（server.js 也读 process.env.PORT，保持一致）
-        process.env.PORT = String(PORT);
-        const { startServer } = require(path.join(__dirname, '..', 'server'));
-        server = await startServer(PORT);
-        console.log('✅ 后端服务已启动 on port', PORT);
-    } catch (err) {
-        console.error('❌ 后端启动失败:', err);
-        dialog.showErrorBox('启动失败', `无法启动后端服务：${err.message}`);
-        app.quit();
-    }
+// ===== IPC（ipcMain.handle）=====
+
+function requireNonEmptyString(value) {
+    if (typeof value !== 'string' || value === '') throw new Error('参数必须是非空字符串');
+    return value;
 }
 
-// ===== IPC 通信：原生文件对话框 =====
-ipcMain.handle('select-directory', async () => {
-    if (!mainWindow) return null;
-    const result = await dialog.showOpenDialog(mainWindow, {
-        properties: ['openDirectory', 'createDirectory'],
-        title: '选择输出目录'
+function registerIpc() {
+    ipcMain.handle('select-directory', (event) => {
+        const parent = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+        return parent ? pickOutputDir(parent) : null;
     });
-    if (result.canceled || result.filePaths.length === 0) return null;
-    return result.filePaths[0];
-});
-
-ipcMain.handle('open-in-finder', async (event, folderPath) => {
-    shell.showItemInFolder(folderPath);
-});
-
-// PDF 打印 IPC：渲染进程 → 主进程隐藏窗口 printToPDF
-const pdfPrinter = require('./pdf-printer');
-ipcMain.handle('print-to-pdf', async (event, { html, options } = {}) => {
-    if (!pdfPrinter.isAvailable()) {
-        throw new Error('PDF 打印功能不可用');
-    }
-    const buf = await pdfPrinter.printToPdf(html, options);
-    return buf; // Buffer 经 IPC 自动转 Uint8Array
-});
-
-// 另存为：复制已生成的文件到用户选择的路径（用于 binary 输出"另存为副本"）
-ipcMain.handle('save-as', async (event, { sourcePath, defaultName } = {}) => {
-    if (!mainWindow) return null;
-    if (!sourcePath) throw new Error('save-as 需要 sourcePath');
-    const result = await dialog.showSaveDialog(mainWindow, {
-        defaultPath: defaultName || path.basename(sourcePath),
-        title: '另存为',
+    ipcMain.handle('open-in-finder', (event, target) => { shell.showItemInFolder(requireNonEmptyString(target)); });
+    ipcMain.handle('open-path', (event, target) => shell.openPath(requireNonEmptyString(target)));
+    ipcMain.handle('expand-paths', (event, paths) => expandPaths(paths));
+    ipcMain.handle('set-theme', (event, value) => {
+        const theme = normalizeTheme(value);
+        nativeTheme.themeSource = theme;
+        writeThemeFile(themeFilePath(), theme);
     });
-    if (result.canceled || !result.filePath) return null;
-    require('fs').copyFileSync(sourcePath, result.filePath);
-    return result.filePath;
-});
+    ipcMain.handle('get-theme', () => nativeTheme.themeSource);
+}
 
-// 多文件选择（原生体验，可选；前端也可用 <input type="file">）
-ipcMain.handle('select-files', async (event, options = {}) => {
-    if (!mainWindow) return null;
-    const result = await dialog.showOpenDialog(mainWindow, {
-        properties: ['openFile', 'multiSelections'],
-        title: options.title || '选择文件',
-        filters: options.filters || [
-            {
-                name: '所有支持的格式',
-                extensions: ['docx', 'pdf', 'xlsx', 'pptx', 'doc', 'xls', 'ppt', 'md', 'markdown', 'html', 'htm', 'json'],
-            },
-            { name: '办公文档', extensions: ['docx', 'pdf', 'xlsx', 'pptx', 'doc', 'xls', 'ppt'] },
-            { name: '标记文档', extensions: ['md', 'markdown', 'html', 'htm', 'json'] },
-            { name: '全部', extensions: ['*'] },
-        ],
+// ===== 生命周期（仅在 Electron 主进程执行）=====
+
+function bootstrap() {
+    const backendReady = startBackend();   // 不等 app.whenReady，与 Chromium 初始化并行
+    // ready 之前恢复主题，保证窗口创建时 shouldUseDarkColors 已反映用户选择
+    try { nativeTheme.themeSource = readThemeFile(themeFilePath()); } catch (err) { console.error('读取主题设置失败:', err); }
+    registerIpc();
+
+    app.whenReady().then(async () => {
+        const handle = await backendReady;
+        if (!handle) return;   // 启动失败已在 startBackend 内提示并退出
+        session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+            // 仅放行剪贴板写入（前端「复制路径」等需要），其余权限一律拒绝
+            callback(permission === 'clipboard-sanitized-write');
+        });
+        buildMenu();
+        createWindow(handle.port);
+        app.on('activate', () => {
+            if (BrowserWindow.getAllWindows().length === 0) createWindow(handle.port);
+        });
+    }).catch((err) => console.error('初始化失败:', err));
+
+    app.on('window-all-closed', () => {
+        if (process.platform !== 'darwin') app.quit();
     });
-    if (result.canceled || result.filePaths.length === 0) return null;
-    const fs = require('fs');
-    return result.filePaths.map((p) => ({
-        path: p,
-        name: path.basename(p),
-        size: fs.statSync(p).size,
-    }));
-});
+    app.on('before-quit', closeBackendThenQuit);
+}
 
-// ===== Electron 应用生命周期 =====
-app.whenReady().then(async () => {
-    await startBackend();
-    buildMenu();
-    createWindow();
+module.exports = {
+    _internal: { normalizeTheme, readThemeFile, writeThemeFile, collectMarkdownFiles, expandPaths },
+};
 
-    app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) {
-            createWindow();
-        }
-    });
-});
-
-app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
-        app.quit();
-    }
-});
-
-app.on('before-quit', () => {
-    if (server) {
-        server.close();
-    }
-});
+if (electron) bootstrap();

@@ -1,450 +1,217 @@
+/**
+ * MarkFlow 本地 HTTP 服务（默认只监听 127.0.0.1，全部 /api 端点需请求头 X-MarkFlow-Token）
+ *   GET  /api/formats             能力矩阵 + soffice / PDF 后端实时探测结果
+ *   POST /api/convert             批量转换，NDJSON 流式回传 accepted/start/progress/item/done
+ *   GET  /api/settings/output-dir 读取当前输出目录
+ *   POST /api/settings/output-dir 设置输出目录（须为已存在且可写的绝对路径目录）
+ * 静态资源仅开放 /、/css、/js、/assets；输出目录持久化于 ~/.markflow/settings.json。
+ */
+const crypto = require('crypto');
 const express = require('express');
-const multer = require('multer');
-const path = require('path');
 const fs = require('fs');
-
-const wordConverter = require('./converters/legacy/word');
-const urlConverter = require('./converters/legacy/url');
-const textConverter = require('./converters/legacy/text');
-
-// 新通用转换调度 + SSE 任务管理
-const converter = require('./converters');
-const jobs = require('./server/jobs');
-const pdfRenderer = require('./converters/renderers/pdf');
+const os = require('os');
+const path = require('path');
+const converters = require('./converters');
+const pdfBackend = require('./converters/pdf/backend');
 const soffice = require('./server/soffice');
-const { decodeUtf8Filename } = require('./converters/ir/util');
+const { assertPublicUrl } = require('./converters/net/fetch-guard');
+const { requireToken, mountStatic } = require('./server/security');
 
-const app = express();
-const PORT = parseInt(process.env.PORT, 10) || 3000;
+const fsp = fs.promises;
+const MAX_ITEMS = 200;
+const CONCURRENCY = 2;
+const DEFAULT_OUTPUT_DIR = path.join(os.homedir(), 'Documents', 'MarkFlow');
+const errorMessage = (err) => (err && err.message ? err.message : String(err));
 
-// 中间件
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(express.static(__dirname)); // 服务前端静态文件
-
-// 文件上传配置 —— 旧 Word 端点专用（仅 .docx）
-const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
-    fileFilter: (req, file, cb) => {
-        if (file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-            cb(null, true);
-        } else {
-            cb(new Error('仅支持 .docx 格式的 Word 文件'));
-        }
-    }
-});
-
-// 新统一上传配置 —— /api/convert 用，接受任意类型，按扩展名在调度器中分发
-const uploadAny = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 100 * 1024 * 1024 }, // 100MB（PPTX/PDF 可能更大）
-});
-// 判断是否在 Electron 打包环境中运行（asar 内无法写入文件）
-const isPackaged = __dirname.includes('app.asar');
-
-// 获取应用根目录（兼容 asar 打包）
-const appRoot = isPackaged
-    ? path.join(__dirname.replace('app.asar', 'app.asar.unpacked'))
-    : __dirname;
-
-// 输出根目录：打包后默认保存到用户文档目录
-let outputDir = isPackaged
-    ? path.join(require('os').homedir(), 'Documents', 'MarkFlow')
-    : path.join(__dirname, 'output');
-
-if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
+function settingsFile() {
+    return process.env.MARKFLOW_SETTINGS_FILE || path.join(os.homedir(), '.markflow', 'settings.json');
 }
 
-// 动态静态文件服务：让浏览器预览能加载 output 目录中的图片
-// 使用自定义中间件而非 express.static，因为 outputDir 可被动态修改
-app.use('/output-files', (req, res, next) => {
-    const filePath = path.join(outputDir, decodeURIComponent(req.path));
-    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-        res.sendFile(filePath);
-    } else {
-        res.status(404).send('文件未找到');
+function readPersistedDir() {
+    try {
+        const { outputDir } = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
+        return typeof outputDir === 'string' ? outputDir : '';
+    } catch (err) {
+        return '';
     }
-});
-
-/**
- * 获取当前生效的输出目录（支持 API 传入自定义路径覆盖默认值）
- */
-function getOutputDir(customDir) {
-    if (customDir && customDir.trim()) {
-        const dir = customDir.trim();
-        // 确保目录存在
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        return dir;
-    }
-    return outputDir;
 }
 
-/**
- * API: 获取当前输出路径
- * GET /api/settings/output-dir
- */
-app.get('/api/settings/output-dir', (req, res) => {
-    res.json({ success: true, outputDir });
-});
+function persistOutputDir(outputDir) {
+    const file = settingsFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ outputDir }, null, 2)}\n`, 'utf8');
+}
 
-/**
- * API: 修改输出路径
- * POST /api/settings/output-dir
- */
-app.post('/api/settings/output-dir', (req, res) => {
-    try {
-        const { dir } = req.body;
-        if (!dir || !dir.trim()) {
-            return res.status(400).json({ success: false, error: '路径不能为空' });
-        }
+// 仅默认目录允许自动创建，其余来源一律要求目录已存在
+function resolveInitialOutputDir(explicit) {
+    const picked = explicit || process.env.MARKFLOW_OUTPUT_DIR || readPersistedDir();
+    if (picked) return picked;
+    fs.mkdirSync(DEFAULT_OUTPUT_DIR, { recursive: true });
+    return DEFAULT_OUTPUT_DIR;
+}
 
-        const newDir = path.resolve(dir.trim());
+// 目录须为绝对路径、已存在且可写；不满足则抛出中文原因
+async function assertUsableDir(dir) {
+    if (typeof dir !== 'string' || dir.trim() === '') throw new Error('目录不能为空');
+    const target = dir.trim();
+    if (!path.isAbsolute(target)) throw new Error(`必须是绝对路径：${target}`);
+    const stat = await fsp.stat(target).catch(() => null);
+    if (!stat || !stat.isDirectory()) throw new Error(`目录不存在：${target}`);
+    await fsp.access(target, fs.constants.W_OK).catch(() => { throw new Error(`目录不可写：${target}`); });
+    return target;
+}
 
-        // 验证路径合法性：尝试创建目录
-        if (!fs.existsSync(newDir)) {
-            fs.mkdirSync(newDir, { recursive: true });
-        }
+// 每次调用都实时探测运行时依赖，并据此拼装可用目标矩阵
+async function probeTargets() {
+    const [sofficeAvailable, backend] = await Promise.all([soffice.isAvailable(), pdfBackend.detect()]);
+    const targets = converters.listTargets({ sofficeAvailable, pdfBackend: backend.available ? backend : null });
+    return { capabilities: { sofficeAvailable, pdfBackend: backend }, targets };
+}
 
-        // 验证路径可写
-        const testFile = path.join(newDir, '.markflow_test');
-        fs.writeFileSync(testFile, '', 'utf8');
-        fs.unlinkSync(testFile);
+async function resolveFileInput(filePath) {
+    if (!path.isAbsolute(filePath)) throw new Error(`路径必须是绝对路径：${filePath}`);
+    const stat = await fsp.stat(filePath).catch(() => null);
+    if (!stat || !stat.isFile()) throw new Error(`文件不存在或不是普通文件：${filePath}`);
+    const type = converters.detectInputType(filePath);
+    if (!type) throw new Error(`不支持的输入格式：${path.extname(filePath) || '(无扩展名)'}`);
+    return { type, input: { path: filePath } };
+}
 
-        outputDir = newDir;
-        console.log(`  📂  输出目录已更新: ${outputDir}`);
-        res.json({ success: true, outputDir });
-    } catch (err) {
-        console.error('设置输出路径失败:', err);
-        res.status(400).json({ success: false, error: `路径无效或无写入权限：${err.message}` });
+async function resolveUrlInput(url) {
+    await assertPublicUrl(url); // 拒绝本机地址与内网、保留网段
+    return { type: 'url', input: { url } };
+}
+
+// → { input: { path } | { url }, target }
+async function normalizeItem(raw, targets) {
+    const item = raw && typeof raw === 'object' ? raw : {};
+    const hasPath = typeof item.path === 'string' && item.path.trim() !== '';
+    const hasUrl = typeof item.url === 'string' && item.url.trim() !== '';
+    if (hasPath === hasUrl) throw new Error('path 与 url 必须二选一');
+    const { type, input } = hasPath
+        ? await resolveFileInput(item.path.trim())
+        : await resolveUrlInput(item.url.trim());
+    const allowed = targets[targets.inputs[type]];
+    if (!allowed) throw new Error(`当前环境不支持 ${type} 输入`);
+    const target = typeof item.target === 'string' ? item.target : '';
+    if (!allowed.includes(target)) {
+        throw new Error(`${type} 输入只能转为 ${allowed.join('、')}，实际为 ${target || '(空)'}`);
     }
-});
+    return { input, target };
+}
 
-/**
- * API: 转换 Word 文件
- * POST /api/convert/word
- */
-app.post('/api/convert/word', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ success: false, error: '未上传文件' });
-        }
-        // multer (busboy) 默认以 latin1 解析文件名，中文会乱码
-        // 需要将 latin1 字节还原为 utf8
-        const originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
-        const dir = getOutputDir(req.body.outputDir);
-        const result = await wordConverter.convert(req.file.buffer, originalName, dir);
-        res.json({ success: true, data: result });
-    } catch (err) {
-        console.error('Word 转换失败:', err);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-/**
- * API: 转换 URL 文章
- * POST /api/convert/url
- */
-app.post('/api/convert/url', async (req, res) => {
-    try {
-        const { url, outputDir: customDir } = req.body;
-        if (!url) {
-            return res.status(400).json({ success: false, error: '请提供文章链接' });
-        }
-        const dir = getOutputDir(customDir);
-        const result = await urlConverter.convert(url, dir);
-        res.json({ success: true, data: result });
-    } catch (err) {
-        console.error('URL 转换失败:', err);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-/**
- * API: 转换粘贴文本
- * POST /api/convert/text
- */
-app.post('/api/convert/text', async (req, res) => {
-    try {
-        const { text, title, outputDir: customDir } = req.body;
-        if (!text) {
-            return res.status(400).json({ success: false, error: '请提供文本内容' });
-        }
-        const dir = getOutputDir(customDir);
-        const result = await textConverter.convert(text, title, dir);
-        res.json({ success: true, data: result });
-    } catch (err) {
-        console.error('文本转换失败:', err);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-/**
- * API: 保存编辑后的 Markdown
- * POST /api/save
- */
-app.post('/api/save', async (req, res) => {
-    try {
-        const { markdown, folderName, outputDir: customDir } = req.body;
-        if (!markdown || !folderName) {
-            return res.status(400).json({ success: false, error: '缺少参数' });
-        }
-        const dir = getOutputDir(customDir);
-        const outputFolder = path.join(dir, folderName);
-        if (!fs.existsSync(outputFolder)) {
-            fs.mkdirSync(outputFolder, { recursive: true });
-        }
-        const mdPath = path.join(outputFolder, `${folderName}.md`);
-        fs.writeFileSync(mdPath, markdown, 'utf8');
-        res.json({ success: true, message: '保存成功', path: mdPath });
-    } catch (err) {
-        console.error('保存失败:', err);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
-// ============================================================
-// 新统一转换 API（P0 起步，与旧端点并存，零回归）
-// ============================================================
-
-/**
- * 能力矩阵 + 平台依赖探测结果
- * GET /api/formats
- */
-app.get('/api/formats', (req, res) => {
-    res.json({
-        success: true,
-        ...converter.getCapabilities({
-            sofficeAvailable: soffice.isAvailable(),
-            electronPrintToPdf: pdfRenderer.isAvailable(),
-        }),
-        sofficeHint: soffice.isAvailable() ? null : soffice.getInstallHint(),
-    });
-});
-
-/**
- * 统一转换入口
- * POST /api/convert
- *
- * multipart/form-data：
- *   files[]   多个文件
- *   manifest  JSON.stringify({ items:[{idx,inputType,outputFormat,options?}], commonOutputDir })
- *
- * application/json：
- *   { items:[{idx,inputType,outputFormat,source,options?}], commonOutputDir }
- *
- * 立即返回 { jobId }，转换异步推进；客户端通过 SSE 订阅进度。
- */
-app.post(
-    '/api/convert',
-    (req, res, next) => {
-        const ct = (req.headers['content-type'] || '').toLowerCase();
-        if (ct.startsWith('multipart/form-data')) {
-            uploadAny.array('files', 50)(req, res, next);
-        } else {
-            next();
-        }
-    },
-    async (req, res) => {
+// 逐项串行校验，任一项不合法即整批拒绝，错误信息保留出错项序号
+async function normalizeItems(rawItems, targets) {
+    if (!Array.isArray(rawItems) || rawItems.length === 0) throw new Error('items 必须是非空数组');
+    if (rawItems.length > MAX_ITEMS) throw new Error(`单次最多 ${MAX_ITEMS} 项，实际 ${rawItems.length} 项`);
+    const items = [];
+    for (let i = 0; i < rawItems.length; i += 1) {
         try {
-            let items;
-            let commonOutputDir;
-
-            if (req.files && req.files.length > 0) {
-                // multipart 模式
-                const manifestStr = req.body && req.body.manifest;
-                if (!manifestStr) {
-                    return res.status(400).json({ success: false, error: '缺少 manifest 字段' });
-                }
-                let manifest;
-                try {
-                    manifest = JSON.parse(manifestStr);
-                } catch (e) {
-                    return res.status(400).json({ success: false, error: 'manifest JSON 解析失败' });
-                }
-                if (!manifest || !Array.isArray(manifest.items)) {
-                    return res.status(400).json({ success: false, error: 'manifest.items 必须是数组' });
-                }
-                items = manifest.items.map((it) => {
-                    const file = req.files[it.idx];
-                    return {
-                        ...it,
-                        name: file ? decodeUtf8Filename(file.originalname) : it.name,
-                        source: file ? file.buffer : it.source,
-                        file: file || null,
-                    };
-                });
-                commonOutputDir = manifest.commonOutputDir;
-            } else {
-                // JSON 模式
-                const body = req.body || {};
-                if (!Array.isArray(body.items)) {
-                    return res.status(400).json({ success: false, error: '缺少 items 数组' });
-                }
-                items = body.items;
-                commonOutputDir = body.commonOutputDir;
-            }
-
-            const dir = getOutputDir(commonOutputDir);
-            const job = jobs.createJob(items);
-
-            // 异步执行，立即返回 jobId，进度通过 SSE 推送
-            jobs.runJob(
-                job.id,
-                async (item, reportProgress) => {
-                    return converter.convert({
-                        inputType: item.inputType,
-                        outputFormat: item.outputFormat,
-                        source: item.source,
-                        name: item.name,
-                        options: item.options || {},
-                        outputDir: dir,
-                        reportProgress,
-                    });
-                },
-                { concurrency: 2 },
-            ).catch((err) => {
-                console.error(`Job ${job.id} 运行异常:`, err);
-            });
-
-            res.json({
-                success: true,
-                jobId: job.id,
-                items: job.items.map((it) => ({ idx: it.idx, status: it.status })),
-            });
+            items.push(await normalizeItem(rawItems[i], targets));
         } catch (err) {
-            console.error('/api/convert 失败:', err);
-            res.status(500).json({ success: false, error: err.message });
+            throw new Error(`第 ${i + 1} 项：${err.message}`);
         }
-    },
-);
-
-/**
- * 任务状态轮询（SSE 兜底）
- * GET /api/jobs/:id
- */
-app.get('/api/jobs/:id', (req, res) => {
-    const job = jobs.getJob(req.params.id);
-    if (!job) {
-        return res.status(404).json({ success: false, error: '任务不存在或已过期' });
     }
-    res.json({
-        success: true,
-        jobId: job.id,
-        status: job.status,
-        items: job.items.map((it) => ({
-            idx: it.idx,
-            status: it.status,
-            result: it.result,
-            error: it.error,
-        })),
-        summary: job.summary,
-    });
-});
+    return items;
+}
 
-/**
- * 任务进度 SSE 流
- * GET /api/jobs/:id/events
- */
-app.get('/api/jobs/:id/events', (req, res) => {
-    jobs.subscribe(req.params.id, res);
-});
-
-/**
- * 编辑后跨格式导出
- * POST /api/export
- * body: { content, sourceFormat, targetFormat, folderName, outputDir? }
- *   - content: 当前编辑器内容（md/html/json 字符串）
- *   - sourceFormat: 'md' | 'html' | 'json'
- *   - targetFormat: 任意 renderer 支持的格式
- *   - folderName: 复用之前转换的文件夹名（避免重算导致写到别处）
- */
-app.post('/api/export', async (req, res) => {
+// accepted → runBatch 的 start/progress/item 事件 → done；客户端断开后停止写入，但不打断已在进行的转换
+async function streamBatch(req, res, items, outputDir) {
+    res.set({ 'Content-Type': 'application/x-ndjson; charset=utf-8', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    let alive = true;
+    req.on('close', () => { alive = false; });
+    const write = (event) => {
+        if (!alive) return;
+        const payload = event.type === 'item' && !event.ok
+            ? { ...event, error: errorMessage(event.error) }
+            : event;
+        res.write(`${JSON.stringify(payload)}\n`);
+    };
+    write({ type: 'accepted', total: items.length, outputDir });
     try {
-        const {
-            content,
-            sourceFormat,
-            targetFormat,
-            folderName,
-            outputDir: customDir,
-        } = req.body || {};
-
-        if (!content || !sourceFormat || !targetFormat || !folderName) {
-            return res.status(400).json({
-                success: false,
-                error: '缺少必要参数：content/sourceFormat/targetFormat/folderName',
-            });
-        }
-
-        const reg = converter._registry;
-        const parser = reg.parsers[sourceFormat];
-        const renderer = reg.renderers[targetFormat];
-        if (!parser) {
-            return res.status(400).json({
-                success: false,
-                error: `不支持的源格式: ${sourceFormat}`,
-            });
-        }
-        if (!renderer) {
-            return res.status(400).json({
-                success: false,
-                error: `不支持的目标格式: ${targetFormat}`,
-            });
-        }
-
-        const dir = getOutputDir(customDir);
-        const outputFolder = path.join(dir, folderName);
-        fs.mkdirSync(outputFolder, { recursive: true });
-
-        // 解析（md/html/json 三类源格式的 parser 不需要 outputDir，但传上无害）
-        const doc = await parser.parse(content, {
-            outputDir: dir,
-            sourceName: folderName,
-        });
-        doc.meta = { ...(doc.meta || {}), folderName };
-
-        const output = await renderer.render(doc);
-
-        const { writeOutputFile } = require('./converters/ir/util');
-        const outputPath = writeOutputFile(
-            outputFolder,
-            folderName,
-            targetFormat,
-            output,
-        );
-
-        res.json({
-            success: true,
-            path: outputPath,
-            filename: path.basename(outputPath),
-            folderName,
-            format: targetFormat,
-        });
+        await converters.runBatch(items, { concurrency: CONCURRENCY, onEvent: write }, (item, onProgress) => (
+            converters.convert({ input: item.input, target: item.target, outputDir, onProgress })
+        ));
     } catch (err) {
-        console.error('/api/export 失败:', err);
-        res.status(500).json({ success: false, error: err.message });
+        write({ type: 'done', total: items.length, succeeded: 0, failed: items.length, error: errorMessage(err) });
     }
-});
+    if (alive) res.end();
+}
 
-// 启动服务（支持 Electron 嵌入和独立运行两种模式）
-function startServer(port = PORT) {
-    return new Promise((resolve) => {
-        const server = app.listen(port, () => {
-            console.log(`\n  MarkFlow 服务已启动`);
-            console.log(`  🌐  http://localhost:${port}`);
-            console.log(`  📂  输出目录: ${outputDir}\n`);
-            resolve(server);
-        });
+function createApp(token, state) {
+    const app = express();
+    app.disable('x-powered-by');
+    app.use(express.json({ limit: '1mb' }));
+    app.use('/api', (req, res, next) => {
+        res.set('Cache-Control', 'no-store');
+        next();
+    }, requireToken(token));
+
+    app.get('/api/formats', async (req, res) => {
+        const { capabilities, targets } = await probeTargets();
+        res.json({ success: true, targets, capabilities, outputDir: state.outputDir });
+    });
+
+    app.get('/api/settings/output-dir', (req, res) => {
+        res.json({ success: true, outputDir: state.outputDir });
+    });
+
+    app.post('/api/settings/output-dir', async (req, res, next) => {
+        try {
+            const dir = await assertUsableDir((req.body || {}).dir);
+            persistOutputDir(dir);
+            state.outputDir = dir;
+            res.json({ success: true, outputDir: dir });
+        } catch (err) {
+            if (err.code) return next(err); // 带 errno 的写盘失败按 500 处理
+            res.status(400).json({ success: false, error: errorMessage(err) });
+        }
+    });
+
+    app.post('/api/convert', async (req, res) => {
+        const body = req.body || {};
+        let batch;
+        try {
+            const outputDir = body.outputDir ? await assertUsableDir(body.outputDir) : state.outputDir;
+            batch = { outputDir, items: await normalizeItems(body.items, (await probeTargets()).targets) };
+        } catch (err) {
+            res.status(400).json({ success: false, error: errorMessage(err) });
+            return;
+        }
+        await streamBatch(req, res, batch.items, batch.outputDir);
+    });
+
+    mountStatic(app, __dirname);
+    app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+        const status = err.status || err.statusCode || 500;
+        if (status >= 500) console.error('服务异常:', err);
+        if (res.headersSent) return res.end();
+        res.status(status).json({ success: false, error: errorMessage(err) });
+    });
+    return app;
+}
+
+function startServer({ host = '127.0.0.1', port = 0, token, outputDir } = {}) {
+    const authToken = token || crypto.randomBytes(24).toString('hex');
+    const app = createApp(authToken, { outputDir: resolveInitialOutputDir(outputDir) });
+    return new Promise((resolve, reject) => {
+        const server = app.listen(port, host);
+        server.once('error', reject);
+        server.once('listening', () => resolve({
+            server,
+            port: server.address().port,
+            token: authToken,
+            close: () => new Promise((done) => { server.closeAllConnections(); server.close(() => done()); }),
+        }));
     });
 }
 
-// 导出供 Electron 主进程使用
-module.exports = { app, startServer, getOutputDir };
+module.exports = { startServer };
 
-// 如果直接运行（非 Electron），自动启动
+// 直接运行：端口与 token 取自环境变量，启动信息只写 stderr，stdout 保持干净
 if (require.main === module) {
-    startServer();
+    startServer({ port: Number(process.env.PORT) || 0, token: process.env.MARKFLOW_TOKEN })
+        .then(({ port, token }) => console.error(`MarkFlow 服务已启动: http://127.0.0.1:${port}  token=${token}`))
+        .catch((err) => { console.error('MarkFlow 启动失败:', errorMessage(err)); process.exitCode = 1; });
 }
