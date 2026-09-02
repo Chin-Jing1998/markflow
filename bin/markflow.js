@@ -150,6 +150,9 @@ async function probeCapabilities() {
 async function cmdServe(values) {
     const { startServer } = require('../server');
     const host = values.host || DEFAULT_HOST;
+    if (!['127.0.0.1', 'localhost', '::1'].includes(host)) {
+        log('警告：监听非回环地址会把本机文件读写能力暴露到网络，请确认网络可信并妥善保管访问令牌');
+    }
     const handle = await startServer({
         host,
         port: parsePositiveInt(values.port, 0),

@@ -2,7 +2,7 @@
  * converters/pdf/backend.js 与 electron/pdf-printer.js 单元测试
  * 覆盖：非 Electron 进程内打印器不可用、本机探测（electron-worker）、真实工作进程出图、
  *       注入 mock 的 electron 主进程/soffice 分支、三级皆无时的中文错误、工作进程异常与超时、
- *       残留临时目录清理
+ *       错误文案脱敏（仅首行 + 路径替换为 <path>）、残留临时目录清理
  */
 const { test, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -228,6 +228,52 @@ test('工作进程退出异常时抛出含退出码与 stderr 摘要的错误', 
     assert.ok(spawnCalls[0].args[1].endsWith('index.html'));
     assert.ok(spawnCalls[0].args[2].endsWith('output.pdf'));
     assert.equal(Object.prototype.hasOwnProperty.call(spawnCalls[0].options.env, 'ELECTRON_RUN_AS_NODE'), false);
+});
+
+test('用户可见错误只取 stderr 首行并把绝对路径脱敏为 <path>，完整 stderr 走 console.error', async () => {
+    // Arrange：真实崩溃时 stderr 是带绝对路径的多行调用栈
+    const rawStderr = [
+        "[pdf-worker] Error: ENOENT: no such file or directory, open '/Users/someone/编程项目工作站/知识库文件转换程序/tmp/index.html'",
+        '    at printFile (/Users/someone/编程项目工作站/知识库文件转换程序/electron/pdf-worker.js:63:39)',
+        '    at async main (/Users/someone/编程项目工作站/知识库文件转换程序/electron/pdf-worker.js:79:5)',
+    ].join('\n');
+    const logged = [];
+    const originalError = console.error;
+    console.error = (...args) => logged.push(args.join(' '));
+    backend._setDeps({
+        printer: unavailablePrinter(),
+        electronPath: process.execPath,
+        soffice: unavailableSoffice(),
+        spawn: () => {
+            const child = fakeChild();
+            setImmediate(() => {
+                child.stderr.emit('data', rawStderr);
+                child.emit('exit', 1, null);
+            });
+            return child;
+        },
+    });
+
+    // Act
+    let message = '';
+    try {
+        await backend.renderPdf({ html: '<p>x</p>' });
+        assert.fail('应当抛错');
+    } catch (err) {
+        message = err.message;
+    } finally {
+        console.error = originalError;
+    }
+
+    // Assert
+    assert.ok(message.includes('code=1'), '保留退出码');
+    assert.ok(message.includes('ENOENT: no such file or directory'), '保留首行的原因说明');
+    assert.ok(!message.includes('    at '), '不得带调用栈');
+    assert.ok(!message.includes('/Users/someone'), '不得泄露绝对路径');
+    assert.ok(!message.includes('pdf-worker.js:63'), '不得泄露源码行号');
+    assert.ok(message.includes('<path>'), '路径应替换为 <path> 占位');
+    assert.equal(logged.length, 1, '完整 stderr 应写一次日志');
+    assert.ok(logged[0].includes('/Users/someone'), '日志侧保留完整路径以便排障');
 });
 
 test('工作进程超时被强制结束并抛出超时错误', async () => {

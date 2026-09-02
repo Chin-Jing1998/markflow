@@ -21,20 +21,21 @@ async function runBatch(items, options = {}, fn) {
     if (typeof fn !== 'function') throw new Error('runBatch: 缺少任务函数 fn');
 
     const { concurrency = DEFAULT_CONCURRENCY, onEvent } = options || {};
-    const emit = createEmitter(onEvent);
+    const emit = typeof onEvent === 'function'
+        ? (event) => { try { onEvent(event); } catch (err) { /* 事件回调自身的异常不影响批处理 */ } }
+        : () => {};
     const total = items.length;
-    const workerCount = resolveConcurrency(concurrency, total);
+    const parsed = Math.floor(Number(concurrency));
+    const workerCount = Math.min(Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_CONCURRENCY, total);
 
     const results = [];
     const errors = [];
     let cursor = 0;
 
     const runOne = async (idx) => {
-        const item = items[idx];
-        emit({ type: 'start', idx, name: displayName(item, idx) });
-        const onProgress = (phase, pct) => emit({ type: 'progress', idx, phase, pct });
+        emit({ type: 'start', idx, name: displayName(items[idx], idx) });
         try {
-            const result = await fn(item, onProgress);
+            const result = await fn(items[idx], (phase, pct) => emit({ type: 'progress', idx, phase, pct }));
             results.push({ idx, result });
             emit({ type: 'item', idx, ok: true, result });
         } catch (error) {
@@ -53,30 +54,10 @@ async function runBatch(items, options = {}, fn) {
     };
 
     await Promise.all(Array.from({ length: workerCount }, worker));
-
     const byIdx = (a, b) => a.idx - b.idx;
-    const sortedResults = [...results].sort(byIdx);
-    const sortedErrors = [...errors].sort(byIdx);
-    emit({ type: 'done', total, succeeded: sortedResults.length, failed: sortedErrors.length });
-    return { results: sortedResults, errors: sortedErrors };
-}
-
-// 非法或非正数回退默认值，再按 items 长度截断
-function resolveConcurrency(value, total) {
-    const parsed = Number(value);
-    const wanted = Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : DEFAULT_CONCURRENCY;
-    return Math.min(wanted, total);
-}
-
-function createEmitter(onEvent) {
-    if (typeof onEvent !== 'function') return () => {};
-    return (event) => {
-        try {
-            onEvent(event);
-        } catch (err) {
-            // 事件回调自身的异常不影响批处理
-        }
-    };
+    const sorted = { results: [...results].sort(byIdx), errors: [...errors].sort(byIdx) };
+    emit({ type: 'done', total, succeeded: sorted.results.length, failed: sorted.errors.length });
+    return sorted;
 }
 
 // start 事件的展示名：item.name → input.path 文件名 → input.url → 序号

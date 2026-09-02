@@ -16,6 +16,8 @@ const {
 
 const CHINESE_RE = /[一-龥]/;
 const PUBLIC_ADDRESS = '93.184.216.34';
+// RFC 5737 TEST-NET-3：守卫眼中是公网地址，实际不可路由，用于验证连接目标
+const UNROUTABLE_PUBLIC_ADDRESS = '203.0.113.1';
 const GBK_CHINESE = Buffer.from([0xd6, 0xd0, 0xce, 0xc4]); // "中文" 的 GBK 编码
 const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
 const BIG_BODY = Buffer.alloc(4096, 0x61);
@@ -26,7 +28,10 @@ const BIG_BODY = Buffer.alloc(4096, 0x61);
 
 function startServer() {
     const pending = [];
+    // 记录实际到达本地服务器的请求路径，用于验证连接是否真的打到了本机
+    const hits = [];
     const server = http.createServer((req, res) => {
+        hits.push(req.url);
         const route = ROUTES[req.url];
         if (!route) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -40,6 +45,8 @@ function startServer() {
             const base = `http://127.0.0.1:${server.address().port}`;
             resolve({
                 base,
+                port: server.address().port,
+                hits,
                 close: () => new Promise((done) => {
                     pending.forEach((res) => res.destroy());
                     server.closeAllConnections();
@@ -66,6 +73,10 @@ const ROUTES = {
     '/a.png': (req, res) => {
         res.writeHead(200, { 'Content-Type': 'image/png' });
         res.end(PNG_BYTES);
+    },
+    '/echo-host': (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(String(req.headers.host || ''));
     },
     '/r1': (req, res) => { res.writeHead(302, { Location: '/r2' }); res.end(); },
     '/r2': (req, res) => { res.writeHead(301, { Location: '/final' }); res.end(); },
@@ -222,4 +233,57 @@ test('fetchBinary 返回 Buffer、mime 与 finalUrl，且透传自定义头', as
     assert.ok(result.buffer.equals(PNG_BYTES));
     assert.equal(result.mime, 'image/png');
     assert.equal(result.finalUrl, `${server.base}/a.png`);
+});
+
+test('assertPublicUrl 拒绝 6to4、NAT64、组播与保留段地址', async () => {
+    // Arrange：前两个内嵌 127.0.0.1，后两个分别属于 224.0.0.0/4 与 240.0.0.0/4
+    const blocked = [
+        'http://[2002:7f00:1::]/',
+        'http://[64:ff9b::7f00:1]/',
+        'http://224.0.0.1/',
+        'http://255.255.255.255/',
+    ];
+
+    // Act & Assert
+    for (const url of blocked) {
+        await assert.rejects(assertPublicUrl(url), CHINESE_RE, `应拒绝 ${url}`);
+    }
+    assert.equal(isPrivateAddress('2002:7f00:1::'), true);
+    assert.equal(isPrivateAddress('64:ff9b::7f00:1'), true);
+    assert.equal(isPrivateAddress('2002:0808:0808::'), false, '6to4 内嵌公网 IPv4 时应放行');
+});
+
+test('连接按守卫已校验的地址建立，Host 头仍为原主机名', async (t) => {
+    // Arrange：域名解析到本机，抓取后由服务器回显收到的 Host
+    const server = await startServer();
+    t.after(() => server.close());
+    t.after(() => _setLookup(null));
+    _setLookup(async () => [{ address: '127.0.0.1', family: 4 }]);
+
+    // Act
+    const res = await fetchText(`http://example.test:${server.port}/echo-host`, { allowPrivateNetwork: true });
+
+    // Assert
+    assert.equal(res.text, `example.test:${server.port}`);
+    assert.deepEqual(server.hits, ['/echo-host'], '请求应确实落到解析出的本机地址');
+});
+
+test('DNS 重绑定：连接钉扎首次解析结果，第二次解析到本机也打不进来', async (t) => {
+    // Arrange：第一次解析（守卫用）给不可路由的公网地址，第二次给本机
+    const server = await startServer();
+    t.after(() => server.close());
+    t.after(() => _setLookup(null));
+    let calls = 0;
+    _setLookup(async () => {
+        calls += 1;
+        return [{ address: calls === 1 ? UNROUTABLE_PUBLIC_ADDRESS : '127.0.0.1', family: 4 }];
+    });
+
+    // Act & Assert：连接打向首次解析结果，超时或直接连接失败，均不得到达本地服务器
+    await assert.rejects(
+        fetchText(`http://rebind.test:${server.port}/echo-host`, { timeoutMs: 300 }),
+        /超时|请求失败/,
+    );
+    assert.equal(calls, 1, 'DNS 只应在守卫阶段解析一次');
+    assert.deepEqual(server.hits, [], '第二次解析结果不得被采用');
 });

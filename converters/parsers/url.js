@@ -1,10 +1,9 @@
 /**
  * URL → IR
  *
- * 流程：fetch-guard 抓页（SSRF 守卫 + 限长限时）
- *       → cheerio 提取标题与正文（微信 / 知乎 / CSDN / 简书 / 通用兜底）
- *       → 图片逐张经 fetch-guard 下载进 assets（失败记 warning 并保留原 URL）
- *       → 内联样式预处理 → turndown('url') → remark-parse + remark-gfm
+ * 流程：fetch-guard 抓页（SSRF 守卫 + 限长限时）→ cheerio 提取标题与正文（微信 / 知乎 /
+ *       CSDN / 简书 / 通用兜底）→ 图片逐张经 fetch-guard 下载进 assets（失败记 warning
+ *       并保留原 URL）→ 内联样式预处理 → turndown('url') → remark-parse + remark-gfm
  *
  * 契约：
  *   - async parse({ url } | string, ctx) → MarkFlowDocument{ ir, assets, warnings, meta }
@@ -22,6 +21,10 @@ const DEFAULT_TITLE = '未命名文章';
 // 懒加载图片常用属性，按优先级取第一个非空值
 const IMAGE_SRC_ATTRS = ['data-src', 'data-original', 'data-actualsrc', 'data-lazy-src', 'src'];
 const IMAGE_CONCURRENCY = 6;
+// 进度百分比：parser 只报 parsing 阶段，三个节点单调递增且不超过 55（其后由调度器接管）
+const PROGRESS_FETCH = 10;
+const PROGRESS_ASSETS = 40;
+const PROGRESS_IR = 55;
 // 通用兜底：只考虑正文文本超过此长度的 div
 const MIN_CONTENT_TEXT_LENGTH = 200;
 const BOLD_STYLE_RE = /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i;
@@ -29,67 +32,41 @@ const ITALIC_STYLE_RE = /font-style\s*:\s*italic/i;
 const STRIKE_STYLE_RE = /text-decoration[^;]*line-through/i;
 const DATA_URL_RE = /^data:([^,]*),([\s\S]*)$/i;
 const MIME_BY_EXT = {
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.png': 'image/png',
-    '.gif': 'image/gif',
-    '.webp': 'image/webp',
-    '.svg': 'image/svg+xml',
-    '.bmp': 'image/bmp',
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+    '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp',
 };
 
-// ============================================================
-// 对外入口
-// ============================================================
-
-/**
- * @param {{ url: string } | string} input
- * @param {{ sourceName?: string, allowPrivateNetwork?: boolean, onProgress?: (phase: string, pct: number) => void }} ctx
- */
+/** @param {{ url: string }|string} input @param {{ sourceName?, allowPrivateNetwork?, onProgress? }} ctx */
 async function parse(input, ctx = {}) {
     const url = resolveUrl(input);
     const allowPrivateNetwork = ctx.allowPrivateNetwork === true;
     const assets = [];
     const warnings = [];
 
-    notify(ctx, 'fetching', 10);
+    notify(ctx, 'parsing', PROGRESS_FETCH);
     const page = await fetchText(url, { allowPrivateNetwork });
     const pageUrl = page.finalUrl;
     const $ = cheerio.load(page.text);
     const title = extractTitle($, pageUrl);
     const contentHtml = extractArticleContent($, pageUrl);
 
-    notify(ctx, 'assets', 40);
+    notify(ctx, 'parsing', PROGRESS_ASSETS);
     const processedHtml = await collectImages(contentHtml, pageUrl, { allowPrivateNetwork, assets, warnings });
     const markdown = buildMarkdown(preprocessHtml(processedHtml), title);
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
     const ir = unified().use(remarkParse).use(remarkGfm).parse(markdown);
-    notify(ctx, 'ir', 90);
+    notify(ctx, 'parsing', PROGRESS_IR);
 
-    const doc = createDocument({
+    return createDocument({
         kind: 'document',
         ir,
         data: null,
-        meta: {
-            title,
-            sourceType: 'url',
-            sourceName: ctx.sourceName || url,
-            sourceUrl: url,
-            finalUrl: pageUrl,
-        },
+        meta: { title, sourceType: 'url', sourceName: ctx.sourceName || url, sourceUrl: url, finalUrl: pageUrl },
         assets,
         warnings,
     });
-    // createDocument 扩展签名落地前不透传 assets/warnings，此处补齐（扩展后本赋值幂等）
-    doc.assets = assets;
-    doc.warnings = warnings;
-    return doc;
 }
-
-// ============================================================
-// 输入解析
-// ============================================================
 
 function resolveUrl(input) {
     const raw = typeof input === 'string' ? input : (input && input.url);
@@ -99,25 +76,21 @@ function resolveUrl(input) {
     return raw.trim();
 }
 
-// ============================================================
-// 标题与正文提取（源自 旧版 url.js:86-156）
-// ============================================================
+// ---------- 标题与正文提取（源自 旧版 url.js:86-156）----------
+
+// 标题候选，按优先级取第一个非空结果；微信正文标题仅对该站生效
+const TITLE_PICKERS = [
+    ($, url) => (url.includes('mp.weixin.qq.com') ? $('#activity-name').text() : ''),
+    ($) => $('meta[property="og:title"]').attr('content'),
+    ($) => $('h1').first().text(),
+    ($) => $('title').first().text(),
+];
 
 function extractTitle($, url) {
-    if (url.includes('mp.weixin.qq.com')) {
-        const wxTitle = cleanTitle($('#activity-name').text());
-        if (wxTitle) return wxTitle;
+    for (const pick of TITLE_PICKERS) {
+        const title = cleanTitle(pick($, url));
+        if (title) return title;
     }
-
-    const ogTitle = cleanTitle($('meta[property="og:title"]').attr('content'));
-    if (ogTitle) return ogTitle;
-
-    const h1 = cleanTitle($('h1').first().text());
-    if (h1) return h1;
-
-    const titleTag = cleanTitle($('title').first().text());
-    if (titleTag) return titleTag;
-
     return DEFAULT_TITLE;
 }
 
@@ -142,11 +115,10 @@ function extractArticleContent($, url) {
         }
     }
 
-    const article = $('article').html();
-    if (article) return article;
-
-    const main = $('main').html();
-    if (main) return main;
+    for (const tag of ['article', 'main']) {
+        const content = $(tag).html();
+        if (content) return content;
+    }
 
     // 通用兜底：文本最长的 div
     let bestContent = '';
@@ -158,17 +130,11 @@ function extractArticleContent($, url) {
             bestContent = $(el).html();
         }
     });
-    if (bestContent) return bestContent;
-
-    return $('body').html() || '';
+    return bestContent || $('body').html() || '';
 }
 
-// ============================================================
-// 图片收集
-// ============================================================
-
 /**
- * 遍历正文中的 <img>：远程图片经 fetch-guard 下载，data URL 直接解码；
+ * 图片收集：遍历正文中的 <img>，远程图片经 fetch-guard 下载，data URL 直接解码；
  * 成功者替换 src 为 images/image_N.ext 并推入 assets，失败者记 warning 并保留原 URL。
  */
 async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warnings }) {
@@ -180,11 +146,8 @@ async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warni
         const raw = pickImageSource($img);
         if (!raw) return;
         const candidate = toCandidate($img, raw, pageUrl);
-        if (candidate.warning) {
-            warnings.push(candidate.warning);
-            return;
-        }
-        candidates.push(candidate);
+        if (candidate.warning) warnings.push(candidate.warning);
+        else candidates.push(candidate);
     });
 
     const results = await mapWithConcurrency(candidates, IMAGE_CONCURRENCY, (candidate) =>
@@ -192,7 +155,10 @@ async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warni
 
     candidates.forEach((candidate, index) => {
         const result = results[index];
-        clearLazyAttrs(candidate.$img);
+        // 懒加载属性已取值，清掉以免渲染端再度覆盖 src
+        for (const attr of IMAGE_SRC_ATTRS) {
+            if (attr !== 'src') candidate.$img.removeAttr(attr);
+        }
         if (!result.ok) {
             warnings.push(`图片下载失败，保留原地址: ${candidate.display}（${result.error}）`);
             candidate.$img.attr('src', candidate.src);
@@ -215,9 +181,7 @@ function pickImageSource($img) {
 }
 
 function toCandidate($img, raw, pageUrl) {
-    if (/^data:/i.test(raw)) {
-        return { $img, kind: 'data', src: raw, display: 'data URL' };
-    }
+    if (/^data:/i.test(raw)) return { $img, kind: 'data', src: raw, display: 'data URL' };
     let absolute;
     try {
         absolute = new URL(raw, pageUrl);
@@ -243,12 +207,8 @@ async function loadImage(candidate, pageUrl, allowPrivateNetwork) {
 async function downloadImage(src, pageUrl, allowPrivateNetwork) {
     // Referer 传页面 URL 以通过防盗链校验
     const { buffer, mime } = await fetchBinary(src, { headers: { Referer: pageUrl }, allowPrivateNetwork });
-    if (mime.startsWith('text/')) {
-        throw new Error(`返回内容不是图片（${mime}）`);
-    }
-    if (buffer.length === 0) {
-        throw new Error('返回内容为空');
-    }
+    if (mime.startsWith('text/')) throw new Error(`返回内容不是图片（${mime}）`);
+    if (buffer.length === 0) throw new Error('返回内容为空');
     const ext = mime.startsWith('image/') ? getExtFromContentType(mime) : getExtFromUrl(src);
     return { ok: true, buffer, ext, mime: mime.startsWith('image/') ? mime : (MIME_BY_EXT[ext] || mime) };
 }
@@ -266,12 +226,6 @@ function decodeDataUrl(src) {
     return { ok: true, buffer, ext: getExtFromContentType(mime), mime };
 }
 
-function clearLazyAttrs($img) {
-    for (const attr of IMAGE_SRC_ATTRS) {
-        if (attr !== 'src') $img.removeAttr(attr);
-    }
-}
-
 async function mapWithConcurrency(items, limit, worker) {
     const results = new Array(items.length);
     let next = 0;
@@ -286,51 +240,33 @@ async function mapWithConcurrency(items, limit, worker) {
     return results;
 }
 
-// ============================================================
-// HTML 预处理（源自 旧版 url.js:339-382）：内联样式 → 语义标签
-// ============================================================
+// ---------- HTML 预处理（源自 旧版 url.js:339-382）：内联样式 → 语义标签 ----------
+
+const STYLE_TO_TAG_RULES = [
+    { selector: 'span, b', re: BOLD_STYLE_RE, tag: 'strong' },
+    { selector: 'span', re: ITALIC_STYLE_RE, tag: 'em' },
+    { selector: 'span', re: STRIKE_STYLE_RE, tag: 'del' },
+];
 
 function preprocessHtml(html) {
     const $ = cheerio.load(html, null, false);
-
-    $('span, b').each((_, el) => {
-        if (BOLD_STYLE_RE.test($(el).attr('style') || '')) {
-            $(el).replaceWith(`<strong>${$(el).html()}</strong>`);
-        }
-    });
-
-    $('span').each((_, el) => {
-        if (ITALIC_STYLE_RE.test($(el).attr('style') || '')) {
-            $(el).replaceWith(`<em>${$(el).html()}</em>`);
-        }
-    });
-
-    $('span').each((_, el) => {
-        if (STRIKE_STYLE_RE.test($(el).attr('style') || '')) {
-            $(el).replaceWith(`<del>${$(el).html()}</del>`);
-        }
-    });
-
+    for (const { selector, re, tag } of STYLE_TO_TAG_RULES) {
+        $(selector).each((_, el) => {
+            if (re.test($(el).attr('style') || '')) {
+                $(el).replaceWith(`<${tag}>${$(el).html()}</${tag}>`);
+            }
+        });
+    }
     $('img').each((_, el) => {
         const dataSrc = $(el).attr('data-src');
-        if (dataSrc && !$(el).attr('src')) {
-            $(el).attr('src', dataSrc);
-        }
+        if (dataSrc && !$(el).attr('src')) $(el).attr('src', dataSrc);
     });
-
     // 移除既无文本又无图片的空 span
     $('span').each((_, el) => {
-        if (!$(el).text().trim() && !$(el).find('img').length) {
-            $(el).remove();
-        }
+        if (!$(el).text().trim() && !$(el).find('img').length) $(el).remove();
     });
-
     return $.html();
 }
-
-// ============================================================
-// Markdown 组装
-// ============================================================
 
 function buildMarkdown(html, title) {
     const markdown = createTurndownService('url').turndown(html)
@@ -340,17 +276,11 @@ function buildMarkdown(html, title) {
     return markdown.startsWith('# ') ? markdown : `# ${title}\n\n${markdown}`;
 }
 
-// ============================================================
-// 工具
-// ============================================================
-
+// 进度回调异常不得影响解析
 function notify(ctx, phase, pct) {
-    if (!ctx || typeof ctx.onProgress !== 'function') return;
     try {
-        ctx.onProgress(phase, pct);
-    } catch (err) {
-        // 调用方回调自身的异常不影响解析
-    }
+        if (ctx && typeof ctx.onProgress === 'function') ctx.onProgress(phase, pct);
+    } catch (err) { /* 忽略调用方回调自身的异常 */ }
 }
 
 function errText(err) {

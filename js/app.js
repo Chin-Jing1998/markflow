@@ -3,7 +3,7 @@
  *
  * 职责：三个输入 tab（办公文档 / 标记文档 / 网页链接）→ 以本地路径或 URL 提交 POST /api/convert
  *       → 逐行解析 NDJSON 进度流 → 右栏结果面板展示并联动 Finder；设置弹窗管理三态主题与输出目录。
- * 约定：所有 /api 请求附带 X-MarkFlow-Token；插入 DOM 的动态文本一律先经 escapeHtml；
+ * 约定：桌面端的 X-MarkFlow-Token 由主进程在请求头注入，前端仅在拿到非空 token 时自行附带；插入 DOM 的动态文本一律先经 escapeHtml；
  *       事件全部委托绑定，不使用内联事件属性；本地文件读取依赖 preload 注入的 window.electronAPI。
  */
 'use strict';
@@ -31,6 +31,7 @@ const TOAST_EXIT_MS = 300;
 const URL_PATTERN = /^https?:\/\//i;
 const DESKTOP_ONLY_MESSAGE = '请使用 MarkFlow 桌面版';
 const SOFFICE_HINT = '安装 LibreOffice 后即可转换 .doc / .xls / .ppt';
+const CONNECTION_LOST_MESSAGE = '连接中断';
 
 // 运行时状态：文件列表按 tab 分开，避免序号跨 tab 串扰
 const state = { activeTab: 'office', filesByTab: { office: [], markup: [] }, caps: null, outputDir: '', isConverting: false, runSeq: 0 };
@@ -94,7 +95,7 @@ function closeModals() {
 
 // ---------- HTTP：token 请求 + NDJSON 流 ----------
 function api(path, init = {}) {
-    const headers = { 'X-MarkFlow-Token': API_TOKEN, ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) };
+    const headers = { ...(API_TOKEN ? { 'X-MarkFlow-Token': API_TOKEN } : {}), ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...(init.headers || {}) };
     return fetch(API_BASE + path, { ...init, headers });
 }
 
@@ -106,6 +107,7 @@ async function readJson(response) {
 }
 
 // 逐行读取 NDJSON 流，每解析出一行即回调 onEvent(event)
+// 容错：单行畸形（服务端半行刷出、非 JSON 噪声、流末残留半行）只跳过该行并告警，不中断整条流
 async function readNdjson(response, onEvent) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -113,7 +115,16 @@ async function readNdjson(response, onEvent) {
     const consume = (chunk, isFinal) => {
         const lines = (buffer + chunk).split('\n');
         buffer = isFinal ? '' : lines.pop();
-        lines.map((line) => line.trim()).filter(Boolean).forEach((line) => onEvent(JSON.parse(line)));
+        lines.map((line) => line.trim()).filter(Boolean).forEach((line) => {
+            let event;
+            try {
+                event = JSON.parse(line);   // 仅包裹解析：onEvent 自身抛错须照常向上冒泡
+            } catch (err) {
+                console.warn('忽略无法解析的事件行', line);
+                return;
+            }
+            onEvent(event);
+        });
     };
     for (;;) {
         const { done, value } = await reader.read();
@@ -169,7 +180,7 @@ function bindDropZone(tab) {
         addFiles(tab, files);
     });
     delegate(panel, '[data-trigger]', (btn) => $(btn.dataset.trigger).click());
-    delegate(panel, '[data-remove]', (btn) => setTabFiles(tab, state.filesByTab[tab].filter((f) => f.path !== btn.dataset.remove)));
+    delegate(panel, '[data-remove]', (btn) => removeTabFile(tab, btn.dataset.remove));
     delegate(panel, '[data-clear-files]', () => setTabFiles(tab, []));
 }
 
@@ -207,13 +218,26 @@ function mergeFiles(tab, entries) {
     setTabFiles(tab, [...byPath.values()]);
 }
 
-// 写入新数组并整体重绘该 tab 的文件列表；无文件时恢复显示拖拽区
+// 写入新数组并整体重绘该 tab 的文件列表；用于新增与清空。无文件时恢复显示拖拽区
 function setTabFiles(tab, files) {
     state.filesByTab = { ...state.filesByTab, [tab]: files };
     $(`drop-zone-${tab}`).hidden = files.length > 0;
     const actions = `<div class="file-list-actions"><button class="btn btn-small btn-secondary" type="button" data-trigger="file-input-${tab}">${icon('plus')} 添加更多</button>
         <button class="btn btn-small btn-secondary" type="button" data-clear-files>${icon('trash')} 清空</button></div>`;
     $(`file-list-${tab}`).innerHTML = files.length === 0 ? '' : files.map(fileItemHtml).join('') + actions;
+}
+
+// 移除单个文件：只摘除对应节点并更新空态，避免整表重绘导致的闪烁与滚动位置丢失
+function removeTabFile(tab, filePath) {
+    const current = state.filesByTab[tab] || [];
+    const remaining = current.filter((file) => file.path !== filePath);
+    if (remaining.length === current.length) return;
+    state.filesByTab = { ...state.filesByTab, [tab]: remaining };
+    const list = $(`file-list-${tab}`);
+    const item = list.querySelector(`.file-item[data-path="${CSS.escape(filePath)}"]`);
+    if (item) item.remove();
+    if (remaining.length === 0) list.innerHTML = '';   // 最后一项被移除时一并撤掉「添加更多 / 清空」操作条
+    $(`drop-zone-${tab}`).hidden = remaining.length > 0;
 }
 
 function fileItemHtml(file) {
@@ -309,7 +333,8 @@ async function runConvert() {
     const items = buildItems();
     if (items.length === 0) return;
     state.runSeq += 1;
-    const ctx = { runId: state.runSeq, tab: state.activeTab, items, names: new Map(), pct: new Map(), completed: 0 };
+    // notified 记录本轮是否已就结果向用户提示过，避免收尾兜底把更具体的错误文案顶掉
+    const ctx = { runId: state.runSeq, tab: state.activeTab, items, names: new Map(), pct: new Map(), completed: 0, notified: false };
     setConverting(true);
     showProgress(items.length);
     try {
@@ -317,8 +342,10 @@ async function runConvert() {
         if (!response.ok) await readJson(response);   // 400 等非流式错误：readJson 抛出服务端错误文案
         await readNdjson(response, (event) => handleConvertEvent(ctx, event));
     } catch (err) {
+        ctx.notified = true;
         showToast(`转换失败：${err.message}`, 'error');
     } finally {
+        failPendingItems(ctx);
         $('loading-modal').classList.remove('active');
         setConverting(false);
     }
@@ -360,12 +387,25 @@ function onItemFinished(ctx, event) {
 }
 
 function onBatchDone(ctx, event) {
+    ctx.notified = true;
     const total = event.total || ctx.items.length;
     const ok = event.succeeded || 0;
     if (event.error) showToast(`转换中断：${event.error}`, 'error');
     else if (ok === total) showToast(`转换完成 ${ok}/${total}`, 'success');
     else if (ok > 0) showToast(`部分成功 ${ok}/${total}`, 'warning');
     else showToast(`全部失败 ${total}/${total}`, 'error');
+}
+
+// 收尾兜底：流已结束（正常 done、异常关闭或请求抛错）而仍停在「转换中」的条目一律判失败，防止界面永久转圈
+function failPendingItems(ctx) {
+    const keyPrefix = `run${ctx.runId}-`;
+    const stuckResults = [...$('results-list').querySelectorAll('.result-item.is-running')]
+        .filter((el) => String(el.dataset.key || '').startsWith(keyPrefix));
+    const stuckFiles = (state.filesByTab[ctx.tab] || []).filter((file) => file.status === 'running');
+    if (stuckResults.length === 0 && stuckFiles.length === 0) return;
+    stuckResults.forEach((el) => updateResultItem(el.dataset.key, { ok: false, error: CONNECTION_LOST_MESSAGE }));
+    stuckFiles.forEach((file) => setFileStatus(ctx.tab, file.path, 'failed'));
+    if (!ctx.notified) showToast(`转换中断：${CONNECTION_LOST_MESSAGE}`, 'error');
 }
 
 // ---------- 进度弹窗：当前项名称 + n/total + 进度条（多项并发时按各项 pct 汇总） ----------
@@ -461,28 +501,36 @@ async function openPath(filePath) {
 }
 
 // ---------- 主题：system / light / dark（CSS light-dark() 随 html.style.colorScheme 即时切换） ----------
+// 初始化专用：读取主进程持久化的主题，只渲染到 DOM，不回写，避免启动期无谓的 theme.json 写盘
 async function syncThemeFromElectron() {
     if (!ELECTRON || typeof ELECTRON.getTheme !== 'function') return;
     try {
         const saved = await ELECTRON.getTheme();
-        if (saved) applyTheme(saved);
+        if (saved) renderTheme(saved);
     } catch (err) {
         showToast(`读取主题设置失败：${err.message}`, 'warning');
     }
 }
 
+// 只做「应用到 DOM」：colorScheme + 按钮高亮，返回归一化后的主题值。
 // 桌面版由主进程持久化主题（theme.json）且实测启动期同步访问 window.localStorage 会阻塞约 4 s，故仅浏览器模式使用 localStorage
-function applyTheme(value) {
+function renderTheme(value) {
     const theme = THEMES.includes(value) ? value : 'system';
     if (!ELECTRON) localStorage.setItem(THEME_KEY, theme);
     document.documentElement.style.colorScheme = theme === 'system' ? 'light dark' : theme;
-    if (ELECTRON && typeof ELECTRON.setTheme === 'function') {
-        Promise.resolve(ELECTRON.setTheme(theme)).catch((err) => showToast(`同步系统外观失败：${err.message}`, 'warning'));
-    }
     document.querySelectorAll('.theme-option').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.scheme === theme);
         btn.setAttribute('aria-pressed', String(btn.dataset.scheme === theme));
     });
+    return theme;
+}
+
+// 用户主动切换主题的唯一入口：先渲染，再回写主进程（全文件仅此一处回写）
+function applyTheme(value) {
+    const theme = renderTheme(value);
+    if (ELECTRON && typeof ELECTRON.setTheme === 'function') {
+        Promise.resolve(ELECTRON.setTheme(theme)).catch((err) => showToast(`同步系统外观失败：${err.message}`, 'warning'));
+    }
 }
 
 // ---------- 设置弹窗：输出目录 ----------
@@ -585,7 +633,7 @@ function applyBrowserMode() {
 
 document.addEventListener('DOMContentLoaded', () => {
     // 桌面版：主进程已按持久化主题驱动 nativeTheme，首屏 CSS 即正确，只需异步回填按钮高亮
-    if (ELECTRON) syncThemeFromElectron(); else applyTheme(localStorage.getItem(THEME_KEY));
+    if (ELECTRON) syncThemeFromElectron(); else renderTheme(localStorage.getItem(THEME_KEY));
     initTabs();
     initDropZones();
     initResultsPanel();
@@ -594,7 +642,6 @@ document.addEventListener('DOMContentLoaded', () => {
     delegate($('format-chips-markup'), '.format-chip:not(:disabled)', selectChip);
     $('convert-btn').addEventListener('click', runConvert);
     if (!ELECTRON) applyBrowserMode();
-    syncThemeFromElectron();
     loadCapabilities();
     loadOutputDir();
 });

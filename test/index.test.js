@@ -96,14 +96,19 @@ describe('listTargets', () => {
             office: ['bundle'],
             markup: ['docx'],
             url: ['bundle'],
-            inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', markdown: 'markup', url: 'url' },
+            inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', url: 'url' },
             capabilities: { sofficeAvailable: false, pdfBackend: null },
         });
     });
 
+    test('inputs 不含 markdown 键（.markdown 已由 detectInputType 归入 md）', () => {
+        assert.equal('markdown' in listTargets().inputs, false);
+        assert.equal('markdown' in listTargets({ sofficeAvailable: true }).inputs, false);
+    });
+
     test('sofficeAvailable=true 时纳入 doc/xls/ppt，顺序固定', () => {
         const targets = listTargets({ sofficeAvailable: true });
-        assert.deepEqual(Object.keys(targets.inputs), ['docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt', 'pdf', 'md', 'markdown', 'url']);
+        assert.deepEqual(Object.keys(targets.inputs), ['docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt', 'pdf', 'md', 'url']);
         assert.deepEqual(targets.markup, ['docx']);
         assert.equal(targets.capabilities.sofficeAvailable, true);
     });
@@ -482,5 +487,63 @@ describe('convert：bundle / pdf（桩 parser 与 renderer）', () => {
         // Assert
         assert.equal(res.ok, true);
         assert.deepEqual(events, [['parsing', 20], ['parsing', 35], ['rendering', 60], ['writing', 90], ['writing', 100]]);
+    });
+
+    test('parser 自定义阶段名归一为 parsing，pct 钳到 [0,55] 且单调不减', async () => {
+        // Arrange：三次上报分别触发「阶段名归一」「上界钳制」「回退丢弃」
+        stubs['./parsers/md'] = {
+            parse: async (input, ctx) => {
+                ctx.onProgress('fetching', 10);
+                ctx.onProgress('assets', 90);
+                ctx.onProgress('ir', 30);
+                return emptyMdDoc();
+            },
+        };
+        stubs['./renderers/docx'] = { render: async () => Buffer.from('PK') };
+        const events = [];
+
+        // Act
+        const res = await convert({
+            input: { path: SAMPLE_MD },
+            target: 'docx',
+            outputDir: root,
+            onProgress: (phase, pct) => events.push([phase, pct]),
+        });
+
+        // Assert
+        assert.equal(res.ok, true);
+        assert.deepEqual(events, [
+            ['parsing', 20],
+            ['parsing', 10],
+            ['parsing', 55],
+            ['rendering', 60],
+            ['writing', 90],
+            ['writing', 100],
+        ]);
+    });
+
+    test('pct 为负数时钳到 0，非有限数字整条丢弃', async () => {
+        // Arrange
+        stubs['./parsers/md'] = {
+            parse: async (input, ctx) => {
+                ctx.onProgress('parsing', -20);
+                ctx.onProgress('parsing', Infinity);
+                ctx.onProgress('parsing', NaN);
+                return emptyMdDoc();
+            },
+        };
+        stubs['./renderers/docx'] = { render: async () => Buffer.from('PK') };
+        const events = [];
+
+        // Act
+        await convert({
+            input: { path: SAMPLE_MD },
+            target: 'docx',
+            outputDir: root,
+            onProgress: (phase, pct) => events.push([phase, pct]),
+        });
+
+        // Assert
+        assert.deepEqual(events, [['parsing', 20], ['parsing', 0], ['rendering', 60], ['writing', 90], ['writing', 100]]);
     });
 });

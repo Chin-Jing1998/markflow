@@ -1,6 +1,6 @@
 /**
  * converters/ir/util.js 单元测试
- * 覆盖：sanitizeFolderName、stripExt、collectText、扩展名推断、decodeUtf8Filename、ensureDir
+ * 覆盖：sanitizeFolderName、stripExt、collectText、扩展名推断、ensureDir
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -132,27 +132,6 @@ describe('getExtFromUrl', () => {
         assert.equal(util.getExtFromUrl('https://x.y/img'), '.jpg');
         assert.equal(util.getExtFromUrl('https://x.y/a.exe'), '.jpg');
         assert.equal(util.getExtFromUrl('not a url'), '.jpg');
-    });
-});
-
-// ============================================================
-// decodeUtf8Filename
-// ============================================================
-
-describe('decodeUtf8Filename', () => {
-    test('还原 latin1 误解码的中文文件名', () => {
-        const mangled = Buffer.from('中文 文档.md', 'utf8').toString('latin1');
-        assert.equal(util.decodeUtf8Filename(mangled), '中文 文档.md');
-    });
-
-    test('已是 utf8 的字符串原样返回', () => {
-        assert.equal(util.decodeUtf8Filename('中文.md'), '中文.md');
-        assert.equal(util.decodeUtf8Filename('plain.md'), 'plain.md');
-    });
-
-    test('非字符串返回空串', () => {
-        assert.equal(util.decodeUtf8Filename(undefined), '');
-        assert.equal(util.decodeUtf8Filename(42), '');
     });
 });
 

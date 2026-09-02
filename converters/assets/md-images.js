@@ -7,12 +7,16 @@
  * 挂载形状：node.data.asset = { absPath, buffer, mime, width, height }
  *
  * 支持的地址形态：
- *   - 相对路径 / 绝对路径   → 相对 baseDir 解析后读盘
- *   - file:// URL           → 转本地路径后读盘
+ *   - 相对路径 / 绝对路径   → 相对 baseDir 解析后读盘，且必须落在 baseDir 之内
+ *   - file:// URL           → 转本地路径后读盘，同样受 baseDir 约束
  *   - http(s):// URL        → 仅当注入 opts.fetchRemote 时下载，否则记 warning
- *   - data: URL             → 解码后落临时文件（下游 HTML 渲染需要 file:// 可达路径）
+ *   - data: URL             → 解码后落进程私有临时目录（下游 HTML 渲染需要 file:// 可达路径）
  *
- * 契约：本函数绝不抛出，所有失败以 warnings 字符串返回；除挂载 asset 外不改动 IR。
+ * 安全边界：本地路径先做词法包含判定（path.relative 不得越出 baseDir），
+ * 命中磁盘后再用 realpath 二次判定，阻断 "../"、绝对路径与符号链接三类逃逸。
+ *
+ * 契约：resolveImages(ir, baseDir, opts?) → { resolved, warnings }，绝不抛出，
+ * 所有失败以 warnings 字符串返回；除挂载 asset 外不改动 IR。
  */
 const fs = require('fs');
 const fsp = fs.promises;
@@ -22,160 +26,112 @@ const crypto = require('crypto');
 const { fileURLToPath } = require('url');
 const { imageSize } = require('image-size');
 
+// 扩展名 → mime；另两张表由它派生，保证三者始终一致
 const MIME_BY_EXT = {
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.gif': 'image/gif',
-    '.webp': 'image/webp',
-    '.bmp': 'image/bmp',
-    '.svg': 'image/svg+xml',
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+    '.webp': 'image/webp', '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
 };
-
-// image-size 返回的 type 字段 → mime
-const MIME_BY_TYPE = {
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    gif: 'image/gif',
-    webp: 'image/webp',
-    bmp: 'image/bmp',
-    svg: 'image/svg+xml',
-};
-
-const EXT_BY_MIME = {
-    'image/png': '.png',
-    'image/jpeg': '.jpg',
-    'image/gif': '.gif',
-    'image/webp': '.webp',
-    'image/bmp': '.bmp',
-    'image/svg+xml': '.svg',
-};
+// image-size 返回的 type 字段（无点扩展名）→ mime
+const MIME_BY_TYPE = Object.fromEntries(Object.entries(MIME_BY_EXT).map(([ext, mime]) => [ext.slice(1), mime]));
+// mime → 扩展名，同一 mime 取先出现的那个扩展名（image/jpeg → .jpg）
+const EXT_BY_MIME = Object.fromEntries(Object.entries(MIME_BY_EXT).toReversed().map(([ext, mime]) => [mime, ext]));
 
 const DEFAULT_MIME = 'application/octet-stream';
-const TEMP_SUBDIR = 'markflow-md-assets';
+// 临时目录前缀；实际目录由 mkdtemp 追加随机后缀，形如 markflow-md-assets-Ab3xY9
+const TEMP_DIR_PREFIX = 'markflow-md-assets-';
 const TEMP_HASH_LEN = 16;
+const TEMP_FILE_MODE = 0o600;
 const STALE_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
-// 模块加载时异步清理超过 1 天未修改的临时图片（上次运行残留），失败静默
-function cleanupStaleTempFiles() {
-    const dir = path.join(os.tmpdir(), TEMP_SUBDIR);
-    return fs.promises.readdir(dir).then(async (names) => {
+// 模块加载时异步清理超过 1 天未修改的历史临时目录（上次运行残留），失败静默。
+// 用 lstat 而非 stat：同名符号链接不会被当作目录递归删除。
+function cleanupStaleTempDirs() {
+    const root = os.tmpdir();
+    return fsp.readdir(root).then(async (names) => {
         const now = Date.now();
         for (const name of names) {
-            const target = path.join(dir, name);
-            const stat = await fs.promises.stat(target).catch(() => null);
-            if (!stat || !stat.isFile() || now - stat.mtimeMs < STALE_TEMP_MAX_AGE_MS) continue;
-            await fs.promises.rm(target, { force: true }).catch(() => {});
+            if (!name.startsWith('markflow-md-assets')) continue; // 同时回收旧版无连字符的固定目录
+            const target = path.join(root, name);
+            const stat = await fsp.lstat(target).catch(() => null);
+            if (!stat || !stat.isDirectory() || now - stat.mtimeMs < STALE_TEMP_MAX_AGE_MS) continue;
+            await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
         }
     }).catch(() => {});
 }
-cleanupStaleTempFiles();
+cleanupStaleTempDirs();
 
-// ============================================================
-// 对外入口
-// ============================================================
+// 本进程私有临时目录（首次落盘时才创建）与「内容摘要 → 已落盘路径」缓存
+let tempDirPromise = null;
+const tempFileByKey = new Map();
 
-/**
- * @param {object} ir      mdast root
- * @param {string} baseDir 相对路径基准目录
- * @param {object} opts    { fetchRemote?: (url) => Promise<{buffer, mime}> }
- * @returns {Promise<{resolved: number, warnings: string[]}>}
- */
 async function resolveImages(ir, baseDir, opts = {}) {
     const warnings = [];
-    const nodes = collectImageNodes(ir);
     const base = baseDir || process.cwd();
     let resolved = 0;
 
-    for (const node of nodes) {
+    for (const node of collectImageNodes(ir)) {
         const url = typeof node.url === 'string' ? node.url.trim() : '';
         if (!url) continue;
-
         let asset = null;
         try {
             asset = await resolveOne(url, base, opts, warnings);
         } catch (err) {
-            warnings.push(`图片解析失败: ${url}（${errText(err)}）`);
-            asset = null;
+            asset = warn(warnings, `图片解析失败: ${url}（${errText(err)}）`);
         }
-
         if (asset) {
             node.data = { ...node.data, asset };
             resolved += 1;
         }
     }
-
     return { resolved, warnings };
 }
 
-// ============================================================
-// 单个地址解析
-// ============================================================
+// 记一条 warning，并以 null 表示该图片未解析成功
+function warn(warnings, message) {
+    warnings.push(message);
+    return null;
+}
 
 async function resolveOne(url, baseDir, opts, warnings) {
-    if (isDataUrl(url)) return resolveDataUrl(url, warnings);
-    if (isRemoteUrl(url)) return resolveRemoteUrl(url, opts, warnings);
+    if (/^data:/i.test(url)) return resolveDataUrl(url, warnings);
+    if (/^https?:\/\//i.test(url)) return resolveRemoteUrl(url, opts, warnings);
     return resolveLocalPath(url, baseDir, warnings);
 }
 
-function isDataUrl(url) {
-    return /^data:/i.test(url);
-}
-
-function isRemoteUrl(url) {
-    return /^https?:\/\//i.test(url);
-}
-
 async function resolveLocalPath(url, baseDir, warnings) {
-    const absPath = await pickExistingPath(url, baseDir);
+    const { absPath, blocked } = await pickSafePath(url, baseDir);
     if (!absPath) {
-        warnings.push(`图片未找到: ${url}`);
-        return null;
+        // 越界优先报告：文件存在与否都不泄露，避免把 baseDir 外的存在性当作探测信道
+        if (blocked) return warn(warnings, `图片超出文档目录，未内嵌: ${url}`);
+        return warn(warnings, `图片未找到: ${url}`);
     }
-
     let buffer;
     try {
         buffer = await fsp.readFile(absPath);
     } catch (err) {
-        warnings.push(`图片未找到: ${url}（${errText(err)}）`);
-        return null;
+        return warn(warnings, `图片未找到: ${url}（${errText(err)}）`);
     }
-
     return buildAsset({ absPath, buffer, mimeHint: guessMimeByExt(absPath), url, warnings });
 }
 
 async function resolveRemoteUrl(url, opts, warnings) {
-    if (typeof opts.fetchRemote !== 'function') {
-        warnings.push(`远程图片未内嵌: ${url}`);
-        return null;
-    }
-
+    if (typeof opts.fetchRemote !== 'function') return warn(warnings, `远程图片未内嵌: ${url}`);
     let fetched;
     try {
         fetched = await opts.fetchRemote(url);
     } catch (err) {
-        warnings.push(`远程图片下载失败: ${url}（${errText(err)}）`);
-        return null;
+        return warn(warnings, `远程图片下载失败: ${url}（${errText(err)}）`);
     }
-
     const buffer = toBuffer(fetched && fetched.buffer);
-    if (!buffer || buffer.length === 0) {
-        warnings.push(`远程图片下载失败: ${url}（返回内容为空）`);
-        return null;
-    }
-
-    const mimeHint = (fetched && fetched.mime) || guessMimeByExt(stripQuery(url));
+    if (!buffer || buffer.length === 0) return warn(warnings, `远程图片下载失败: ${url}（返回内容为空）`);
+    // 猜扩展名前先剥掉查询串与锚点
+    const mimeHint = (fetched && fetched.mime) || guessMimeByExt(String(url).split('?')[0].split('#')[0]);
     return buildAsset({ absPath: null, buffer, mimeHint, url, warnings });
 }
 
-function resolveDataUrl(url, warnings) {
+async function resolveDataUrl(url, warnings) {
     const matched = /^data:([^,]*),([\s\S]*)$/i.exec(url);
-    if (!matched) {
-        warnings.push(`图片解析失败: data URL 格式非法`);
-        return null;
-    }
-
+    if (!matched) return warn(warnings, '图片解析失败: data URL 格式非法');
     const descriptor = matched[1] || '';
     const mimeHint = (descriptor.split(';')[0] || '').trim() || DEFAULT_MIME;
     let buffer;
@@ -184,122 +140,122 @@ function resolveDataUrl(url, warnings) {
             ? Buffer.from(matched[2], 'base64')
             : Buffer.from(decodeURIComponent(matched[2]), 'utf8');
     } catch (err) {
-        warnings.push(`图片解析失败: data URL 解码失败（${errText(err)}）`);
-        return null;
+        return warn(warnings, `图片解析失败: data URL 解码失败（${errText(err)}）`);
     }
-
-    if (buffer.length === 0) {
-        warnings.push(`图片解析失败: data URL 内容为空`);
-        return null;
-    }
-
+    if (buffer.length === 0) return warn(warnings, '图片解析失败: data URL 内容为空');
     return buildAsset({ absPath: null, buffer, mimeHint, url: 'data URL', warnings });
 }
 
-// ============================================================
-// asset 组装
-// ============================================================
-
 // absPath 为空表示来源非磁盘（远程/data URL），落临时文件以便 HTML 渲染用 file:// 引用
-function buildAsset({ absPath, buffer, mimeHint, url, warnings }) {
+async function buildAsset({ absPath, buffer, mimeHint, url, warnings }) {
     const measured = measure(buffer);
-    if (measured.width === null) {
-        warnings.push(`图片尺寸解析失败: ${url}`);
-    }
-
+    if (measured.width === null) warnings.push(`图片尺寸解析失败: ${url}`);
     const mime = normalizeMime(mimeHint, measured.type);
-    const finalPath = absPath || writeTempFile(buffer, mime, warnings);
-
-    return {
-        absPath: finalPath,
-        buffer,
-        mime,
-        width: measured.width,
-        height: measured.height,
-    };
+    const finalPath = absPath || await writeTempFile(buffer, mime, warnings);
+    return { absPath: finalPath, buffer, mime, width: measured.width, height: measured.height };
 }
 
 function measure(buffer) {
     try {
-        const size = imageSize(buffer);
-        return {
-            width: Number.isFinite(size.width) ? size.width : null,
-            height: Number.isFinite(size.height) ? size.height : null,
-            type: size.type || null,
-        };
+        const { width, height, type } = imageSize(buffer);
+        const finite = (v) => (Number.isFinite(v) ? v : null);
+        return { width: finite(width), height: finite(height), type: type || null };
     } catch (err) {
         return { width: null, height: null, type: null };
     }
 }
 
-function writeTempFile(buffer, mime, warnings) {
+// ============================================================
+// 进程私有临时目录
+// ============================================================
+
+// 首次调用时 mkdtemp 建目录（权限 0700，路径不可预测），并登记退出时清理；缓存 promise 以免重复创建
+function ensureTempDir() {
+    if (!tempDirPromise) {
+        tempDirPromise = fsp.mkdtemp(path.join(os.tmpdir(), TEMP_DIR_PREFIX)).then((dir) => {
+            process.once('exit', () => {
+                try { fs.rmSync(dir, { recursive: true, force: true }); } catch (err) { /* 退出阶段静默 */ }
+            });
+            return dir;
+        });
+        // 创建失败不缓存失败态，允许下次重试；此处仅消费拒绝，调用方仍从原 promise 收到错误
+        tempDirPromise.catch(() => { tempDirPromise = null; });
+    }
+    return tempDirPromise;
+}
+
+// 同一进程内同内容只落盘一次；wx + 0600 保证不覆盖已有文件、不对同组同其他用户开放
+async function writeTempFile(buffer, mime, warnings) {
+    const key = `${crypto.createHash('sha1').update(buffer).digest('hex').slice(0, TEMP_HASH_LEN)}${EXT_BY_MIME[mime] || '.bin'}`;
+    const cached = tempFileByKey.get(key);
+    if (cached) return cached;
     try {
-        const dir = path.join(os.tmpdir(), TEMP_SUBDIR);
-        fs.mkdirSync(dir, { recursive: true });
-        const hash = crypto.createHash('sha1').update(buffer).digest('hex').slice(0, TEMP_HASH_LEN);
-        const target = path.join(dir, `${hash}${EXT_BY_MIME[mime] || '.bin'}`);
-        if (!fs.existsSync(target)) {
-            fs.writeFileSync(target, buffer);
-        }
+        const target = path.join(await ensureTempDir(), key);
+        // 目录为本进程私有，EEXIST 只可能源于并发写同一内容，视同成功
+        await fsp.writeFile(target, buffer, { flag: 'wx', mode: TEMP_FILE_MODE })
+            .catch((err) => { if (!err || err.code !== 'EEXIST') throw err; });
+        tempFileByKey.set(key, target);
         return target;
     } catch (err) {
-        warnings.push(`图片临时落盘失败（${errText(err)}）`);
-        return null;
+        return warn(warnings, `图片临时落盘失败（${errText(err)}）`);
     }
 }
 
 // ============================================================
-// 路径与 mime 工具
+// 本地路径解析与目录边界判定
 // ============================================================
 
+// 逐个候选路径判定：先词法包含，再存在性，最后 realpath 二次包含；
+// 返回 { absPath, blocked }，blocked 表示至少有一个候选因越界被拒。
 // 先用 decodeURIComponent 结果，取不到再回退原字符串（文件名含字面量 % 时）
-async function pickExistingPath(url, baseDir) {
-    const candidates = [];
-    for (const raw of toPathCandidates(url)) {
-        const abs = path.resolve(baseDir, raw);
-        if (!candidates.includes(abs)) candidates.push(abs);
-    }
+async function pickSafePath(url, baseDir) {
+    const candidates = new Set(toPathCandidates(url).map((raw) => path.resolve(baseDir, raw)));
+    let blocked = false;
     for (const abs of candidates) {
-        if (await isReadableFile(abs)) return abs;
+        if (!isWithinDir(baseDir, abs)) { blocked = true; continue; }
+        if (!await isReadableFile(abs)) continue;
+        if (!await isRealWithinDir(baseDir, abs)) { blocked = true; continue; }
+        return { absPath: abs, blocked };
     }
-    return null;
+    return { absPath: null, blocked };
 }
 
-function toPathCandidates(url) {
-    if (/^file:\/\//i.test(url)) {
-        const list = [];
-        try {
-            list.push(fileURLToPath(url));
-        } catch (err) {
-            // 非规范 file:// 写法，退化为剥离协议头
-        }
-        const stripped = url.replace(/^file:\/\//i, '');
-        list.push(safeDecode(stripped), stripped);
-        return list.filter(Boolean);
-    }
-    const decoded = safeDecode(url);
-    return decoded === url ? [url] : [decoded, url];
+// 词法判定：absPath 位于 baseDir 之内（含 baseDir 自身）
+function isWithinDir(baseDir, absPath) {
+    const rel = path.relative(path.resolve(baseDir), absPath);
+    if (rel === '') return true;
+    return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
-function safeDecode(value) {
+// realpath 判定：解开符号链接后仍在 baseDir 之内；任一端 realpath 失败即视为越界
+async function isRealWithinDir(baseDir, absPath) {
     try {
-        return decodeURIComponent(value);
-    } catch (err) {
-        return value;
-    }
-}
-
-async function isReadableFile(absPath) {
-    try {
-        const stat = await fsp.stat(absPath);
-        return stat.isFile();
+        const [realBase, realTarget] = await Promise.all([fsp.realpath(baseDir), fsp.realpath(absPath)]);
+        return isWithinDir(realBase, realTarget);
     } catch (err) {
         return false;
     }
 }
 
-function stripQuery(url) {
-    return String(url).split('?')[0].split('#')[0];
+function toPathCandidates(url) {
+    if (!/^file:\/\//i.test(url)) {
+        const decoded = safeDecode(url);
+        return decoded === url ? [url] : [decoded, url];
+    }
+    const list = [];
+    try {
+        list.push(fileURLToPath(url));
+    } catch (err) { /* 非规范 file:// 写法，退化为剥离协议头 */ }
+    const stripped = url.replace(/^file:\/\//i, '');
+    return [...list, safeDecode(stripped), stripped].filter(Boolean);
+}
+
+function safeDecode(value) {
+    try { return decodeURIComponent(value); } catch (err) { return value; }
+}
+
+async function isReadableFile(absPath) {
+    try { return (await fsp.stat(absPath)).isFile(); } catch (err) { return false; }
 }
 
 function guessMimeByExt(target) {
@@ -310,12 +266,10 @@ function guessMimeByExt(target) {
 function normalizeMime(mimeHint, detectedType) {
     const hint = String(mimeHint || '').trim().toLowerCase();
     if (hint && hint !== DEFAULT_MIME) return hint;
-    const byType = detectedType && MIME_BY_TYPE[String(detectedType).toLowerCase()];
-    return byType || DEFAULT_MIME;
+    return (detectedType && MIME_BY_TYPE[String(detectedType).toLowerCase()]) || DEFAULT_MIME;
 }
 
 function toBuffer(value) {
-    if (!value) return null;
     if (Buffer.isBuffer(value)) return value;
     if (value instanceof Uint8Array || value instanceof ArrayBuffer) return Buffer.from(value);
     return null;
@@ -325,10 +279,6 @@ function errText(err) {
     return (err && err.message) ? err.message : String(err);
 }
 
-// ============================================================
-// IR 遍历
-// ============================================================
-
 // 递归收集 image 节点，覆盖表格单元格、列表项、引用等任意嵌套层级
 function collectImageNodes(node, out = []) {
     if (!node || typeof node !== 'object') return out;
@@ -337,12 +287,8 @@ function collectImageNodes(node, out = []) {
         return out;
     }
     if (node.type === 'image') out.push(node);
-    if (Array.isArray(node.children)) {
-        for (const child of node.children) collectImageNodes(child, out);
-    }
+    if (Array.isArray(node.children)) for (const child of node.children) collectImageNodes(child, out);
     return out;
 }
 
-module.exports = { resolveImages, collectImageNodes,
-    _cleanupStaleTempFiles: cleanupStaleTempFiles,
-};
+module.exports = { resolveImages, collectImageNodes };

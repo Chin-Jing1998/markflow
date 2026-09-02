@@ -10,8 +10,7 @@
  *   - 引用块左缩进 + 左边线 + 灰色文字；代码块逐行拆分、等宽字体、浅灰底纹；
  *   - 表格带边框、表头加粗；HTML 节点去标签后作普通文本；
  *   - 未知节点降级为纯文本段落，绝不静默丢弃。
- * 渲染器只向 doc.warnings 推入字符串，不打印 stdout。
- * 纯文本收集统一引用 converters/ir/util.js 的 collectText。
+ * 渲染器只向 doc.warnings 推入字符串，不打印 stdout；纯文本收集统一用 ir/util 的 collectText。
  */
 const {
     Document,
@@ -30,28 +29,16 @@ const {
     ShadingType,
 } = require('docx');
 const { imageSize } = require('image-size');
-const { stripHtml } = require('../ir/util');
+const { stripHtml, collectText } = require('../ir/util');
 const { downgradeCustomNodes } = require('../ir/schema');
-const { collectText } = require('../ir/util');
 
-// ============================================================
-// 常量
-// ============================================================
+// ---- 常量 ----
 
 const HEADING_MAP = {
-    1: HeadingLevel.HEADING_1,
-    2: HeadingLevel.HEADING_2,
-    3: HeadingLevel.HEADING_3,
-    4: HeadingLevel.HEADING_4,
-    5: HeadingLevel.HEADING_5,
-    6: HeadingLevel.HEADING_6,
+    1: HeadingLevel.HEADING_1, 2: HeadingLevel.HEADING_2, 3: HeadingLevel.HEADING_3,
+    4: HeadingLevel.HEADING_4, 5: HeadingLevel.HEADING_5, 6: HeadingLevel.HEADING_6,
 };
-
-const ALIGN_MAP = {
-    left: AlignmentType.LEFT,
-    center: AlignmentType.CENTER,
-    right: AlignmentType.RIGHT,
-};
+const ALIGN_MAP = { left: AlignmentType.LEFT, center: AlignmentType.CENTER, right: AlignmentType.RIGHT };
 
 /** 文档默认字体：西文 Calibri，中文回退微软雅黑（macOS 由 Word 自动回退到苹方） */
 const DEFAULT_FONT = { ascii: 'Calibri', hAnsi: 'Calibri', eastAsia: '微软雅黑', cs: 'Calibri' };
@@ -72,29 +59,16 @@ const TASK_UNCHECKED_PREFIX = '☐ ';
 
 const QUOTE_BORDER = { style: BorderStyle.SINGLE, size: 18, color: LINE_COLOR, space: 8 };
 const TABLE_BORDER = { style: BorderStyle.SINGLE, size: 4, color: LINE_COLOR };
-const TABLE_BORDERS = {
-    top: TABLE_BORDER,
-    bottom: TABLE_BORDER,
-    left: TABLE_BORDER,
-    right: TABLE_BORDER,
-    insideHorizontal: TABLE_BORDER,
-    insideVertical: TABLE_BORDER,
-};
+const TABLE_BORDERS = Object.fromEntries(
+    ['top', 'bottom', 'left', 'right', 'insideHorizontal', 'insideVertical'].map((side) => [side, TABLE_BORDER]),
+);
 
 /** docx ImageRun 支持的位图类型：由 mime 或 image-size 嗅探结果映射 */
-const IMAGE_TYPE_BY_MIME = {
-    'image/png': 'png',
-    'image/jpeg': 'jpg',
-    'image/jpg': 'jpg',
-    'image/gif': 'gif',
-    'image/bmp': 'bmp',
-};
+const IMAGE_TYPE_BY_MIME = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/gif': 'gif', 'image/bmp': 'bmp' };
 const IMAGE_TYPE_BY_SNIFF = { png: 'png', jpg: 'jpg', jpeg: 'jpg', gif: 'gif', bmp: 'bmp' };
 const UNKNOWN_MIMES = new Set(['', 'application/octet-stream']);
 
-// ============================================================
-// 入口
-// ============================================================
+// ---- 入口 ----
 
 async function render(doc) {
     if (!doc || typeof doc !== 'object') throw new Error('docx 渲染器需要 doc 对象');
@@ -108,19 +82,13 @@ async function render(doc) {
     const document = new Document({
         creator: 'MarkFlow',
         title: String((doc.meta && doc.meta.title) || ''),
-        styles: {
-            default: {
-                document: { run: { font: DEFAULT_FONT, size: DEFAULT_FONT_SIZE_HALF_PT } },
-            },
-        },
+        styles: { default: { document: { run: { font: DEFAULT_FONT, size: DEFAULT_FONT_SIZE_HALF_PT } } } },
         sections: [{ children: blocks }],
     });
     return Packer.toBuffer(document);
 }
 
-// ============================================================
-// 块级节点
-// ============================================================
+// ---- 块级节点 ----
 
 function blocksToDocx(nodes, ctx) {
     const out = [];
@@ -132,14 +100,10 @@ function blocksToDocx(nodes, ctx) {
 function blockToDocx(node, ctx) {
     if (!node || typeof node !== 'object') return [];
     switch (node.type) {
-        case 'heading':
-            return [
-                makeParagraph(
-                    ctx,
-                    { heading: HEADING_MAP[node.depth] || HeadingLevel.HEADING_6 },
-                    inlineToRuns(node.children, ctx),
-                ),
-            ];
+        case 'heading': {
+            const heading = HEADING_MAP[node.depth] || HeadingLevel.HEADING_6;
+            return [makeParagraph(ctx, { heading }, inlineToRuns(node.children, ctx))];
+        }
         case 'paragraph':
             return [makeParagraph(ctx, {}, inlineToRuns(node.children, ctx))];
         case 'list':
@@ -177,10 +141,7 @@ function makeParagraph(ctx, options, children) {
         props.indent = { ...base, left: (Number(base.left) || 0) + INDENT_STEP_TWIP * ctx.quoteDepth };
         props.border = { ...(props.border || {}), left: QUOTE_BORDER };
     }
-    return new Paragraph({
-        ...props,
-        children: children.length > 0 ? children : [new TextRun({ text: '' })],
-    });
+    return new Paragraph({ ...props, children: children.length > 0 ? children : [new TextRun({ text: '' })] });
 }
 
 /** 统一构造文字 run：处于引用块内且未指定颜色/字符样式时用灰色 */
@@ -202,34 +163,15 @@ function ruleParagraph() {
 }
 
 function codeToDocx(node, ctx) {
-    const lines = String(node.value || '')
-        .replace(/\r\n?/g, '\n')
-        .replace(/\t/g, '    ')
-        .split('\n');
+    const lines = String(node.value || '').replace(/\r\n?/g, '\n').replace(/\t/g, '    ').split('\n');
     const runs = lines.map((line, index) =>
-        makeRun(
-            {
-                text: line,
-                font: CODE_FONT,
-                size: CODE_FONT_SIZE_HALF_PT,
-                ...(index > 0 ? { break: 1 } : {}),
-            },
-            ctx,
-        ),
+        makeRun({ text: line, font: CODE_FONT, size: CODE_FONT_SIZE_HALF_PT, ...(index > 0 ? { break: 1 } : {}) }, ctx),
     );
-    return makeParagraph(
-        ctx,
-        {
-            shading: { fill: CODE_FILL, type: ShadingType.CLEAR },
-            spacing: { before: 120, after: 120 },
-        },
-        runs,
-    );
+    const options = { shading: { fill: CODE_FILL, type: ShadingType.CLEAR }, spacing: { before: 120, after: 120 } };
+    return makeParagraph(ctx, options, runs);
 }
 
-// ============================================================
-// 列表
-// ============================================================
+// ---- 列表 ----
 
 function listToDocx(listNode, ctx) {
     const out = [];
@@ -294,9 +236,7 @@ function listParagraph(runs, { prefix, ordered, depth, isFirst, taskPrefix }, ct
     return makeParagraph(ctx, options, children);
 }
 
-// ============================================================
-// 表格
-// ============================================================
+// ---- 表格 ----
 
 function tableToDocx(tableNode, ctx) {
     const aligns = Array.isArray(tableNode.align) ? tableNode.align : [];
@@ -317,13 +257,7 @@ function tableToDocx(tableNode, ctx) {
         return new TableRow({ children: cells, tableHeader: isHeader });
     });
 
-    return [
-        new Table({
-            rows,
-            width: { size: 100, type: WidthType.PERCENTAGE },
-            borders: TABLE_BORDERS,
-        }),
-    ];
+    return [new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE }, borders: TABLE_BORDERS })];
 }
 
 function tableCell(children, { isHeader, align }, ctx) {
@@ -334,9 +268,7 @@ function tableCell(children, { isHeader, align }, ctx) {
     });
 }
 
-// ============================================================
-// 行内节点（fmt 为继承的格式：bold/italics/strike/style 等）
-// ============================================================
+// ---- 行内节点（fmt 为继承的格式：bold/italics/strike/style 等）----
 
 function inlineToRuns(nodes, ctx, fmt = {}) {
     const out = [];
@@ -383,9 +315,7 @@ function linkToDocx(node, ctx, fmt) {
     return [new ExternalHyperlink({ link: url, children })];
 }
 
-// ============================================================
-// 图片
-// ============================================================
+// ---- 图片 ----
 
 function imageToDocx(node, ctx, fmt) {
     const alt = String(node.alt || node.url || '图片');
@@ -447,21 +377,12 @@ function resolveImageSize(asset, data) {
 }
 
 function measure(data) {
-    try {
-        return imageSize(data);
-    } catch (err) {
-        return null;
-    }
+    try { return imageSize(data); } catch (err) { return null; }
 }
 
 function positiveInt(value) {
     const n = Number(value);
     return Number.isFinite(n) && n > 0 ? Math.round(n) : null;
 }
-
-// ============================================================
-// 文本工具
-// ============================================================
-
 
 module.exports = { render };

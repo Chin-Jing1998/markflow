@@ -2,8 +2,7 @@
  * DOCX → IR
  *
  * 流程：mammoth（docx → HTML，图片经 convertImage 截获为 Buffer）
- *       → turndown('word')（HTML → Markdown）
- *       → remark-parse + remark-gfm（Markdown → mdast）
+ *       → turndown('word')（HTML → Markdown）→ remark-parse + remark-gfm（Markdown → mdast）
  *
  * 契约：
  *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, assets, warnings, meta }
@@ -16,7 +15,7 @@ const mammoth = require('mammoth');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
-const util = require('../ir/util');
+const { stripExt, getExtFromContentType } = require('../ir/util');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
@@ -25,16 +24,11 @@ const INLINE_BASE64_IMG_RE = /<img\b[^>]*?\bsrc="data:image\/([a-z0-9.+-]+);base
 // 游离在标签之外的 base64 图片文本
 const STRAY_BASE64_RE = /data:image\/[^;]+;base64,[A-Za-z0-9+/=]{50,}/g;
 const H1_RE = /<h1[^>]*>([\s\S]*?)<\/h1>/i;
+// 进度百分比：parser 只报 parsing 阶段，三个节点单调递增且不超过 55（其后由调度器接管）
+const PROGRESS_READ = 20;
+const PROGRESS_ASSETS = 40;
+const PROGRESS_IR = 55;
 const HTML_ENTITIES = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&nbsp;': ' ' };
-
-// util.stripExt 由核心执行者提供；落地前用内联实现兜底
-const stripExt = typeof util.stripExt === 'function'
-    ? util.stripExt
-    : (name) => path.basename(String(name || ''), path.extname(String(name || '')));
-
-// ============================================================
-// 对外入口
-// ============================================================
 
 /**
  * @param {{ path?: string, buffer?: Buffer }} input
@@ -46,19 +40,19 @@ async function parse(input, ctx = {}) {
     const assets = [];
     const warnings = [];
 
-    notify(ctx, 'parsing', 20);
+    notify(ctx, 'parsing', PROGRESS_READ);
     const rawHtml = await convertWithMammoth(source, assets, warnings);
     const html = collectInlineBase64Images(rawHtml, assets, warnings);
-    notify(ctx, 'assets', 60);
+    notify(ctx, 'parsing', PROGRESS_ASSETS);
 
     const title = extractTitle(html) || stripExt(sourceName);
     const markdown = cleanupMarkdown(createTurndownService('word').turndown(html));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
     const ir = unified().use(remarkParse).use(remarkGfm).parse(markdown);
-    notify(ctx, 'ir', 90);
+    notify(ctx, 'parsing', PROGRESS_IR);
 
-    const doc = createDocument({
+    return createDocument({
         kind: 'document',
         ir,
         data: null,
@@ -66,29 +60,15 @@ async function parse(input, ctx = {}) {
         assets,
         warnings,
     });
-    // createDocument 扩展签名落地前不透传 assets/warnings，此处补齐（扩展后本赋值幂等）
-    doc.assets = assets;
-    doc.warnings = warnings;
-    return doc;
 }
 
-// ============================================================
-// 输入解析
-// ============================================================
-
 function resolveSource(input) {
-    if (input && typeof input.path === 'string' && input.path) {
-        return { path: path.resolve(input.path) };
-    }
-    if (input && Buffer.isBuffer(input.buffer)) {
-        return { buffer: input.buffer };
-    }
+    if (input && typeof input.path === 'string' && input.path) return { path: path.resolve(input.path) };
+    if (input && Buffer.isBuffer(input.buffer)) return { buffer: input.buffer };
     throw new Error('parsers/docx 需要 input.path（.docx 文件路径）或 input.buffer');
 }
 
-// ============================================================
-// mammoth 转换
-// ============================================================
+// ---------- mammoth 转换 ----------
 
 async function convertWithMammoth(source, assets, warnings) {
     const options = {
@@ -117,7 +97,7 @@ async function convertWithMammoth(source, assets, warnings) {
 
 function pushAsset(assets, buffer, contentType) {
     const mime = normalizeMime(contentType);
-    const name = `images/image_${assets.length + 1}${util.getExtFromContentType(mime)}`;
+    const name = `images/image_${assets.length + 1}${getExtFromContentType(mime)}`;
     assets.push({ name, buffer, mime });
     return name;
 }
@@ -128,9 +108,7 @@ function normalizeMime(contentType) {
     return mime === 'image/jpg' ? 'image/jpeg' : mime;
 }
 
-// ============================================================
-// HTML 后处理
-// ============================================================
+// ---------- HTML 后处理 ----------
 
 // 把残留的 base64 内嵌图片收进 assets，并清掉游离的 base64 文本
 function collectInlineBase64Images(html, assets, warnings) {
@@ -150,19 +128,14 @@ function collectInlineBase64Images(html, assets, warnings) {
 function extractTitle(html) {
     const matched = H1_RE.exec(html);
     if (!matched) return '';
-    return decodeEntities(matched[1].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+    const text = matched[1].replace(/<[^>]+>/g, '')
+        .replace(/&(?:amp|lt|gt|quot|#39|nbsp);/g, (entity) => HTML_ENTITIES[entity] || entity);
+    return text.replace(/\s+/g, ' ').trim();
 }
 
-function decodeEntities(text) {
-    return text.replace(/&(?:amp|lt|gt|quot|#39|nbsp);/g, (entity) => HTML_ENTITIES[entity] || entity);
-}
-
-// ============================================================
 // Markdown 清理（源自 旧版 word.js:101-110）
 // 注：legacy 还会删除任意 100 字符以上的 [A-Za-z0-9+/=] 连续串以清理 base64 残留；
 //     本实现已在 HTML 阶段精确收编全部内嵌图片，该规则会误删正文长串，故不再沿用。
-// ============================================================
-
 function cleanupMarkdown(markdown) {
     return String(markdown || '')
         .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)/g, '')
@@ -170,17 +143,11 @@ function cleanupMarkdown(markdown) {
         .trim();
 }
 
-// ============================================================
-// 工具
-// ============================================================
-
+// 进度回调异常不得影响解析
 function notify(ctx, phase, pct) {
-    if (!ctx || typeof ctx.onProgress !== 'function') return;
     try {
-        ctx.onProgress(phase, pct);
-    } catch (err) {
-        // 调用方回调自身的异常不影响解析
-    }
+        if (ctx && typeof ctx.onProgress === 'function') ctx.onProgress(phase, pct);
+    } catch (err) { /* 忽略调用方回调自身的异常 */ }
 }
 
 function errText(err) {

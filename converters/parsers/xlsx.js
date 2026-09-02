@@ -29,6 +29,10 @@ const {
 } = require('../ir/schema');
 const { stripExt } = require('../ir/util');
 
+// 进度百分比区间：parser 只报 parsing 阶段，按已解析 sheet 比例映射到该区间
+const PROGRESS_MIN = 20;
+const PROGRESS_MAX = 55;
+
 let ExcelJS = null;
 function loadExcelJS() {
     if (!ExcelJS) ExcelJS = require('exceljs');
@@ -52,6 +56,7 @@ async function parse(input, ctx = {}) {
 
     const sheetsData = [];
     const ir = createRoot();
+    const sheetTotal = Math.max(wb.worksheets.length, 1);
     let sheetIdx = 0;
 
     wb.eachSheet((ws) => {
@@ -86,7 +91,7 @@ async function parse(input, ctx = {}) {
         }
 
         sheetIdx++;
-        notify(ctx, 'parse', null);
+        notify(ctx, 'parsing', PROGRESS_MIN + Math.round((sheetIdx / sheetTotal) * (PROGRESS_MAX - PROGRESS_MIN)));
     });
 
     return createDocument({

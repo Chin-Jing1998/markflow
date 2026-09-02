@@ -5,13 +5,26 @@
  *   1) 按路径读取 utf8 文本，baseDir 取源文件所在目录，供图片相对路径解析；
  *   2) 挂载 remark-gfm —— 缺失它会导致表格、删除线、任务列表退化为原始字面量文本；
  *   3) 宽松标题预处理 —— 兼容 "#标题"（缺空格）与全角 "＃标题" 两种非标准写法；
- *   4) 解析后立即把图片解析为可内嵌资源，挂到 image 节点的 data.asset 上。
+ *   4) 解析后立即把图片解析为可内嵌资源，挂到 image 节点的 data.asset 上；
+ *   5) 其中可被二进制渲染器内嵌的那部分统一编号为 images/image_N.ext 后作为 assets 返回
+ *      —— 资源名不能沿用 Markdown 里的原始地址，否则 "../x.png"、绝对路径与 http(s) 地址
+ *      会被当作落盘路径使用。
  */
 const fsp = require('fs').promises;
 const path = require('path');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
+const { stripExt } = require('../ir/util');
 const { resolveImages, collectImageNodes } = require('../assets/md-images');
+
+// docx 等二进制渲染器可内嵌的图片类型 → 资源扩展名；不在表内的（svg/webp 等）不进 assets，
+// 但 image 节点上的 data.asset 仍保留，HTML 渲染照常可用
+const EMBEDDABLE_EXT_BY_MIME = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/gif': '.gif',
+    'image/bmp': '.bmp',
+};
 
 // 行首 1-6 个井号（半角或全角），且后面不再跟井号 —— 即构成合法 ATX 标题前缀
 const HEADING_PREFIX_RE = /^([#＃]{1,6})(?![#＃])/gm;
@@ -34,16 +47,12 @@ async function parse(input, ctx = {}) {
 
     const title = extractTitle(ir) || stripExt(sourceName);
 
-    const { resolved, warnings } = await resolveImages(ir, baseDir, {
+    const { warnings } = await resolveImages(ir, baseDir, {
         fetchRemote: ctx.fetchRemote,
     });
     notify(ctx, 'parsing', 55);
 
-    // 已成功解析（可内嵌）的图片登记为 assets，供调度器统计 imagesCount；同一 url 只登记一次
-    const seen = new Set();
-    const assets = collectImageNodes(ir)
-        .filter((node) => node.data && node.data.asset && node.data.asset.buffer && !seen.has(node.url) && seen.add(node.url))
-        .map((node) => ({ name: node.url, buffer: node.data.asset.buffer, mime: node.data.asset.mime }));
+    const assets = collectAssets(ir);
 
     return createDocument({
         kind: 'document',
@@ -113,9 +122,22 @@ function toPlainText(node) {
     return node.children.map(toPlainText).join('');
 }
 
-function stripExt(name) {
-    if (!name) return '';
-    return path.basename(String(name), path.extname(String(name)));
+// ============================================================
+// 资源登记
+// ============================================================
+
+// 按文档顺序收集可内嵌图片，统一编号为 images/image_N.ext；同一 url 只登记一次
+function collectAssets(ir) {
+    const assets = [];
+    const seen = new Set();
+    for (const node of collectImageNodes(ir)) {
+        const asset = node.data && node.data.asset;
+        const ext = asset && asset.buffer ? EMBEDDABLE_EXT_BY_MIME[asset.mime] : undefined;
+        if (!ext || seen.has(node.url)) continue;
+        seen.add(node.url);
+        assets.push({ name: `images/image_${assets.length + 1}${ext}`, buffer: asset.buffer, mime: asset.mime });
+    }
+    return assets;
 }
 
 // ============================================================

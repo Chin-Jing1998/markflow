@@ -124,7 +124,11 @@ test('onProgress 回调抛错不影响解析', async () => {
 
     // Assert
     assert.ok(calls.length >= 1);
-    assert.equal(calls[0][0], 'parse');
+    assert.equal(calls[0][0], 'parsing');
+    assert.ok(
+        calls.every(([phase, pct]) => phase === 'parsing' && pct >= 20 && pct <= 55),
+        `进度只应为 parsing 且落在 20–55，实际 ${JSON.stringify(calls)}`,
+    );
     assert.equal(doc.kind, 'document');
 });
 

@@ -7,7 +7,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MarkFlow - 知识库转换工具</title>
     <link rel="stylesheet" href="css/styles.css">
@@ -34,7 +34,7 @@
     <div class="app-container">
         <!-- 顶部导航 -->
         <header class="topbar">
-            <div class="logo" id="logo">
+            <div class="logo">
                 <span class="logo-m">M</span><span class="logo-ark">ark</span>
                 <span class="logo-dot"></span>
                 <span class="logo-f">F</span><span class="logo-low">low</span>
@@ -85,7 +85,7 @@
                             <input type="file" id="file-input-markup" accept=".md,.markdown" multiple hidden>
                         </div>
                         <div class="file-list" id="file-list-markup"></div>
-                        <div class="format-selector" id="format-selector-markup">
+                        <div class="format-selector">
                             <span class="format-label">输出格式</span>
                             <div class="format-chips" id="format-chips-markup" role="group" aria-label="输出格式">
                                 <button class="format-chip active" type="button" data-format="docx" title="Word 文档" aria-pressed="true">
@@ -124,7 +124,7 @@
             </section>
 
             <!-- 右栏：转换结果 -->
-            <section class="results-panel panel-glass" id="results-panel" aria-label="转换结果">
+            <section class="results-panel panel-glass" aria-label="转换结果">
                 <div class="results-header">
                     <h2 class="results-title">
                         <svg class="icon" aria-hidden="true"><use href="assets/icons.svg#list-checks"/></svg> 转换结果

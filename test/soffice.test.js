@@ -1,6 +1,6 @@
 /**
  * server/soffice.js 单元测试
- * 覆盖：探测缺失时的中文安装提示、命令行参数构造、独立 UserInstallation profile 的建与删、
+ * 覆盖：探测缺失时的中文安装提示、命令行参数构造、独立 UserInstallation profile 的建与删与 URL 编码、
  *       多次调用串行排队、转换失败与产物缺失的错误信息、参数校验、探测结果缓存
  *
  * 全程用 _setDetect / _setExecFile 注入假实现，不依赖本机是否安装 LibreOffice。
@@ -10,6 +10,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { pathToFileURL, fileURLToPath } = require('node:url');
 
 const soffice = require('../server/soffice');
 
@@ -39,10 +40,18 @@ function readOutDir(args) {
     return args[args.indexOf('--outdir') + 1];
 }
 
-/** 从参数数组里取 -env:UserInstallation=file:// 后的目录 */
+const USER_INSTALLATION_PREFIX = '-env:UserInstallation=';
+
+/** 从参数数组里取 -env:UserInstallation= 的原始取值（规范 file URL） */
+function readProfileUrl(args) {
+    const hit = args.find((a) => a.startsWith(`${USER_INSTALLATION_PREFIX}file://`));
+    return hit ? hit.slice(USER_INSTALLATION_PREFIX.length) : null;
+}
+
+/** 从参数数组里取 UserInstallation 指向的本地目录（file URL 解码后） */
 function readProfileDir(args) {
-    const hit = args.find((a) => a.startsWith('-env:UserInstallation=file://'));
-    return hit ? hit.replace('-env:UserInstallation=file://', '') : null;
+    const url = readProfileUrl(args);
+    return url ? fileURLToPath(url) : null;
 }
 
 /** 按 soffice 的产物命名规则写出目标文件 */
@@ -163,6 +172,7 @@ test('转换命令含 --headless、--convert-to 与独立 UserInstallation profi
 
     const profileDir = readProfileDir(args);
     assert.ok(profileDir, '必须传入 -env:UserInstallation=file://<dir>');
+    assert.equal(readProfileUrl(args), pathToFileURL(profileDir).href, 'UserInstallation 须为规范 file URL');
     assert.ok(profileExistedDuringCall, '转换期间临时 profile 目录应存在');
     assert.equal(fs.existsSync(profileDir), false, '转换结束后临时 profile 应被删除');
 
@@ -187,6 +197,44 @@ test('转换失败时临时 profile 同样被清理', async () => {
     // Act & Assert
     await assert.rejects(() => soffice.convertFile(filePath, 'docx', { outDir }));
     assert.equal(fs.existsSync(profileDir), false);
+});
+
+test('UserInstallation 为百分号编码的规范 file URL：含空格与 # 的临时目录被编码为 %20 与 %23', async () => {
+    // Arrange：把 TMPDIR 指向含空格与 # 的目录，令 mkdtemp 产出需要编码的 profile 路径
+    const base = makeTempDir();
+    const spaced = path.join(base, 'temp dir#1');
+    fs.mkdirSync(spaced, { recursive: true });
+    const savedEnv = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+    for (const key of Object.keys(savedEnv)) process.env[key] = spaced;
+
+    let capturedUrl = null;
+    let profileExistedDuringCall = false;
+    soffice._setDetect(async () => FAKE_SOFFICE);
+    soffice._setExecFile((file, args, options, cb) => {
+        capturedUrl = readProfileUrl(args);
+        profileExistedDuringCall = fs.existsSync(readProfileDir(args));
+        writeExpectedOutput(args);
+        cb(null, '', '');
+    });
+    const { filePath } = makeInputFile();
+
+    // Act
+    try {
+        await soffice.convertFile(filePath, 'docx', { outDir: path.join(spaced, 'out') });
+    } finally {
+        for (const [key, value] of Object.entries(savedEnv)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+        fs.rmSync(base, { recursive: true, force: true });
+    }
+
+    // Assert
+    assert.ok(capturedUrl.startsWith('file:///'), `应为 file:/// 三斜杠形态，实际 ${capturedUrl}`);
+    assert.ok(capturedUrl.includes('%20'), `空格应编码为 %20，实际 ${capturedUrl}`);
+    assert.ok(capturedUrl.includes('%231'), `# 应编码为 %23，实际 ${capturedUrl}`);
+    assert.ok(!capturedUrl.includes('temp dir'), '不得残留未编码的原始路径');
+    assert.ok(profileExistedDuringCall, '解码后应能定位到实际创建的 profile 目录');
 });
 
 // ============================================================

@@ -1,7 +1,7 @@
 /**
  * converters/renderers/html.js 单元测试
- * 覆盖：原始 HTML 安全（script/onerror 不透传）、file:// 图片路径、<title> 转义、
- *       GFM 表格/删除线/任务列表、CJK 字体栈与打印 CSS、自定义节点降级
+ * 覆盖：原始 HTML 安全（script/onerror 不透传）、file:// 图片路径、无 asset 图片丢弃 src、
+ *       打印页面 CSP、<title> 转义、GFM 表格/删除线/任务列表、CJK 字体栈与打印 CSS、自定义节点降级
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -74,9 +74,9 @@ test('原始 HTML 不透传：script 与 onerror 被移除，普通行内标签�
     assert.ok(html.includes('<h1>标题</h1>'));
 });
 
-test('带 asset 的图片 src 改写为 file:// 绝对路径，远程图片保持原 url', async () => {
+test('带 asset 的图片 src 改写为 file:// 绝对路径，保留 alt 与 title', async () => {
     // Arrange
-    const ir = await parseMarkdown('![本地](images/pic.png "说明")\n\n![远程](https://example.com/a.png)\n');
+    const ir = await parseMarkdown('![本地](images/pic.png "说明")\n');
     const images = collect(ir, (n) => n.type === 'image');
     images[0].data = { asset: { absPath: ASSET_PATH, buffer: Buffer.alloc(0), mime: 'image/png', width: 8, height: 8 } };
 
@@ -88,7 +88,47 @@ test('带 asset 的图片 src 改写为 file:// 绝对路径，远程图片保�
     assert.ok(expected.startsWith('file://'));
     assert.ok(html.includes(`src="${expected}"`), `本地图片 src 应为 ${expected}`);
     assert.ok(html.includes('alt="本地"') && html.includes('title="说明"'));
-    assert.ok(html.includes('src="https://example.com/a.png"'), '远程图片应保留原 url');
+});
+
+test('无本地 asset 的图片一律丢弃 src：远程、内网与 file:// URL 都不出现在输出中', async () => {
+    // Arrange：打印窗口会真实发起请求，故被 SSRF 守卫拒绝的地址不得进入 <img src>
+    const md = [
+        '![远程](https://example.com/a.png)',
+        '',
+        '![内网](http://192.168.1.1/probe.png)',
+        '',
+        '![本机](http://127.0.0.1:8080/x.png "标题")',
+        '',
+        '![元数据](http://169.254.169.254/latest/meta-data/)',
+        '',
+        '![本地文件](file:///etc/hosts)',
+        '',
+    ].join('\n');
+    const ir = await parseMarkdown(md);
+
+    // Act
+    const html = await htmlRenderer.render(makeDoc(ir));
+
+    // Assert
+    for (const url of ['example.com', '192.168.1.1', '127.0.0.1', '169.254.169.254', '/etc/hosts']) {
+        assert.ok(!html.includes(url), `输出中不得出现 ${url}`);
+    }
+    assert.ok(!/<img[^>]*\ssrc=/.test(html), '无 asset 的图片不得带 src 属性');
+    assert.ok(html.includes('<img alt="远程">'), 'alt 文本应保留为占位');
+    assert.ok(!html.includes('title="标题"'), '无来源图片不保留 title');
+});
+
+test('打印页面 <head> 声明 CSP：默认全禁，图片与字体只放行 file: 与 data:', async () => {
+    // Arrange
+    const ir = await parseMarkdown('正文\n');
+
+    // Act
+    const html = await htmlRenderer.render(makeDoc(ir));
+
+    // Assert
+    const csp = "default-src 'none'; img-src file: data:; style-src 'unsafe-inline'; font-src file: data:";
+    assert.ok(html.includes(`<meta http-equiv="Content-Security-Policy" content="${csp}">`), `应含 CSP：${csp}`);
+    assert.ok(html.indexOf('Content-Security-Policy') < html.indexOf('<body>'), 'CSP 须在 <body> 之前声明');
 });
 
 test('<title> 使用 meta.title 并做 HTML 转义', async () => {

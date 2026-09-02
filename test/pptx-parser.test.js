@@ -75,6 +75,7 @@ const NS =
     'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
 const REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
 const IMAGE_REL_TYPE = `${REL_NS.replace('/package/', '/officeDocument/')}/image`;
+const NOTES_REL_TYPE = `${REL_NS.replace('/package/', '/officeDocument/')}/notesSlide`;
 
 function shapeXml(text, phType) {
     const ph = phType ? `<p:ph type="${phType}"/>` : '';
@@ -96,9 +97,10 @@ function picXml(rid) {
     );
 }
 
-function slideXml({ title, bodies = [], picRids = [] }) {
+function slideXml({ title, subTitle, bodies = [], picRids = [] }) {
     const shapes = [];
     if (title) shapes.push(shapeXml(title, 'title'));
+    if (subTitle) shapes.push(shapeXml(subTitle, 'subTitle'));
     for (const body of bodies) shapes.push(shapeXml(body, null));
     for (const rid of picRids) shapes.push(picXml(rid));
     return (
@@ -144,7 +146,8 @@ function contentTypesXml() {
 
 /**
  * @param {object} spec
- * @param {Array} spec.slides 每页 { title?, bodies?, picRids?, rels?, notes? }
+ * @param {Array} spec.slides 每页 { title?, subTitle?, bodies?, picRids?, rels?, notes?, notesFile? }
+ *   notes 给定时写入 ppt/notesSlides/<notesFile 或 notesSlideN.xml> 并在本页 rels 中登记 notesSlide 关系
  * @param {string} [spec.coreTitle] docProps/core.xml 的 dc:title
  * @param {object} [spec.media] zip 内媒体路径 → Buffer，默认放一张 ppt/media/image1.png
  */
@@ -181,9 +184,15 @@ async function makePptxFile({ slides, coreTitle, fileName = '产品发布.pptx',
 
     slides.forEach((slide, i) => {
         const n = i + 1;
+        const rels = [...(slide.rels || [])];
+        if (slide.notes) {
+            // 备注文件名允许与页码不一致，关联关系一律写进本页 rels
+            const notesFile = slide.notesFile || `notesSlide${n}.xml`;
+            zip.file(`ppt/notesSlides/${notesFile}`, notesXml(slide.notes));
+            rels.push({ id: 'rIdNotes', type: NOTES_REL_TYPE, target: `../notesSlides/${notesFile}` });
+        }
         zip.file(`ppt/slides/slide${n}.xml`, slideXml(slide));
-        zip.file(`ppt/slides/_rels/slide${n}.xml.rels`, relsXml(slide.rels || []));
-        if (slide.notes) zip.file(`ppt/notesSlides/notesSlide${n}.xml`, notesXml(slide.notes));
+        zip.file(`ppt/slides/_rels/slide${n}.xml.rels`, relsXml(rels));
     });
 
     const buffer = await zip.generateAsync({ type: 'nodebuffer' });
@@ -490,4 +499,73 @@ test('包内没有 slide 时抛出中文错误', async () => {
 
     // Act & Assert
     await assert.rejects(() => parse({ path: filePath }), /未找到 slide 文件/);
+});
+
+test('备注按本页 rels 关联，备注文件名与页码不一致时不错位', async () => {
+    // Arrange：只有第 2 页有备注，但备注文件名是 notesSlide1.xml
+    const { filePath } = await makePptxFile({
+        slides: [
+            { title: '第一页' },
+            { title: '第二页', notes: '只属于第二页的备注', notesFile: 'notesSlide1.xml' },
+        ],
+    });
+
+    // Act
+    const doc = await parse({ path: filePath });
+    const slideBreaks = collect(doc.ir, (n) => n.type === 'slideBreak');
+
+    // Assert
+    assert.equal(slideBreaks[0].data.notes, '');
+    assert.equal(slideBreaks[1].data.notes, '只属于第二页的备注');
+    assert.deepEqual(doc.data.slides.map((s) => s.notes), ['', '只属于第二页的备注']);
+    const quotes = collect(doc.ir, (n) => n.type === 'blockquote');
+    assert.equal(quotes.length, 1);
+    assert.equal(plainText(quotes[0]), '备注：只属于第二页的备注');
+});
+
+test('subTitle 占位符归入正文，不顶替 title', async () => {
+    // Arrange
+    const { filePath } = await makePptxFile({
+        slides: [{ title: '正标题', subTitle: '副标题', bodies: ['正文'] }],
+    });
+
+    // Act
+    const doc = await parse({ path: filePath });
+    const [slideBreak] = collect(doc.ir, (n) => n.type === 'slideBreak');
+
+    // Assert
+    assert.equal(slideBreak.data.title, '正标题');
+    assert.deepEqual(
+        collect(doc.ir, (n) => n.type === 'paragraph').map(plainText),
+        ['副标题', '正文'],
+    );
+});
+
+test('dc:title 中的 XML 实体被还原', async () => {
+    // Arrange
+    const { filePath } = await makePptxFile({ ...minimalSpec(), coreTitle: '研发 &amp; 市场' });
+
+    // Act
+    const doc = await parse({ path: filePath });
+
+    // Assert
+    assert.equal(doc.meta.title, '研发 & 市场');
+});
+
+test('onProgress 只报 parsing 阶段，百分比单调且落在 20–55', async () => {
+    // Arrange
+    const { filePath } = await makePptxFile({
+        slides: [{ title: '一' }, { title: '二' }, { title: '三' }],
+    });
+    const calls = [];
+
+    // Act
+    await parse({ path: filePath }, { onProgress: (phase, pct) => calls.push([phase, pct]) });
+
+    // Assert
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(([phase]) => phase === 'parsing'), JSON.stringify(calls));
+    const pcts = calls.map(([, pct]) => pct);
+    assert.deepEqual(pcts, [...pcts].sort((a, b) => a - b), '百分比应单调不降');
+    assert.ok(pcts.every((pct) => pct >= 20 && pct <= 55), JSON.stringify(pcts));
 });

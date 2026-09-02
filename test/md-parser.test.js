@@ -201,7 +201,7 @@ test('本地相对路径图片被解析为可内嵌 asset，远程图片记 warn
     assert.equal(remote.data && remote.data.asset, undefined);
 
     assert.equal(doc.assets.length, 1);
-    assert.equal(doc.assets[0].name, 'images/pic.png');
+    assert.equal(doc.assets[0].name, 'images/image_1.png');
     assert.ok(
         doc.warnings.some((w) => w.includes('远程图片未内嵌')),
         `warnings 应含远程未内嵌提示，实际为 ${JSON.stringify(doc.warnings)}`,
@@ -232,4 +232,54 @@ test('input.text 形态可用，baseDir 取 ctx.baseDir', async () => {
     assert.equal(doc.meta.title, '内联标题');
     assert.equal(doc.meta.baseDir, dir);
     assert.equal(image.data.asset.width, 8);
+});
+
+// 最小合法 GIF：image-size 只读前 10 字节的签名与宽高
+const GIF_1X1 = Buffer.concat([
+    Buffer.from('GIF89a', 'ascii'),
+    Buffer.from([0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00]),
+]);
+
+test('assets 只收可内嵌类型并统一编号，同一 url 只登记一次', async () => {
+    // Arrange：png 与 gif 可内嵌，svg 不可内嵌；png 被引用两次
+    const { dir } = makeFixture();
+    fs.writeFileSync(path.join(dir, 'images', 'anim.gif'), GIF_1X1);
+    fs.writeFileSync(
+        path.join(dir, 'images', 'logo.svg'),
+        '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"></svg>',
+    );
+    const md = [
+        '![一](images/pic.png)', '',
+        '![二](images/pic.png)', '',
+        '![三](images/anim.gif)', '',
+        '![四](images/logo.svg)', '',
+    ].join('\n');
+
+    // Act
+    const doc = await parse({ text: md }, { baseDir: dir });
+
+    // Assert
+    assert.deepEqual(
+        doc.assets.map((a) => [a.name, a.mime]),
+        [['images/image_1.png', 'image/png'], ['images/image_2.gif', 'image/gif']],
+    );
+    // svg 不进 assets，但节点上仍挂着 asset，HTML 渲染照常可用
+    const svg = collect(doc.ir, (n) => n.type === 'image').find((n) => n.url === 'images/logo.svg');
+    assert.ok(svg.data && svg.data.asset, 'svg 仍应挂上 data.asset');
+    assert.equal(svg.data.asset.mime, 'image/svg+xml');
+});
+
+test('资源名不沿用 Markdown 中的原始地址，子目录与中文文件名同样被编号', async () => {
+    // Arrange：图片放在多层子目录，目录名与文件名均为中文
+    const { dir } = makeFixture();
+    const nested = path.join(dir, 'assets', '插图');
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(nested, '示意图.png'), makePng(4, 4));
+
+    // Act
+    const doc = await parse({ text: '![示意](assets/插图/示意图.png)\n' }, { baseDir: dir });
+
+    // Assert
+    assert.deepEqual(doc.assets.map((a) => a.name), ['images/image_1.png']);
+    assert.equal(collect(doc.ir, (n) => n.type === 'image')[0].url, 'assets/插图/示意图.png');
 });

@@ -22,6 +22,11 @@ const MAX_ITEMS = 200;
 const CONCURRENCY = 2;
 const DEFAULT_OUTPUT_DIR = path.join(os.homedir(), 'Documents', 'MarkFlow');
 const errorMessage = (err) => (err && err.message ? err.message : String(err));
+// 对外只给统一文案，避免成为文件存在性/类型的探测预言机；细节写 stderr
+function inputUnavailable(detail) {
+    console.error('输入校验失败:', detail);
+    return new Error('输入不可用或格式不受支持');
+}
 
 function settingsFile() {
     return process.env.MARKFLOW_SETTINGS_FILE || path.join(os.homedir(), '.markflow', 'settings.json');
@@ -71,9 +76,9 @@ async function probeTargets() {
 async function resolveFileInput(filePath) {
     if (!path.isAbsolute(filePath)) throw new Error(`路径必须是绝对路径：${filePath}`);
     const stat = await fsp.stat(filePath).catch(() => null);
-    if (!stat || !stat.isFile()) throw new Error(`文件不存在或不是普通文件：${filePath}`);
+    if (!stat || !stat.isFile()) throw inputUnavailable(`文件不存在或不是普通文件：${filePath}`);
     const type = converters.detectInputType(filePath);
-    if (!type) throw new Error(`不支持的输入格式：${path.extname(filePath) || '(无扩展名)'}`);
+    if (!type) throw inputUnavailable(`不支持的输入格式：${filePath}`);
     return { type, input: { path: filePath } };
 }
 
@@ -194,7 +199,9 @@ function createApp(token, state) {
         const status = err.status || err.statusCode || 500;
         if (status >= 500) console.error('服务异常:', err);
         if (res.headersSent) return res.end();
-        res.status(status).json({ success: false, error: errorMessage(err) });
+        const isInternal = status >= 500 || Boolean(err.code);
+        const message = isInternal ? (status === 404 ? '资源不存在' : '服务内部错误') : errorMessage(err);
+        res.status(status).json({ success: false, error: message });
     });
     return app;
 }

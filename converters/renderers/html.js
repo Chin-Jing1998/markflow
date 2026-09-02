@@ -5,6 +5,9 @@
  * 定位：主要作为 PDF 渲染的中间产物（Electron/Chromium 打印），因此：
  *   - 关闭 allowDangerousHtml，IR 中的原始 HTML 只保留去标签后的文本，杜绝脚本注入；
  *   - 带 data.asset.absPath 的图片改写为 file:// 绝对路径，打印进程可直接读盘；
+ *   - 无本地 asset 的图片一律丢弃 src 只留 alt：打印窗口在本机运行，若保留远程或内网 URL，
+ *     Chromium 会实际发起请求，等于把已被 SSRF 守卫拦下的地址重新放行，并暴露本机可达性；
+ *   - <head> 声明 CSP（default-src 'none'; img-src file: data:），从浏览器侧再封一道外发通道；
  *   - 内联 CSS 使用 CJK 字体栈，并声明 @page 边距，表格/代码块按打印场景设置换行与边框。
  */
 const { pathToFileURL } = require('url');
@@ -15,6 +18,13 @@ const { downgradeCustomNodes } = require('../ir/schema');
 const FONT_STACK =
     '-apple-system, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI", sans-serif';
 const MONO_FONT_STACK = '"SF Mono", Menlo, Consolas, "Courier New", monospace';
+
+/**
+ * 打印页面的内容安全策略：默认全禁，只放行本地文件与内联样式。
+ * img-src/font-src 限于 file: 与 data:，页面无论如何都无法向网络发起请求；
+ * style-src 'unsafe-inline' 是 PAGE_CSS 以 <style> 内联所必需。
+ */
+const PRINT_CSP = "default-src 'none'; img-src file: data:; style-src 'unsafe-inline'; font-src file: data:";
 
 const PAGE_CSS = `
 @page { margin: 1.5cm; }
@@ -64,26 +74,27 @@ async function render(doc) {
 // 自定义 handler
 // ============================================================
 
-/** image：带本地 asset 的图片写成 file:// 绝对路径，其余保留原 url */
+/** image：带本地 asset 的图片写成 file:// 绝对路径；无 asset 时不输出 src，只保留 alt 占位 */
 function imageHandler(state, node) {
-    const properties = { src: resolveImageSrc(node) };
+    const src = resolveImageSrc(node);
+    const properties = src ? { src } : {};
     if (node.alt !== null && node.alt !== undefined) properties.alt = node.alt;
-    if (node.title !== null && node.title !== undefined) properties.title = node.title;
+    // title 仅在图片确有本地来源时保留，无来源的图片降级为纯 alt 占位
+    if (src && node.title !== null && node.title !== undefined) properties.title = node.title;
     const result = { type: 'element', tagName: 'img', properties, children: [] };
     state.patch(node, result);
     return state.applyData(node, result);
 }
 
+/** 只认 data.asset.absPath；解析失败或根本没有本地文件时返回空串，绝不回退到原始 url */
 function resolveImageSrc(node) {
     const asset = node.data && node.data.asset;
-    if (asset && typeof asset.absPath === 'string' && asset.absPath) {
-        try {
-            return pathToFileURL(asset.absPath).href;
-        } catch (err) {
-            // 非法路径时回退到原始 url
-        }
+    if (!asset || typeof asset.absPath !== 'string' || !asset.absPath) return '';
+    try {
+        return pathToFileURL(asset.absPath).href;
+    } catch (err) {
+        return '';
     }
-    return typeof node.url === 'string' ? node.url : '';
 }
 
 /** html：原始 HTML 不透传，去标签后仅保留文本（script/style 连同内容一并丢弃） */
@@ -104,6 +115,7 @@ function wrapDocument(title, body) {
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${PRINT_CSP}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title}</title>
 <style>${PAGE_CSS}</style>

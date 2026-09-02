@@ -1,7 +1,8 @@
 /**
  * electron/main.js 纯逻辑单元测试（不启动 Electron）
- * 覆盖：普通 Node 进程 require 主进程文件无副作用；expandPaths（递归收集、跳过目录、深度与总数上限、
- * 文件原样返回、忽略不存在路径与非法入参）；主题文件读写与非法值回退。
+ * 覆盖：普通 Node 进程 require 主进程文件无副作用；expandPaths（递归收集全部支持扩展名、exts 覆盖、
+ * 符号链接解析与成环保护、跳过目录、深度与总数上限、入参数组截断、文件原样返回、忽略不存在路径与
+ * 非法入参）；isOpenablePath 白名单；主题文件读写与非法值回退。
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -9,7 +10,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const main = require('../electron/main');
-const { expandPaths, readThemeFile, writeThemeFile, normalizeTheme } = main._internal;
+const { expandPaths, isOpenablePath, readThemeFile, writeThemeFile, normalizeTheme } = main._internal;
+
+/** 与 electron/main.js 的 MAX_SCAN_FILES 保持一致 */
+const MAX_SCAN_FILES = 500;
 
 const TMP_ROOT = path.join(__dirname, 'tmp');
 fs.mkdirSync(TMP_ROOT, { recursive: true });
@@ -32,7 +36,7 @@ function writeFiles(files) {
 describe('require 主进程文件', () => {
     test('普通 Node 进程中不抛错，只导出 _internal', () => {
         assert.deepEqual(Object.keys(main), ['_internal']);
-        for (const fn of ['normalizeTheme', 'readThemeFile', 'writeThemeFile', 'expandPaths']) {
+        for (const fn of ['normalizeTheme', 'readThemeFile', 'writeThemeFile', 'expandPaths', 'isOpenablePath']) {
             assert.equal(typeof main._internal[fn], 'function', `_internal.${fn} 应为函数`);
         }
     });
@@ -48,6 +52,8 @@ describe('expandPaths', () => {
         'tree/a.md': '# a',
         'tree/b.markdown': '# b',
         'tree/c.txt': 'text',
+        'tree/office.docx': 'docx',
+        'tree/sheet.XLSX': 'xlsx',
         'tree/sub/d.md': '# d',
         'tree/sub/deep/E.MD': '# e',
         'tree/.git/skip.md': '# skipped',
@@ -55,17 +61,61 @@ describe('expandPaths', () => {
         'tree/.hidden/skip.md': '# skipped',
     });
 
-    test('目录递归收集全部 .md/.markdown，不含 .txt，跳过 .git、node_modules 与点开头目录', async () => {
+    test('目录递归收集全部支持扩展名（含 .docx/.xlsx），不含 .txt，跳过 .git、node_modules 与点开头目录', async () => {
         // Act
         const result = await expandPaths([tree]);
 
         // Assert
         const rel = result.map((f) => path.relative(tree, f.path)).sort();
-        assert.deepEqual(rel, ['a.md', 'b.markdown', 'sub/d.md', 'sub/deep/E.MD']);
+        assert.deepEqual(rel, ['a.md', 'b.markdown', 'office.docx', 'sheet.XLSX', 'sub/d.md', 'sub/deep/E.MD']);
         for (const f of result) {
             assert.equal(f.name, path.basename(f.path));
             assert.equal(f.size, fs.statSync(f.path).size);
         }
+    });
+
+    test('传入 exts 时只收集指定扩展名（大小写不敏感，可省略前导点）', async () => {
+        // Act
+        const onlyMd = await expandPaths([tree], ['.md']);
+        const officeOnly = await expandPaths([tree], ['docx', 'XLSX']);
+
+        // Assert
+        assert.deepEqual(onlyMd.map((f) => path.relative(tree, f.path)).sort(), ['a.md', 'sub/d.md', 'sub/deep/E.MD']);
+        assert.deepEqual(officeOnly.map((f) => f.name).sort(), ['office.docx', 'sheet.XLSX']);
+    });
+
+    test('exts 为空数组或非数组时回退到全部支持扩展名', async () => {
+        const withEmpty = await expandPaths([tree], []);
+        const withGarbage = await expandPaths([tree], 'not-array');
+        const expected = ['a.md', 'b.markdown', 'office.docx', 'sheet.XLSX', 'sub/d.md', 'sub/deep/E.MD'];
+        assert.deepEqual(withEmpty.map((f) => path.relative(tree, f.path)).sort(), expected);
+        assert.deepEqual(withGarbage.map((f) => path.relative(tree, f.path)).sort(), expected);
+    });
+
+    test('目录内的符号链接文件被解析后收集，不再静默跳过', async () => {
+        // Arrange：Dirent.isFile() 对符号链接为 false，需 stat 解析目标类型
+        writeFiles({ 'links/real/target.md': '# target' });
+        const alias = path.join(root, 'links', 'alias.md');
+        fs.symlinkSync(path.join(root, 'links', 'real', 'target.md'), alias);
+
+        // Act
+        const result = await expandPaths([path.join(root, 'links')]);
+
+        // Assert
+        assert.deepEqual(result.map((f) => f.name).sort(), ['alias.md', 'target.md']);
+        assert.equal(result.find((f) => f.name === 'alias.md').size, fs.statSync(alias).size);
+    });
+
+    test('目录符号链接成环时不重复进入、不死循环', async () => {
+        // Arrange：cycle/inner/back → cycle，构成自引用
+        writeFiles({ 'cycle/inner/x.md': '# x' });
+        fs.symlinkSync(path.join(root, 'cycle'), path.join(root, 'cycle', 'inner', 'back'));
+
+        // Act
+        const result = await expandPaths([path.join(root, 'cycle')]);
+
+        // Assert
+        assert.deepEqual(result.map((f) => f.name), ['x.md']);
     });
 
     test('文件路径原样返回（不按扩展名过滤），带 name 与 size', async () => {
@@ -102,6 +152,57 @@ describe('expandPaths', () => {
 
         const result = await expandPaths([path.join(root, 'many')]);
         assert.equal(result.length, 500);
+    });
+
+    test('入参数组超过上限时先截断，超出部分不再被 stat 或展开', async () => {
+        // Arrange：前 500 项是不存在的占位路径，真实文件排在截断线之外
+        const padding = Array.from({ length: MAX_SCAN_FILES }, (_, i) => path.join(root, `absent-${i}.md`));
+        const beyond = path.join(root, 'tree', 'a.md');
+
+        // Act
+        const result = await expandPaths([...padding, beyond]);
+
+        // Assert：若未截断则会返回 a.md，返回空数组即证明第 501 项未被处理
+        assert.deepEqual(result, []);
+        assert.equal(fs.existsSync(beyond), true, '截断线外的文件本身确实存在');
+    });
+});
+
+// ============================================================
+// open-path 白名单
+// ============================================================
+
+describe('isOpenablePath', () => {
+    const dir = path.join(root, 'openable');
+    writeFiles({
+        'openable/doc.md': '# md',
+        'openable/data.json': '{}',
+        'openable/report.DOCX': 'docx',
+        'openable/report.pdf': '%PDF-1.4',
+        'openable/script.sh': 'echo 1',
+        'openable/noext': 'x',
+    });
+    fs.mkdirSync(path.join(dir, 'Some.app'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'plain-dir'), { recursive: true });
+
+    test('放行 .md/.json/.docx/.pdf 文件（扩展名大小写不敏感）', async () => {
+        for (const name of ['doc.md', 'data.json', 'report.DOCX', 'report.pdf']) {
+            assert.equal(await isOpenablePath(path.join(dir, name)), true, `${name} 应被放行`);
+        }
+    });
+
+    test('拒绝白名单外的扩展名、无扩展名文件与不存在的路径', async () => {
+        assert.equal(await isOpenablePath(path.join(dir, 'script.sh')), false);
+        assert.equal(await isOpenablePath(path.join(dir, 'noext')), false);
+        assert.equal(await isOpenablePath(path.join(dir, 'no-such-file.md')), false);
+        assert.equal(await isOpenablePath('/etc/hosts'), false);
+    });
+
+    test('放行普通目录，拒绝 .app 应用包（含尾部分隔符形态）', async () => {
+        assert.equal(await isOpenablePath(path.join(dir, 'plain-dir')), true);
+        assert.equal(await isOpenablePath(dir), true);
+        assert.equal(await isOpenablePath(path.join(dir, 'Some.app')), false);
+        assert.equal(await isOpenablePath(`${path.join(dir, 'Some.app')}${path.sep}`), false);
     });
 });
 

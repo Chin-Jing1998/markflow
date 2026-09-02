@@ -3,31 +3,27 @@
  *
  * 契约：parse({ path }, ctx) → MarkFlowDocument，按绝对路径读取、不写盘。
  *
- * 用 pdfjs-dist 的 legacy ESM build（pdf.mjs，无 worker，Node 友好）：
- *   - 逐页 getTextContent() 拿文字块
- *   - 按 y 坐标分组成行（容差 2px），同行按 x 排
- *   - 行间字号阈值（基于全文档字号中位数 × 1.4）识别可能的小标题，输出 H3
- *   - 多页时每页前插入 H2 "第 N 页" 便于结构化
+ * 用 pdfjs-dist 的 legacy ESM build（pdf.mjs，无 worker，Node 友好）：逐页 getTextContent()
+ * 拿文字块，按 y 坐标分桶成行（桶宽 2px、桶内按 x 排），行间以字号阈值（全文档非空行字号
+ * 中位数 × 1.4）识别可能的小标题输出 H3，多页时每页前插入 H2 "第 N 页" 便于结构化。
+ * 解析结束后销毁 loadingTask，释放 pdfjs 持有的解析缓存。
  *
  * 不做图片提取与表格识别（pdfjs operatorList 解析复杂度高），assets 恒为空数组。
  * data 只保留页数等轻量元信息，不再快照整页文本 —— 否则 JSON 输出体积翻倍。
  */
 const fsp = require('fs').promises;
 const path = require('path');
-const {
-    createDocument,
-    createRoot,
-    createHeading,
-    createParagraph,
-} = require('../ir/schema');
+const { createDocument, createRoot, createHeading, createParagraph } = require('../ir/schema');
 const { stripExt } = require('../ir/util');
 
 /** 行分组的 y 坐标容差（PDF 用户空间单位） */
 const LINE_Y_TOLERANCE = 2;
-/** 小标题判定：字号 ≥ 全文中位数 × 该系数 */
+/** 小标题判定：字号 ≥ 全文中位数 × 该系数，且文本长度小于该上限 */
 const HEADING_FONT_RATIO = 1.4;
-/** 小标题判定：文本长度上限（过长的大字号行按正文处理） */
 const HEADING_MAX_LENGTH = 80;
+// 进度百分比区间：parser 只报 parsing 阶段，按已解析页数比例映射到该区间
+const PROGRESS_MIN = 20;
+const PROGRESS_MAX = 55;
 
 let pdfjsLib = null;
 
@@ -44,19 +40,29 @@ async function loadPdfjs() {
  * @param {{ sourceName?: string, onProgress?: Function }} [ctx]
  */
 async function parse(input, ctx = {}) {
-    const absPath = resolveInputPath(input);
+    if (!input || typeof input.path !== 'string' || !input.path) {
+        throw new Error('parsers/pdf 需要 input.path（文件绝对路径）');
+    }
+    const absPath = path.resolve(input.path);
     const sourceName = ctx.sourceName || path.basename(absPath);
 
     const buffer = await fsp.readFile(absPath);
     const pdfjs = await loadPdfjs();
-
     const loadingTask = pdfjs.getDocument({
         data: new Uint8Array(buffer),
         disableFontFace: true,
         useSystemFonts: true,
     });
-    const pdf = await loadingTask.promise;
+    try {
+        return await buildDocument(await loadingTask.promise, { sourceName, ctx });
+    } finally {
+        // 不释放的话 pdfjs 会把整份文档的解析缓存留在内存里，批量转换时逐份累积
+        await loadingTask.destroy().catch(() => {});
+    }
+}
 
+/** 逐页取文本 → 行 → IR；与文档生命周期解耦，便于在 finally 里统一释放 loadingTask */
+async function buildDocument(pdf, { sourceName, ctx }) {
     const numPages = pdf.numPages;
     const pagesData = [];
     const allFontSizes = [];
@@ -65,106 +71,70 @@ async function parse(input, ctx = {}) {
     for (let i = 1; i <= numPages; i++) {
         const page = await pdf.getPage(i);
         const textContent = await page.getTextContent();
-        const lines = groupByLine(textContent.items);
-        const lineRecords = lines
+        const lines = groupByLine(textContent.items)
             .map((line) => {
                 const text = line.map((it) => it.str).join('').trim();
-                const avgSize =
-                    line.reduce((sum, it) => sum + Math.abs(it.transform[0]), 0) /
-                    Math.max(line.length, 1);
-                allFontSizes.push(avgSize);
+                const avgSize = line.reduce((sum, it) => sum + Math.abs(it.transform[0]), 0)
+                    / Math.max(line.length, 1);
                 return { text, fontSize: avgSize };
             })
             .filter((r) => r.text);
-        pagesData.push({ pageNum: i, lines: lineRecords });
-        notify(ctx, 'parse', Math.round((i / numPages) * 100));
+        // 空行的字号不参与中位数，否则空白行会把阈值拉偏
+        for (const line of lines) allFontSizes.push(line.fontSize);
+        pagesData.push({ pageNum: i, lines });
+        notify(ctx, 'parsing', PROGRESS_MIN + Math.round((i / numPages) * (PROGRESS_MAX - PROGRESS_MIN)));
     }
 
-    // 字号阈值：中位数 × 1.4
+    // 第二遍：按字号阈值（中位数 × 1.4）区分小标题与正文，构建 IR
     const headingFontSizeThreshold = computeMedian(allFontSizes) * HEADING_FONT_RATIO;
+    const isHeading = (line) => headingFontSizeThreshold > 0
+        && line.fontSize >= headingFontSizeThreshold
+        && line.text.length < HEADING_MAX_LENGTH;
 
-    // 构建 IR
     const ir = createRoot();
     for (const page of pagesData) {
-        if (numPages > 1) {
-            ir.children.push(createHeading(2, `第 ${page.pageNum} 页`));
-        }
+        if (numPages > 1) ir.children.push(createHeading(2, `第 ${page.pageNum} 页`));
         for (const line of page.lines) {
-            if (
-                headingFontSizeThreshold > 0 &&
-                line.fontSize >= headingFontSizeThreshold &&
-                line.text.length < HEADING_MAX_LENGTH
-            ) {
-                ir.children.push(createHeading(3, line.text));
-            } else {
-                ir.children.push(createParagraph(line.text));
-            }
+            ir.children.push(isHeading(line) ? createHeading(3, line.text) : createParagraph(line.text));
         }
     }
 
-    // PDF 内嵌元数据（无则回退文件名）
-    let pdfMeta = null;
-    try {
-        const m = await pdf.getMetadata();
-        pdfMeta = m && m.info ? m.info : null;
-    } catch (e) {
-        pdfMeta = null;
-    }
-
+    // PDF 内嵌元数据（读取失败或缺失时回退文件名）
+    const pdfMeta = await Promise.resolve()
+        .then(() => pdf.getMetadata())
+        .then((m) => (m && m.info) || null, () => null);
     const embeddedTitle = pdfMeta && (pdfMeta.Title || pdfMeta.title);
-    const title = (embeddedTitle && String(embeddedTitle).trim()) || stripExt(sourceName);
 
     return createDocument({
         kind: 'document',
         ir,
-        data: {
-            numPages,
-            pageLineCounts: pagesData.map((p) => p.lines.length),
-            metadata: pdfMeta,
+        data: { numPages, pageLineCounts: pagesData.map((p) => p.lines.length), metadata: pdfMeta },
+        meta: {
+            title: (embeddedTitle && String(embeddedTitle).trim()) || stripExt(sourceName),
+            sourceType: 'pdf',
+            sourceName,
         },
-        meta: { title, sourceType: 'pdf', sourceName },
         assets: [],
         warnings: [],
     });
 }
 
-// ============================================================
-// 输入与文本处理
-// ============================================================
-
-function resolveInputPath(input) {
-    if (input && typeof input.path === 'string' && input.path) {
-        return path.resolve(input.path);
-    }
-    throw new Error('parsers/pdf 需要 input.path（文件绝对路径）');
-}
-
-// 按 y 坐标分组成行（PDF 坐标系：y 大的在上方）
+/**
+ * 按 y 坐标分桶成行（PDF 坐标系：y 大的在上方），桶内按 x 升序。
+ * 不用「相邻比较 + 容差」的比较器排序：那种比较器不满足传递性（a≈b、b≈c 但 a≢c），
+ * 排序结果依赖实现细节，会把同页文字排乱。先按 round(y / tolerance) 分桶即可保证稳定。
+ */
 function groupByLine(items, tolerance = LINE_Y_TOLERANCE) {
-    const sorted = [...items].sort((a, b) => {
-        const ya = a.transform[5];
-        const yb = b.transform[5];
-        if (Math.abs(ya - yb) > tolerance) return yb - ya;
-        return a.transform[4] - b.transform[4];
-    });
-
-    const lines = [];
-    let currentLine = [];
-    let currentY = null;
-    for (const item of sorted) {
+    const buckets = new Map();
+    for (const item of items) {
         if (!item.str) continue;
-        const y = item.transform[5];
-        if (currentY === null || Math.abs(y - currentY) <= tolerance) {
-            currentLine.push(item);
-            currentY = y;
-        } else {
-            if (currentLine.length) lines.push(currentLine);
-            currentLine = [item];
-            currentY = y;
-        }
+        const key = Math.round(item.transform[5] / tolerance);
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(item);
     }
-    if (currentLine.length) lines.push(currentLine);
-    return lines;
+    return [...buckets.keys()]
+        .sort((a, b) => b - a)
+        .map((key) => buckets.get(key).sort((a, b) => a.transform[4] - b.transform[4]));
 }
 
 function computeMedian(nums) {
@@ -176,12 +146,9 @@ function computeMedian(nums) {
 
 // 进度回调异常不得影响解析
 function notify(ctx, phase, pct) {
-    if (!ctx || typeof ctx.onProgress !== 'function') return;
     try {
-        ctx.onProgress(phase, pct);
-    } catch (err) {
-        // 忽略调用方回调自身的异常
-    }
+        if (ctx && typeof ctx.onProgress === 'function') ctx.onProgress(phase, pct);
+    } catch (err) { /* 忽略调用方回调自身的异常 */ }
 }
 
 module.exports = { parse };

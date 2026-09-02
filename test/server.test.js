@@ -207,7 +207,7 @@ describe('POST /api/convert 入参校验', () => {
         ['items 为空数组', { items: [] }, /items 必须是非空数组/],
         ['items 缺失', {}, /items 必须是非空数组/],
         ['相对路径', { items: [{ path: 'relative.md', target: 'docx' }] }, /^第 1 项：路径必须是绝对路径/],
-        ['文件不存在', { items: [{ path: '/nonexistent/a.md', target: 'docx' }] }, /^第 1 项：文件不存在/],
+        ['文件不存在', { items: [{ path: '/nonexistent/a.md', target: 'docx' }] }, /^第 1 项：输入不可用/],
         ['目标与输入类型不匹配', { items: [{ path: SAMPLE_MD, target: 'bundle' }] }, /^第 1 项：md 输入只能转为/],
         ['本机地址 URL', { items: [{ url: 'http://127.0.0.1/', target: 'bundle' }] }, /^第 1 项：/],
         ['path 与 url 同时缺失', { items: [{ target: 'docx' }] }, /^第 1 项：path 与 url 必须二选一/],

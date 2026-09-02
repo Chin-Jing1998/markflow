@@ -4,13 +4,11 @@
  * 职责：在 Electron 主进程内复用内嵌 Chromium 的 webContents.printToPDF 把 HTML 渲染为 PDF。
  * 流程：HTML 写入 os.tmpdir() 下的 markflow-pdf-<随机> 目录内 index.html → 隐藏 BrowserWindow.loadFile →
  *       等待 did-finish-load 与 document.fonts.ready → printToPDF → finally 删除临时目录。
- * 约束：
- *   - 非 Electron 进程内（require('electron') 为路径字符串或抛错）isAvailable() 返回 false 且不抛异常；
- *   - 串行队列保证同一时刻只有一个隐藏窗口；
- *   - 模块加载时异步清理 os.tmpdir() 下修改时间超过 1 天的 markflow-pdf-* 残留目录。
+ * 约束：非 Electron 进程内（require('electron') 为路径字符串或抛错）isAvailable() 返回 false 且不抛异常；
+ *       串行队列保证同一时刻只有一个隐藏窗口；模块加载时异步清理 os.tmpdir() 下修改时间超过 1 天的
+ *       markflow-pdf-* 残留目录。
  */
-const fs = require('fs');
-const fsp = fs.promises;
+const fsp = require('fs').promises;
 const os = require('os');
 const path = require('path');
 
@@ -23,38 +21,28 @@ const FONTS_READY_SCRIPT = 'document.fonts.ready.then(() => true)';
 
 const electron = loadElectronMain();
 let printQueue = Promise.resolve();
+const noop = () => undefined;
 
 /** 仅当 require('electron') 返回带 app/BrowserWindow 的模块对象时视为主进程 */
 function loadElectronMain() {
     try {
         const mod = require('electron');
         return mod && typeof mod === 'object' && mod.app && mod.BrowserWindow ? mod : null;
-    } catch (err) {
-        return null;
-    }
+    } catch (err) { return null; }
 }
 
 function isAvailable() {
     return electron !== null;
 }
 
-/**
- * @param {string} html 完整 HTML 文档
- * @param {{ pageSize?: string, landscape?: boolean, margins?: object }} [options]
- * @returns {Promise<Buffer>}
- */
+/** @param {string} html 完整 HTML 文档 @param {{ pageSize?, landscape?, margins? }} [options] @returns {Promise<Buffer>} */
 async function printToPdf(html, options = {}) {
-    if (!isAvailable()) {
-        throw new Error('PDF 打印不可用：当前进程不是 Electron 主进程。');
-    }
+    if (!isAvailable()) throw new Error('PDF 打印不可用：当前进程不是 Electron 主进程。');
     if (typeof html !== 'string') throw new Error('printToPdf 需要 HTML 字符串');
 
     const task = () => doPrint(html, options);
     const run = printQueue.then(task, task);
-    printQueue = run.then(
-        () => undefined,
-        () => undefined,
-    );
+    printQueue = run.then(noop, noop);
     return run;
 }
 
@@ -73,10 +61,16 @@ async function doPrint(html, options) {
         const htmlPath = path.join(tmpDir, 'index.html');
         await fsp.writeFile(htmlPath, html, 'utf8');
         await loadAndWait(win, htmlPath);
-        return await win.webContents.printToPDF(buildPrintOptions(options));
+        return await win.webContents.printToPDF({
+            printBackground: true,
+            pageSize: options.pageSize || DEFAULT_PAGE_SIZE,
+            landscape: !!options.landscape,
+            margins: options.margins || DEFAULT_MARGINS,
+            preferCSSPageSize: true,
+        });
     } finally {
         if (!win.isDestroyed()) win.destroy();
-        await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+        await fsp.rm(tmpDir, { recursive: true, force: true }).catch(noop);
     }
 }
 
@@ -90,21 +84,8 @@ async function loadAndWait(win, htmlPath) {
         });
     });
     await Promise.all([win.loadFile(htmlPath), loaded]);
-    try {
-        await webContents.executeJavaScript(FONTS_READY_SCRIPT, true);
-    } catch (err) {
-        // 字体就绪等待失败不阻断打印
-    }
-}
-
-function buildPrintOptions(options = {}) {
-    return {
-        printBackground: true,
-        pageSize: options.pageSize || DEFAULT_PAGE_SIZE,
-        landscape: !!options.landscape,
-        margins: options.margins || DEFAULT_MARGINS,
-        preferCSSPageSize: true,
-    };
+    // 字体就绪等待失败（含 webContents 已销毁的同步抛错）不阻断打印
+    try { await webContents.executeJavaScript(FONTS_READY_SCRIPT, true); } catch (err) { /* 忽略 */ }
 }
 
 /**
@@ -113,13 +94,7 @@ function buildPrintOptions(options = {}) {
  */
 async function cleanupStaleTempDirs(now = Date.now()) {
     const base = os.tmpdir();
-    let names = [];
-    try {
-        names = await fsp.readdir(base);
-    } catch (err) {
-        return 0;
-    }
-
+    const names = await fsp.readdir(base).catch(() => []);
     let removed = 0;
     for (const name of names) {
         if (!name.startsWith(TEMP_PREFIX)) continue;
@@ -136,6 +111,6 @@ async function cleanupStaleTempDirs(now = Date.now()) {
     return removed;
 }
 
-cleanupStaleTempDirs().catch(() => undefined);
+cleanupStaleTempDirs().catch(noop);
 
 module.exports = { printToPdf, isAvailable, _cleanupStaleTempDirs: cleanupStaleTempDirs };

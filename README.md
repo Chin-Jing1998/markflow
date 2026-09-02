@@ -127,7 +127,7 @@ args = ["/绝对路径/mcp/server.js"]
 
 ## HTTP API
 
-服务默认仅监听 `127.0.0.1`，随机分配端口；全部 `/api/*` 端点须携带请求头 `X-MarkFlow-Token`。
+服务默认仅监听 `127.0.0.1`，随机分配端口；全部 `/api/*` 端点须携带请求头 `X-MarkFlow-Token`。令牌于每次启动时随机生成：`markflow serve` 会把地址与令牌打印到 stderr，供脚本自行携带；桌面端则由 Electron 主进程在请求发出前注入该请求头，页面代码不接触令牌。
 
 | 方法与路径 | 说明 |
 |---|---|
@@ -148,9 +148,12 @@ PDF 渲染按以下顺序选择后端：
 ## 安全说明
 
 - HTTP 服务仅绑定本机回环地址，并使用每次启动时生成的令牌进行鉴权。
+- 桌面端的访问令牌由主进程在 `webRequest` 层为 `/api/*` 请求注入请求头，既不写入命令行参数（同机其他进程可读），也不下发给渲染进程；渲染进程无从读取令牌，即便伪造该请求头也会被主进程覆盖。
 - 静态资源仅开放 `index.html`、`css/`、`js/`、`assets/` 四处，其余路径一律 404。
 - 网页抓取内置 SSRF 守卫：拒绝解析到内网或保留网段的地址，限制页面正文不超过 20 MB、单张图片不超过 10 MB。
 - Markdown 中的原始 HTML 标签在转换为 docx、pdf 时只保留其文本内容。
+- PDF 打印页面启用 CSP（`default-src 'none'; img-src file: data:`）。Markdown 中的图片只允许引用文档所在目录内的本地文件；远程与内网图片不进入打印页面，仅保留 `alt` 文本占位，因此隐藏的打印窗口不会向任何地址发起请求。
+- 桌面端「打开」操作限定于转换产物：仅放行 `.md`、`.json`、`.docx`、`.pdf` 文件与普通目录，`.app` 应用包及其他类型一律拒绝。
 - 桌面端界面启用 CSP（`default-src 'self'`），不加载任何外部资源。
 
 ## 目录结构
@@ -183,7 +186,7 @@ PDF 渲染按以下顺序选择后端：
 ```bash
 npm ci                # 安装依赖
 npm run electron       # 启动桌面端
-npm test               # 运行测试（node:test，275 项）
+npm test               # 运行测试（node:test，306 项）
 npm run build:mac      # 打包 macOS 安装包
 npm run build:win      # 打包 Windows 安装包
 ```
