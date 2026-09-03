@@ -1,6 +1,6 @@
 {
   "name": "markflow",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MarkFlow - 知识库文件转换命令行工具（CLI + MCP）：办公文档/PDF/网页 → Markdown+JSON+图片；Markdown → DOCX/PDF",
   "bin": {
     "markflow": "bin/markflow.js"
