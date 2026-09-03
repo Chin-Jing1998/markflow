@@ -1,6 +1,10 @@
 # MarkFlow
 
+**v2.0.0**
+
 知识库文件转换命令行工具。把办公文档、PDF 与网页转成 Markdown 知识库包，把 Markdown 转回 Word 或 PDF。提供命令行与 MCP 两种用法，供人直接调用，也供 Claude Code、Codex 等 agent 直接操作。
+
+v1.0.0 是带图形界面的 Electron 桌面应用，自 v2.0.0 起改为纯命令行工具：桌面界面与 HTTP 服务已移除，输出格式矩阵按下表固定，不再支持任意格式互转。完整变更见 [v2.0.0 Release](https://github.com/Chin-Jing1998/markflow/releases/tag/v2.0.0)。
 
 ## 功能一览
 
