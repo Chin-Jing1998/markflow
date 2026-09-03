@@ -1,11 +1,8 @@
 # 依赖
 node_modules/
 
-# 临时输出文件
-output/
-
-# 历史遗留：早期 electron-builder 打包产物，桌面端已移除，可安全删除
-dist/
+# 测试产物：test/{output,index,util}.test.js 以此为落盘根目录
+test/tmp/
 
 # 系统文件
 .DS_Store
@@ -21,4 +18,3 @@ Thumbs.db
 # 环境变量
 .env
 .env.local
-test/tmp/
