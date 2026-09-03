@@ -1,7 +1,7 @@
 /**
- * converters/pdf/backend.js 与 electron/pdf-printer.js 单元测试
- * 覆盖：非 Electron 进程内打印器不可用、本机探测（electron-worker）、真实工作进程出图、
- *       注入 mock 的 electron 主进程/soffice 分支、三级皆无时的中文错误、工作进程异常与超时、
+ * converters/pdf/backend.js 单元测试
+ * 覆盖：本机探测（electron-worker）、真实工作进程出图、注入 mock 的 soffice 分支、
+ *       两级皆无时的中文错误、工作进程异常与超时、
  *       错误文案脱敏（仅首行 + 路径替换为 <path>）、残留临时目录清理
  */
 const { test, afterEach } = require('node:test');
@@ -12,7 +12,6 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 
 const backend = require('../converters/pdf/backend');
-const printer = require('../electron/pdf-printer');
 
 const MOCK_PDF = Buffer.from('%PDF-1.4 mock-pdf');
 const MOCK_DOCX = Buffer.from('PKmock-docx');
@@ -45,15 +44,6 @@ function countWorkerTempDirs() {
     return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('markflow-pdf-worker-')).length;
 }
 
-function unavailablePrinter() {
-    return {
-        isAvailable: () => false,
-        printToPdf: async () => {
-            throw new Error('printer 不应被调用');
-        },
-    };
-}
-
 function unavailableSoffice() {
     return {
         isAvailable: async () => false,
@@ -78,12 +68,7 @@ function fakeChild() {
 // 用例
 // ============================================================
 
-test('非 Electron 进程内 pdf-printer.isAvailable() 为 false 且 printToPdf 拒绝', async () => {
-    assert.equal(printer.isAvailable(), false);
-    await assert.rejects(() => printer.printToPdf('<p>x</p>'), /Electron 主进程/);
-});
-
-test('本机探测：存在 electron 二进制且非主进程时返回 electron-worker', async (t) => {
+test('本机探测：存在 electron 二进制时返回 electron-worker', async (t) => {
     if (!getElectronPath()) {
         t.skip('本机未安装 electron 二进制');
         return;
@@ -91,7 +76,6 @@ test('本机探测：存在 electron 二进制且非主进程时返回 electron-
     const result = await backend.detect();
     assert.equal(result.name, 'electron-worker');
     assert.equal(result.available, true);
-    assert.equal(backend.isAvailableSync(), true);
 });
 
 test('electron-worker 真实出图：返回 %PDF 开头的 Buffer 并清理临时目录', { timeout: WORKER_TEST_TIMEOUT_MS }, async (t) => {
@@ -115,36 +99,6 @@ test('electron-worker 真实出图：返回 %PDF 开头的 Buffer 并清理临�
     assert.equal(countWorkerTempDirs(), before, '工作进程临时目录应被清理');
 });
 
-test('Electron 主进程后端优先：printer 可用时直接打印，不触碰其他后端', async () => {
-    // Arrange
-    const printed = [];
-    backend._setDeps({
-        printer: {
-            isAvailable: () => true,
-            printToPdf: async (html) => {
-                printed.push(html);
-                return MOCK_PDF;
-            },
-        },
-        electronPath: null,
-        soffice: {
-            isAvailable: async () => {
-                throw new Error('不应探测 soffice');
-            },
-            getInstallHint: () => '',
-        },
-    });
-
-    // Act
-    const detected = await backend.detect();
-    const pdf = await backend.renderPdf({ html: '<p>主进程</p>' });
-
-    // Assert
-    assert.deepEqual(detected, { name: 'electron', available: true, hint: '' });
-    assert.deepEqual(printed, ['<p>主进程</p>']);
-    assert.equal(pdf, MOCK_PDF);
-});
-
 test('soffice 分支：调用 getDocxBuffer，写入 DOCX 后经 convertFile 得到 PDF', async () => {
     // Arrange
     const calls = [];
@@ -158,7 +112,7 @@ test('soffice 分支：调用 getDocxBuffer，写入 DOCX 后经 convertFile 得
             return outPath;
         },
     };
-    backend._setDeps({ printer: unavailablePrinter(), electronPath: null, soffice });
+    backend._setDeps({ electronPath: null, soffice });
     let docxCalls = 0;
     const getDocxBuffer = async () => {
         docxCalls += 1;
@@ -181,9 +135,9 @@ test('soffice 分支：调用 getDocxBuffer，写入 DOCX 后经 convertFile 得
     assert.equal(fs.existsSync(calls[0].inputPath), false, 'soffice 临时目录应被清理');
 });
 
-test('三级后端皆不可用时抛中文错误并附安装提示', async () => {
+test('两级后端皆不可用时抛中文错误并附安装提示', async () => {
     // Arrange
-    backend._setDeps({ printer: unavailablePrinter(), electronPath: null, soffice: unavailableSoffice() });
+    backend._setDeps({ electronPath: null, soffice: unavailableSoffice() });
 
     // Act
     const detected = await backend.detect();
@@ -192,7 +146,6 @@ test('三级后端皆不可用时抛中文错误并附安装提示', async () =>
     assert.equal(detected.name, null);
     assert.equal(detected.available, false);
     assert.ok(detected.hint.includes('MOCK_HINT_INSTALL'));
-    assert.equal(backend.isAvailableSync(), false);
     await assert.rejects(
         () => backend.renderPdf({ html: '<p>x</p>', getDocxBuffer: async () => MOCK_DOCX }),
         (err) => err.message.includes('PDF 输出不可用') && err.message.includes('MOCK_HINT_INSTALL'),
@@ -203,7 +156,6 @@ test('工作进程退出异常时抛出含退出码与 stderr 摘要的错误', 
     // Arrange
     const spawnCalls = [];
     backend._setDeps({
-        printer: unavailablePrinter(),
         electronPath: process.execPath,
         soffice: unavailableSoffice(),
         spawn: (file, args, options) => {
@@ -224,7 +176,7 @@ test('工作进程退出异常时抛出含退出码与 stderr 摘要的错误', 
     );
     assert.equal(spawnCalls.length, 1);
     assert.equal(spawnCalls[0].file, process.execPath);
-    assert.ok(spawnCalls[0].args[0].endsWith(path.join('electron', 'pdf-worker.js')));
+    assert.ok(spawnCalls[0].args[0].endsWith(path.join('pdf', 'electron-worker.js')));
     assert.ok(spawnCalls[0].args[1].endsWith('index.html'));
     assert.ok(spawnCalls[0].args[2].endsWith('output.pdf'));
     assert.equal(Object.prototype.hasOwnProperty.call(spawnCalls[0].options.env, 'ELECTRON_RUN_AS_NODE'), false);
@@ -234,14 +186,13 @@ test('用户可见错误只取 stderr 首行并把绝对路径脱敏为 <path>�
     // Arrange：真实崩溃时 stderr 是带绝对路径的多行调用栈
     const rawStderr = [
         "[pdf-worker] Error: ENOENT: no such file or directory, open '/Users/someone/编程项目工作站/知识库文件转换程序/tmp/index.html'",
-        '    at printFile (/Users/someone/编程项目工作站/知识库文件转换程序/electron/pdf-worker.js:63:39)',
-        '    at async main (/Users/someone/编程项目工作站/知识库文件转换程序/electron/pdf-worker.js:79:5)',
+        '    at printFile (/Users/someone/编程项目工作站/知识库文件转换程序/converters/pdf/electron-worker.js:63:39)',
+        '    at async main (/Users/someone/编程项目工作站/知识库文件转换程序/converters/pdf/electron-worker.js:79:5)',
     ].join('\n');
     const logged = [];
     const originalError = console.error;
     console.error = (...args) => logged.push(args.join(' '));
     backend._setDeps({
-        printer: unavailablePrinter(),
         electronPath: process.execPath,
         soffice: unavailableSoffice(),
         spawn: () => {
@@ -270,7 +221,7 @@ test('用户可见错误只取 stderr 首行并把绝对路径脱敏为 <path>�
     assert.ok(message.includes('ENOENT: no such file or directory'), '保留首行的原因说明');
     assert.ok(!message.includes('    at '), '不得带调用栈');
     assert.ok(!message.includes('/Users/someone'), '不得泄露绝对路径');
-    assert.ok(!message.includes('pdf-worker.js:63'), '不得泄露源码行号');
+    assert.ok(!message.includes('electron-worker.js:63'), '不得泄露源码行号');
     assert.ok(message.includes('<path>'), '路径应替换为 <path> 占位');
     assert.equal(logged.length, 1, '完整 stderr 应写一次日志');
     assert.ok(logged[0].includes('/Users/someone'), '日志侧保留完整路径以便排障');
@@ -280,7 +231,6 @@ test('工作进程超时被强制结束并抛出超时错误', async () => {
     // Arrange
     let child;
     backend._setDeps({
-        printer: unavailablePrinter(),
         electronPath: process.execPath,
         soffice: unavailableSoffice(),
         workerTimeoutMs: 50,
@@ -295,7 +245,7 @@ test('工作进程超时被强制结束并抛出超时错误', async () => {
     assert.equal(child.killed, true, '超时后应 kill 子进程');
 });
 
-test('pdf-printer 清理超过 1 天的 markflow-pdf-* 残留目录，保留新目录', async () => {
+test('backend 清理超过 1 天的 markflow-pdf-* 残留目录，保留新目录', async () => {
     // Arrange
     const stale = fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-pdf-stale-'));
     const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-pdf-fresh-'));
@@ -304,7 +254,7 @@ test('pdf-printer 清理超过 1 天的 markflow-pdf-* 残留目录，保留新�
 
     try {
         // Act
-        const removed = await printer._cleanupStaleTempDirs();
+        const removed = await backend._cleanupStaleTempDirs();
 
         // Assert
         assert.ok(removed >= 1);

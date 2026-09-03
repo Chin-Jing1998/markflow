@@ -1,12 +1,13 @@
 /**
- * PDF 出图后端（三级回退）：把 HTML（必要时改用 DOCX）渲染为 PDF Buffer，
+ * PDF 出图后端（两级回退）：把 HTML（必要时改用 DOCX）渲染为 PDF Buffer，
  * 按运行环境依次尝试 BACKENDS 候选表：
- *   ① electron        —— 当前进程就是 Electron 主进程，直接用 electron/pdf-printer 打印；
- *   ② electron-worker —— 普通 Node 进程但项目内装有 electron 二进制，spawn 独立 Electron
- *                        运行 electron/pdf-worker.js 打印（串行排队，超时 60s）；
- *   ③ soffice         —— 本机装有 LibreOffice，先由 getDocxBuffer 生成 DOCX，再 soffice 转 PDF；
- *   ④ 三者皆无        —— 抛中文错误并附安装/使用提示。
+ *   ① electron-worker —— 项目内装有 electron 二进制，spawn 独立 Electron 无界面运行
+ *                        converters/pdf/electron-worker.js 打印（串行排队，超时 60s）；
+ *   ② soffice         —— 本机装有 LibreOffice，先由 getDocxBuffer 生成 DOCX，再 soffice 转 PDF；
+ *   ③ 二者皆无        —— 抛中文错误并附安装/使用提示。
  * 探测结果缓存：成功永久缓存，失败缓存 60s 后可重探；detect({ force:true }) 强制重探。
+ * 模块加载时异步清理 os.tmpdir() 下修改时间超过 1 天的 markflow-pdf-* 残留目录
+ * （上次异常退出遗留的工作目录，正常路径已在 finally 中清理）。
  * 依赖可经 _setDeps 注入以便测试，_reset 恢复真实实现并清空缓存。
  */
 const fs = require('fs');
@@ -18,12 +19,13 @@ const { spawn } = require('child_process');
 const WORKER_TIMEOUT_MS = 60000;
 const DETECT_FAILURE_TTL_MS = 60000;
 const TEMP_PREFIX = 'markflow-pdf-';
+const STALE_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const STDERR_KEEP_LIMIT = 4096;
 const STDERR_EXCERPT_LIMIT = 500;
 /** POSIX 风格绝对路径（连续的 /段）；用于把 stderr 摘要中的本机路径脱敏为 <path> */
 const ABSOLUTE_PATH_RE = /(?:\/[^\s/]+)+/g;
 const PDF_MAGIC = '%PDF';
-const WORKER_SCRIPT = path.join(__dirname, '..', '..', 'electron', 'pdf-worker.js');
+const WORKER_SCRIPT = path.join(__dirname, 'electron-worker.js');
 
 let overrides = {};
 let detectCache = null;
@@ -36,8 +38,7 @@ const attempt = (fn) => { try { return fn(); } catch (err) { return null; } };
 
 // ---- 依赖装载（可被 _setDeps 覆盖）与探测 ----
 
-const getPrinter = () => ('printer' in overrides ? overrides.printer : attempt(() => require('../../electron/pdf-printer')));
-const getSoffice = () => ('soffice' in overrides ? overrides.soffice : attempt(() => require('../../server/soffice')));
+const getSoffice = () => ('soffice' in overrides ? overrides.soffice : attempt(() => require('../soffice')));
 const getSpawn = () => (typeof overrides.spawn === 'function' ? overrides.spawn : spawn);
 const getWorkerScript = () => overrides.workerScript || WORKER_SCRIPT;
 const getWorkerTimeoutMs = () => (Number(overrides.workerTimeoutMs) > 0 ? Number(overrides.workerTimeoutMs) : WORKER_TIMEOUT_MS);
@@ -47,11 +48,6 @@ function getElectronPath() {
     if ('electronPath' in overrides) return overrides.electronPath;
     const mod = attempt(() => require('electron'));
     return typeof mod === 'string' && mod ? mod : null;
-}
-
-function isPrinterAvailable() {
-    const printer = getPrinter();
-    return !!attempt(() => printer && typeof printer.isAvailable === 'function' && printer.isAvailable());
 }
 
 function findElectronBinary() {
@@ -68,7 +64,6 @@ async function isSofficeAvailable() {
 
 /** 后端候选表：check 为真的首个候选胜出，其 run(html, { getDocxBuffer }) 负责出图 */
 const BACKENDS = [
-    { name: 'electron', check: () => isPrinterAvailable(), run: (html) => getPrinter().printToPdf(html) },
     { name: 'electron-worker', check: () => !!findElectronBinary(), run: (html) => renderViaWorker(html, findElectronBinary()) },
     { name: 'soffice', check: () => isSofficeAvailable(), run: (html, opts) => renderViaSoffice(opts.getDocxBuffer) },
 ];
@@ -84,14 +79,13 @@ function buildHint() {
         ? soffice.getInstallHint()
         : '前往 https://www.libreoffice.org/download/ 安装 LibreOffice';
     return 'PDF 输出需要以下任一环境：'
-        + '① 在 MarkFlow 桌面端（Electron）内运行；'
-        + '② 项目目录已安装 electron 依赖（执行 npm install 后自动可用）；'
-        + `③ 本机安装 LibreOffice（${sofficeHint}）。`;
+        + '① 项目目录已安装 electron 依赖（执行 npm install 后自动可用）；'
+        + `② 本机安装 LibreOffice（${sofficeHint}）。`;
 }
 
 /**
  * 探测可用后端（结果缓存）
- * @returns {Promise<{ name: 'electron'|'electron-worker'|'soffice'|null, available: boolean, hint: string }>}
+ * @returns {Promise<{ name: 'electron-worker'|'soffice'|null, available: boolean, hint: string }>}
  */
 async function detect({ force = false } = {}) {
     if (!force && detectCache && (detectCache.available || Date.now() - detectFailedAt < DETECT_FAILURE_TTL_MS)) {
@@ -103,11 +97,6 @@ async function detect({ force = false } = {}) {
     return detectCache;
 }
 
-/** 同步探测：覆盖能同步判定的 ①② 与已缓存的成功结果，供 server.js 之类的同步调用方使用 */
-function isAvailableSync() {
-    if (detectCache && detectCache.available) return true;
-    return isPrinterAvailable() || !!findElectronBinary();
-}
 
 /** @param {{ html: string, getDocxBuffer?: () => Promise<Buffer> }} params @returns {Promise<Buffer>} */
 async function renderPdf({ html, getDocxBuffer } = {}) {
@@ -126,7 +115,7 @@ function ensurePdf(output, backendName) {
     return buffer;
 }
 
-// ---- ② 独立 Electron 工作进程 ----
+// ---- ① 独立 Electron 工作进程 ----
 
 /** 串行排队：Electron 实例开销大，同一时刻只跑一个工作进程 */
 function renderViaWorker(html, electronPath) {
@@ -202,7 +191,7 @@ function excerpt(text) {
     return firstLine.replace(ABSOLUTE_PATH_RE, '<path>').slice(0, STDERR_EXCERPT_LIMIT);
 }
 
-// ---- ③ LibreOffice：DOCX → PDF ----
+// ---- ② LibreOffice：DOCX → PDF ----
 
 async function renderViaSoffice(getDocxBuffer) {
     if (typeof getDocxBuffer !== 'function') throw new Error('soffice 后端需要 getDocxBuffer 以先生成 DOCX');
@@ -219,7 +208,34 @@ async function renderViaSoffice(getDocxBuffer) {
     }
 }
 
-/** 覆盖依赖：{ printer, electronPath, soffice, spawn, workerScript, workerTimeoutMs }；传入后清空探测缓存 */
+// ---- 残留临时目录清理 ----
+
+/**
+ * 清理 os.tmpdir() 下修改时间超过 1 天的 markflow-pdf-* 目录（上次异常退出的残留）
+ * @returns {Promise<number>} 删除的目录数
+ */
+async function cleanupStaleTempDirs(now = Date.now()) {
+    const base = os.tmpdir();
+    const names = await fsp.readdir(base).catch(() => []);
+    let removed = 0;
+    for (const name of names) {
+        if (!name.startsWith(TEMP_PREFIX)) continue;
+        const full = path.join(base, name);
+        try {
+            const stat = await fsp.stat(full);
+            if (!stat.isDirectory() || now - stat.mtimeMs < STALE_TEMP_MAX_AGE_MS) continue;
+            await fsp.rm(full, { recursive: true, force: true });
+            removed += 1;
+        } catch (err) {
+            // 单个目录清理失败不影响其余
+        }
+    }
+    return removed;
+}
+
+cleanupStaleTempDirs().catch(noop);
+
+/** 覆盖依赖：{ electronPath, soffice, spawn, workerScript, workerTimeoutMs }；传入后清空探测缓存 */
 function _setDeps(next = {}) {
     overrides = { ...overrides, ...next };
     detectCache = null;
@@ -234,4 +250,7 @@ function _reset() {
     workerQueue = Promise.resolve();
 }
 
-module.exports = { detect, renderPdf, isAvailableSync, WORKER_TIMEOUT_MS, _setDeps, _reset };
+module.exports = {
+    detect, renderPdf,
+    _setDeps, _reset, _cleanupStaleTempDirs: cleanupStaleTempDirs,
+};

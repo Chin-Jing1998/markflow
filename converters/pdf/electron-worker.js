@@ -2,10 +2,10 @@
  * 独立 Electron PDF 工作进程
  *
  * 用法：Electron <本脚本> <in.html> <out.pdf> [userDataDir]
- * 由 converters/pdf/backend.js 在非 Electron 主进程环境下 spawn 调用：
+ * 由 converters/pdf/backend.js 在普通 Node 进程中 spawn 调用：
  * 隐藏窗口 loadFile 载入 HTML，等待加载与字体就绪后 printToPDF 写出到 out.pdf，
  * 成功 app.exit(0)；任何异常写 stderr 并 app.exit(1)。
- * 可选第三参数指定独立的 userData 目录，避免与桌面端或并行工作进程共用 Chromium profile。
+ * 可选第三参数指定独立的 userData 目录，避免并行工作进程共用 Chromium profile。
  */
 const { app, BrowserWindow } = require('electron');
 const fs = require('fs');
@@ -28,7 +28,7 @@ function parseArgs(argv) {
     const positional = argv.slice(2).filter((arg) => !String(arg).startsWith('--'));
     const [inPath, outPath, userDataDir] = positional;
     if (!inPath || !outPath) {
-        throw new Error('用法：Electron pdf-worker.js <in.html> <out.pdf> [userDataDir]');
+        throw new Error('用法：Electron electron-worker.js <in.html> <out.pdf> [userDataDir]');
     }
     return {
         inPath: path.resolve(inPath),

@@ -1,117 +1,99 @@
-<p align="center">
-  <img src="build/icon.png" alt="MarkFlow" width="128" height="128">
-</p>
+# MarkFlow
 
-<h1 align="center">MarkFlow</h1>
-
-<p align="center">
-  <b>知识库文件转换工具</b> —— Electron 桌面应用 + 命令行工具 + MCP 服务三合一
-</p>
-
-<p align="center">
-  <a href="#功能一览">功能一览</a> • <a href="#安装与运行">安装与运行</a> • <a href="#http-api">HTTP API</a> • <a href="#pdf-输出说明">PDF 输出</a> • <a href="#安全说明">安全说明</a> • <a href="#目录结构">目录结构</a> • <a href="#开发与测试">开发与测试</a> • <a href="#已知限制">已知限制</a> • <a href="#许可证">许可证</a>
-</p>
-
----
-
-MarkFlow 面向知识库建设场景，把办公文档、Markdown 文档与网页统一转换为结构化产物。三种使用方式共享同一套转换内核（`converters/`）：桌面应用提供图形界面与拖拽交互，命令行工具面向批处理与脚本集成，MCP 服务面向 Claude Code、Codex 等 agent 客户端。
+知识库文件转换命令行工具。把办公文档、PDF 与网页转成 Markdown 知识库包，把 Markdown 转回 Word 或 PDF。提供命令行与 MCP 两种用法，供人直接调用，也供 Claude Code、Codex 等 agent 直接操作。
 
 ## 功能一览
 
-| 输入类型 | 支持格式 | 输出产物 | 说明 |
-|---|---|---|---|
-| 办公文档 | `.docx` `.xlsx` `.pptx` `.pdf`；`.doc` `.xls` `.ppt` 需本机安装 LibreOffice | `{输出目录}/{名称}/{名称}.md` + `{名称}.json` + `images/` | docx、pptx 抽取内嵌图片；pdf、xlsx 不提取图片 |
-| 标记文档 | `.md` `.markdown`（桌面端可拖入文件夹，递归收集） | `{输出目录}/{名称}.docx` 或 `.pdf`（二选一） | 图片按 md 所在目录解析相对路径并内嵌；支持 GFM 表格、删除线、任务列表、代码块、引用块、超链接；井号后无空格的 `#标题` 也按标题处理 |
-| 网页链接 | 每行一个 URL，仅 `http://` `https://`，拒绝内网与本机地址 | 同办公文档的 bundle 产物 | 文章正文与图片下载后内嵌，图片存入 `images/` |
+三类输入，各自对应固定的产物形态。
 
-bundle 产物中的 JSON 结构固定为：
+| 输入 | 扩展名 | 产物 |
+|---|---|---|
+| 办公文档 | `.docx` `.xlsx` `.pptx` `.pdf`；`.doc` `.xls` `.ppt` 需 LibreOffice | `{输出目录}/{名称}/` 下的 `{名称}.md` + `{名称}.json` + `images/` |
+| 标记文档 | `.md` `.markdown` | `{输出目录}/{名称}.docx` 或 `{名称}.pdf`，二选一 |
+| 网页链接 | `http` / `https` | 同办公文档，文章图片一并下载到 `images/` |
 
-```json
-{
-  "schemaVersion": 1,
-  "kind": "document | workbook | presentation",
-  "ir": "<mdast 语法树>",
-  "data": "…",
-  "meta": { "title": "…", "sourceType": "…" }
-}
-```
+要点说明：
 
-### 桌面端界面
+- **图片**：Word 与 PowerPoint 的内嵌图片、网页文章的图片会被提取到 `images/` 并在 Markdown 中以相对路径引用。PDF 与 Excel 不提取图片。
+- **Markdown 转 Word 与 PDF**：支持 GFM 表格、删除线、任务列表、代码块、引用块与超链接；图片按 Markdown 文件所在目录解析相对路径并内嵌。井号后缺空格的 `#标题` 也按标题处理。
+- **JSON 产物**：结构为 `{ schemaVersion, kind, ir, data, meta }`，其中 `ir` 是 mdast 语法树，`kind` 取 `document`、`workbook` 或 `presentation`，便于后续程序化处理。
+- **同名产物直接覆盖**，重复转换结果幂等。
 
-左栏为三个 tab：办公文档、标记文档、网页链接；右栏为转换结果面板，逐项显示状态、输出路径、图片数、告警与错误，并提供「在 Finder 中显示」「打开」操作。设置中可选择输出目录（默认 `~/Documents/MarkFlow`，设置持久化在 `~/.markflow/settings.json`）与外观主题（跟随系统 / 浅色 / 深色，默认跟随系统）。界面不加载任何远程资源。
+## 安装
 
-## 安装与运行
-
-环境要求：Node.js ≥ 22。
+要求 Node.js 22 或更高版本。
 
 ```bash
-git clone <本仓库地址>
-cd 知识库文件转换程序
 npm ci
 ```
 
-### 桌面端
+仓库内可直接用 `node bin/markflow.js`，或 `npm link` 后全局使用 `markflow` 命令。
+
+可选依赖两项，缺失时相关功能自动降级并给出提示：
+
+- **Electron**：用作 PDF 输出的排版引擎，随 `npm ci` 一并安装。
+- **LibreOffice**：转换 `.doc`、`.xls`、`.ppt` 三种旧二进制格式必需；同时作为 PDF 输出的备用后端。macOS 用 `brew install --cask libreoffice` 安装。
+
+## 命令行
 
 ```bash
-npm run electron
+markflow convert <输入...> [--to bundle|docx|pdf] [--out <目录>] [--json] [--concurrency <n>]
+markflow formats [--json]
+markflow mcp
 ```
 
-### 命令行（CLI）
+**convert** 接受多个输入，可以是本地文件路径或网页地址，混合传入也可以。
 
-仓库内运行 `node bin/markflow.js <子命令>`（或 `npm run cli -- <子命令>`）；执行 `npm link` 后可使用全局命令 `markflow`。`--help` 输出：
+- `--to` 省略时按输入类型取默认值：办公文档、PDF 与网页转 `bundle`，Markdown 转 `docx`。
+- `--out` 指定输出目录，必须已存在；省略时取环境变量 `MARKFLOW_OUTPUT_DIR`，再回退到当前目录。
+- `--json` 让标准输出只有一行 JSON 结果，进度与日志走标准错误，便于程序解析。省略时成功项的产物路径逐行打印到标准输出。
+- 退出码：全部成功为 0，参数错误为 1，存在失败项为 2。
 
-```
-用法：markflow <子命令> [选项]
-
-  convert <输入...>   转换本地文件或 http(s) 网页，输入可多个
-  formats             列出可用的输入类型、转换目标与运行时能力
-  serve               启动本地 HTTP 服务（地址与令牌打印到 stderr）
-  mcp                 以 stdio 方式启动 MCP 服务，供 agent 调用
-
-选项：
-  --to <目标>         bundle | docx | pdf；省略时按输入类型取默认值（Office/PDF/网页 → bundle，Markdown → docx）
-  --out <目录>        输出目录，必须已存在；默认取 MARKFLOW_OUTPUT_DIR，再回退到当前目录
-  --json              stdout 只输出一行 JSON 结果，其余信息走 stderr
-  --concurrency <n>   convert 的并发数，默认 2
-  --host <地址>       serve 监听地址，默认 127.0.0.1
-  --port <端口>       serve 监听端口，默认 0（由系统分配）
-  -h, --help          显示本说明
-  -v, --version       显示版本号
-
-退出码：0 全部成功；1 参数错误或运行异常；2 存在失败项
+```bash
+markflow convert 季度报告.docx 会议纪要.pptx --out ~/Documents/知识库
+markflow convert 技术方案.md --to pdf --out ~/Desktop
+markflow convert https://example.com/article --out ~/Documents/知识库
+markflow convert ~/笔记/*.md --to docx --out ~/Documents/输出 --json
 ```
 
-人类可读模式下，成功项的产物路径逐行写入 stdout，进度与汇总信息写入 stderr；`--json` 模式下 stdout 仅输出一行：
+`--json` 模式的输出结构：
 
 ```json
 {
   "ok": true,
-  "outputDir": "…",
+  "outputDir": "/Users/you/Documents/知识库",
   "results": [
-    { "input": "…", "target": "…", "name": "…", "title": "…", "outputPath": "…", "outputs": {}, "imagesCount": 0, "warnings": [] }
+    {
+      "input": "季度报告.docx",
+      "target": "bundle",
+      "name": "季度报告",
+      "title": "2026 年第一季度经营分析",
+      "outputPath": "/Users/you/Documents/知识库/季度报告",
+      "outputs": {
+        "md": "/Users/you/Documents/知识库/季度报告/季度报告.md",
+        "json": "/Users/you/Documents/知识库/季度报告/季度报告.json",
+        "imagesDir": "/Users/you/Documents/知识库/季度报告/images"
+      },
+      "imagesCount": 7,
+      "warnings": []
+    }
   ],
-  "errors": [{ "input": "…", "error": "…" }]
+  "errors": []
 }
 ```
 
-查看当前环境可用的转换目标与能力探测：`markflow formats --json`。
+**formats** 列出当前可用的输入类型、转换目标与运行时能力，包括 LibreOffice 是否就绪、PDF 用的是哪个后端。
 
-启动本地 HTTP 服务（供浏览器或脚本调用，URL 与访问令牌打印到 stderr）：`markflow serve --port 0 --host 127.0.0.1 --out ~/Documents/MarkFlow`。
+## MCP 服务
 
-### MCP 服务
+以标准输入输出方式提供两个工具，供 agent 直接调用。
 
-以 stdio 方式启动：
+| 工具 | 入参 | 用途 |
+|---|---|---|
+| `convert_document` | `paths` 与 `urls` 至少一项；`target` 可选；`outputDir` 必填且须已存在；`returnContent` 为真时附带 Markdown 正文，上限 20 万字符 | 转换文件或网页，返回结构同命令行的 `--json` |
+| `list_formats` | 无 | 查询可用格式与运行时能力 |
 
-```bash
-markflow mcp
-```
-
-提供两个工具：
-
-- `convert_document`：入参 `paths?: string[]`、`urls?: string[]`、`target?: 'bundle' | 'docx' | 'pdf'`、`outputDir: string`（须已存在）、`returnContent?: boolean`（为 `true` 时在 bundle 结果中附带 Markdown 正文，上限 200000 字符）；返回结构与 CLI 的 `--json` 一致。
-- `list_formats`：无入参，返回输入类型与转换目标的对应矩阵，以及 LibreOffice、PDF 后端的可用性。
-
-**Claude Code**：仓库根目录已提供 `.mcp.json`，在本仓库目录内启动会话即自动识别；也可在任意目录执行：
+**Claude Code**：仓库根已有 `.mcp.json`，在本目录启动会话即自动识别。其他目录可执行：
 
 ```bash
 claude mcp add markflow -- node /绝对路径/mcp/server.js
@@ -125,83 +107,58 @@ command = "node"
 args = ["/绝对路径/mcp/server.js"]
 ```
 
-## HTTP API
+## PDF 输出
 
-服务默认仅监听 `127.0.0.1`，随机分配端口；全部 `/api/*` 端点须携带请求头 `X-MarkFlow-Token`。令牌于每次启动时随机生成：`markflow serve` 会把地址与令牌打印到 stderr，供脚本自行携带；桌面端则由 Electron 主进程在请求发出前注入该请求头，页面代码不接触令牌。
+Markdown 转 PDF 的链路是「Markdown 语法树 → HTML → Chromium 打印」，中文字体栈与打印样式经过专门调整。后端按顺序尝试：
 
-| 方法与路径 | 说明 |
-|---|---|
-| `GET /api/formats` | 返回能力矩阵与实时探测结果 |
-| `POST /api/convert` | 请求体 `{ items: [{ path\|url, target }], outputDir? }`；响应为 NDJSON 事件流，依次为 `accepted`、`start`、`progress`、`item`、`done` |
-| `GET /api/settings/output-dir` | 读取当前输出目录 |
-| `POST /api/settings/output-dir` | 设置输出目录，须为已存在且可写的绝对路径 |
+1. **Electron 工作进程**：派生无界面 Electron 子进程调用 Chromium 打印，排版质量最高，为默认路径。
+2. **LibreOffice**：先渲染为 DOCX，再由 `soffice --headless --convert-to pdf` 转换，作为未安装 Electron 时的备用。
 
-## PDF 输出说明
-
-PDF 渲染按以下顺序选择后端：
-
-1. 桌面端内运行时，使用 Electron 内置 Chromium 直接打印；
-2. CLI / MCP 场景下，优先 spawn 仓库内的 Electron 二进制（开发环境或执行 `npm install` 后可用），以独立进程打印；
-3. 以上均不可用时，尝试本机 LibreOffice（`soffice --headless --convert-to pdf`，先由 DOCX 中转再转出 PDF）；
-4. 三者都不可用则报错，并在错误信息中给出安装提示。
+两者都不可用时报错并给出安装提示。用 `markflow formats` 可查看当前生效的后端。
 
 ## 安全说明
 
-- HTTP 服务仅绑定本机回环地址，并使用每次启动时生成的令牌进行鉴权。
-- 桌面端的访问令牌由主进程在 `webRequest` 层为 `/api/*` 请求注入请求头，既不写入命令行参数（同机其他进程可读），也不下发给渲染进程；渲染进程无从读取令牌，即便伪造该请求头也会被主进程覆盖。
-- 静态资源仅开放 `index.html`、`css/`、`js/`、`assets/` 四处，其余路径一律 404。
-- 网页抓取内置 SSRF 守卫：拒绝解析到内网或保留网段的地址，限制页面正文不超过 20 MB、单张图片不超过 10 MB。
-- Markdown 中的原始 HTML 标签在转换为 docx、pdf 时只保留其文本内容。
-- PDF 打印页面启用 CSP（`default-src 'none'; img-src file: data:`）。Markdown 中的图片只允许引用文档所在目录内的本地文件；远程与内网图片不进入打印页面，仅保留 `alt` 文本占位，因此隐藏的打印窗口不会向任何地址发起请求。
-- 桌面端「打开」操作限定于转换产物：仅放行 `.md`、`.json`、`.docx`、`.pdf` 文件与普通目录，`.app` 应用包及其他类型一律拒绝。
-- 桌面端界面启用 CSP（`default-src 'self'`），不加载任何外部资源。
+- **网页抓取**内置 SSRF 防护：只允许 `http` 与 `https`；域名解析后的全部地址若命中环回、私网、链路本地、组播或保留段一律拒绝；连接钉扎在已校验的地址上，规避 DNS 重绑定；重定向逐跳复验，最多 5 跳；页面上限 20 MB，图片上限 10 MB。
+- **Markdown 中的图片**只允许引用文档所在目录之内的本地文件，绝对路径、`../` 越界与指向外部的符号链接一律拒绝并记录告警，避免转换第三方文档时泄露本机文件。
+- **原始 HTML** 在 Word 与 PDF 输出中只保留文本，不执行也不外发；PDF 打印页面启用内容安全策略，未解析的远程图片不会进入打印过程。
+- **临时文件**写入进程私有目录，权限 600，进程退出时清理，过期残留定期回收。
 
 ## 目录结构
 
 ```
-知识库文件转换程序/
-├── bin/                 CLI 入口（markflow.js）
-├── mcp/                 MCP stdio 服务
-├── electron/            Electron 主进程、preload、PDF 打印 worker
-├── server.js            HTTP 服务入口
-├── server/               安全中间件、LibreOffice 适配
-├── converters/           转换内核
-│   ├── index.js          调度：解析 → IR → 渲染 → 落盘
-│   ├── batch.js           批量并发控制
-│   ├── output.js          产物落盘
-│   ├── targets.js         输入类型与目标裁决
-│   ├── parsers/           各输入格式解析器（docx/xlsx/pptx/pdf/md/url 及旧二进制格式）
-│   ├── renderers/         输出渲染器（md/json/html/docx/pdf）
-│   ├── ir/                中间表示（IR）定义与工具函数
-│   ├── assets/            Markdown 图片路径解析
-│   ├── net/               SSRF 守卫与限长 fetch
-│   └── pdf/               PDF 后端选择
-├── index.html / js/ / css/ / assets/   前端（桌面端界面）
-├── test/                 测试与 fixture
-└── package.json
+bin/markflow.js            命令行入口
+mcp/server.js              MCP stdio 服务
+converters/
+  index.js                 转换调度：输入类型识别、目标裁决、标题与命名
+  batch.js                 并发批处理与事件流
+  output.js                产物落盘（bundle 与单文件两种形态）
+  targets.js               输入类型与转换目标的对应关系
+  soffice.js               LibreOffice 适配（异步、串行队列）
+  parsers/                 各格式解析为中间表示
+  renderers/               中间表示渲染为 md / json / html / docx / pdf
+  ir/                      中间表示的结构、工具与 Markdown 处理
+  assets/md-images.js      Markdown 图片解析与内嵌
+  net/fetch-guard.js       SSRF 防护与限长抓取
+  pdf/                     PDF 后端选择与 Electron 打印工作进程
+test/                      测试与固定样本
 ```
 
 ## 开发与测试
 
 ```bash
-npm ci                # 安装依赖
-npm run electron       # 启动桌面端
-npm test               # 运行测试（node:test，306 项）
-npm run build:mac      # 打包 macOS 安装包
-npm run build:win      # 打包 Windows 安装包
+npm test        # node:test，246 项
+npm run cli     # 等同 node bin/markflow.js
+npm run mcp     # 等同 node mcp/server.js
 ```
 
-CI 在 `v*` 标签推送时触发，先运行测试再执行打包。
-
-可选依赖：LibreOffice（用于旧二进制格式 `.doc` `.xls` `.ppt` 的转换，以及 CLI/MCP 场景下的 PDF 输出兜底）。
+持续集成在分支推送与拉取请求时运行完整测试。
 
 ## 已知限制
 
-- pdf 输入不提取图片。
-- pptx 仅提取幻灯片中的 `p:pic` 图片，不含背景图与母版图。
-- xlsx 不提取图片。
-- 纯浏览器模式（执行 `node server.js` 后用浏览器打开）仅供调试，文件拖拽功能需在桌面端中使用。
+- PDF 输入不提取图片；PowerPoint 只提取幻灯片正文中的图片，不含背景图与母版图；Excel 不提取图片。
+- `.doc`、`.xls`、`.ppt` 三种旧二进制格式必须安装 LibreOffice 才能转换。
+- Markdown 只能转为 Word 或 PDF，不支持转为知识库包；办公文档与网页只能转为知识库包，不支持直接转 Word 或 PDF。
 
 ## 许可证
 
-[MIT License](LICENSE) © 2026 MarkFlow
+MIT，见 [LICENSE](LICENSE)。

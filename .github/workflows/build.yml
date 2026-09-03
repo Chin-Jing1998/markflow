@@ -1,14 +1,9 @@
-name: Build & Release
+name: 测试
 
 on:
   push:
     branches: ['**']
-    tags:
-      - 'v*'
   pull_request:
-
-permissions:
-  contents: write
 
 jobs:
   test:
@@ -28,69 +23,3 @@ jobs:
 
       - name: 运行测试
         run: npm test
-
-  build-mac:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
-    runs-on: macos-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 配置 Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: 安装依赖
-        run: npm ci
-
-      - name: 运行测试
-        run: npm test
-
-      - name: 构建 macOS 安装包
-        run: npm run build:mac
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 上传至 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-win:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
-    runs-on: windows-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 配置 Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: 安装依赖
-        run: npm ci
-
-      - name: 运行测试
-        run: npm test
-
-      - name: 构建 Windows 安装包
-        run: npm run build:win
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 上传至 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

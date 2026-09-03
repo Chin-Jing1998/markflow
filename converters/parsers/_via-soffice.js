@@ -8,7 +8,7 @@
 const fsp = require('fs').promises;
 const os = require('os');
 const path = require('path');
-const soffice = require('../../server/soffice');
+const soffice = require('../soffice');
 
 /**
  * @param {string} sourceExt 源格式短名（doc / xls / ppt），用于错误信息与临时目录前缀

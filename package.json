@@ -1,8 +1,7 @@
 {
   "name": "markflow",
   "version": "1.0.0",
-  "description": "MarkFlow - 知识库文件转换工具（办公文档/网页 → Markdown+JSON+图片；Markdown → DOCX/PDF）",
-  "main": "electron/main.js",
+  "description": "MarkFlow - 知识库文件转换命令行工具（CLI + MCP）：办公文档/PDF/网页 → Markdown+JSON+图片；Markdown → DOCX/PDF",
   "bin": {
     "markflow": "bin/markflow.js"
   },
@@ -10,73 +9,16 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node server.js",
-    "electron": "electron .",
-    "build:mac": "electron-builder --mac",
-    "build:win": "electron-builder --win",
-    "build:all": "electron-builder --mac --win",
-    "build": "electron-builder",
     "test": "node --test \"test/*.test.js\"",
     "cli": "node bin/markflow.js",
     "mcp": "node mcp/server.js"
   },
-  "build": {
-    "appId": "com.markflow.app",
-    "productName": "MarkFlow",
-    "copyright": "Copyright © 2026 MarkFlow",
-    "directories": {
-      "output": "dist"
-    },
-    "files": [
-      "**/*",
-      "!dist/**",
-      "!output/**",
-      "!.git/**",
-      "!*.md",
-      "!test/**",
-      "!.github/**",
-      "!.mcp.json",
-      "!web-archive/**"
-    ],
-    "mac": {
-      "category": "public.app-category.productivity",
-      "target": [
-        {
-          "target": "zip",
-          "arch": [
-            "universal"
-          ]
-        }
-      ],
-      "icon": "build/icon.icns",
-      "darkModeSupport": true
-    },
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
-      ],
-      "icon": "build/icon.png"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "installerLanguages": [
-        "zh_CN",
-        "en_US"
-      ],
-      "language": "2052",
-      "shortcutName": "MarkFlow"
-    }
-  },
   "keywords": [
     "markdown",
     "converter",
-    "knowledge-base"
+    "knowledge-base",
+    "cli",
+    "mcp"
   ],
   "author": "MarkFlow",
   "license": "MIT",
@@ -85,7 +27,6 @@
     "cheerio": "^1.2.0",
     "docx": "^9.6.1",
     "exceljs": "^4.4.0",
-    "express": "^5.2.1",
     "image-size": "^2.0.2",
     "jszip": "^3.10.1",
     "mammoth": "^1.12.0",
@@ -99,8 +40,7 @@
     "unified": "^11.0.5",
     "zod": "^3.25.76"
   },
-  "devDependencies": {
-    "electron": "^35.7.5",
-    "electron-builder": "^26.8.1"
+  "optionalDependencies": {
+    "electron": "^35.7.5"
   }
 }

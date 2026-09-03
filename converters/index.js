@@ -265,7 +265,7 @@ function loadOptionalModule(relPath) {
     }
 }
 
-// 测试钩子：替换模块加载器以注入桩 parser/renderer（与 server/soffice.js 的 _set*/_reset 约定一致）
+// 测试钩子：替换模块加载器以注入桩 parser/renderer（与 converters/soffice.js 的 _set*/_reset 约定一致）
 function _setModuleLoader(fn) { moduleLoader = typeof fn === 'function' ? fn : require; }
 function _reset() { moduleLoader = require; }
 

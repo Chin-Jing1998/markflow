@@ -1,5 +1,5 @@
 /**
- * server/soffice.js 单元测试
+ * converters/soffice.js 单元测试
  * 覆盖：探测缺失时的中文安装提示、命令行参数构造、独立 UserInstallation profile 的建与删与 URL 编码、
  *       多次调用串行排队、转换失败与产物缺失的错误信息、参数校验、探测结果缓存
  *
@@ -12,7 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL, fileURLToPath } = require('node:url');
 
-const soffice = require('../server/soffice');
+const soffice = require('../converters/soffice');
 
 const FAKE_SOFFICE = '/fake/bin/soffice';
 

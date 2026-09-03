@@ -74,7 +74,7 @@ async function handleConvertDocument(args = {}) {
 
 async function handleListFormats() {
     const [sofficeAvailable, pdfBackend] = await Promise.all([
-        require('../server/soffice').isAvailable(),
+        require('../converters/soffice').isAvailable(),
         require('../converters/pdf/backend').detect(),
     ]);
     const capabilities = { sofficeAvailable: Boolean(sofficeAvailable), pdfBackend };

@@ -2,7 +2,7 @@
 /**
  * MarkFlow 命令行入口
  *
- * 子命令：convert（批量转换）、formats（能力矩阵）、serve（本地 HTTP 服务）、mcp（MCP stdio 服务）。
+ * 子命令：convert（批量转换）、formats（能力矩阵）、mcp（MCP stdio 服务）。
  * 输出约定：--json 模式下 stdout 只输出一行 JSON，进度与错误一律走 stderr，便于 agent 直接解析。
  * 退出码：0 全部成功；1 参数错误或运行异常；2 存在失败项。
  * 本文件零第三方依赖，参数解析用 node:util 的 parseArgs。
@@ -17,10 +17,9 @@ const pkg = require('../package.json');
 
 const EXIT = Object.freeze({ OK: 0, USAGE: 1, FAILED: 2 });
 const DEFAULT_CONCURRENCY = 2;
-const DEFAULT_HOST = '127.0.0.1';
 const OPTIONS = Object.freeze({
     to: { type: 'string' }, out: { type: 'string' }, json: { type: 'boolean' },
-    concurrency: { type: 'string' }, port: { type: 'string' }, host: { type: 'string' },
+    concurrency: { type: 'string' },
     help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
 });
 
@@ -33,7 +32,7 @@ const messageOf = (err) => (err && err.message ? err.message : String(err));
 
 // ==================== 入口 ====================
 
-// 返回数字表示退出码；返回 null 表示保持进程运行（serve / mcp）
+// 返回数字表示退出码；返回 null 表示保持进程运行（mcp）
 async function main(argv) {
     let parsed;
     try {
@@ -49,9 +48,8 @@ async function main(argv) {
     try {
         if (command === 'convert') return await cmdConvert(values, positionals.slice(1));
         if (command === 'formats') return await cmdFormats(values);
-        if (command === 'serve') return await cmdServe(values);
         if (command === 'mcp') return await cmdMcp();
-        throw new UsageError(`未知子命令：${command}（可用：convert、formats、serve、mcp）`);
+        throw new UsageError(`未知子命令：${command}（可用：convert、formats、mcp）`);
     } catch (err) {
         log(err instanceof UsageError ? err.message : `执行失败：${messageOf(err)}`);
         return EXIT.USAGE;
@@ -139,37 +137,13 @@ async function cmdFormats(values) {
 // 运行时能力探测：LibreOffice 与 PDF 后端
 async function probeCapabilities() {
     const [sofficeAvailable, pdfBackend] = await Promise.all([
-        require('../server/soffice').isAvailable(),
+        require('../converters/soffice').isAvailable(),
         require('../converters/pdf/backend').detect(),
     ]);
     return { sofficeAvailable: Boolean(sofficeAvailable), pdfBackend };
 }
 
-// ==================== serve / mcp ====================
-
-async function cmdServe(values) {
-    const { startServer } = require('../server');
-    const host = values.host || DEFAULT_HOST;
-    if (!['127.0.0.1', 'localhost', '::1'].includes(host)) {
-        log('警告：监听非回环地址会把本机文件读写能力暴露到网络，请确认网络可信并妥善保管访问令牌');
-    }
-    const handle = await startServer({
-        host,
-        port: parsePositiveInt(values.port, 0),
-        outputDir: values.out ? path.resolve(process.cwd(), values.out) : undefined,
-    });
-    log(`MarkFlow 服务已启动：http://${host}:${handle.port}`);
-    if (handle.token) log(`访问令牌：${handle.token}`);
-    log('按 Ctrl+C 停止服务');
-    const stop = () => {
-        Promise.resolve(typeof handle.close === 'function' ? handle.close() : undefined)
-            .catch((err) => log(`停止服务时出错：${messageOf(err)}`))
-            .then(() => process.exit(EXIT.OK));
-    };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
-    return null;
-}
+// ==================== mcp ====================
 
 async function cmdMcp() {
     await require('../mcp/server').start();
@@ -195,7 +169,6 @@ function printUsage() {
 
   convert <输入...>   转换本地文件或 http(s) 网页，输入可多个
   formats             列出可用的输入类型、转换目标与运行时能力
-  serve               启动本地 HTTP 服务（地址与令牌打印到 stderr）
   mcp                 以 stdio 方式启动 MCP 服务，供 agent 调用
 
 选项：
@@ -203,8 +176,6 @@ function printUsage() {
   --out <目录>        输出目录，必须已存在；默认取 MARKFLOW_OUTPUT_DIR，再回退到当前目录
   --json              stdout 只输出一行 JSON 结果，其余信息走 stderr
   --concurrency <n>   convert 的并发数，默认 ${DEFAULT_CONCURRENCY}
-  --host <地址>       serve 监听地址，默认 ${DEFAULT_HOST}
-  --port <端口>       serve 监听端口，默认 0（由系统分配）
   -h, --help          显示本说明
   -v, --version       显示版本号
 
