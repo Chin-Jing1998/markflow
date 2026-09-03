@@ -1,14 +1,21 @@
 /**
  * URL → IR
  *
- * 流程：fetch-guard 抓页（SSRF 守卫 + 限长限时）→ cheerio 提取标题与正文（微信 / 知乎 /
- *       CSDN / 简书 / 通用兜底）→ 图片逐张经 fetch-guard 下载进 assets（失败记 warning
- *       并保留原 URL）→ 内联样式预处理 → turndown('url') → remark-parse + remark-gfm
+ * 流程：fetch-guard 抓页（SSRF 守卫 + 限长限时）→ cheerio 载入 → 标题提取
+ *       → 正文提取（web/extract 的三级链路：站点选择器 → Readability → 旧兜底）
+ *       → 噪声清洗（web/noise）→ 图片逐张经 fetch-guard 下载进 assets（失败记 warning
+ *       并保留原 URL）→ 内联样式预处理 → turndown('url') → 文本规范化（web/normalize）
+ *       → remark-parse + remark-gfm
  *
  * 契约：
  *   - async parse({ url } | string, ctx) → MarkFlowDocument{ ir, assets, warnings, meta }
  *   - 不写盘、不打印；ctx.allowPrivateNetwork 透传给 fetch-guard（仅测试使用）
  *   - 成功下载的图片按文档顺序编号为 images/image_N.ext（N 从 1 起），与 assets 一一对应
+ *   - ctx.skipImages 为 true 时一张图都不下载：图片地址就地绝对化，清单挂在 data.images 上，
+ *     assets 保持为空（供 MCP 的 extract_article 只读提取使用）
+ *   - meta 除 title/sourceType/sourceName/sourceUrl/finalUrl 外，另含 extraction（实际命中的
+ *     提取方式）、fetchedAt、wordCount 以及 web/metadata 取到的 author/publishedAt/
+ *     siteName/excerpt/lang——取不到的字段一律省略而非置空
  */
 const cheerio = require('cheerio');
 const { loadUnified } = require('../ir/unified-loader');
@@ -16,6 +23,10 @@ const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
 const { fetchText, fetchBinary } = require('../net/fetch-guard');
 const { getExtFromContentType, getExtFromUrl } = require('../ir/util');
+const { extractContent, hostnameOf, matchesHost } = require('../web/extract');
+const { cleanNoise } = require('../web/noise');
+const { normalizeMarkdown } = require('../web/normalize');
+const { extractMetadata, countWords } = require('../web/metadata');
 
 const DEFAULT_TITLE = '未命名文章';
 // 懒加载图片常用属性，按优先级取第一个非空值
@@ -25,8 +36,8 @@ const IMAGE_CONCURRENCY = 6;
 const PROGRESS_FETCH = 10;
 const PROGRESS_ASSETS = 40;
 const PROGRESS_IR = 55;
-// 通用兜底：只考虑正文文本超过此长度的 div
-const MIN_CONTENT_TEXT_LENGTH = 200;
+// skipImages 模式下 data URL 只保留这么长，base64 正文对阅读无价值
+const DATA_URL_DISPLAY_MAX = 64;
 const BOLD_STYLE_RE = /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i;
 const ITALIC_STYLE_RE = /font-style\s*:\s*italic/i;
 const STRIKE_STYLE_RE = /text-decoration[^;]*line-through/i;
@@ -36,23 +47,28 @@ const MIME_BY_EXT = {
     '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp',
 };
 
-/** @param {{ url: string }|string} input @param {{ sourceName?, allowPrivateNetwork?, onProgress? }} ctx */
+/** @param {{ url: string }|string} input @param {{ sourceName?, allowPrivateNetwork?, skipImages?, onProgress? }} ctx */
 async function parse(input, ctx = {}) {
     const url = resolveUrl(input);
     const allowPrivateNetwork = ctx.allowPrivateNetwork === true;
+    const skipImages = ctx.skipImages === true;
     const assets = [];
     const warnings = [];
 
     notify(ctx, 'parsing', PROGRESS_FETCH);
     const page = await fetchText(url, { allowPrivateNetwork });
     const pageUrl = page.finalUrl;
+    const fetchedAt = new Date().toISOString();
     const $ = cheerio.load(page.text);
     const title = extractTitle($, pageUrl);
-    const contentHtml = extractArticleContent($, pageUrl);
+    const extracted = extractContent({ $, html: page.text, url: pageUrl });
+    const contentHtml = cleanNoise(extracted.html);
 
     notify(ctx, 'parsing', PROGRESS_ASSETS);
-    const processedHtml = await collectImages(contentHtml, pageUrl, { allowPrivateNetwork, assets, warnings });
-    const markdown = buildMarkdown(preprocessHtml(processedHtml), title);
+    const { html: processedHtml, images } = skipImages
+        ? listImages(contentHtml, pageUrl)
+        : { html: await collectImages(contentHtml, pageUrl, { allowPrivateNetwork, assets, warnings }), images: [] };
+    const markdown = normalizeMarkdown(buildMarkdown(preprocessHtml(processedHtml), title));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
     const ir = unified().use(remarkParse).use(remarkGfm).parse(markdown);
@@ -61,8 +77,18 @@ async function parse(input, ctx = {}) {
     return createDocument({
         kind: 'document',
         ir,
-        data: null,
-        meta: { title, sourceType: 'url', sourceName: ctx.sourceName || url, sourceUrl: url, finalUrl: pageUrl },
+        data: skipImages ? { images } : null,
+        meta: {
+            title,
+            ...extractMetadata({ $, article: extracted.article, url, finalUrl: pageUrl }),
+            sourceType: 'url',
+            sourceName: ctx.sourceName || url,
+            sourceUrl: url,
+            finalUrl: pageUrl,
+            fetchedAt,
+            extraction: extracted.extraction,
+            wordCount: countWords(markdown),
+        },
         assets,
         warnings,
     });
@@ -76,11 +102,11 @@ function resolveUrl(input) {
     return raw.trim();
 }
 
-// ---------- 标题与正文提取（源自 旧版 url.js:86-156）----------
+// ---------- 标题提取（源自 旧版 url.js:86-156；正文提取已迁往 web/extract.js）----------
 
 // 标题候选，按优先级取第一个非空结果；微信正文标题仅对该站生效
 const TITLE_PICKERS = [
-    ($, url) => (url.includes('mp.weixin.qq.com') ? $('#activity-name').text() : ''),
+    ($, url) => (matchesHost(hostnameOf(url), 'mp.weixin.qq.com') ? $('#activity-name').text() : ''),
     ($) => $('meta[property="og:title"]').attr('content'),
     ($) => $('h1').first().text(),
     ($) => $('title').first().text(),
@@ -98,39 +124,37 @@ function cleanTitle(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
-// 站点专属选择器：命中即返回
-const SITE_SELECTORS = [
-    { match: 'mp.weixin.qq.com', selectors: ['#js_content'] },
-    { match: 'zhihu.com', selectors: ['.Post-RichTextContainer', '.RichContent-inner'] },
-    { match: 'csdn.net', selectors: ['#content_views', '#article_content'] },
-    { match: 'jianshu.com', selectors: ['article', '._2rhmJa'] },
-];
-
-function extractArticleContent($, url) {
-    for (const site of SITE_SELECTORS) {
-        if (!url.includes(site.match)) continue;
-        for (const selector of site.selectors) {
-            const content = $(selector).html();
-            if (content) return content;
+/**
+ * 只读模式的图片处理：不下载任何图片，就地把地址绝对化，并按文档顺序列出清单。
+ * data URL 截断保留类型前缀——完整 base64 对阅读没有价值，还会撑爆返回体积。
+ */
+function listImages(html, pageUrl) {
+    const $ = cheerio.load(html, null, false);
+    const images = [];
+    $('img').each((_, el) => {
+        const $img = $(el);
+        const raw = pickImageSource($img);
+        // 懒加载属性已取值，清掉以免渲染端再度覆盖 src
+        for (const attr of IMAGE_SRC_ATTRS) {
+            if (attr !== 'src') $img.removeAttr(attr);
         }
-    }
-
-    for (const tag of ['article', 'main']) {
-        const content = $(tag).html();
-        if (content) return content;
-    }
-
-    // 通用兜底：文本最长的 div
-    let bestContent = '';
-    let maxLength = 0;
-    $('div').each((_, el) => {
-        const text = $(el).text().trim();
-        if (text.length > maxLength && text.length > MIN_CONTENT_TEXT_LENGTH) {
-            maxLength = text.length;
-            bestContent = $(el).html();
-        }
+        if (!raw) return;
+        const src = toDisplayUrl(raw, pageUrl);
+        $img.attr('src', src);
+        images.push({ url: src, alt: ($img.attr('alt') || '').trim() });
     });
-    return bestContent || $('body').html() || '';
+    return { html: $.html(), images };
+}
+
+function toDisplayUrl(raw, pageUrl) {
+    if (/^data:/i.test(raw)) {
+        return raw.length > DATA_URL_DISPLAY_MAX ? `${raw.slice(0, DATA_URL_DISPLAY_MAX)}...` : raw;
+    }
+    try {
+        return new URL(raw, pageUrl).href;
+    } catch (err) {
+        return raw;
+    }
 }
 
 /**

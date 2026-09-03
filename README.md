@@ -16,6 +16,9 @@
 
 - **图片**：Word 与 PowerPoint 的内嵌图片、网页文章的图片会被提取到 `images/` 并在 Markdown 中以相对路径引用。PDF 与 Excel 不提取图片。
 - **Markdown 转 Word 与 PDF**：支持 GFM 表格、删除线、任务列表、代码块、引用块与超链接；图片按 Markdown 文件所在目录解析相对路径并内嵌。井号后缺空格的 `#标题` 也按标题处理。
+- **网页正文提取**：三级策略——微信、知乎、CSDN、简书、掘金、思否、少数派、博客园的专属选择器优先命中；未命中走 Mozilla Readability 评分；再不行回退通用容器识别。实际命中的方式记录在 `meta.extraction` 中。
+- **噪声清洗**：自动剔除分享栏、相关阅读、推荐位、评论区、面包屑、页内目录，以及「点击关注」「长按识别二维码」「转载请注明出处」一类整段引导语；清洗在图片下载之前完成，被剔除区域内的图片不会产生无谓的网络请求。
+- **YAML front matter**：知识库包的 Markdown 带有元数据头，含标题、作者、发布时间、原文链接、站点名、摘要、语言、字数、提取方式、抓取与转换时间；办公文档只写它拥有的字段。Obsidian、basic-memory 等工具可直接索引与回溯出处。Markdown 输入自带的 front matter 会被剥离并合并进元数据，不会混入 Word 与 PDF 正文。
 - **JSON 产物**：结构为 `{ schemaVersion, kind, ir, data, meta }`，其中 `ir` 是 mdast 语法树，`kind` 取 `document`、`workbook` 或 `presentation`，便于后续程序化处理。
 - **同名产物直接覆盖**，重复转换结果幂等。
 
@@ -86,11 +89,12 @@ markflow convert ~/笔记/*.md --to docx --out ~/Documents/输出 --json
 
 ## MCP 服务
 
-以标准输入输出方式提供两个工具，供 agent 直接调用。
+以标准输入输出方式提供三个工具，供 agent 直接调用。
 
 | 工具 | 入参 | 用途 |
 |---|---|---|
 | `convert_document` | `paths` 与 `urls` 至少一项；`target` 可选；`outputDir` 必填且须已存在；`returnContent` 为真时附带 Markdown 正文，上限 20 万字符 | 转换文件或网页，返回结构同命令行的 `--json` |
+| `extract_article` | `url` 必填；`maxChars` 可选，默认 5 万字符 | 只提取不落盘，直接返回正文 Markdown 与元数据；不下载图片，仅列出地址。适合「读一篇文章」而不需要文件的场合 |
 | `list_formats` | 无 | 查询可用格式与运行时能力 |
 
 **Claude Code**：仓库根已有 `.mcp.json`，在本目录启动会话即自动识别。其他目录可执行：
@@ -140,13 +144,14 @@ converters/
   assets/md-images.js      Markdown 图片解析与内嵌
   net/fetch-guard.js       SSRF 防护与限长抓取
   pdf/                     PDF 后端选择与 Electron 打印工作进程
+  web/                     网页正文提取、噪声清洗、元数据与 front matter
 test/                      测试与固定样本
 ```
 
 ## 开发与测试
 
 ```bash
-npm test        # node:test，246 项
+npm test        # node:test，325 项
 npm run cli     # 等同 node bin/markflow.js
 npm run mcp     # 等同 node mcp/server.js
 ```
@@ -158,6 +163,7 @@ npm run mcp     # 等同 node mcp/server.js
 - PDF 输入不提取图片；PowerPoint 只提取幻灯片正文中的图片，不含背景图与母版图；Excel 不提取图片。
 - `.doc`、`.xls`、`.ppt` 三种旧二进制格式必须安装 LibreOffice 才能转换。
 - Markdown 只能转为 Word 或 PDF，不支持转为知识库包；办公文档与网页只能转为知识库包，不支持直接转 Word 或 PDF。
+- Readability 的可读性阈值已按中文段落长度下调（中文段落多在 50 至 150 字，默认阈值会把多数中文文章判为不可读）；判定失误时由字符数下限双重兜底，回退通用提取。
 
 ## 许可证
 

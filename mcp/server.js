@@ -3,7 +3,7 @@
  *
  * stdio 传输下 stdout 被 JSON-RPC 帧独占，因此先把 console 的标准输出通道重定向到 stderr，
  * 防止依赖库的日志污染协议流；此重定向必须在 require 其它模块之前完成。
- * 工具：convert_document（批量转换）、list_formats（能力矩阵）。
+ * 工具：convert_document（批量转换）、list_formats（能力矩阵）、extract_article（网页只读提取）。
  */
 console.log = console.error;
 console.info = console.error;
@@ -19,6 +19,7 @@ const pkg = require('../package.json');
 
 const CONCURRENCY = 2;
 const MAX_CONTENT_CHARS = 200000;
+const DEFAULT_EXTRACT_MAX_CHARS = 50000;
 
 const CONVERT_INPUT = {
     paths: z.array(z.string()).optional().describe('本地文件绝对路径列表'),
@@ -41,6 +42,21 @@ const CAPABILITIES = z.object({
     pdfBackend: z.object({ name: z.string().nullable(), available: z.boolean(), hint: z.string() }),
 });
 const FORMATS_OUTPUT = { targets: z.record(z.any()), capabilities: CAPABILITIES, version: z.string() };
+
+const EXTRACT_INPUT = {
+    url: z.string().url().describe('网页地址'),
+    maxChars: z.number().int().positive().optional()
+        .describe(`返回 Markdown 的最大字符数，默认 ${DEFAULT_EXTRACT_MAX_CHARS}，超出截断并标记`),
+};
+// 取不到的元数据字段整条省略，故除必有字段外一律 optional
+const EXTRACT_OUTPUT = {
+    url: z.string(), finalUrl: z.string(), title: z.string(),
+    author: z.string().optional(), publishedAt: z.string().optional(), siteName: z.string().optional(),
+    excerpt: z.string().optional(), lang: z.string().optional(),
+    wordCount: z.number(), extraction: z.string(), markdown: z.string(), truncated: z.boolean(),
+    images: z.array(z.object({ url: z.string(), alt: z.string() })),
+};
+const EXTRACT_OPTIONAL_META = Object.freeze(['author', 'publishedAt', 'siteName', 'excerpt', 'lang']);
 
 // ==================== 工具实现 ====================
 
@@ -85,6 +101,45 @@ async function handleListFormats() {
     return success({ targets, capabilities, version: pkg.version });
 }
 
+/**
+ * 网页只读提取：复用 parsers/url 的提取链路（ctx.skipImages 关掉图片下载），
+ * 渲染成 Markdown 直接返回。全程不落盘、不产生 assets，图片只列原始地址。
+ */
+async function handleExtractArticle(args = {}) {
+    const url = typeof args.url === 'string' ? args.url.trim() : '';
+    if (!url) return failure('缺少 url');
+    const maxChars = Number.isInteger(args.maxChars) && args.maxChars > 0 ? args.maxChars : DEFAULT_EXTRACT_MAX_CHARS;
+
+    let doc;
+    try {
+        doc = await require('../converters/parsers/url').parse({ url }, { skipImages: true });
+    } catch (err) {
+        return failure(messageOf(err));
+    }
+
+    const markdown = String(await require('../converters/renderers/md').render(doc));
+    const meta = doc.meta || {};
+    const truncated = markdown.length > maxChars;
+    return success({
+        url,
+        finalUrl: typeof meta.finalUrl === 'string' ? meta.finalUrl : url,
+        title: typeof meta.title === 'string' ? meta.title : '',
+        ...pickStrings(meta, EXTRACT_OPTIONAL_META),
+        wordCount: Number.isFinite(meta.wordCount) ? meta.wordCount : 0,
+        extraction: typeof meta.extraction === 'string' ? meta.extraction : '',
+        markdown: truncated ? markdown.slice(0, maxChars) : markdown,
+        truncated,
+        images: doc.data && Array.isArray(doc.data.images) ? doc.data.images : [],
+    });
+}
+
+// 只挑出确实有值的字符串字段，空值不进结果
+function pickStrings(source, keys) {
+    return Object.fromEntries(
+        keys.filter((key) => typeof source[key] === 'string' && source[key] !== '').map((key) => [key, source[key]]),
+    );
+}
+
 // returnContent 为 true 且产物含 Markdown 时附带正文（截断到上限）
 async function describeResult(input, result, returnContent) {
     const { target, name, title, outputPath, imagesCount } = result;
@@ -104,6 +159,12 @@ function createServer() {
         inputSchema: CONVERT_INPUT,
         outputSchema: CONVERT_OUTPUT,
     }, handleConvertDocument);
+    server.registerTool('extract_article', {
+        title: '提取网页正文',
+        description: '抓取网页并只返回提取后的 Markdown 正文与元数据，不下载图片、不写任何文件。',
+        inputSchema: EXTRACT_INPUT,
+        outputSchema: EXTRACT_OUTPUT,
+    }, handleExtractArticle);
     // list_formats 不声明 inputSchema：SDK 会给出空对象 schema，且允许调用方省略 arguments
     server.registerTool('list_formats', {
         title: '列出可用格式',

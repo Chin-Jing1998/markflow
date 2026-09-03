@@ -18,6 +18,7 @@
 const path = require('path');
 const fsp = require('fs').promises;
 const { sanitizeFolderName, stripExt, collectText } = require('./ir/util');
+const { prependFrontMatter } = require('./web/frontmatter');
 const output = require('./output');
 const { runBatch } = require('./batch');
 
@@ -186,9 +187,11 @@ function formatTimestamp(date = new Date()) {
 
 async function renderTarget(doc, target) {
     if (target === 'bundle') {
+        // Markdown 产物统一带 YAML front matter，便于知识库按元数据检索；
+        // docx/pdf 这类单文件目标不加，否则 YAML 会变成正文里的一段文字
         const md = await getRenderer('md').render(doc);
         const json = await getRenderer('json').render(doc);
-        return { md: String(md), json: String(json) };
+        return { md: prependFrontMatter(String(md), doc.meta), json: String(json) };
     }
     const buffer = await getRenderer(target).render(doc);
     if (!Buffer.isBuffer(buffer)) throw new Error(`渲染器 ${target} 未返回 Buffer`);

@@ -293,9 +293,12 @@ describe('convert：bundle / pdf（桩 parser 与 renderer）', () => {
         assert.equal(res.imagesCount, 1);
         assert.deepEqual(res.warnings, ['提示一']);
 
-        // Assert：产物内容
+        // Assert：产物内容。bundle 的 Markdown 带 YAML front matter，办公文档只写它拥有的字段
         const md = fs.readFileSync(res.outputs.md, 'utf8');
-        assert.match(md, /^# 来自 H1 的标题/);
+        assert.match(
+            md,
+            /^---\ntitle: "来自 H1 的标题"\nsource: "季度 报告\.docx"\nsourceType: "docx"\nconvertedAt: "[^"]+"\n---\n\n# 来自 H1 的标题/,
+        );
         assert.match(md, /!\[图\]\(images\/image_1\.png\)/);
         const json = JSON.parse(fs.readFileSync(res.outputs.json, 'utf8'));
         assert.deepEqual(Object.keys(json), ['schemaVersion', 'kind', 'ir', 'data', 'meta']);
@@ -327,7 +330,10 @@ describe('convert：bundle / pdf（桩 parser 与 renderer）', () => {
         assert.equal(res.imagesCount, 0);
         assert.equal('imagesDir' in res.outputs, false);
         assert.equal(fs.existsSync(path.join(root, 'a', 'images')), false);
-        assert.equal(fs.readFileSync(res.outputs.md, 'utf8'), '# x\n');
+        assert.match(
+            fs.readFileSync(res.outputs.md, 'utf8'),
+            /^---\ntitle: "元数据标题"\nsourceType: "pdf"\nconvertedAt: "[^"]+"\n---\n\n# x\n$/,
+        );
     });
 
     test('url 输入：无标题时名称为「主机名-时间戳」且标题回退默认值；有标题时取清洗后的标题', async () => {
