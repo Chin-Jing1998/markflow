@@ -15,6 +15,7 @@
  */
 const { parseHTML } = require('linkedom');
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
+const { hostnameOf } = require('../util');
 
 // 站点专属选择器：url 含 match 时按 selectors 顺序取第一个非空结果
 const SITE_SELECTORS = Object.freeze([
@@ -59,15 +60,6 @@ function extractContent({ $, html, url }) {
 }
 
 // ---------- 一级：站点专属选择器 ----------
-
-/** 取 URL 主机名；解析失败返回空串 */
-function hostnameOf(url) {
-    try {
-        return new URL(String(url || '')).hostname.toLowerCase();
-    } catch (err) {
-        return '';
-    }
-}
 
 /** 主机名匹配：全等或为其子域，避免查询串等位置的子串误命中 */
 function matchesHost(host, domain) {
@@ -148,7 +140,6 @@ function longestDiv($) {
 }
 
 module.exports = {
-    extractContent,
-    SITE_SELECTORS,
-    MIN_READABILITY_TEXT_LENGTH,
-    READERABLE_OPTIONS, hostnameOf, matchesHost };
+    extractContent, matchesHost,
+    SITE_SELECTORS, MIN_READABILITY_TEXT_LENGTH, READERABLE_OPTIONS,
+};

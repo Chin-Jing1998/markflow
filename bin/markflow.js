@@ -7,16 +7,15 @@
  * 退出码：0 全部成功；1 参数错误或运行异常；2 存在失败项。
  * 本文件零第三方依赖，参数解析用 node:util 的 parseArgs。
  */
-const fs = require('fs');
 const path = require('path');
 const { parseArgs } = require('node:util');
 
-const { convert, listTargets, runBatch } = require('../converters');
-const { resolveTarget, classifyInput } = require('../converters/targets');
+const service = require('../converters/service');
+const { errText, isFile, isDirectory } = require('../converters/util');
 const pkg = require('../package.json');
 
 const EXIT = Object.freeze({ OK: 0, USAGE: 1, FAILED: 2 });
-const DEFAULT_CONCURRENCY = 2;
+const DEFAULT_CONCURRENCY = service.DEFAULT_CONCURRENCY;
 const OPTIONS = Object.freeze({
     to: { type: 'string' }, out: { type: 'string' }, json: { type: 'boolean' },
     concurrency: { type: 'string' },
@@ -28,7 +27,6 @@ class UsageError extends Error {}
 
 const out = (text) => process.stdout.write(`${text}\n`);
 const log = (text) => process.stderr.write(`${text}\n`);
-const messageOf = (err) => (err && err.message ? err.message : String(err));
 
 // ==================== 入口 ====================
 
@@ -38,7 +36,7 @@ async function main(argv) {
     try {
         parsed = parseArgs({ args: argv, allowPositionals: true, options: OPTIONS });
     } catch (err) {
-        log(`参数错误：${messageOf(err)}`);
+        log(`参数错误：${errText(err)}`);
         return EXIT.USAGE;
     }
     const { values, positionals } = parsed;
@@ -51,7 +49,7 @@ async function main(argv) {
         if (command === 'mcp') return await cmdMcp();
         throw new UsageError(`未知子命令：${command}（可用：convert、formats、mcp）`);
     } catch (err) {
-        log(err instanceof UsageError ? err.message : `执行失败：${messageOf(err)}`);
+        log(err instanceof UsageError ? err.message : `执行失败：${errText(err)}`);
         return EXIT.USAGE;
     }
 }
@@ -60,8 +58,8 @@ async function main(argv) {
 
 async function cmdConvert(values, inputs) {
     if (inputs.length === 0) throw new UsageError('convert 需要至少一个输入：文件路径或 http(s) 网址');
-    const outputDir = resolveOutputDir(values.out);
-    const tasks = inputs.map((raw) => planTask(raw, values.to));
+    const outputDir = await resolveCliOutputDir(values.out);
+    const tasks = await planTasks(inputs, values.to);
     const asJson = Boolean(values.json);
     const concurrency = parsePositiveInt(values.concurrency, DEFAULT_CONCURRENCY);
 
@@ -71,59 +69,49 @@ async function cmdConvert(values, inputs) {
         const task = tasks[event.idx];
         if (event.type === 'start') log(`开始：${task.raw} → ${task.target}`);
         else if (event.type === 'item') {
-            log(event.ok ? `完成：${task.raw} → ${event.result.outputPath}` : `失败：${task.raw} → ${messageOf(event.error)}`);
+            log(event.ok ? `完成：${task.raw} → ${event.result.outputPath}` : `失败：${task.raw} → ${errText(event.error)}`);
         }
     };
-    const { results, errors } = await runBatch(tasks, { concurrency, onEvent }, (task, onProgress) =>
-        convert({ input: task.input, target: task.target, outputDir, onProgress }),
-    );
+    const payload = await service.runConversion({ tasks, outputDir, concurrency, onEvent });
 
-    const payload = {
-        ok: errors.length === 0,
-        outputDir,
-        results: results.map(({ idx, result }) => ({
-            input: tasks[idx].raw, target: result.target, name: result.name, title: result.title,
-            outputPath: result.outputPath, outputs: result.outputs,
-            imagesCount: result.imagesCount, warnings: result.warnings,
-        })),
-        errors: errors.map(({ idx, error }) => ({ input: tasks[idx].raw, error: messageOf(error) })),
-    };
     if (asJson) out(JSON.stringify(payload));
     else {
         payload.results.forEach((item) => out(item.outputPath));
         log(`汇总：成功 ${payload.results.length} 项，失败 ${payload.errors.length} 项，输出目录 ${outputDir}`);
     }
-    return errors.length === 0 ? EXIT.OK : EXIT.FAILED;
+    return payload.ok ? EXIT.OK : EXIT.FAILED;
 }
 
-// 归类输入、预检存在性并裁决目标；任一不合法即抛 UsageError（不启动转换）
-function planTask(raw, requested) {
+// 在服务层规划之上追加 CLI 专属的存在性预检；任一不合法即抛 UsageError（不启动转换）
+async function planTasks(inputs, requested) {
+    let tasks;
     try {
-        const { input, type } = classifyInput(raw, process.cwd());
-        if (input.path && !isFile(input.path)) throw new Error(`输入文件不存在：${input.path}`);
-        return { raw, input, target: resolveTarget(type, requested) };
+        tasks = service.planTasks(inputs, requested, process.cwd());
     } catch (err) {
-        throw new UsageError(messageOf(err));
+        throw new UsageError(errText(err));
     }
+    for (const task of tasks) {
+        if (task.input.path && !(await isFile(task.input.path))) {
+            throw new UsageError(`输入文件不存在：${task.input.path}`);
+        }
+    }
+    return tasks;
 }
 
 // --out → 环境变量 MARKFLOW_OUTPUT_DIR → 当前工作目录；目录必须已存在
-function resolveOutputDir(value) {
+async function resolveCliOutputDir(value) {
     const dir = path.resolve(process.cwd(), value || process.env.MARKFLOW_OUTPUT_DIR || process.cwd());
-    if (!isDirectory(dir)) throw new UsageError(`输出目录不存在：${dir}`);
+    if (!(await isDirectory(dir))) throw new UsageError(`输出目录不存在：${dir}`);
     return dir;
 }
 
 // ==================== formats ====================
 
 async function cmdFormats(values) {
-    const capabilities = await probeCapabilities();
+    const formats = await service.describeFormats();
+    const { targets, capabilities } = formats;
     const { pdfBackend } = capabilities;
-    const targets = listTargets({
-        sofficeAvailable: capabilities.sofficeAvailable,
-        pdfBackend: pdfBackend.available ? pdfBackend : null,
-    });
-    if (values.json) { out(JSON.stringify({ targets, capabilities, version: pkg.version })); return EXIT.OK; }
+    if (values.json) { out(JSON.stringify(formats)); return EXIT.OK; }
     out(`MarkFlow ${pkg.version} 可用转换目标`);
     out(`  Office/PDF 文件 → ${targets.office.join('、')}`);
     out(`  Markdown        → ${targets.markup.join('、')}`);
@@ -134,15 +122,6 @@ async function cmdFormats(values) {
     return EXIT.OK;
 }
 
-// 运行时能力探测：LibreOffice 与 PDF 后端
-async function probeCapabilities() {
-    const [sofficeAvailable, pdfBackend] = await Promise.all([
-        require('../converters/soffice').isAvailable(),
-        require('../converters/pdf/backend').detect(),
-    ]);
-    return { sofficeAvailable: Boolean(sofficeAvailable), pdfBackend };
-}
-
 // ==================== mcp ====================
 
 async function cmdMcp() {
@@ -151,11 +130,6 @@ async function cmdMcp() {
 }
 
 // ==================== 通用工具 ====================
-
-// 路径不存在时返回 null 而非抛异常
-const statOrNull = (target) => fs.statSync(target, { throwIfNoEntry: false }) || null;
-const isFile = (target) => { const stat = statOrNull(target); return Boolean(stat && stat.isFile()); };
-const isDirectory = (target) => { const stat = statOrNull(target); return Boolean(stat && stat.isDirectory()); };
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number(value);
@@ -188,6 +162,6 @@ main(process.argv.slice(2))
         if (typeof code === 'number') process.exitCode = code;
     })
     .catch((err) => {
-        log(`执行失败：${messageOf(err)}`);
+        log(`执行失败：${errText(err)}`);
         process.exitCode = EXIT.USAGE;
     });

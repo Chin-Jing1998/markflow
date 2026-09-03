@@ -16,49 +16,23 @@
  * pct 钳制到 [0,55] 并在同一次转换内单调不减（见 buildParserContext）。
  */
 const path = require('path');
-const fsp = require('fs').promises;
 const { sanitizeFolderName, stripExt, collectText } = require('./ir/util');
+const { statOrNull } = require('./util');
+const {
+    detectInputType, assertTargetAllowed,
+    SUPPORTED_EXTENSIONS, INPUT_CLASS, LEGACY_INPUT_TYPES, REMOTE_URL_RE,
+} = require('./targets');
 const { prependFrontMatter } = require('./web/frontmatter');
 const output = require('./output');
 const { runBatch } = require('./batch');
 
-// 扩展名 → 输入类型
-const EXT_TO_TYPE = Object.freeze({
-    '.docx': 'docx', '.doc': 'doc', '.xlsx': 'xlsx', '.xls': 'xls', '.pptx': 'pptx',
-    '.ppt': 'ppt', '.pdf': 'pdf', '.md': 'md', '.markdown': 'md',
-});
-const SUPPORTED_EXTENSIONS = Object.freeze(Object.keys(EXT_TO_TYPE));
-
-// 输入类型 → 输入类别（决定可选目标）；键序即 listTargets().inputs 的键序。
-// 键必须与 detectInputType 的返回值一一对应：.markdown 已归入 md，故此处没有 markdown 键
-const INPUT_CLASS = Object.freeze({
-    docx: 'office', doc: 'office', xlsx: 'office', xls: 'office', pptx: 'office',
-    ppt: 'office', pdf: 'office', md: 'markup', url: 'url',
-});
-// 旧二进制格式依赖 soffice 转码
-const LEGACY_INPUT_TYPES = Object.freeze(['doc', 'xls', 'ppt']);
-// 目标 → { 接受的输入类别, 拒绝时的提示 }
-const TARGET_RULES = Object.freeze({
-    bundle: { classes: ['office', 'url'], hint: 'bundle 仅接受 Office、PDF 文件与网页输入' },
-    docx: { classes: ['markup'], hint: 'docx 仅接受 Markdown 输入' },
-    pdf: { classes: ['markup'], hint: 'pdf 仅接受 Markdown 输入' },
-});
 // 需要内嵌远程图片的目标
 const BINARY_TARGETS = Object.freeze(['docx', 'pdf']);
-const REMOTE_URL_RE = /^https?:\/\//i;
 const REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 const DEFAULT_TITLE = '未命名文档';
 const PROGRESS = Object.freeze({ PARSING: 20, RENDERING: 60, WRITING: 90, DONE: 100 });
 // parser 上报进度的允许区间：上界须低于 RENDERING，避免解析阶段的百分比越过渲染阶段
 const PARSER_PCT = Object.freeze({ MIN: 0, MAX: 55 });
-
-// 'docx'|'doc'|'xlsx'|'xls'|'pptx'|'ppt'|'pdf'|'md'|'url'|null
-function detectInputType(pathOrUrl) {
-    if (typeof pathOrUrl !== 'string' || !pathOrUrl.trim()) return null;
-    const value = pathOrUrl.trim();
-    if (REMOTE_URL_RE.test(value)) return 'url';
-    return EXT_TO_TYPE[path.extname(value).toLowerCase()] || null;
-}
 
 // 调用方负责探测 soffice 与 PDF 后端；本函数只做矩阵拼装
 function listTargets({ sofficeAvailable = false, pdfBackend = null } = {}) {
@@ -139,16 +113,6 @@ async function assertOutputDir(outputDir) {
     if (!stat.isDirectory()) throw new Error(`输出路径不是目录：${outputDir}`);
 }
 
-function assertTargetAllowed(target, inputType) {
-    const rule = TARGET_RULES[target];
-    if (!rule) throw new Error(`不支持的目标格式：${target}（可选：${Object.keys(TARGET_RULES).join('、')}）`);
-    if (!rule.classes.includes(INPUT_CLASS[inputType])) throw new Error(`目标 ${target} 不接受 ${inputType} 输入：${rule.hint}`);
-}
-
-async function statOrNull(target) {
-    try { return await fsp.stat(target); } catch (err) { return null; }
-}
-
 // meta.title 优先，其次首个 H1 的纯文本
 function extractRawTitle(doc) {
     const metaTitle = doc.meta && typeof doc.meta.title === 'string' ? doc.meta.title.trim() : '';
@@ -171,10 +135,12 @@ function firstH1Text(node) {
 function resolveOutputName(source, rawTitle) {
     if (source.type !== 'url') return sanitizeFolderName(stripExt(source.sourceName));
     if (rawTitle) return sanitizeFolderName(rawTitle);
-    return sanitizeFolderName(`${hostnameOf(source.url)}-${formatTimestamp()}`);
+    return sanitizeFolderName(`${hostnameForFileName(source.url)}-${formatTimestamp()}`);
 }
 
-function hostnameOf(url) {
+// 仅用于给无标题网页起文件名，故取不到主机名时回退为可读的 'web'，
+// 与 web/extract.js 中用于站点匹配的 hostnameOf（回退空串）语义不同
+function hostnameForFileName(url) {
     try { return new URL(url).hostname || 'web'; } catch (err) { return 'web'; }
 }
 
@@ -232,11 +198,11 @@ function buildParserContext({ source, target, allowPrivateNetwork, emit }) {
     };
 }
 
-// 远程图片下载器：依赖 net/fetch-guard，模块缺失时返回 undefined（parser 将记 warning 而非内嵌）
+// 远程图片下载器：经 net/fetch-guard 限长抓取，SSRF 校验在守卫内完成。
+// 走 moduleLoader 而非直接 require，以便测试注入桩实现（同 parser/renderer 的加载路径）
 function createRemoteFetcher(allowPrivateNetwork) {
-    const guard = loadOptionalModule('./net/fetch-guard');
-    if (!guard || typeof guard.fetchBinary !== 'function') return undefined;
-    return (url) => guard.fetchBinary(url, { maxBytes: REMOTE_IMAGE_MAX_BYTES, allowPrivateNetwork: Boolean(allowPrivateNetwork) });
+    const { fetchBinary } = moduleLoader('./net/fetch-guard');
+    return (url) => fetchBinary(url, { maxBytes: REMOTE_IMAGE_MAX_BYTES, allowPrivateNetwork: Boolean(allowPrivateNetwork) });
 }
 
 // 进度回调自身的异常不影响转换
@@ -254,18 +220,6 @@ function loadPart(dir, name, method, label) {
     const mod = moduleLoader(`./${dir}/${name}`);
     if (!mod || typeof mod[method] !== 'function') throw new Error(`${label} ${name} 未导出 ${method}()`);
     return mod;
-}
-
-// 仅当缺失的正是目标模块本身（错误信息点名了它，兼容相对说明符与绝对路径两种写法）才返回 null；
-// 其依赖缺失等其它错误照常抛出
-function loadOptionalModule(relPath) {
-    try {
-        return moduleLoader(relPath);
-    } catch (err) {
-        const named = err && String(err.message).replace(/\\/g, '/').includes(relPath.replace(/^\.\//, ''));
-        if (named && err.code === 'MODULE_NOT_FOUND') return null;
-        throw err;
-    }
 }
 
 // 测试钩子：替换模块加载器以注入桩 parser/renderer（与 converters/soffice.js 的 _set*/_reset 约定一致）

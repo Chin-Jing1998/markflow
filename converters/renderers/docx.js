@@ -30,6 +30,7 @@ const {
 } = require('docx');
 const { imageSize } = require('image-size');
 const { stripHtml, collectText } = require('../ir/util');
+const { toBuffer } = require('../util');
 const { downgradeCustomNodes } = require('../ir/schema');
 
 // ---- 常量 ----
@@ -342,12 +343,6 @@ function imageToDocx(node, ctx, fmt) {
     } catch (err) {
         return degrade(`docx 内嵌失败（${err && err.message ? err.message : err}）`);
     }
-}
-
-function toBuffer(value) {
-    if (Buffer.isBuffer(value)) return value;
-    if (value instanceof Uint8Array) return Buffer.from(value);
-    return null;
 }
 
 /** 由 mime 判定 docx 图片类型；mime 未知时用 image-size 嗅探，已知但不支持（svg/webp/emf）返回 null */

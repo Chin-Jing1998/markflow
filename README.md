@@ -133,10 +133,13 @@ Markdown 转 PDF 的链路是「Markdown 语法树 → HTML → Chromium 打印�
 bin/markflow.js            命令行入口
 mcp/server.js              MCP stdio 服务
 converters/
-  index.js                 转换调度：输入类型识别、目标裁决、标题与命名
+  index.js                 转换调度：解析、渲染、标题与命名、落盘
+  service.js               CLI 与 MCP 共用的服务层（能力探测、任务规划、结果信封）
+  targets.js               输入识别、归类与目标裁决（规则的单一来源）
   batch.js                 并发批处理与事件流
   output.js                产物落盘（bundle 与单文件两种形态）
-  targets.js               输入类型与转换目标的对应关系
+  util.js                  跨层通用工具（错误取文、二进制归一、路径探查、进度上报）
+  tmp.js                   临时目录的创建、退出清理与残留回收
   soffice.js               LibreOffice 适配（异步、串行队列）
   parsers/                 各格式解析为中间表示
   renderers/               中间表示渲染为 md / json / html / docx / pdf

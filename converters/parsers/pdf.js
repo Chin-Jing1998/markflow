@@ -15,6 +15,7 @@ const fsp = require('fs').promises;
 const path = require('path');
 const { createDocument, createRoot, createHeading, createParagraph } = require('../ir/schema');
 const { stripExt } = require('../ir/util');
+const { notify } = require('../util');
 
 /** 行分组的 y 坐标容差（PDF 用户空间单位） */
 const LINE_Y_TOLERANCE = 2;
@@ -144,11 +145,5 @@ function computeMedian(nums) {
     return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-// 进度回调异常不得影响解析
-function notify(ctx, phase, pct) {
-    try {
-        if (ctx && typeof ctx.onProgress === 'function') ctx.onProgress(phase, pct);
-    } catch (err) { /* 忽略调用方回调自身的异常 */ }
-}
 
 module.exports = { parse };

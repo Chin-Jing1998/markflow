@@ -19,6 +19,7 @@ const { createDocument } = require('../ir/schema');
 const { stripExt } = require('../ir/util');
 const { resolveImages, collectImageNodes } = require('../assets/md-images');
 const { stripFrontMatter } = require('../web/frontmatter');
+const { notify } = require('../util');
 
 // docx 等二进制渲染器可内嵌的图片类型 → 资源扩展名；不在表内的（svg/webp 等）不进 assets，
 // 但 image 节点上的 data.asset 仍保留，HTML 渲染照常可用
@@ -155,13 +156,5 @@ function collectAssets(ir) {
 // 进度回调（回调异常不得影响解析）
 // ============================================================
 
-function notify(ctx, phase, pct) {
-    if (!ctx || typeof ctx.onProgress !== 'function') return;
-    try {
-        ctx.onProgress(phase, pct);
-    } catch (err) {
-        // 忽略调用方回调自身的异常
-    }
-}
 
 module.exports = { parse };

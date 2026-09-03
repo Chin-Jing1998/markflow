@@ -146,7 +146,7 @@ async function resolveAddresses(host) {
  * allowPrivateNetwork 为 true 时跳过内网判定，但仍按解析结果钉扎（仅测试使用）。
  * @returns {Promise<{ parsed: URL, address: string, family: number }>}
  */
-async function resolveTarget(url, { allowPrivateNetwork = false } = {}) {
+async function resolveAndPinHost(url, { allowPrivateNetwork = false } = {}) {
     let parsed;
     try {
         parsed = new URL(String(url));
@@ -181,7 +181,7 @@ async function resolveTarget(url, { allowPrivateNetwork = false } = {}) {
 
 /** 校验 URL 可安全访问；allowPrivateNetwork 为 true 时跳过内网判定（仅测试使用） */
 async function assertPublicUrl(url, options = {}) {
-    return (await resolveTarget(url, options)).parsed;
+    return (await resolveAndPinHost(url, options)).parsed;
 }
 
 async function withTimeout(timeoutMs, task) {
@@ -259,7 +259,7 @@ function discardBody(response) {
 
 /** 逐跳跟随重定向，每一跳都重新过守卫并重新钉扎地址 */
 async function guardedFetch(url, { headers, allowPrivateNetwork, signal }) {
-    let current = await resolveTarget(url, { allowPrivateNetwork });
+    let current = await resolveAndPinHost(url, { allowPrivateNetwork });
 
     for (let hop = 0; ; hop += 1) {
         const response = await rawFetch(current, headers, signal);
@@ -276,7 +276,7 @@ async function guardedFetch(url, { headers, allowPrivateNetwork, signal }) {
         } catch (err) {
             throw new Error(`重定向目标非法: ${location}`);
         }
-        current = await resolveTarget(next, { allowPrivateNetwork });
+        current = await resolveAndPinHost(next, { allowPrivateNetwork });
     }
 }
 

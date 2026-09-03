@@ -13,8 +13,8 @@ const fsp = require('fs').promises;
 const { z } = require('zod');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
-const { convert, listTargets, runBatch } = require('../converters');
-const { resolveTarget, classifyInput } = require('../converters/targets');
+const service = require('../converters/service');
+const { errText, isDirectory } = require('../converters/util');
 const pkg = require('../package.json');
 
 const CONCURRENCY = 2;
@@ -68,37 +68,20 @@ async function handleConvertDocument(args = {}) {
 
     let tasks;
     try {
-        tasks = raws.map((raw) => {
-            const { input, type } = classifyInput(raw, process.cwd());
-            return { raw, input, target: resolveTarget(type, args.target) };
-        });
+        tasks = service.planTasks(raws, args.target, process.cwd());
     } catch (err) {
-        return failure(messageOf(err));
+        return failure(errText(err));
     }
 
-    const run = (task) => convert({ input: task.input, target: task.target, outputDir });
-    const { results, errors } = await runBatch(tasks, { concurrency: CONCURRENCY }, run);
+    const payload = await service.runConversion({ tasks, outputDir, concurrency: CONCURRENCY });
     return success({
-        ok: errors.length === 0,
-        outputDir,
-        results: await Promise.all(
-            results.map(({ idx, result }) => describeResult(tasks[idx].raw, result, args.returnContent)),
-        ),
-        errors: errors.map(({ idx, error }) => ({ input: tasks[idx].raw, error: messageOf(error) })),
+        ...payload,
+        results: await Promise.all(payload.results.map((item) => withContent(item, args.returnContent))),
     });
 }
 
 async function handleListFormats() {
-    const [sofficeAvailable, pdfBackend] = await Promise.all([
-        require('../converters/soffice').isAvailable(),
-        require('../converters/pdf/backend').detect(),
-    ]);
-    const capabilities = { sofficeAvailable: Boolean(sofficeAvailable), pdfBackend };
-    const targets = listTargets({
-        sofficeAvailable: capabilities.sofficeAvailable,
-        pdfBackend: pdfBackend.available ? pdfBackend : null,
-    });
-    return success({ targets, capabilities, version: pkg.version });
+    return success(await service.describeFormats());
 }
 
 /**
@@ -114,7 +97,7 @@ async function handleExtractArticle(args = {}) {
     try {
         doc = await require('../converters/parsers/url').parse({ url }, { skipImages: true });
     } catch (err) {
-        return failure(messageOf(err));
+        return failure(errText(err));
     }
 
     const markdown = String(await require('../converters/renderers/md').render(doc));
@@ -140,13 +123,10 @@ function pickStrings(source, keys) {
     );
 }
 
-// returnContent 为 true 且产物含 Markdown 时附带正文（截断到上限）
-async function describeResult(input, result, returnContent) {
-    const { target, name, title, outputPath, imagesCount } = result;
-    const outputs = result.outputs || {};
-    const item = { input, target, name, title, outputPath, outputs, imagesCount, warnings: result.warnings || [] };
-    if (!returnContent || !outputs.md) return item;
-    return { ...item, content: (await readTextOrEmpty(outputs.md)).slice(0, MAX_CONTENT_CHARS) };
+// returnContent 为 true 且产物含 Markdown 时附带正文（截断到上限）；其余字段由服务层给出
+async function withContent(item, returnContent) {
+    if (!returnContent || !item.outputs.md) return item;
+    return { ...item, content: (await readTextOrEmpty(item.outputs.md)).slice(0, MAX_CONTENT_CHARS) };
 }
 
 // ==================== 服务装配 ====================
@@ -209,8 +189,6 @@ async function start() {
 
 // ==================== 通用工具 ====================
 
-const messageOf = (err) => (err && err.message ? err.message : String(err));
-
 function success(structuredContent) {
     return { content: [{ type: 'text', text: JSON.stringify(structuredContent, null, 2) }], structuredContent };
 }
@@ -220,11 +198,6 @@ function failure(message) {
     return { isError: true, content: [{ type: 'text', text: message }] };
 }
 
-async function isDirectory(target) {
-    if (typeof target !== 'string' || !target.trim()) return false;
-    try { return (await fsp.stat(target)).isDirectory(); } catch (err) { return false; }
-}
-
 async function readTextOrEmpty(filePath) {
     try { return await fsp.readFile(filePath, 'utf8'); } catch (err) { return ''; }
 }
@@ -232,5 +205,5 @@ async function readTextOrEmpty(filePath) {
 module.exports = { createServer, start };
 
 if (require.main === module) {
-    start().catch((err) => { console.error(`MarkFlow MCP 启动失败：${messageOf(err)}`); process.exit(1); });
+    start().catch((err) => { console.error(`MarkFlow MCP 启动失败：${errText(err)}`); process.exit(1); });
 }

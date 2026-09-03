@@ -497,7 +497,8 @@ test('skipImages 模式下 data URL 图片截断显示，不撑爆返回体积',
 
 test('站点选择器按主机名匹配：子域命中，查询串与伪造子域不命中', () => {
     // Arrange
-    const { hostnameOf, matchesHost } = require('../converters/web/extract');
+    const { matchesHost } = require('../converters/web/extract');
+    const { hostnameOf } = require('../converters/util');
     const cases = [
         ['https://blog.csdn.net/user/article', 'csdn.net', true],
         ['https://csdn.net/x', 'csdn.net', true],

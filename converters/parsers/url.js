@@ -23,10 +23,11 @@ const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
 const { fetchText, fetchBinary } = require('../net/fetch-guard');
 const { getExtFromContentType, getExtFromUrl } = require('../ir/util');
-const { extractContent, hostnameOf, matchesHost } = require('../web/extract');
+const { extractContent, matchesHost } = require('../web/extract');
 const { cleanNoise } = require('../web/noise');
 const { normalizeMarkdown } = require('../web/normalize');
 const { extractMetadata, countWords } = require('../web/metadata');
+const { notify, errText, hostnameOf } = require('../util');
 
 const DEFAULT_TITLE = '未命名文章';
 // 懒加载图片常用属性，按优先级取第一个非空值
@@ -300,15 +301,6 @@ function buildMarkdown(html, title) {
     return markdown.startsWith('# ') ? markdown : `# ${title}\n\n${markdown}`;
 }
 
-// 进度回调异常不得影响解析
-function notify(ctx, phase, pct) {
-    try {
-        if (ctx && typeof ctx.onProgress === 'function') ctx.onProgress(phase, pct);
-    } catch (err) { /* 忽略调用方回调自身的异常 */ }
-}
 
-function errText(err) {
-    return (err && err.message) ? err.message : String(err);
-}
 
 module.exports = { parse };

@@ -16,6 +16,7 @@ const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
 const { stripExt, getExtFromContentType } = require('../ir/util');
+const { notify, errText } = require('../util');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
@@ -143,15 +144,6 @@ function cleanupMarkdown(markdown) {
         .trim();
 }
 
-// 进度回调异常不得影响解析
-function notify(ctx, phase, pct) {
-    try {
-        if (ctx && typeof ctx.onProgress === 'function') ctx.onProgress(phase, pct);
-    } catch (err) { /* 忽略调用方回调自身的异常 */ }
-}
 
-function errText(err) {
-    return (err && err.message) ? err.message : String(err);
-}
 
 module.exports = { parse };

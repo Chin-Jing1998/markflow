@@ -9,6 +9,8 @@
  * 时间统一为 ISO 8601（Date 可解析才输出，不可解析则省略该字段）。
  */
 
+const { hostnameOf } = require('../util');
+
 // 摘要最大长度，按 Unicode 码点计（避免截断代理对）
 const EXCERPT_MAX_LENGTH = 200;
 // article:author 常填作者主页地址而非姓名，遇到 URL 则跳过
@@ -137,10 +139,6 @@ function toIsoString(value) {
 function truncate(text, maxLength) {
     const chars = Array.from(text);
     return chars.length <= maxLength ? text : `${chars.slice(0, maxLength).join('')}…`;
-}
-
-function hostnameOf(url) {
-    try { return new URL(String(url)).hostname || ''; } catch (err) { return ''; }
 }
 
 // 剔除空值字段：下游 front matter 只写实际存在的键

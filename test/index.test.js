@@ -422,32 +422,6 @@ describe('convert：bundle / pdf（桩 parser 与 renderer）', () => {
         assert.ok(calls[0].opts.maxBytes > 0);
     });
 
-    test('fetch-guard 自身缺失时 fetchRemote 为 undefined；其依赖缺失时错误照常抛出', async () => {
-        // Arrange
-        let ctxSeen = null;
-        stubs['./parsers/md'] = { parse: async (input, ctx) => { ctxSeen = ctx; return emptyMdDoc(); } };
-        stubs['./renderers/docx'] = { render: async () => Buffer.from('PK') };
-        stubs['./net/fetch-guard'] = null;
-
-        // Act
-        const res = await convert({ input: { path: SAMPLE_MD }, target: 'docx', outputDir: root });
-
-        // Assert
-        assert.equal(res.ok, true);
-        assert.equal('fetchRemote' in ctxSeen, true);
-        assert.equal(ctxSeen.fetchRemote, undefined);
-
-        // Arrange：fetch-guard 自身存在但其依赖缺失
-        stubs['./net/fetch-guard'] = () => {
-            const err = new Error("Cannot find module 'undici'");
-            err.code = 'MODULE_NOT_FOUND';
-            throw err;
-        };
-
-        // Act & Assert
-        await assert.rejects(convert({ input: { path: SAMPLE_MD }, target: 'docx', outputDir: root }), /undici/);
-    });
-
     test('渲染器未返回 Buffer、解析器返回无效文档、模块缺少导出时均抛中文错误', async () => {
         const params = { input: { path: SAMPLE_MD }, target: 'docx', outputDir: root };
 

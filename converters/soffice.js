@@ -11,8 +11,8 @@
 const { execFile } = require('child_process');
 const fsp = require('fs').promises;
 const path = require('path');
-const os = require('os');
 const { pathToFileURL } = require('url');
+const tmp = require('./tmp');
 
 const CONVERT_TIMEOUT_MS = 120000;
 /** 探测失败后的缓存有效期（毫秒）：过期可重探，避免用户装好 LibreOffice 后必须重启 */
@@ -57,9 +57,7 @@ async function pathExists(p) {
     try { await fsp.access(p); return true; } catch (e) { return false; }
 }
 
-function excerpt(text) {
-    return String(text || '').trim().slice(0, STDERR_EXCERPT_LIMIT);
-}
+const excerpt = (text) => tmp.excerpt(text, { limit: STDERR_EXCERPT_LIMIT });
 
 // ---- 探测 ----
 
@@ -125,7 +123,7 @@ async function runConvert(inputPath, targetExt, outDir) {
     }
 
     await fsp.mkdir(outDir, { recursive: true });
-    const profileDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'markflow-soffice-profile-'));
+    const profileDir = await tmp.makeTempDir('markflow-soffice-profile-');
 
     try {
         // UserInstallation 必须是规范 file URL：裸拼接会让含空格、井号或非 ASCII 的临时目录路径
@@ -156,7 +154,7 @@ async function runConvert(inputPath, targetExt, outDir) {
         return outputPath;
     } finally {
         // 临时 profile 清理失败不影响转换结果
-        await fsp.rm(profileDir, { recursive: true, force: true }).catch(noop);
+        await tmp.removeTempDir(profileDir);
     }
 }
 

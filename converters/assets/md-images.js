@@ -18,13 +18,13 @@
  * 契约：resolveImages(ir, baseDir, opts?) → { resolved, warnings }，绝不抛出，
  * 所有失败以 warnings 字符串返回；除挂载 asset 外不改动 IR。
  */
-const fs = require('fs');
-const fsp = fs.promises;
-const os = require('os');
+const fsp = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
 const { fileURLToPath } = require('url');
 const { imageSize } = require('image-size');
+const { errText, toBuffer } = require('../util');
+const { createTempDirFactory, cleanupStaleTempDirs } = require('../tmp');
 
 // 扩展名 → mime；另两张表由它派生，保证三者始终一致
 const MIME_BY_EXT = {
@@ -37,31 +37,18 @@ const MIME_BY_TYPE = Object.fromEntries(Object.entries(MIME_BY_EXT).map(([ext, m
 const EXT_BY_MIME = Object.fromEntries(Object.entries(MIME_BY_EXT).toReversed().map(([ext, mime]) => [mime, ext]));
 
 const DEFAULT_MIME = 'application/octet-stream';
-// 临时目录前缀；实际目录由 mkdtemp 追加随机后缀，形如 markflow-md-assets-Ab3xY9
+// 临时目录前缀；实际目录由 mkdtemp 追加随机后缀，形如 markflow-md-assets-Ab3xY9。
+// 回收时按无连字符的前缀匹配，以便一并清掉旧版的固定名目录
 const TEMP_DIR_PREFIX = 'markflow-md-assets-';
+const TEMP_DIR_MATCH_PREFIX = 'markflow-md-assets';
 const TEMP_HASH_LEN = 16;
 const TEMP_FILE_MODE = 0o600;
-const STALE_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
-// 模块加载时异步清理超过 1 天未修改的历史临时目录（上次运行残留），失败静默。
-// 用 lstat 而非 stat：同名符号链接不会被当作目录递归删除。
-function cleanupStaleTempDirs() {
-    const root = os.tmpdir();
-    return fsp.readdir(root).then(async (names) => {
-        const now = Date.now();
-        for (const name of names) {
-            if (!name.startsWith('markflow-md-assets')) continue; // 同时回收旧版无连字符的固定目录
-            const target = path.join(root, name);
-            const stat = await fsp.lstat(target).catch(() => null);
-            if (!stat || !stat.isDirectory() || now - stat.mtimeMs < STALE_TEMP_MAX_AGE_MS) continue;
-            await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
-        }
-    }).catch(() => {});
-}
-cleanupStaleTempDirs();
+// 模块加载时异步清理超过 1 天未修改的历史临时目录（上次运行残留），失败静默
+cleanupStaleTempDirs({ matchPrefix: TEMP_DIR_MATCH_PREFIX }).catch(() => {});
 
 // 本进程私有临时目录（首次落盘时才创建）与「内容摘要 → 已落盘路径」缓存
-let tempDirPromise = null;
+const ensureTempDir = createTempDirFactory(TEMP_DIR_PREFIX);
 const tempFileByKey = new Map();
 
 async function resolveImages(ir, baseDir, opts = {}) {
@@ -169,21 +156,6 @@ function measure(buffer) {
 // 进程私有临时目录
 // ============================================================
 
-// 首次调用时 mkdtemp 建目录（权限 0700，路径不可预测），并登记退出时清理；缓存 promise 以免重复创建
-function ensureTempDir() {
-    if (!tempDirPromise) {
-        tempDirPromise = fsp.mkdtemp(path.join(os.tmpdir(), TEMP_DIR_PREFIX)).then((dir) => {
-            process.once('exit', () => {
-                try { fs.rmSync(dir, { recursive: true, force: true }); } catch (err) { /* 退出阶段静默 */ }
-            });
-            return dir;
-        });
-        // 创建失败不缓存失败态，允许下次重试；此处仅消费拒绝，调用方仍从原 promise 收到错误
-        tempDirPromise.catch(() => { tempDirPromise = null; });
-    }
-    return tempDirPromise;
-}
-
 // 同一进程内同内容只落盘一次；wx + 0600 保证不覆盖已有文件、不对同组同其他用户开放
 async function writeTempFile(buffer, mime, warnings) {
     const key = `${crypto.createHash('sha1').update(buffer).digest('hex').slice(0, TEMP_HASH_LEN)}${EXT_BY_MIME[mime] || '.bin'}`;
@@ -269,15 +241,6 @@ function normalizeMime(mimeHint, detectedType) {
     return (detectedType && MIME_BY_TYPE[String(detectedType).toLowerCase()]) || DEFAULT_MIME;
 }
 
-function toBuffer(value) {
-    if (Buffer.isBuffer(value)) return value;
-    if (value instanceof Uint8Array || value instanceof ArrayBuffer) return Buffer.from(value);
-    return null;
-}
-
-function errText(err) {
-    return (err && err.message) ? err.message : String(err);
-}
 
 // 递归收集 image 节点，覆盖表格单元格、列表项、引用等任意嵌套层级
 function collectImageNodes(node, out = []) {

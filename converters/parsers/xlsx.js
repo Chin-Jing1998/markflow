@@ -28,6 +28,7 @@ const {
     createText,
 } = require('../ir/schema');
 const { stripExt } = require('../ir/util');
+const { notify } = require('../util');
 
 // 进度百分比区间：parser 只报 parsing 阶段，按已解析 sheet 比例映射到该区间
 const PROGRESS_MIN = 20;
@@ -140,13 +141,5 @@ function formatCell(v) {
 }
 
 // 进度回调异常不得影响解析
-function notify(ctx, phase, pct) {
-    if (!ctx || typeof ctx.onProgress !== 'function') return;
-    try {
-        ctx.onProgress(phase, pct);
-    } catch (err) {
-        // 忽略调用方回调自身的异常
-    }
-}
 
 module.exports = { parse };

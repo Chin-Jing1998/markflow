@@ -24,6 +24,7 @@ const path = require('path');
 const cheerio = require('cheerio');
 const { createDocument, createRoot, createParagraph, createSlideBreak, createBlockquote } = require('../ir/schema');
 const { stripExt } = require('../ir/util');
+const { notify } = require('../util');
 
 /** 图片扩展名 → MIME，未收录的回退 application/octet-stream */
 const IMAGE_MIME_BY_EXT = {
@@ -269,11 +270,5 @@ async function readCoreTitle(xml) {
     }
 }
 
-// 进度回调异常不得影响解析
-function notify(ctx, phase, pct) {
-    try {
-        if (ctx && typeof ctx.onProgress === 'function') ctx.onProgress(phase, pct);
-    } catch (err) { /* 忽略调用方回调自身的异常 */ }
-}
 
 module.exports = { parse };

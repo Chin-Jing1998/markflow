@@ -13,6 +13,7 @@
 const path = require('path');
 const fsp = require('fs').promises;
 const { ensureDir } = require('./ir/util');
+const { toBuffer } = require('./util');
 
 const IMAGES_DIRNAME = 'images';
 const WINDOWS_DRIVE_RE = /^[A-Za-z]:/;
@@ -82,11 +83,7 @@ async function writeSingle({ outputDir, name, ext, buffer } = {}) {
     return target;
 }
 
-function toBuffer(value) {
-    if (Buffer.isBuffer(value)) return value;
-    return value instanceof Uint8Array ? Buffer.from(value) : null;
-}
-
+// 与 bin/markflow.js 的 resolveCliOutputDir 分工不同：这里只做路径解析，不校验存在性、不读环境变量
 function resolveOutputDir(outputDir) {
     if (typeof outputDir !== 'string' || !outputDir.trim()) throw new Error('缺少输出目录 outputDir');
     return path.resolve(outputDir);

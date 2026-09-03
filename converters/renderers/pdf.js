@@ -15,10 +15,5 @@ async function render(doc) {
     return backend.renderPdf({ html, getDocxBuffer: () => docxRenderer.render(doc) });
 }
 
-
-/** 异步完整探测：{ name, available, hint } */
-function detect(opts) {
-    return backend.detect(opts);
-}
-
-module.exports = { render, detect };
+// 只导出 render：能力探测由 CLI 与 MCP 直连 converters/pdf/backend.detect()
+module.exports = { render };

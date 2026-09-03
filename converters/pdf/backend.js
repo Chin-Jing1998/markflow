@@ -12,18 +12,15 @@
  */
 const fs = require('fs');
 const fsp = fs.promises;
-const os = require('os');
 const path = require('path');
+const tmp = require('../tmp');
 const { spawn } = require('child_process');
 
 const WORKER_TIMEOUT_MS = 60000;
 const DETECT_FAILURE_TTL_MS = 60000;
 const TEMP_PREFIX = 'markflow-pdf-';
-const STALE_TEMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const STDERR_KEEP_LIMIT = 4096;
 const STDERR_EXCERPT_LIMIT = 500;
-/** POSIX 风格绝对路径（连续的 /段）；用于把 stderr 摘要中的本机路径脱敏为 <path> */
-const ABSOLUTE_PATH_RE = /(?:\/[^\s/]+)+/g;
 const PDF_MAGIC = '%PDF';
 const WORKER_SCRIPT = path.join(__dirname, 'electron-worker.js');
 
@@ -126,7 +123,7 @@ function renderViaWorker(html, electronPath) {
 }
 
 async function runWorker(html, electronPath) {
-    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), `${TEMP_PREFIX}worker-`));
+    const tmpDir = await tmp.makeTempDir(`${TEMP_PREFIX}worker-`);
     const inPath = path.join(tmpDir, 'index.html');
     const outPath = path.join(tmpDir, 'output.pdf');
     try {
@@ -134,7 +131,7 @@ async function runWorker(html, electronPath) {
         await spawnWorker(electronPath, [getWorkerScript(), inPath, outPath, path.join(tmpDir, 'profile')]);
         return await fsp.readFile(outPath);
     } finally {
-        await fsp.rm(tmpDir, { recursive: true, force: true }).catch(noop);
+        await tmp.removeTempDir(tmpDir);
     }
 }
 
@@ -186,10 +183,7 @@ function wrapSpawnError(err) {
  * 用户可见的 stderr 摘要：只取首行并把绝对路径替换为 <path>。
  * 首行之后通常是调用栈，既无助于用户排障，又会把项目目录结构暴露到界面与日志导出中。
  */
-function excerpt(text) {
-    const firstLine = String(text || '').trim().split(/\r?\n/)[0] || '';
-    return firstLine.replace(ABSOLUTE_PATH_RE, '<path>').slice(0, STDERR_EXCERPT_LIMIT);
-}
+const excerpt = (text) => tmp.excerpt(text, { limit: STDERR_EXCERPT_LIMIT, firstLineOnly: true, redactPaths: true });
 
 // ---- ② LibreOffice：DOCX → PDF ----
 
@@ -198,40 +192,20 @@ async function renderViaSoffice(getDocxBuffer) {
     const docx = await getDocxBuffer();
     if (!Buffer.isBuffer(docx) || docx.length === 0) throw new Error('getDocxBuffer 未返回有效的 DOCX Buffer');
 
-    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), `${TEMP_PREFIX}soffice-`));
+    const tmpDir = await tmp.makeTempDir(`${TEMP_PREFIX}soffice-`);
     try {
         const docxPath = path.join(tmpDir, 'document.docx');
         await fsp.writeFile(docxPath, docx);
         return await fsp.readFile(await getSoffice().convertFile(docxPath, 'pdf', { outDir: tmpDir }));
     } finally {
-        await fsp.rm(tmpDir, { recursive: true, force: true }).catch(noop);
+        await tmp.removeTempDir(tmpDir);
     }
 }
 
 // ---- 残留临时目录清理 ----
 
-/**
- * 清理 os.tmpdir() 下修改时间超过 1 天的 markflow-pdf-* 目录（上次异常退出的残留）
- * @returns {Promise<number>} 删除的目录数
- */
-async function cleanupStaleTempDirs(now = Date.now()) {
-    const base = os.tmpdir();
-    const names = await fsp.readdir(base).catch(() => []);
-    let removed = 0;
-    for (const name of names) {
-        if (!name.startsWith(TEMP_PREFIX)) continue;
-        const full = path.join(base, name);
-        try {
-            const stat = await fsp.stat(full);
-            if (!stat.isDirectory() || now - stat.mtimeMs < STALE_TEMP_MAX_AGE_MS) continue;
-            await fsp.rm(full, { recursive: true, force: true });
-            removed += 1;
-        } catch (err) {
-            // 单个目录清理失败不影响其余
-        }
-    }
-    return removed;
-}
+/** 清理 os.tmpdir() 下修改时间超过 1 天的 markflow-pdf-* 目录（上次异常退出的残留） */
+const cleanupStaleTempDirs = (now = Date.now()) => tmp.cleanupStaleTempDirs({ matchPrefix: TEMP_PREFIX, now });
 
 cleanupStaleTempDirs().catch(noop);
 
