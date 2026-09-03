@@ -62,6 +62,36 @@ test('listTools 恰好暴露 convert_document、extract_article 与 list_formats
     });
 });
 
+// Claude Desktop 内置客户端的校验器只接受 2020-12 标识，见到 draft-07 会抛 “unsupported dialect”
+// 并在校验层拦下调用；SDK 默认输出 draft-07，故服务端在出站帧上改写。此用例守住该改写不被回退。
+test('工具 schema 声明 2020-12 方言，且不含仅 draft-07 成立的构造', async () => {
+    // Arrange
+    const DIALECT = 'https://json-schema.org/draft/2020-12/schema';
+    // 两版语义不一致的关键字：元组式 items 在 2020-12 中改为 prefixItems，其余为 draft-07 专属
+    const walk = (node, at) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) return node.forEach((child, i) => walk(child, `${at}[${i}]`));
+        ['definitions', '$ref', 'dependencies'].forEach((key) => {
+            assert.ok(!(key in node), `${at} 含 draft-07 专属关键字 ${key}`);
+        });
+        assert.ok(!Array.isArray(node.items), `${at} 使用了元组式 items`);
+        Object.entries(node).forEach(([key, value]) => walk(value, `${at}.${key}`));
+    };
+
+    // Act
+    const { tools } = await client.listTools();
+
+    // Assert
+    tools.forEach((tool) => {
+        assert.equal(tool.outputSchema.$schema, DIALECT, `${tool.name} 的 outputSchema 方言不符`);
+        if (tool.inputSchema && tool.inputSchema.$schema !== undefined) {
+            assert.equal(tool.inputSchema.$schema, DIALECT, `${tool.name} 的 inputSchema 方言不符`);
+        }
+        walk(tool.inputSchema, `${tool.name}.inputSchema`);
+        walk(tool.outputSchema, `${tool.name}.outputSchema`);
+    });
+});
+
 test('convert_document 的 inputSchema 声明 outputDir 为必填', async () => {
     // Act
     const { tools } = await client.listTools();

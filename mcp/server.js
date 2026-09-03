@@ -174,9 +174,36 @@ function createServer() {
     return server;
 }
 
+// SDK 1.30 经 zod v3 转换器生成 schema 时固定写入 draft-07 标识，而 Claude Desktop 内置客户端的
+// 校验器只接受 2020-12：见到其它标识即抛 “unsupported dialect” 并在校验层拦下调用，工具根本不执行。
+// 生成的 schema 只用到 type / properties / required / items / additionalProperties 等两版语义一致的
+// 关键字，不含 definitions、$ref 或元组式 items，故仅在出站帧上改写标识即可，schema 语义不变。
+const JSON_SCHEMA_2020_12 = 'https://json-schema.org/draft/2020-12/schema';
+
+/** 返回改写了 $schema 的副本；本身未声明 $schema 时原样返回 */
+function withCurrentDialect(schema) {
+    if (!schema || typeof schema !== 'object' || typeof schema.$schema !== 'string') return schema;
+    return { ...schema, $schema: JSON_SCHEMA_2020_12 };
+}
+
+/** 改写 tools/list 响应中各工具 schema 的方言标识；其余 JSON-RPC 帧原样透传 */
+function normalizeToolDialects(message) {
+    const tools = message && message.result && message.result.tools;
+    if (!Array.isArray(tools)) return message;
+    const rewritten = tools.map((tool) => {
+        const next = { ...tool, inputSchema: withCurrentDialect(tool.inputSchema) };
+        if (tool.outputSchema) next.outputSchema = withCurrentDialect(tool.outputSchema);
+        return next;
+    });
+    return { ...message, result: { ...message.result, tools: rewritten } };
+}
+
 async function start() {
     const server = createServer();
-    await server.connect(new StdioServerTransport());
+    const transport = new StdioServerTransport();
+    const send = transport.send.bind(transport);
+    transport.send = (message, options) => send(normalizeToolDialects(message), options);
+    await server.connect(transport);
     return server;
 }
 
