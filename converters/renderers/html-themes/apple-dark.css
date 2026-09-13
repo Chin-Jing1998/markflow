@@ -1,0 +1,38 @@
+/* apple-dark：深色苹果风。与 apple 同版式，仅替换色彩，不随系统主题切换 */
+html { -webkit-text-size-adjust: 100%; background: #1c1c1e; }
+body {
+  font-family: var(--mf-font);
+  font-size: var(--mf-size);
+  line-height: var(--mf-lh);
+  max-width: var(--mf-width);
+  margin: 0 auto;
+  padding: 3rem 1.5rem 5rem;
+  background: #1c1c1e;
+  color: #f5f5f7;
+  overflow-wrap: break-word;
+}
+h1, h2, h3, h4, h5, h6 { line-height: 1.25; font-weight: 600; margin: calc(var(--mf-space) * 2.4) 0 var(--mf-space); letter-spacing: -0.01em; color: #ffffff; }
+h1 { font-size: 2em; margin-top: 0; }
+h2 { font-size: 1.5em; }
+h3 { font-size: 1.25em; }
+h4, h5, h6 { font-size: 1em; }
+p { margin: var(--mf-space) 0; }
+ul, ol { margin: var(--mf-space) 0; padding-left: 1.6em; }
+li { margin: calc(var(--mf-space) * 0.4) 0; }
+img { max-width: 100%; height: auto; display: block; margin: calc(var(--mf-space) * 1.5) auto; border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; margin: calc(var(--mf-space) * 1.5) 0; font-size: 0.95em; }
+th, td { border: 1px solid #3a3a3c; padding: 0.5em 0.8em; text-align: left; vertical-align: top; }
+th { background: #2c2c2e; font-weight: 600; }
+code, pre { font-family: var(--mf-mono); }
+code { background: #2c2c2e; padding: 0.15em 0.4em; border-radius: 5px; font-size: 0.88em; color: #f2f2f7; }
+pre { background: #2c2c2e; padding: 1em 1.2em; border-radius: 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+pre code { background: none; padding: 0; font-size: 0.88em; }
+blockquote { border-left: 3px solid #48484a; margin: calc(var(--mf-space) * 1.5) 0; padding: 0.2em 1.2em; color: #aeaeb2; }
+hr { border: none; border-top: 1px solid #3a3a3c; margin: calc(var(--mf-space) * 3) 0; }
+a { color: #0a84ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+ul.contains-task-list { list-style: none; padding-left: 1.2em; }
+.task-list-item input[type="checkbox"] { margin-right: 0.4em; vertical-align: middle; }
+.mf-math { font-style: italic; }
+.mf-math-display { display: block; text-align: center; margin: calc(var(--mf-space) * 1.5) 0; }
+math { font-size: 1.05em; }
