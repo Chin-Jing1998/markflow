@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!--
+    MarkFlow 桌面端主页面：经 mf-app://app/ 加载，CSP 由主进程协议处理器以响应头下发。
+    结构：全宽拖动条（hiddenInset / titleBarOverlay 让位）→ 左侧导航 → 内容区（页面元素由 js/app.js 挂载）→ 轻提示容器。
+-->
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <title>MarkFlow</title>
+    <link rel="stylesheet" href="css/tokens.css">
+    <link rel="stylesheet" href="css/app.css">
+    <script type="module" src="js/app.js"></script>
+</head>
+<body>
+    <div class="window-drag-bar" aria-hidden="true"></div>
+    <mf-sidebar class="sidebar"></mf-sidebar>
+    <main class="content" id="content" aria-live="polite"></main>
+    <mf-toast></mf-toast>
+</body>
+</html>

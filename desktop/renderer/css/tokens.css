@@ -1,0 +1,128 @@
+/* ============================================================
+   MarkFlow 桌面端 · 设计令牌（自 v1 css/styles.css 恢复）
+   设计语言：macOS Tahoe / iOS 26 风格 —— 材质、连续圆角、动态强调色、弹簧动效
+   主题：单份 token，浅 / 深两套取值经 light-dark() 由 color-scheme 决定；
+         页面跟随 prefers-color-scheme，用户固定主题时由主进程同步 nativeTheme.themeSource
+   ============================================================ */
+
+:root {
+    color-scheme: light dark;
+
+    /* Dynamic Tint（默认 Apple Blue，改 --tint-h 即可整体换色） */
+    --tint-h: 252; --tint-c: 0.18; --tint-l: 63%;
+    --accent: oklch(var(--tint-l) var(--tint-c) var(--tint-h));
+    --accent-hover: oklch(calc(var(--tint-l) + 4%) var(--tint-c) var(--tint-h));
+    --accent-bg: color-mix(in oklch, var(--accent) 12%, transparent);
+    --accent-ring: color-mix(in oklch, var(--accent) 35%, transparent);
+
+    /* Surface（浅 / 深） */
+    --bg: light-dark(oklch(98% 0.003 250), oklch(18% 0.004 260));
+    --bg-translucent: light-dark(oklch(98% 0.003 250 / 0.55), oklch(18% 0.004 260 / 0.55));
+    --surface-1: light-dark(color-mix(in oklch, white 72%, transparent), color-mix(in oklch, white 8%, transparent));
+    --surface-2: light-dark(color-mix(in oklch, white 84%, transparent), color-mix(in oklch, white 14%, transparent));
+    --surface-3: light-dark(color-mix(in oklch, white 94%, transparent), color-mix(in oklch, white 22%, transparent));
+    --surface-stroke: light-dark(color-mix(in oklch, white 60%, transparent), color-mix(in oklch, white 14%, transparent));
+    --highlight-top: light-dark(rgba(255,255,255,.6), rgba(255,255,255,.10));
+    --surface-highlight: linear-gradient(180deg, var(--highlight-top), rgba(255,255,255,0) 55%);
+    --sidebar-bg: light-dark(rgba(255,255,255,0.28), rgba(255,255,255,0.03));
+
+    /* Label / Separator */
+    --label-primary: light-dark(oklch(20% 0.01 260), oklch(96% 0.005 260));
+    --label-secondary: light-dark(oklch(48% 0.01 260), oklch(70% 0.01 260));
+    --label-tertiary: light-dark(oklch(65% 0.01 260), oklch(52% 0.01 260));
+    --label-on-accent: oklch(99% 0.01 var(--tint-h));
+    --separator: light-dark(color-mix(in oklch, black 8%, transparent), color-mix(in oklch, white 12%, transparent));
+    --separator-opaque: light-dark(color-mix(in oklch, black 12%, transparent), color-mix(in oklch, white 18%, transparent));
+
+    /* System Colors */
+    --system-red: oklch(64% 0.22 27);
+    --system-green: oklch(72% 0.18 145);
+    --system-orange: oklch(75% 0.16 60);
+
+    /* Continuous Corner（伪 squircle） */
+    --r-sm: 10px; --r-md: 14px; --r-lg: 20px; --r-xl: 28px; --r-pill: 999px;
+
+    /* 多层阴影（颜色分量按主题取值） */
+    --shadow-inset-1: light-dark(rgba(255,255,255,.5), rgba(255,255,255,.08));
+    --shadow-inset-2: light-dark(rgba(255,255,255,.7), rgba(255,255,255,.12));
+    --shadow-ring-1: light-dark(rgba(0,0,0,.04), rgba(0,0,0,.4));
+    --shadow-ring-2: light-dark(rgba(0,0,0,.06), rgba(0,0,0,.5));
+    --shadow-near-1: light-dark(rgba(0,0,0,.05), rgba(0,0,0,.4));
+    --shadow-near-2: light-dark(rgba(0,0,0,.06), rgba(0,0,0,.5));
+    --shadow-far-1: light-dark(rgba(0,0,0,.06), rgba(0,0,0,.45));
+    --shadow-far-2: light-dark(rgba(0,0,0,.10), rgba(0,0,0,.6));
+    --shadow-1: 0 0.5px 0 0 var(--shadow-inset-2) inset, 0 0 0 1px var(--shadow-ring-1), 0 1px 2px var(--shadow-near-1), 0 8px 24px var(--shadow-far-1);
+    --shadow-2: 0 0.5px 0 0 var(--shadow-inset-2) inset, 0 0 0 1px var(--shadow-ring-2), 0 2px 6px var(--shadow-near-2), 0 24px 60px var(--shadow-far-2);
+    --glow-accent: 0 0 0 4px var(--accent-ring), 0 6px 24px color-mix(in oklch, var(--accent) 35%, transparent);
+
+    /* Motion · Spring tokens */
+    --ease-spring: cubic-bezier(0.30, 0.70, 0.40, 1.00);
+    --ease-standard: cubic-bezier(0.40, 0.00, 0.20, 1.00);
+    --dur-fast: 150ms; --dur-base: 250ms; --dur-slow: 400ms;
+    --transition: all var(--dur-base) var(--ease-spring);
+
+    /* Type · 系统字体优先，不加载远程字体 */
+    --font: -apple-system, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", Menlo, monospace;
+
+    /* Space · 4pt grid */
+    --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px;
+    --s-5: 20px; --s-6: 24px; --s-8: 32px; --s-10: 40px;
+
+    /* 标题栏让位：Windows titleBarOverlay 提供 env()，macOS hiddenInset 取回退值 */
+    --titlebar-height: env(titlebar-area-height, 52px);
+    --sidebar-width: 220px;
+}
+
+/* ===== Reset ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+body {
+    background: transparent;          /* 让 Electron vibrancy 透出；无 vibrancy 平台由窗口 backgroundColor 兜底 */
+    color: var(--label-primary);
+    font-family: var(--font);
+    font-size: 13.5px;
+    line-height: 1.5;
+    overflow: hidden;
+    font-feature-settings: "ss01", "cv01", "cv02";
+    user-select: none;
+}
+input, textarea, select, button { font-family: inherit; }
+input, textarea { user-select: text; }
+a { color: var(--accent); }
+.icon { width: 1em; height: 1em; flex-shrink: 0; vertical-align: -0.15em; }
+button .icon { font-size: 15px; }
+
+/* ===== Scrollbar (overlay style) ===== */
+::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+    background: color-mix(in oklch, var(--label-primary) 20%, transparent);
+    border-radius: var(--r-pill);
+    background-clip: padding-box;
+    border: 3px solid transparent;
+}
+::-webkit-scrollbar-thumb:hover { background: color-mix(in oklch, var(--label-primary) 35%, transparent); background-clip: padding-box; border: 3px solid transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ===== 降级处理 ===== */
+@media (prefers-reduced-transparency: reduce) {
+    body { background: var(--bg) !important; }
+    .sidebar { background: var(--bg) !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+@media (prefers-contrast: more) {
+    :root {
+        --separator: light-dark(rgba(0, 0, 0, 0.4), rgba(255, 255, 255, 0.4));
+        --label-secondary: var(--label-primary);
+    }
+}
