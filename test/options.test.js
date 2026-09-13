@@ -23,6 +23,7 @@ describe('normalizeOptions', () => {
         assert.deepEqual(opts, DEFAULT_OPTIONS);
         assert.equal(opts.imageFormat, 'jpg');
         assert.equal(opts.jpegQuality, 90);
+        assert.equal(opts.jpegPpi, 330);
         assert.equal(opts.math, 'image');
         assert.equal(opts.pdfBackend, 'auto');
         assert.deepEqual(opts.mineru, {
@@ -63,6 +64,7 @@ describe('normalizeOptions', () => {
         });
 
         assert.equal(opts.jpegQuality, 75);
+        assert.equal(opts.jpegPpi, 330);
         assert.equal(opts.html.theme, 'github');
         assert.equal(opts.html.fontSize, 18);
         assert.equal(opts.html.lineHeight, 1.7);
@@ -165,7 +167,7 @@ describe('normalizeOptions', () => {
     });
 
     test('未知键与非对象入参被拒绝', () => {
-        assert.throws(() => normalizeOptions({ jpegQualiy: 90 }), /未知选项：jpegQualiy（可用：imageFormat、jpegQuality、math、pdfBackend/);
+        assert.throws(() => normalizeOptions({ jpegQualiy: 90 }), /未知选项：jpegQualiy（可用：imageFormat、jpegQuality、jpegPpi、math、pdfBackend/);
         assert.throws(() => normalizeOptions({ html: { fontsize: 12 } }), /未知选项：html\.fontsize（可用：theme、fontFamily、fontSize/);
         assert.throws(() => normalizeOptions({ xml: { patent: { rasterize: true } } }), /未知选项：xml\.patent\.rasterize/);
         assert.throws(() => normalizeOptions('jpg'), /选项 options 须为对象，实际："jpg"/);
@@ -203,6 +205,9 @@ describe('OPTION_ENUMS、describeOptions 与 redactOptions', () => {
         assert.deepEqual(JSON.parse(JSON.stringify(desc)), desc);
         assert.deepEqual(desc.jpegQuality, {
             type: 'number', description: 'JPEG 质量', min: 60, max: 100, integer: true, default: 90,
+        });
+        assert.deepEqual(desc.jpegPpi, {
+            type: 'number', description: 'JPEG 分辨率（PPI）', min: 72, max: 600, integer: true, default: 330,
         });
         assert.equal(desc.html.type, 'object');
         assert.deepEqual(desc.html.fields.theme.values, OPTION_ENUMS.htmlThemes);

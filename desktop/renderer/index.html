@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <!--
     MarkFlow 桌面端主页面：经 mf-app://app/ 加载，CSP 由主进程协议处理器以响应头下发。
-    结构：全宽拖动条（hiddenInset / titleBarOverlay 让位）→ 左侧导航 → 内容区（页面元素由 js/app.js 挂载）→ 轻提示容器。
+    结构：全宽拖动条（hiddenInset / titleBarOverlay 让位）→ 全窗口顶部状态栏 → 左标签栏与内容区 → 页面元素（由 js/app.js 挂载）→ 轻提示容器。
 -->
 <html lang="zh-CN">
 <head>
@@ -15,6 +15,7 @@
 </head>
 <body>
     <div class="window-drag-bar" aria-hidden="true"></div>
+    <mf-status-bar class="status-bar" role="status" aria-label="MarkFlow"></mf-status-bar>
     <mf-sidebar class="sidebar"></mf-sidebar>
     <main class="content" id="content" aria-live="polite"></main>
     <mf-toast></mf-toast>

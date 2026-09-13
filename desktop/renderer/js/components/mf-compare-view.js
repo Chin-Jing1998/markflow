@@ -24,6 +24,7 @@ class MfCompareView extends HTMLElement {
         if (this.dataset.ready) return;
         this.dataset.ready = '1';
         this.pending = null;
+        this.scrollSync = null;
         this.innerHTML = `
             <header class="page-header">
                 <h1>预览</h1>
@@ -37,26 +38,32 @@ class MfCompareView extends HTMLElement {
                     <button class="icon-btn icon-btn-sm" type="button" data-action="close" title="关闭预览" hidden>${icon('x')}</button>
                 </div>
             </header>
-            <div class="page-body compare-body">
-                <section class="compare-empty" data-role="empty">
-                    <div class="dropzone-icon">${icon('preview')}</div>
-                    <h3>对比预览</h3>
-                    <p>左栏是来源文档，右栏是将要导出的产物；改动右侧格式面板即可实时看到效果。</p>
-                    <div class="dropzone-actions">
-                        <button class="btn btn-primary" type="button" data-action="pick">${icon('file')}选择文件…</button>
+            <div class="page-body page-layout compare-body">
+                <aside class="page-sidebar compare-sidebar" aria-label="预览设置">
+                    <div class="page-sidebar-heading">预览设置</div>
+                    <p class="page-sidebar-note" data-role="sidebar-note">打开来源文件后，可在此调整导出格式。</p>
+                    <mf-format-panel class="panel" data-role="format-panel" hidden></mf-format-panel>
+                </aside>
+                <section class="compare-main">
+                    <section class="compare-empty" data-role="empty">
+                        <div class="dropzone-icon">${icon('preview')}</div>
+                        <h3>对比预览</h3>
+                        <p>左侧为格式设置，中间是来源文档，右侧是将要导出的产物；改动格式选项即可实时看到效果。</p>
+                        <div class="dropzone-actions">
+                            <button class="btn btn-primary" type="button" data-action="pick">${icon('file')}选择文件…</button>
+                        </div>
+                        <div class="field-row compare-url">
+                            <input class="input" type="url" data-role="url" placeholder="或粘贴一条网页链接（http / https）" spellcheck="false">
+                            <button class="btn btn-secondary" type="button" data-action="open-url">${icon('link')}预览网页</button>
+                        </div>
+                        <p class="compare-error" data-role="error" hidden></p>
+                    </section>
+                    <div class="compare-grid" data-role="grid" hidden>
+                        <mf-source-pane class="pane pane-source"></mf-source-pane>
+                        <mf-product-pane class="pane pane-product"></mf-product-pane>
                     </div>
-                    <div class="field-row compare-url">
-                        <input class="input" type="url" data-role="url" placeholder="或粘贴一条网页链接（http / https）" spellcheck="false">
-                        <button class="btn btn-secondary" type="button" data-action="open-url">${icon('link')}预览网页</button>
-                    </div>
-                    <p class="compare-error" data-role="error" hidden></p>
+                    <div class="compare-busy" data-role="busy" hidden><span class="spinner">${icon('spinner')}</span><span data-role="busy-text">正在准备预览…</span></div>
                 </section>
-                <div class="compare-grid" data-role="grid" hidden>
-                    <mf-source-pane class="pane pane-source"></mf-source-pane>
-                    <mf-product-pane class="pane pane-product"></mf-product-pane>
-                    <mf-format-panel class="panel"></mf-format-panel>
-                </div>
-                <div class="compare-busy" data-role="busy" hidden><span class="spinner">${icon('spinner')}</span><span data-role="busy-text">正在准备预览…</span></div>
             </div>
             <footer class="page-footer">
                 <div class="footer-summary" data-role="status"></div>
@@ -76,6 +83,7 @@ class MfCompareView extends HTMLElement {
 
     disconnectedCallback() {
         if (this.unsubscribe) this.unsubscribe();
+        this.unbindScrollSync();
     }
 
     refresh() {
@@ -91,6 +99,8 @@ class MfCompareView extends HTMLElement {
         this.querySelector('[data-role="grid"]').hidden = !preview;
         this.querySelector('[data-role="empty"]').hidden = Boolean(preview);
         this.querySelector('[data-role="busy"]').hidden = !busy;
+        this.querySelector('[data-role="sidebar-note"]').hidden = Boolean(preview);
+        this.querySelector('[data-role="format-panel"]').hidden = !preview;
         const error = this.querySelector('[data-role="error"]');
         error.hidden = !state.previewError || Boolean(preview);
         error.textContent = state.previewError || '';
@@ -102,6 +112,7 @@ class MfCompareView extends HTMLElement {
         }
         this.querySelector('[data-role="target-field"]').hidden = !preview;
         if (!preview) {
+            this.unbindScrollSync();
             this.querySelector('.preview-name').textContent = '';
             this.querySelector('[data-role="status"]').textContent = '';
             return;
@@ -112,6 +123,7 @@ class MfCompareView extends HTMLElement {
         this.querySelector('[data-action="refresh"]').hidden = preview.live && !this.pending;
         this.querySelector('mf-source-pane').view = preview.sourceView;
         this.querySelector('mf-product-pane').product = preview.product;
+        this.bindScrollSync();
         this.querySelector('mf-format-panel').context = {
             formats: state.formats, target: preview.target, type: preview.type,
             options: this.pending || preview.options, busy,
@@ -182,7 +194,6 @@ class MfCompareView extends HTMLElement {
             const opened = await api.previewOpen(payload);
             store.set({ preview: opened, previewBusy: false });
             if (previous) api.previewClose(previous.sessionId).catch(() => undefined);
-            for (const warning of opened.warnings || []) notify(warning, 'warning', 6000);
         } catch (err) {
             store.set({ previewBusy: false, previewError: err.message, preview: null });
             notify(err.message, 'error', 6000);
@@ -255,6 +266,107 @@ class MfCompareView extends HTMLElement {
 
     setBusyText(text) {
         this.querySelector('[data-role="busy-text"]').textContent = text;
+    }
+
+    bindScrollSync() {
+        const sourceFrame = this.querySelector('.pane-source .view-frame');
+        const productFrame = this.querySelector('.pane-product .view-frame');
+        if (this.scrollSync && this.scrollSync.sourceFrame === sourceFrame && this.scrollSync.productFrame === productFrame) return;
+        this.unbindScrollSync();
+        if (!sourceFrame || !productFrame) return;
+
+        const refresh = () => this.attachScrollers(sourceFrame, productFrame);
+        sourceFrame.addEventListener('load', refresh);
+        productFrame.addEventListener('load', refresh);
+        this.scrollSync = { sourceFrame, productFrame, refresh, source: null, product: null, locked: false };
+        refresh();
+    }
+
+    attachScrollers(sourceFrame, productFrame) {
+        const state = this.scrollSync;
+        if (!state || state.sourceFrame !== sourceFrame || state.productFrame !== productFrame) return;
+        const source = this.getScrollTarget(sourceFrame);
+        const product = this.getScrollTarget(productFrame);
+        if (!source || !product || (state.source === source && state.product === product)) return;
+        this.removeScrollListeners(state.source, state.onSource);
+        this.removeScrollListeners(state.product, state.onProduct);
+        state.source = source;
+        state.product = product;
+        state.onSource = () => this.syncScroll(source, product);
+        state.onProduct = () => this.syncScroll(product, source);
+        this.addScrollListeners(source, state.onSource);
+        this.addScrollListeners(product, state.onProduct);
+    }
+
+    getScrollTarget(frame) {
+        const document = frame.contentDocument;
+        const window = frame.contentWindow;
+        if (!document || !window) return null;
+        return { frame, document, window };
+    }
+
+    addScrollListeners(target, handler) {
+        if (!target) return;
+        target.window.addEventListener('scroll', handler, { passive: true });
+        target.document.addEventListener('scroll', handler, { passive: true });
+        target.document.documentElement?.addEventListener('scroll', handler, { passive: true });
+        target.document.body?.addEventListener('scroll', handler, { passive: true });
+    }
+
+    removeScrollListeners(target, handler) {
+        if (!target || !handler) return;
+        target.window.removeEventListener('scroll', handler);
+        target.document.removeEventListener('scroll', handler);
+        target.document.documentElement?.removeEventListener('scroll', handler);
+        target.document.body?.removeEventListener('scroll', handler);
+    }
+
+    readScrollTop(target) {
+        const { document, window } = target;
+        return Math.max(
+            Number(window.scrollY) || 0,
+            Number(document.documentElement?.scrollTop) || 0,
+            Number(document.body?.scrollTop) || 0,
+        );
+    }
+
+    readScrollMax(target) {
+        const { document, frame } = target;
+        const scrollHeight = Math.max(
+            Number(document.documentElement?.scrollHeight) || 0,
+            Number(document.body?.scrollHeight) || 0,
+        );
+        return Math.max(0, scrollHeight - frame.clientHeight);
+    }
+
+    writeScrollTop(target, value) {
+        const top = Math.max(0, Number(value) || 0);
+        target.window.scrollTo(0, top);
+        if (target.document.documentElement) target.document.documentElement.scrollTop = top;
+        if (target.document.body) target.document.body.scrollTop = top;
+    }
+
+    syncScroll(from, to) {
+        const state = this.scrollSync;
+        if (!state || state.locked) return;
+        const fromMax = this.readScrollMax(from);
+        const toMax = this.readScrollMax(to);
+        const ratio = fromMax > 0 ? this.readScrollTop(from) / fromMax : 0;
+        state.locked = true;
+        this.writeScrollTop(to, ratio * toMax);
+        requestAnimationFrame(() => {
+            if (this.scrollSync === state) state.locked = false;
+        });
+    }
+
+    unbindScrollSync() {
+        const state = this.scrollSync;
+        if (!state) return;
+        state.sourceFrame.removeEventListener('load', state.refresh);
+        state.productFrame.removeEventListener('load', state.refresh);
+        this.removeScrollListeners(state.source, state.onSource);
+        this.removeScrollListeners(state.product, state.onProduct);
+        this.scrollSync = null;
     }
 }
 

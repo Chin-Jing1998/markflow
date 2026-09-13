@@ -8,6 +8,7 @@
  */
 import './components/mf-toast.js';
 import './components/mf-sidebar.js';
+import './components/mf-status-bar.js';
 import './components/mf-convert-page.js';
 import './components/mf-library-page.js';
 import './components/mf-settings-page.js';

@@ -224,7 +224,7 @@ test('render 命中重解析项时重新解析并重建来源栏', async () => {
 });
 
 test('REPARSE_KEYS 覆盖解析管线相关项，changedReparseKeys 逐项判定（含数组）', () => {
-    for (const key of ['imageFormat', 'math', 'pdfBackend', 'patentParts', 'rasterizeTables', 'rasterizeFormulas', 'imageDpi', 'sectionDetection', 'xmlProfile', 'jpegQuality']) {
+    for (const key of ['imageFormat', 'math', 'pdfBackend', 'patentParts', 'rasterizeTables', 'rasterizeFormulas', 'imageDpi', 'sectionDetection', 'xmlProfile', 'jpegQuality', 'jpegPpi']) {
         assert.ok(REPARSE_KEYS.includes(key), `REPARSE_KEYS 缺少 ${key}`);
     }
     assert.ok(!REPARSE_KEYS.includes('theme') && !REPARSE_KEYS.includes('fontSize'), '排版类选项不应触发重解析');

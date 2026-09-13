@@ -126,22 +126,23 @@ class MfProductPane extends HTMLElement {
     }
 
     mount(view, host) {
+        const mountCompareFrame = (options) => mountFrame(host, { ...options, scrollbar: true, sameOrigin: true });
         if (view.kind === 'pdf') {
-            mountFrame(host, { src: view.url, title: '产物 PDF' });
+            mountCompareFrame({ src: view.url, title: '产物 PDF' });
             return;
         }
         if (view.kind === 'xml') {
             const part = this.activePart;
-            if (this.tab === 'rendered' && part && part.structuredHtml) mountFrame(host, { srcdoc: part.structuredHtml, title: '产物结构视图' });
-            else mountFrame(host, { srcdoc: textDocument(part ? part.xml : '', { title: 'XML 原文' }), title: 'XML 原文' });
+            if (this.tab === 'rendered' && part && part.structuredHtml) mountCompareFrame({ srcdoc: part.structuredHtml, title: '产物结构视图' });
+            else mountCompareFrame({ srcdoc: textDocument(part ? part.xml : '', { title: 'XML 原文' }), title: 'XML 原文' });
             return;
         }
         if (this.tab === 'raw') {
             const raw = view.kind === 'md' ? view.raw : view.html;
-            mountFrame(host, { srcdoc: textDocument(raw || '', { title: '原文' }), title: '产物原文' });
+            mountCompareFrame({ srcdoc: textDocument(raw || '', { title: '原文' }), title: '产物原文' });
             return;
         }
-        mountFrame(host, { srcdoc: view.html || '', title: '产物' });
+        mountCompareFrame({ srcdoc: view.html || '', title: '产物' });
     }
 
     /** 预检清单：patent profile 的 precheck.json，按 blocking / warning 分组显示，并附 DTD 校验结果 */

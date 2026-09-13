@@ -109,7 +109,8 @@ markflow mcp
 | `--patent-parts <部分列表>` | `claims` \| `description` \| `drawings` \| `abstract` \| `abstract-figure`，逗号分隔 | `auto` | `patent` profile 下输出的五书子集；`auto` 按识别结果输出 |
 | `--pdf-backend <后端>` | `auto` \| `mineru` \| `local` | `auto` | PDF 解析后端：`auto` 有令牌走云端否则本地，`mineru` 强制云端，`local` 强制本地 |
 | `--image-format <格式>` | `jpg` \| `keep` | `jpg` | 图片归一格式：`jpg` 把位图统一转为 JPEG，`keep` 保持原格式 |
-| `--jpeg-quality <n>` | 整数 60–100 | `90` | JPEG 质量 |
+| `--jpeg-quality <n>` | 整数 60–100 | `90` | JPEG 压缩质量 |
+| `--jpeg-ppi <n>` | 整数 72–600 | `330` | JPEG 分辨率（PPI） |
 | `--math <方式>` | `image` \| `text` | `image` | docx 公式：`image` 栅格为图片，`text` 降级为线性化文本 |
 | `--mineru-model <模型>` | `pipeline` \| `vlm` | `pipeline` | MinerU 解析模型 |
 | `--mineru-ocr` | 布尔开关 | `false` | 强制 OCR |
@@ -206,7 +207,8 @@ markflow config unset mineru-token         # 从配置文件移除；其它来�
 | `patentParts` | 五书名数组 | 否 | `patent` profile 下输出的五书子集 |
 | `pdfBackend` | `auto` \| `mineru` \| `local` | 否 | PDF 解析后端 |
 | `imageFormat` | `jpg` \| `keep` | 否 | 图片归一格式 |
-| `jpegQuality` | `integer` | 否 | JPEG 质量，60–100 |
+| `jpegQuality` | `integer` | 否 | JPEG 压缩质量，60–100 |
+| `jpegPpi` | `integer` | 否 | JPEG 分辨率，72–600 PPI，默认 330 |
 | `math` | `image` \| `text` | 否 | docx 公式处理方式 |
 | `validate` | `boolean` | 否 | `xml` 目标的校验开关 |
 | `mineru` | `{ model, ocr, language, pageRanges }` | 否 | MinerU 解析参数；令牌不接受经此传入 |
@@ -272,7 +274,7 @@ JSON 产物结构为 `{ schemaVersion, kind, ir, data, meta }`，其中 `ir` 为
 
 结构约定：每份文件头三行固定为 XML 声明、`<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd">` 与 `showxml.xsl` 样式处理指令，根元素为 `<cn-application-body lang="zh" country="CN">`。说明书段号四位补零连续编排（段首已有 `[0001]` 者剥离并复用，与预期不一致时记「段号跳变」告警）；权项 id 形如 `cl001`，`根据权利要求 N 所述` 自动解析为 `<claim-ref>`；附图 id 形如 `f0001`、图片 id 形如 `i0001`，`wi`/`he` 由像素与 JPEG 密度换算为毫米。表格与公式在本 profile 下一律栅格为 JPG，栅格化后端不可用时降级为逐行文本或线性化文本并告警。
 
-转档前预检覆盖：GB18030 之外的字符、图片格式与密度（官方只受理 JPG/TIF、72–300 DPI）、浮动对象与文本框、OLE 对象、Word 自动编号、修订痕迹、文档保护、批注、非常规中文字体、公式后标点、缺节。问题项分 `blocking`（官方工具会拒绝转换）与 `warning` 两级，全部写入 `precheck.json` 并进入结果的 `warnings`。
+转档前预检覆盖：GB18030 之外的字符、图片格式与密度（官方只受理 JPG/TIF、72–300 DPI）、浮动对象与文本框、OLE 对象、Word 自动编号、修订痕迹、文档保护、批注、非常规中文字体、公式后标点、缺节。问题项分 `blocking`（官方工具会拒绝转换）与 `warning` 两级，全部写入 `precheck.json` 并进入结果的 `warnings`。因此，patent profile 提交前应使用 `--jpeg-ppi 72–300`；通用 JPG 默认值仍为 330 PPI。
 
 加 `--validate` 后，随包分发的官方 DTD 会逐份校验五书。交叉核对可用 `xmllint`，在仓库根目录执行：
 
@@ -310,7 +312,7 @@ MinerU 的全部产物原样落在产物目录的 `mineru/` 下，包括 `full.m
 
 ## 图片与公式处理
 
-图片默认统一为 JPG：png、bmp、tiff、webp 与静态 gif 解码后铺白合成，以 `--jpeg-quality`（默认 90）编码，并写入 300 DPI 的 JFIF 密度；已是 JPEG 的只补写密度、不重编码。svg、emf、wmf 与动图 gif 保持原格式并告警。`--image-format keep` 关闭整条归一链路。
+图片默认统一为 JPG：png、bmp、tiff、webp 与静态 gif 解码后铺白合成，以 `--jpeg-quality`（默认 90）控制压缩质量，并以 `--jpeg-ppi`（默认 330 PPI）写入 JFIF 密度；已是 JPEG 的只补写密度、不重编码。svg、emf、wmf 与动图 gif 保持原格式并告警。`--image-format keep` 关闭整条归一链路。
 
 护栏与降级：默认按 `raster.maxWidth`（1600 px）等比缩小，`patent` profile 下禁用缩放以保留原始像素；像素数超过 8000 万或字节数超过 200 MB 的图片保留原图并告警；多页 TIFF 取首页；单张失败只降级为告警，不影响整份转换。`patent` profile 下的 EMF/WMF 先试栅格化后端，再试 LibreOffice，两者皆不可用时告警。
 

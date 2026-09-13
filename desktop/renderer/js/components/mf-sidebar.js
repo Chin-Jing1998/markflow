@@ -1,5 +1,5 @@
 /**
- * <mf-sidebar>：左侧导航（转换 / 文件库 / 阅读 / 预览 / 设置）。路由为 hash（#/convert 等）。
+ * <mf-sidebar>：左标签栏导航（转换 / 文件库 / 阅读 / 预览 / 设置）。路由为 hash（#/convert 等）。
  */
 import { store } from '../store.js';
 import { icon } from '../icons.js';
@@ -13,8 +13,8 @@ const NAV = Object.freeze([
 const FOOT = Object.freeze([{ route: 'settings', label: '设置', icon: 'settings' }]);
 
 const item = ({ route, label, icon: name, pending }) => `
-    <a class="nav-item${pending ? ' is-pending' : ''}" href="#/${route}" data-route="${route}" ${pending ? `title="${pending}提供" aria-disabled="true"` : ''}>
-        ${icon(name)}<span>${label}</span>${pending ? `<em class="nav-badge">${pending}</em>` : ''}
+    <a class="nav-item${pending ? ' is-pending' : ''}" href="#/${route}" data-route="${route}" aria-label="${label}" title="${pending ? `${pending}提供` : label}" ${pending ? 'aria-disabled="true"' : ''}>
+        ${icon(name)}<span class="nav-label">${label}</span>${pending ? `<em class="nav-badge">${pending}</em>` : ''}
     </a>`;
 
 class MfSidebar extends HTMLElement {
@@ -22,12 +22,9 @@ class MfSidebar extends HTMLElement {
         if (this.dataset.ready) return;
         this.dataset.ready = '1';
         this.innerHTML = `
-            <div class="sidebar-brand" aria-label="MarkFlow">
-                <span class="brand-mark">M</span><span class="brand-text">MarkFlow</span>
-            </div>
-            <nav class="sidebar-nav" aria-label="主导航">${NAV.map(item).join('')}</nav>
+            <nav class="sidebar-nav" aria-label="主标签栏">${NAV.map(item).join('')}</nav>
             <div class="sidebar-spacer"></div>
-            <nav class="sidebar-nav sidebar-foot" aria-label="次导航">${FOOT.map(item).join('')}</nav>`;
+            <nav class="sidebar-nav sidebar-foot" aria-label="次标签栏">${FOOT.map(item).join('')}</nav>`;
         this.unsubscribe = store.subscribe((state) => this.sync(state));
         this.sync(store.get());
     }

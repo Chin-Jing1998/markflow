@@ -12,7 +12,7 @@
  *     （桌面端永不传 allowPrivateNetwork），且全程不经 mf:paths:expand。
  *   render({ sessionId, target, options })
  *     → { sessionId, target, options, product, warnings, reparsed, changedKeys, sourceView? }
- *     仅当 REPARSE_KEYS 里的项发生变化时才重新解析（imageFormat / jpegQuality / math / pdfBackend /
+ *     仅当 REPARSE_KEYS 里的项发生变化时才重新解析（imageFormat / jpegQuality / jpegPpi / math / pdfBackend /
  *     xml profile 与 patent 子项 / mineru 各项 / raster 各项——它们都作用在解析管线上），
  *     此时连同来源栏一起重建；其余选项只重渲染，界面据此做 300 ms 防抖实时预览。
  *   export({ sessionId, outputDir? })
@@ -51,7 +51,7 @@ const MAX_SESSIONS = 3;
 const STRUCTURED_SOURCE_TYPES = Object.freeze(['xlsx', 'pptx', 'url']);
 /** 改这些扁平选项须重新解析：它们作用在 parseDocument 的管线（图片归一、栅格化、PDF 后端）上 */
 const REPARSE_KEYS = Object.freeze([
-    'imageFormat', 'jpegQuality', 'math', 'pdfBackend',
+    'imageFormat', 'jpegQuality', 'jpegPpi', 'math', 'pdfBackend',
     'xmlProfile', 'patentParts', 'rasterizeTables', 'rasterizeFormulas', 'imageDpi', 'sectionDetection',
     'mineruModel', 'mineruOcr', 'mineruFormula', 'mineruTable', 'mineruLang', 'mineruTimeout', 'pageRanges',
     'rasterScale', 'rasterMaxWidth',

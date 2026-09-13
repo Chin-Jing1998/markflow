@@ -8,7 +8,7 @@
  * 分三组：
  *   排版   主题、字体、字号、行高、栏宽、段距、纸张、横向（改动只需重渲染）
  *   XML    方言、缩进、段号起止与位数、五书子集、分节识别、表格 / 公式栅格、图片密度
- *   解析   图片格式、JPEG 质量、文档公式、PDF 解析后端
+ *   解析   图片格式、JPEG 分辨率、文档公式、PDF 解析后端
  * 带「需重新解析」标记的字段改动后，主进程会在同一会话内重新 parseDocument（见 preview-session.REPARSE_KEYS），
  * 面板在该组标题上给出提示。
  *
@@ -54,7 +54,7 @@ const FIELDS = Object.freeze([
     { key: 'imageDpi', label: '图片密度（DPI）', group: 'xml', targets: ['xml'], path: ['xml', 'patent', 'imageDpi'], profile: 'patent', reparse: true },
 
     { key: 'imageFormat', label: '图片格式', group: 'parse', targets: ALL_TARGETS, path: ['imageFormat'], reparse: true },
-    { key: 'jpegQuality', label: 'JPEG 质量', group: 'parse', targets: ALL_TARGETS, path: ['jpegQuality'], reparse: true },
+    { key: 'jpegPpi', label: 'JPG 分辨率（PPI）', group: 'parse', targets: ALL_TARGETS, path: ['jpegPpi'], reparse: true },
     { key: 'math', label: '文档公式', group: 'parse', targets: ALL_TARGETS, path: ['math'], types: ['docx'], reparse: true },
     { key: 'pdfBackend', label: 'PDF 解析后端', group: 'parse', targets: ALL_TARGETS, path: ['pdfBackend'], types: ['pdf'], reparse: true },
 ]);

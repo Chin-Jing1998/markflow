@@ -2,7 +2,7 @@
  * 主窗口（参数照 R4 探针 REPORT.md「阶段 4」第 5 条）
  *
  * windowOptionsFor({ platform, isDark, osRelease, preloadPath }) → BrowserWindow 构造参数（纯函数，可单测）
- *   macOS：titleBarStyle 'hiddenInset' + trafficLightPosition {16,16} + vibrancy 'sidebar'（visualEffectState 'active'）
+ *   macOS：titleBarStyle 'hiddenInset' + trafficLightPosition {16,8} + vibrancy 'sidebar'（visualEffectState 'active'）
  *          + roundedCorners，transparent 保持 false；
  *   Windows：titleBarStyle 'hidden' + titleBarOverlay（高 52，按钮区由页面 env(titlebar-area-*) 让位），
  *          backgroundMaterial 'mica' 仅 Win11 22H2（build ≥ 22621）及以上，Win10 纯色回退；
@@ -19,7 +19,7 @@ const LIGHT_BACKGROUND = '#f5f5f7';
 const DARK_SYMBOL = '#f5f5f7';
 const LIGHT_SYMBOL = '#1c1c1e';
 const TITLEBAR_HEIGHT = 52;
-const TRAFFIC_LIGHT_POSITION = Object.freeze({ x: 16, y: 16 });
+const TRAFFIC_LIGHT_POSITION = Object.freeze({ x: 16, y: 8 });
 const WIN11_MICA_MIN_BUILD = 22621;
 const SHOW_FALLBACK_MS = 1500;
 const DEFAULT_BOUNDS = Object.freeze({ width: 1280, height: 820, minWidth: 960, minHeight: 640 });

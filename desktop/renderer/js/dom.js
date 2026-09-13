@@ -56,12 +56,38 @@ export function classOf(type) {
  * 产物与来源一律放 <iframe sandbox srcdoc>：沙箱帧继承本页 CSP，内联脚本与 javascript: 被拦，
  * 远程图在请求前就被 img-src 拦掉。只放开 allow-popups，使帧内的 target="_blank" 外链
  * 走主窗口的 setWindowOpenHandler → shell.openExternal；不放开 allow-scripts。
+ * 对比预览的滚动同步按需增加 allow-same-origin，以便宿主读取两帧的滚动位置；仍不放开脚本执行。
  * PDF 例外：交 Chromium 内置阅读器的 iframe 不得带 sandbox，否则整帧被 ERR_BLOCKED_BY_CLIENT 拦掉。
  */
 export const FRAME_SANDBOX = 'allow-popups';
 
+const FRAME_SCROLLBAR_STYLE = `<style data-markflow-scrollbar>
+html { scrollbar-color: color-mix(in oklch, currentColor 20%, transparent) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+    background: color-mix(in oklch, currentColor 20%, transparent);
+    border-radius: 999px;
+    background-clip: padding-box;
+    border: 3px solid transparent;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in oklch, currentColor 35%, transparent);
+    background-clip: padding-box;
+    border: 3px solid transparent;
+}
+::-webkit-scrollbar-corner { background: transparent; }
+</style>`;
+
+function withFrameScrollbar(srcdoc) {
+    const documentHtml = String(srcdoc || '');
+    return /<\/head\s*>/i.test(documentHtml)
+        ? documentHtml.replace(/<\/head\s*>/i, `${FRAME_SCROLLBAR_STYLE}</head>`)
+        : `${FRAME_SCROLLBAR_STYLE}${documentHtml}`;
+}
+
 /** 每次换视图都重建 iframe：sandbox 属性无法在已加载的帧上切换，PDF 帧也应随视图关闭一并移除 */
-export function mountFrame(host, { srcdoc = null, src = null, title = '预览' }) {
+export function mountFrame(host, { srcdoc = null, src = null, title = '预览', scrollbar = false, sameOrigin = false }) {
     host.replaceChildren();
     const frame = document.createElement('iframe');
     frame.className = 'view-frame';
@@ -69,8 +95,8 @@ export function mountFrame(host, { srcdoc = null, src = null, title = '预览' }
     frame.referrerPolicy = 'no-referrer';
     if (src) frame.src = src;
     else {
-        frame.setAttribute('sandbox', FRAME_SANDBOX);
-        frame.srcdoc = srcdoc || '';
+        frame.setAttribute('sandbox', [FRAME_SANDBOX, sameOrigin ? 'allow-same-origin' : ''].filter(Boolean).join(' '));
+        frame.srcdoc = scrollbar ? withFrameScrollbar(srcdoc) : (srcdoc || '');
     }
     host.append(frame);
     return frame;

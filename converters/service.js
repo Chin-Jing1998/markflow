@@ -103,6 +103,7 @@ const FLAT_MAP = Object.freeze([
     ['pdfBackend', ['pdfBackend'], asString],
     ['imageFormat', ['imageFormat'], asString],
     ['jpegQuality', ['jpegQuality'], asNumber],
+    ['jpegPpi', ['jpegPpi'], asNumber],
     ['math', ['math'], asString],
     ['mineruModel', ['mineru.model'], asString],
     ['mineruOcr', ['mineru.ocr'], asBoolean],

@@ -5,9 +5,9 @@
  *   - kinds       要栅格的节点类型子集，取值 'table' | 'math'；由 index.js 按 options 推导：
  *                 options.math === 'image' → 含 'math'；xml.profile === 'patent'（且目标为 xml 或未指定）
  *                 → 按 xml.patent.rasterizeTables / rasterizeFormulas 追加 'table' / 'math'
- *   - options     normalizeOptions 归一后的选项：patent profile 取 xml.patent.imageDpi（默认 300）且不缩放；
- *                 其它 profile 按 raster.scale 提升密度（dpi = 96 × scale）并按 raster.maxWidth 限宽（限宽后
- *                 JFIF 密度按比例下调，物理尺寸不变）
+ *   - options     normalizeOptions 归一后的选项：patent profile 取 xml.patent.imageDpi（默认 300）出图且不缩放；
+ *                 其它 profile 按 raster.scale 提升出图密度（dpi = 96 × scale）并按 raster.maxWidth 限宽；
+ *                 JPEG 文件统一按 options.jpegPpi（默认 330 PPI）写入 JFIF 密度
  *   - doc         处理后的文档（不修改入参，只在改动路径上新建节点）：命中节点替换为 image 节点
  *                 { type:'image', url:'images/<file>', alt, title:null,
  *                   data:{ assetName:'images/<file>', role:'table'|'formula', inline, width, height, dpi } }
@@ -24,7 +24,7 @@
  *   alt：表格为「表格 N」，公式为线性化文本。
  * inline：行内公式（位于段落内且 display 为假）为 true，其余为 false。
  *
- * 片段页由 raster/fragment.js 构造，出图由 raster/backend.js 负责；PNG 经 jimp 铺白转 JPG 并写入 JFIF 密度。
+ * 片段页由 raster/fragment.js 构造，出图由 raster/backend.js 负责；PNG 经 jimp 铺白转 JPG 并写入 jpegPpi 指定的 JFIF 密度。
  * converters/index.js 仅在 kinds 非空时经 moduleLoader 懒加载并调用本模块；本模块顶层不 require electron
  * 或其它重依赖（jimp 经 assets/jimp-loader.js 动态加载）。
  */
@@ -47,6 +47,7 @@ const DEFAULT_DPI = 300;
 const DEFAULT_SCALE = 2;
 const DEFAULT_MAX_WIDTH = 1600;
 const DEFAULT_QUALITY = 90;
+const DEFAULT_PPI = 330;
 const WHITE = 0xffffffff;
 /** 段落序列的计数容器：公式的「段」号取最近的这类祖先（table 整张计一个段号） */
 const PARAGRAPH_LIKE = new Set(['paragraph', 'heading', KIND_TABLE]);
@@ -71,7 +72,7 @@ async function rasterizeNodes(doc, { kinds = [], options } = {}) {
 
     let images;
     try {
-        images = await backend.rasterize(targets.map((target) => ({ id: target.id, html: buildFragment(target) })), { dpi: settings.dpi });
+        images = await backend.rasterize(targets.map((target) => ({ id: target.id, html: buildFragment(target) })), { dpi: settings.renderDpi });
     } catch (err) {
         warnings.push(`栅格化失败：${errText(err)}${degradeSummary(targets)}`);
         return { doc: applyReplacements(doc, degradeAll(targets), []), rasterized: 0, warnings, backend: detected.name };
@@ -158,7 +159,8 @@ function readSettings(options) {
     const isPatent = xml.profile === 'patent';
     return {
         quality: numberOr(source.jpegQuality, DEFAULT_QUALITY),
-        dpi: isPatent ? numberOr(patent.imageDpi, DEFAULT_DPI) : CSS_DPI * numberOr(raster.scale, DEFAULT_SCALE),
+        ppi: numberOr(source.jpegPpi, DEFAULT_PPI),
+        renderDpi: isPatent ? numberOr(patent.imageDpi, DEFAULT_DPI) : CSS_DPI * numberOr(raster.scale, DEFAULT_SCALE),
         // patent profile 下禁用缩放：专利图片的 wi/he 由原始像素与 DPI 换算
         maxWidth: isPatent ? 0 : numberOr(raster.maxWidth, DEFAULT_MAX_WIDTH),
     };
@@ -166,18 +168,16 @@ function readSettings(options) {
 
 const numberOr = (value, fallback) => (Number.isFinite(value) ? value : fallback);
 
-/** PNG → 白底合成 → 按 maxWidth 限宽（密度同比例下调）→ JPEG → 写 JFIF 密度 */
+/** PNG → 白底合成 → 按 maxWidth 限宽 → JPEG → 写入指定 PPI 的 JFIF 密度 */
 async function encodeJpeg(png, settings) {
     const { Jimp } = await loadJimp();
     const image = await Jimp.read(png);
     const flat = new Jimp({ width: image.width, height: image.height, color: WHITE });
     flat.composite(image, 0, 0);
-    let dpi = settings.dpi;
     if (settings.maxWidth > 0 && flat.width > settings.maxWidth) {
-        dpi = (settings.dpi * settings.maxWidth) / flat.width;
         flat.resize({ w: settings.maxWidth });
     }
-    const density = Math.max(1, Math.round(dpi));
+    const density = Math.max(1, Math.round(settings.ppi));
     const buffer = setJpegDensity(await flat.getBuffer(JPEG_MIME, { quality: settings.quality }), density);
     return { buffer, width: flat.width, height: flat.height, dpi: density };
 }

@@ -52,10 +52,10 @@ test('首次运行：文件缺失时取默认值，不落盘', () => {
 test('set：深合并 + 原子写，重新加载得到同样内容，不留临时文件', async () => {
     const dir = workDir();
     const store = makeStore(dir);
-    const next = await store.set({ theme: 'dark', outputDir: path.join(dir, 'custom'), defaults: { theme: 'github', jpegQuality: 85 }, library: { mode: 'managed' } });
+    const next = await store.set({ theme: 'dark', outputDir: path.join(dir, 'custom'), defaults: { theme: 'github', jpegQuality: 85, jpegPpi: 420 }, library: { mode: 'managed' } });
     assert.equal(next.theme, 'dark');
     assert.equal(next.outputDir, path.join(dir, 'custom'));
-    assert.deepEqual(next.defaults, { theme: 'github', jpegQuality: 85 });
+    assert.deepEqual(next.defaults, { theme: 'github', jpegQuality: 85, jpegPpi: 420 });
     assert.equal(next.library.mode, 'managed');
     assert.equal(next.library.root, path.join(dir, 'lib'), '未改的字段保留默认');
 

@@ -76,9 +76,10 @@ class MfSourcePane extends HTMLElement {
             ? Object.entries(TABS).map(([key, text]) => `<button class="pane-tab${this.tab === key ? ' is-active' : ''}" type="button" role="tab" data-tab="${key}">${text}</button>`).join('')
             : '';
 
-        if (view.kind === 'pdf') mountFrame(host, { src: view.url, title: '来源 PDF' });
-        else if (hasRaw && this.tab === 'raw') mountFrame(host, { srcdoc: textDocument(view.raw, { title: 'Markdown 原文' }), title: '来源原文' });
-        else mountFrame(host, { srcdoc: view.html || '', title: '来源' });
+        const mountCompareFrame = (options) => mountFrame(host, { ...options, scrollbar: true, sameOrigin: true });
+        if (view.kind === 'pdf') mountCompareFrame({ src: view.url, title: '来源 PDF' });
+        else if (hasRaw && this.tab === 'raw') mountCompareFrame({ srcdoc: textDocument(view.raw, { title: 'Markdown 原文' }), title: '来源原文' });
+        else mountCompareFrame({ srcdoc: view.html || '', title: '来源' });
 
         foot.hidden = !view.structured;
         if (view.structured) foot.textContent = '该格式没有可直接还原的版式，左栏显示的是解析所得的结构视图。';

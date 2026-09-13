@@ -41,7 +41,7 @@ describe('buildOptions', () => {
         // Act
         const opts = service.buildOptions({
             theme: 'github', xmlProfile: 'patent', patentParts: 'claims, description', pdfBackend: 'local',
-            imageFormat: 'keep', jpegQuality: '85', math: 'text', mineruModel: 'vlm', mineruOcr: 'true',
+            imageFormat: 'keep', jpegQuality: '85', jpegPpi: '420', math: 'text', mineruModel: 'vlm', mineruOcr: 'true',
             mineruLang: 'en', pageRanges: '1-3', font: 'Georgia, serif', fontSize: '18', lineHeight: '1.5',
             numberingStart: '10', numberingWidth: '5', mineruToken: 'tok', spacing: 'loose', pageSize: 'Letter',
             landscape: 'yes', inlineImages: 'false', imageDpi: 150, rasterScale: 3, validate: 'true',
@@ -55,6 +55,7 @@ describe('buildOptions', () => {
         assert.equal(opts.pdfBackend, 'local');
         assert.equal(opts.imageFormat, 'keep');
         assert.equal(opts.jpegQuality, 85);
+        assert.equal(opts.jpegPpi, 420);
         assert.equal(opts.math, 'text');
         assert.equal(opts.mineru.model, 'vlm');
         assert.equal(opts.mineru.ocr, true);

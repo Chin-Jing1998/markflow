@@ -33,6 +33,7 @@ const CONVERT_FLAGS = Object.freeze([
     { flag: 'pdf-backend', key: 'pdfBackend', path: 'pdfBackend', value: '<后端>' },
     { flag: 'image-format', key: 'imageFormat', path: 'imageFormat', value: '<格式>' },
     { flag: 'jpeg-quality', key: 'jpegQuality', path: 'jpegQuality', value: '<n>' },
+    { flag: 'jpeg-ppi', key: 'jpegPpi', path: 'jpegPpi', value: '<n>' },
     { flag: 'math', key: 'math', path: 'math', value: '<方式>' },
     { flag: 'mineru-model', key: 'mineruModel', path: 'mineru.model', value: '<模型>' },
     { flag: 'mineru-ocr', key: 'mineruOcr', path: 'mineru.ocr', type: 'boolean' },

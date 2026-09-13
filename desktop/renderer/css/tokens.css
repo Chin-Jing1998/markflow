@@ -71,7 +71,8 @@
 
     /* 标题栏让位：Windows titleBarOverlay 提供 env()，macOS hiddenInset 取回退值 */
     --titlebar-height: env(titlebar-area-height, 52px);
-    --sidebar-width: 220px;
+    --statusbar-height: 28px;
+    --sidebar-width: 56px;
 }
 
 /* ===== Reset ===== */

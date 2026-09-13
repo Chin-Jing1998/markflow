@@ -38,8 +38,11 @@ class MfLibraryPage extends HTMLElement {
                     <button class="btn btn-secondary btn-small" type="button" data-action="migrate">${icon('move')}迁移到托管目录</button>
                 </div>
             </header>
-            <div class="page-body library-body">
-                <aside class="library-facets"><mf-facets></mf-facets></aside>
+            <div class="page-body page-layout library-body">
+                <aside class="page-sidebar library-facets" aria-label="文件库筛选">
+                    <div class="page-sidebar-heading">筛选</div>
+                    <mf-facets></mf-facets>
+                </aside>
                 <section class="library-main">
                     <div class="library-status"></div>
                     <div class="migration-panel" hidden></div>

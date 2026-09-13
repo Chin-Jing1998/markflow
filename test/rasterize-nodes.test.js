@@ -1,6 +1,6 @@
 /**
  * converters/raster/rasterize-nodes.js 与 raster/fragment.js 单元测试（桩后端）
- * 覆盖：table → image 节点与 JPG 资源（JFIF 密度 300、白底）、omath-<段>-<序> 命名与行内 inline 标记、
+ * 覆盖：table → image 节点与 JPG 资源（JFIF 密度 330、白底）、omath-<段>-<序> 命名与行内 inline 标记、
  *       patent 不缩放 / 非 patent 按 scale 与 maxWidth、后端不可用与单任务 / 整批失败的降级 + warning、
  *       入参不变与未触及节点保持引用、无命中不触碰后端、资源名冲突、片段页内容与无 http(s) 引用
  */
@@ -97,7 +97,7 @@ const dims = (node) => ({ width: node.data.width, height: node.data.height, dpi:
 // rasterizeNodes
 // ============================================================
 
-test('table → image 节点与 JPG 资源：命名 table-<序>、role table、JFIF 密度 300、math 节点不受影响', async () => {
+test('table → image 节点与 JPG 资源：命名 table-<序>、role table、JFIF 密度 330、math 节点不受影响', async () => {
     // Arrange
     const calls = stubBackend();
     const doc = sampleDoc();
@@ -117,7 +117,7 @@ test('table → image 节点与 JPG 资源：命名 table-<序>、role table、J
     assert.equal(children[1].type, 'image');
     assert.equal(children[1].url, 'images/table-1.jpg');
     assert.equal(children[1].alt, '表格 1');
-    assert.deepEqual(children[1].data, { assetName: 'images/table-1.jpg', role: 'table', inline: false, width: 400, height: 40, dpi: 300 });
+    assert.deepEqual(children[1].data, { assetName: 'images/table-1.jpg', role: 'table', inline: false, width: 400, height: 40, dpi: 330 });
     assert.equal(children[5].url, 'images/table-2.jpg');
     assert.equal(children[0], doc.ir.children[0], '未命中的段落沿用原引用');
 
@@ -126,7 +126,7 @@ test('table → image 节点与 JPG 资源：命名 table-<序>、role table、J
     const asset = result.doc.assets[1];
     assert.equal(asset.name, 'images/table-1.jpg');
     assert.equal(asset.mime, 'image/jpeg');
-    assert.deepEqual(readJfif(asset.buffer), { units: 1, x: 300, y: 300 });
+    assert.deepEqual(readJfif(asset.buffer), { units: 1, x: 330, y: 330 });
     assert.equal(result.doc.assets[2].name, 'images/table-2.jpg');
 });
 
@@ -149,7 +149,7 @@ test('math → image 节点：omath-<段>-<序> 编号、行内公式 inline 为
     assert.deepEqual(p1.children.map((node) => node.type), ['text', 'image', 'text', 'image', 'text']);
     assert.equal(p1.children[1].url, 'images/omath-1-1.jpg');
     assert.equal(p1.children[1].alt, 'a/b');
-    assert.deepEqual(p1.children[1].data, { assetName: 'images/omath-1-1.jpg', role: 'formula', inline: true, width: 400, height: 40, dpi: 192 });
+    assert.deepEqual(p1.children[1].data, { assetName: 'images/omath-1-1.jpg', role: 'formula', inline: true, width: 400, height: 40, dpi: 330 });
     assert.equal(p1.children[3].url, 'images/omath-1-2.jpg');
     assert.equal(p1.children[3].data.inline, true);
     assert.equal(children[1], doc.ir.children[1], '表格沿用原引用');
@@ -162,7 +162,7 @@ test('math → image 节点：omath-<段>-<序> 编号、行内公式 inline 为
     assert.equal(children[4].alt, 'a/b');
 });
 
-test('patent profile 按 imageDpi 出图且不缩放；其它 profile 按 raster.scale 提升密度并按 maxWidth 限宽（密度同比下调）', async () => {
+test('patent profile 按 imageDpi 出图且不缩放；JPEG 统一写入 jpegPpi 密度，非 patent 仍按 raster.scale 出图并按 maxWidth 限宽', async () => {
     // Arrange
     const doc = createDocument({ ir: createRoot([table([['甲']])]) });
     const run = async (raw) => {
@@ -179,16 +179,16 @@ test('patent profile 按 imageDpi 出图且不缩放；其它 profile 按 raster
 
     // Assert
     assert.equal(patent.dpi, 150);
-    assert.deepEqual(dims(patent.node), { width: 400, height: 40, dpi: 150 });
-    assert.deepEqual(readJfif(patent.asset.buffer), { units: 1, x: 150, y: 150 });
+    assert.deepEqual(dims(patent.node), { width: 400, height: 40, dpi: 330 });
+    assert.deepEqual(readJfif(patent.asset.buffer), { units: 1, x: 330, y: 330 });
 
     assert.equal(limited.dpi, 96);
-    assert.deepEqual(dims(limited.node), { width: 200, height: 20, dpi: 48 });
-    assert.deepEqual(readJfif(limited.asset.buffer), { units: 1, x: 48, y: 48 });
+    assert.deepEqual(dims(limited.node), { width: 200, height: 20, dpi: 330 });
+    assert.deepEqual(readJfif(limited.asset.buffer), { units: 1, x: 330, y: 330 });
 
     assert.equal(scaled.dpi, 288);
-    assert.deepEqual(dims(scaled.node), { width: 400, height: 40, dpi: 288 });
-    assert.deepEqual(readJfif(scaled.asset.buffer), { units: 1, x: 288, y: 288 });
+    assert.deepEqual(dims(scaled.node), { width: 400, height: 40, dpi: 330 });
+    assert.deepEqual(readJfif(scaled.asset.buffer), { units: 1, x: 330, y: 330 });
 });
 
 test('后端不可用：表格降级为逐行文本、公式降级为线性化文本，附一条中文 warning，backend 为 null', async () => {

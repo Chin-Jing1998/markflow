@@ -21,7 +21,7 @@
  * settings.json（version 1）：
  *   { version: 1, theme: 'system'|'light'|'dark', outputDir,
  *     defaultTargets: { office, markup, url },
- *     defaults: { theme?, imageFormat?, jpegQuality?, math?, pdfBackend?, mineruModel?, xmlProfile? }（扁平转换选项，交 service.buildOptions），
+ *     defaults: { theme?, imageFormat?, jpegQuality?, jpegPpi?, math?, pdfBackend?, mineruModel?, xmlProfile? }（扁平转换选项，交 service.buildOptions），
  *     library: { mode: 'index'|'managed', root } }
  * secrets.json：{ mineruToken: <base64 密文> }。令牌永不进入 settings.json、日志与 IPC 回包。
  */
@@ -60,6 +60,7 @@ const DEFAULTS_FIELDS = Object.freeze({
     theme: z.enum([...OPTION_ENUMS.htmlThemes]),
     imageFormat: z.enum([...OPTION_ENUMS.imageFormats]),
     jpegQuality: z.number().int().min(60).max(100),
+    jpegPpi: z.number().int().min(72).max(600),
     math: z.enum([...OPTION_ENUMS.mathModes]),
     pdfBackend: z.enum([...OPTION_ENUMS.pdfBackends]),
     mineruModel: z.enum([...OPTION_ENUMS.mineruModels]),

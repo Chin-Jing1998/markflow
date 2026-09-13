@@ -13,7 +13,8 @@
  *   redactOptions(options)  返回去掉敏感项（mineru.token）的深拷贝；凡是要写进结果、日志或 JSON 的选项一律先经此处理
  *
  * 结构（方案 §3.3.1）：
- *   imageFormat 'jpg'|'keep'    jpegQuality 60–100    math 'image'|'text'    pdfBackend 'auto'|'mineru'|'local'
+ *   imageFormat 'jpg'|'keep'    jpegQuality 60–100    jpegPpi 72–600    math 'image'|'text'
+ *   pdfBackend 'auto'|'mineru'|'local'
  *   mineru { model, ocr, formula, table, language, pageRanges, timeoutSec, token }
  *   html   { theme, fontFamily, fontSize(px), lineHeight, contentWidth(px), spacing, inlineImages }
  *   pdf    { theme, pageSize, landscape, margins{top,bottom,left,right} }           页边距单位英寸
@@ -72,6 +73,7 @@ const marginFields = (def) => ({
 const SCHEMA = {
     imageFormat: enumField(OPTION_ENUMS.imageFormats, 'jpg', '图片归一格式：jpg 把位图统一转为 JPEG，keep 保持原格式'),
     jpegQuality: numberField({ min: 60, max: 100, integer: true, default: 90, description: 'JPEG 质量' }),
+    jpegPpi: numberField({ min: 72, max: 600, integer: true, default: 330, description: 'JPEG 分辨率（PPI）' }),
     math: enumField(OPTION_ENUMS.mathModes, 'image', 'docx 公式的处理方式：image 栅格为图片，text 降级为线性化文本'),
     pdfBackend: enumField(OPTION_ENUMS.pdfBackends, 'auto', 'PDF 解析后端：auto 有 MinerU 令牌走云端否则本地，mineru 强制云端，local 强制本地'),
     mineru: objectField({

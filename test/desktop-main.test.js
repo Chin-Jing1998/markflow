@@ -56,7 +56,7 @@ test('window.js：三平台窗口参数照 R4 结论', () => {
     const { windowOptionsFor, supportsMica, windowsBuildOf, backgroundFor, overlayFor, TITLEBAR_HEIGHT } = require('../desktop/main/window');
     const mac = windowOptionsFor({ platform: 'darwin', isDark: true, preloadPath: '/p/preload.js' });
     assert.equal(mac.titleBarStyle, 'hiddenInset');
-    assert.deepEqual(mac.trafficLightPosition, { x: 16, y: 16 });
+    assert.deepEqual(mac.trafficLightPosition, { x: 16, y: 8 });
     assert.equal(mac.vibrancy, 'sidebar');
     assert.equal(mac.visualEffectState, 'active');
     assert.equal(mac.transparent, false);
@@ -145,8 +145,15 @@ test('preload.js 只 require electron，且事件通道白名单为三个', () =
 test('渲染层：页面与模块文件齐备，脚本以 ES 模块加载', () => {
     const rendererDir = path.join(__dirname, '..', 'desktop', 'renderer');
     const html = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
+    const sidebar = fs.readFileSync(path.join(rendererDir, 'js', 'components', 'mf-sidebar.js'), 'utf8');
+    const statusBar = fs.readFileSync(path.join(rendererDir, 'js', 'components', 'mf-status-bar.js'), 'utf8');
     assert.match(html, /<script type="module" src="js\/app\.js"><\/script>/);
     assert.ok(!/<meta http-equiv="Content-Security-Policy"/.test(html), 'CSP 由协议处理器响应头下发，页面不重复声明');
+    assert.match(html, /<mf-status-bar class="status-bar"[^>]*><\/mf-status-bar>\s*<mf-sidebar/, '状态栏应位于左标签栏与内容区之前');
+    assert.ok(!sidebar.includes('brand-app-icon'), '左标签栏不应显示品牌图标');
+    assert.ok(!sidebar.includes('brand-mark'), '左标签栏不应再使用 CSS 绘制的旧标志');
+    assert.match(statusBar, /status-bar-brand.*MarkFlow/s, '顶部状态栏应仅显示居中的 MarkFlow');
+    assert.ok(!statusBar.includes('就绪'), '顶部状态栏不应显示就绪状态');
     for (const rel of ['css/tokens.css', 'css/app.css', 'js/app.js', 'js/api.js', 'js/store.js', 'js/dom.js', 'js/icons.js', 'js/url-lines.mjs']) {
         assert.ok(fs.existsSync(path.join(rendererDir, rel)), rel);
     }
@@ -154,6 +161,6 @@ test('渲染层：页面与模块文件齐备，脚本以 ES 模块加载', () =
     assert.deepEqual(components, [
         'mf-compare-view.js', 'mf-convert-page.js', 'mf-dropzone.js', 'mf-facets.js', 'mf-format-panel.js',
         'mf-library-page.js', 'mf-product-pane.js', 'mf-progress.js', 'mf-reader-page.js', 'mf-settings-page.js',
-        'mf-sidebar.js', 'mf-source-pane.js', 'mf-task-list.js', 'mf-toast.js', 'mf-url-input.js',
+        'mf-sidebar.js', 'mf-source-pane.js', 'mf-status-bar.js', 'mf-task-list.js', 'mf-toast.js', 'mf-url-input.js',
     ]);
 });

@@ -79,11 +79,12 @@ test('--help 的选项段由 options.js 的描述树生成，列出全部转换�
     // Assert
     assert.equal(code, 0);
     const flags = ['--theme', '--xml-profile', '--patent-parts', '--pdf-backend', '--image-format',
-        '--jpeg-quality', '--math', '--mineru-model', '--mineru-ocr', '--mineru-lang', '--page-ranges',
+        '--jpeg-quality', '--jpeg-ppi', '--math', '--mineru-model', '--mineru-ocr', '--mineru-lang', '--page-ranges',
         '--font', '--font-size', '--line-height', '--numbering-start', '--validate'];
     flags.forEach((flag) => assert.ok(stdout.includes(flag), `--help 应列出 ${flag}`));
     assert.match(stdout, /可选 apple \| apple-dark \| github \| academic \| reader \| print；默认 apple/);
     assert.match(stdout, /范围 60–100；默认 90/);
+    assert.match(stdout, /范围 72–600；默认 330/);
     assert.match(stdout, /config {2,}读写/);
     assert.match(stdout, /mineru-token/);
 });
@@ -314,7 +315,7 @@ test('转换选项透传到结果 options：theme 兼作 pdf 主题，font-size 
     const { code, stdout } = await runCli([
         'convert', SAMPLE_MD, '--to', 'html', '--out', outDir, '--json',
         '--theme', 'github', '--font', 'Georgia, serif', '--font-size', '18', '--line-height', '1.5',
-        '--image-format', 'keep', '--jpeg-quality', '80', '--math', 'text', '--pdf-backend', 'local',
+        '--image-format', 'keep', '--jpeg-quality', '80', '--jpeg-ppi', '420', '--math', 'text', '--pdf-backend', 'local',
         '--xml-profile', 'patent', '--patent-parts', 'claims,description', '--numbering-start', '7',
         '--mineru-model', 'vlm', '--mineru-ocr', '--mineru-lang', 'en', '--page-ranges', '1-3',
     ]);
@@ -330,6 +331,7 @@ test('转换选项透传到结果 options：theme 兼作 pdf 主题，font-size 
     assert.equal(options.html.lineHeight, 1.5);
     assert.equal(options.imageFormat, 'keep');
     assert.equal(options.jpegQuality, 80);
+    assert.equal(options.jpegPpi, 420);
     assert.equal(options.math, 'text');
     assert.equal(options.pdfBackend, 'local');
     assert.equal(options.xml.profile, 'patent');
@@ -357,6 +359,7 @@ test('省略转换选项时结果 options 取 options.js 的默认值，信封�
     assert.equal(options.html.theme, 'apple');
     assert.equal(options.imageFormat, 'jpg');
     assert.equal(options.jpegQuality, 90);
+    assert.equal(options.jpegPpi, 330);
     assert.equal(options.xml.profile, 'generic');
 });
 

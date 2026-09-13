@@ -43,7 +43,8 @@ const CONVERT_INPUT = {
         .describe('PDF 解析后端：auto 有 MinerU 令牌走云端否则本地，mineru 强制云端，local 强制本地'),
     imageFormat: enumOf(OPTION_ENUMS.imageFormats, 'imageFormat').optional()
         .describe('图片归一格式：jpg 把位图统一转为 JPEG，keep 保持原格式'),
-    jpegQuality: z.number().int().optional().describe('JPEG 质量，60–100'),
+    jpegQuality: z.number().int().optional().describe('JPEG 压缩质量，60–100'),
+    jpegPpi: z.number().int().optional().describe('JPEG 分辨率，72–600 PPI，默认 330'),
     math: enumOf(OPTION_ENUMS.mathModes, 'math').optional()
         .describe('docx 公式：image 栅格为图片，text 降级为线性化文本'),
     mineru: z.object({
@@ -76,7 +77,7 @@ const CONVERT_INPUT = {
 };
 // 入参中交给 service.buildOptions 的键；其余（paths/urls/target/outputDir/returnContent）由本文件自行处理
 const OPTION_ARG_KEYS = Object.freeze([
-    'theme', 'xmlProfile', 'patentParts', 'pdfBackend', 'imageFormat', 'jpegQuality', 'math',
+    'theme', 'xmlProfile', 'patentParts', 'pdfBackend', 'imageFormat', 'jpegQuality', 'jpegPpi', 'math',
     'mineru', 'html', 'docx', 'xml', 'validate',
 ]);
 const RESULT_ITEM = z.object({

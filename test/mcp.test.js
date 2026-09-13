@@ -103,7 +103,7 @@ test('convert_document 的 inputSchema 暴露全部转换选项，只有 outputD
 
     // Assert：入参键清单
     assert.deepEqual(Object.keys(properties).sort(), [
-        'docx', 'html', 'imageFormat', 'jpegQuality', 'math', 'mineru', 'outputDir', 'paths',
+        'docx', 'html', 'imageFormat', 'jpegPpi', 'jpegQuality', 'math', 'mineru', 'outputDir', 'paths',
         'patentParts', 'pdfBackend', 'returnContent', 'target', 'theme', 'urls', 'validate', 'xml', 'xmlProfile',
     ].sort());
     assert.equal(properties.validate.type, 'boolean');
@@ -222,7 +222,7 @@ test('convert_document 透传转换选项：扁平键与嵌套段都进入结果
         name: 'convert_document',
         arguments: {
             paths: [SAMPLE_MD], target: 'html', outputDir,
-            theme: 'github', imageFormat: 'keep', jpegQuality: 80, math: 'text', pdfBackend: 'local',
+            theme: 'github', imageFormat: 'keep', jpegQuality: 80, jpegPpi: 420, math: 'text', pdfBackend: 'local',
             xmlProfile: 'patent', patentParts: ['claims', 'description'],
             mineru: { model: 'vlm', ocr: true, language: 'en', pageRanges: '1-3' },
             html: { fontSize: 20, spacing: 'loose', inlineImages: false },
@@ -240,6 +240,7 @@ test('convert_document 透传转换选项：扁平键与嵌套段都进入结果
     assert.equal(options.html.spacing, 'loose');
     assert.equal(options.imageFormat, 'keep');
     assert.equal(options.jpegQuality, 80);
+    assert.equal(options.jpegPpi, 420);
     assert.equal(options.math, 'text');
     assert.equal(options.pdfBackend, 'local');
     assert.equal(options.xml.profile, 'patent');
@@ -271,6 +272,7 @@ test('省略转换选项时结果 options 取默认值', async () => {
     assert.equal(options.html.theme, 'apple');
     assert.equal(options.imageFormat, 'jpg');
     assert.equal(options.jpegQuality, 90);
+    assert.equal(options.jpegPpi, 330);
     assert.equal(options.xml.profile, 'generic');
 });
 

@@ -110,8 +110,9 @@ for (const [channel, payload, label] of REJECTS) {
 test('schema 放行合法入参并原样返回', () => {
     assert.equal(validatePayload('mf:formats:describe', undefined), undefined);
     assert.deepEqual(validatePayload('mf:paths:expand', { paths: ['/a', '/b'] }), { paths: ['/a', '/b'] });
-    const run = validatePayload('mf:convert:run', { items: [{ id: 't1', path: '/a.md', target: 'docx' }, { url: 'https://example.com/x' }], options: { theme: 'github', jpegQuality: 80, landscape: true } });
+    const run = validatePayload('mf:convert:run', { items: [{ id: 't1', path: '/a.md', target: 'docx' }, { url: 'https://example.com/x' }], options: { theme: 'github', jpegQuality: 80, jpegPpi: 420, landscape: true } });
     assert.equal(run.items.length, 2);
+    assert.equal(run.options.jpegPpi, 420);
     assert.deepEqual(validatePayload('mf:convert:run', { items: [{ id: 'u1', url: 'HTTP://Example.com/页面?q=1', target: 'html' }] }).items, [{ id: 'u1', url: 'HTTP://Example.com/页面?q=1', target: 'html' }]);
     assert.deepEqual(validatePayload('mf:library:list', { query: 'x', facets: { favorite: true, tag: 't' }, limit: 10, offset: 0 }).facets, { favorite: true, tag: 't' });
     assert.deepEqual(validatePayload('mf:settings:setMineruToken', { token: null }), { token: null });

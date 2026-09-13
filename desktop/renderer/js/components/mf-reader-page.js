@@ -23,21 +23,33 @@ class MfReaderPage extends HTMLElement {
                 <h1>阅读</h1>
                 <div class="page-header-actions">
                     <span class="preview-name"></span>
-                    <span class="pane-tabs" role="tablist"></span>
                     <button class="btn btn-secondary btn-small" type="button" data-action="pick">${icon('file')}打开文件…</button>
                     <button class="icon-btn icon-btn-sm" type="button" data-action="close" title="关闭" hidden>${icon('x')}</button>
                 </div>
             </header>
-            <div class="page-body reader-body">
-                <section class="compare-empty" data-role="empty">
-                    <div class="dropzone-icon">${icon('reader')}</div>
-                    <h3>直接打开阅读</h3>
-                    <p>支持 Markdown、HTML、XML 与 PDF：图片按原位显示，脚本与远程资源一律拦截，外链交系统浏览器打开。</p>
-                    <div class="dropzone-actions"><button class="btn btn-primary" type="button" data-action="pick">${icon('file')}选择文件…</button></div>
-                    <p class="compare-error" data-role="error" hidden></p>
+            <div class="page-body page-layout reader-body">
+                <aside class="page-sidebar reader-sidebar" aria-label="阅读侧栏">
+                    <div class="page-sidebar-heading">阅读</div>
+                    <div class="page-sidebar-section">
+                        <div class="page-sidebar-label">视图</div>
+                        <span class="pane-tabs" role="tablist"></span>
+                    </div>
+                    <div class="page-sidebar-section reader-sidebar-file">
+                        <div class="page-sidebar-label">当前文件</div>
+                        <div class="page-sidebar-value" data-role="sidebar-file">尚未打开文件</div>
+                    </div>
+                </aside>
+                <section class="reader-main">
+                    <section class="compare-empty" data-role="empty">
+                        <div class="dropzone-icon">${icon('reader')}</div>
+                        <h3>直接打开阅读</h3>
+                        <p>支持 Markdown、HTML、XML 与 PDF：图片按原位显示，脚本与远程资源一律拦截，外链交系统浏览器打开。</p>
+                        <div class="dropzone-actions"><button class="btn btn-primary" type="button" data-action="pick">${icon('file')}选择文件…</button></div>
+                        <p class="compare-error" data-role="error" hidden></p>
+                    </section>
+                    <div class="reader-frame" data-role="frame" hidden></div>
+                    <div class="compare-busy" data-role="busy" hidden><span class="spinner">${icon('spinner')}</span><span>正在打开…</span></div>
                 </section>
-                <div class="reader-frame" data-role="frame" hidden></div>
-                <div class="compare-busy" data-role="busy" hidden><span class="spinner">${icon('spinner')}</span><span>正在打开…</span></div>
             </div>
             <footer class="page-footer">
                 <div class="footer-summary" data-role="status"></div>
@@ -130,9 +142,12 @@ class MfReaderPage extends HTMLElement {
         error.textContent = state.readerError || '';
 
         const tabs = this.querySelector('.pane-tabs');
+        const sidebarFile = this.querySelector('[data-role="sidebar-file"]');
         if (!reader) {
             this.querySelector('.preview-name').textContent = '';
             this.querySelector('[data-role="status"]').textContent = '';
+            sidebarFile.textContent = '尚未打开文件';
+            sidebarFile.title = '';
             tabs.replaceChildren();
             this.querySelector('[data-role="frame"]').replaceChildren();
             return;
@@ -140,6 +155,8 @@ class MfReaderPage extends HTMLElement {
 
         this.querySelector('.preview-name').innerHTML =
             `<span class="chip">${escapeHtml(KIND_LABELS[reader.kind] || reader.kind)}</span><span class="preview-title" title="${escapeAttr(reader.path)}">${escapeHtml(reader.name)}</span>`;
+        sidebarFile.textContent = reader.name;
+        sidebarFile.title = reader.path;
         const available = this.tabsFor(view);
         if (!available.some(([key]) => key === this.tab)) this.tab = available.length > 0 ? available[0][0] : 'rendered';
         tabs.innerHTML = available.map(([key, text]) => `<button class="pane-tab${this.tab === key ? ' is-active' : ''}" type="button" role="tab" data-tab="${key}">${escapeHtml(text)}</button>`).join('');
@@ -157,12 +174,13 @@ class MfReaderPage extends HTMLElement {
             host.replaceChildren();
             return;
         }
-        if (view.kind === 'pdf') mountFrame(host, { src: view.url, title: 'PDF 阅读器' });
+        const mountReaderFrame = (options) => mountFrame(host, { ...options, scrollbar: true });
+        if (view.kind === 'pdf') mountReaderFrame({ src: view.url, title: 'PDF 阅读器' });
         else if (view.kind === 'xml') {
-            if (this.tab === 'rendered' && view.structuredHtml) mountFrame(host, { srcdoc: view.structuredHtml, title: 'XML 结构视图' });
-            else mountFrame(host, { srcdoc: textDocument(view.xml || '', { title: 'XML 原文' }), title: 'XML 原文' });
-        } else if (view.kind === 'md' && this.tab === 'raw') mountFrame(host, { srcdoc: textDocument(view.raw || '', { title: 'Markdown 原文' }), title: 'Markdown 原文' });
-        else mountFrame(host, { srcdoc: view.html || '', title: '阅读视图' });
+            if (this.tab === 'rendered' && view.structuredHtml) mountReaderFrame({ srcdoc: view.structuredHtml, title: 'XML 结构视图' });
+            else mountReaderFrame({ srcdoc: textDocument(view.xml || '', { title: 'XML 原文' }), title: 'XML 原文' });
+        } else if (view.kind === 'md' && this.tab === 'raw') mountReaderFrame({ srcdoc: textDocument(view.raw || '', { title: 'Markdown 原文' }), title: 'Markdown 原文' });
+        else mountReaderFrame({ srcdoc: view.html || '', title: '阅读视图' });
     }
 }
 

@@ -97,6 +97,7 @@ const FlatOptionsSchema = z.object({
     pdfBackend: z.enum([...OPTION_ENUMS.pdfBackends]),
     imageFormat: z.enum([...OPTION_ENUMS.imageFormats]),
     jpegQuality: z.number().int().min(60).max(100),
+    jpegPpi: z.number().int().min(72).max(600),
     math: z.enum([...OPTION_ENUMS.mathModes]),
     mineruModel: z.enum([...OPTION_ENUMS.mineruModels]),
     mineruOcr: z.boolean(),

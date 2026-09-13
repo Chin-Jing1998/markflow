@@ -52,7 +52,7 @@ class MfSettingsPage extends HTMLElement {
                 <section class="card">
                     <h2>转换默认项</h2>
                     <div class="field-grid" data-role="defaults"></div>
-                    <label class="field"><span>JPEG 质量（60–100）</span><input class="input input-short" type="number" min="60" max="100" step="1" data-field="jpegQuality" placeholder="90"></label>
+                    <label class="field"><span>JPG 分辨率（PPI）</span><input class="input" type="number" min="72" max="600" step="1" data-field="jpegPpi" placeholder="330"></label>
                 </section>
                 <section class="card">
                     <h2>MinerU 令牌</h2>
@@ -122,7 +122,7 @@ class MfSettingsPage extends HTMLElement {
         this.querySelector('[data-field="outputDir"]').value = settings.outputDir;
         this.querySelector('[data-field="libraryMode"]').value = settings.library.mode;
         this.querySelector('[data-field="libraryRoot"]').value = settings.library.root;
-        this.querySelector('[data-field="jpegQuality"]').value = settings.defaults.jpegQuality != null ? settings.defaults.jpegQuality : '';
+        this.querySelector('[data-field="jpegPpi"]').value = settings.defaults.jpegPpi != null ? settings.defaults.jpegPpi : 330;
         this.renderDefaultTargets(settings, state.formats);
         this.renderDefaults(settings, state.formats);
     }
@@ -184,8 +184,8 @@ class MfSettingsPage extends HTMLElement {
             const chosen = value(`[data-field="default-${key}"]`);
             defaults[key] = chosen ? chosen : null;
         }
-        const quality = value('[data-field="jpegQuality"]').trim();
-        defaults.jpegQuality = quality === '' ? null : Number(quality);
+        const ppi = value('[data-field="jpegPpi"]').trim();
+        defaults.jpegPpi = ppi === '' ? null : Number(ppi);
         return {
             outputDir: value('[data-field="outputDir"]').trim(),
             defaultTargets: Object.fromEntries(Object.keys(CLASS_LABELS).map((cls) => [cls, value(`[data-field="target-${cls}"]`)])),
