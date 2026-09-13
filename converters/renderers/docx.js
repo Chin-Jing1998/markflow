@@ -8,7 +8,10 @@
  *     svg/webp/emf 或无 asset 的图片降级为斜体 alt 文本并记 warning；
  *   - 链接输出真实超链接（ExternalHyperlink），任务列表以 ☐/☑ 前缀表达；
  *   - 引用块左缩进 + 左边线 + 灰色文字；代码块逐行拆分、等宽字体、浅灰底纹；
- *   - 表格带边框、表头加粗；HTML 节点去标签后作普通文本；
+ *   - 表格带边框、表头加粗；HTML 节点去标签后作普通文本（含 data.safeTable 的 <table> 片段，
+ *     docx 不重建表格结构，仅取其文本，属已知限制）；
+ *   - math 节点先经 degradeMath 降级为线性化文本；
+ *   - 纸张、页边距、正文字号与中西文字体取自 options.docx（省略 options 时为该模块的默认值）；
  *   - 未知节点降级为纯文本段落，绝不静默丢弃。
  * 渲染器只向 doc.warnings 推入字符串，不打印 stdout；纯文本收集统一用 ir/util 的 collectText。
  */
@@ -31,7 +34,8 @@ const {
 const { imageSize } = require('image-size');
 const { stripHtml, collectText } = require('../ir/util');
 const { toBuffer } = require('../util');
-const { downgradeCustomNodes } = require('../ir/schema');
+const { downgradeCustomNodes, degradeMath } = require('../ir/schema');
+const { normalizeOptions } = require('../options');
 
 // ---- 常量 ----
 
@@ -43,7 +47,14 @@ const ALIGN_MAP = { left: AlignmentType.LEFT, center: AlignmentType.CENTER, righ
 
 /** 文档默认字体：西文 Calibri，中文回退微软雅黑（macOS 由 Word 自动回退到苹方） */
 const DEFAULT_FONT = { ascii: 'Calibri', hAnsi: 'Calibri', eastAsia: '微软雅黑', cs: 'Calibri' };
-const DEFAULT_FONT_SIZE_HALF_PT = 22; // 11pt
+const DEFAULT_FONT_SIZE_PT = 11;
+
+const TWIP_PER_INCH = 1440;
+/** 纸张尺寸（twip）：A4 = 210×297mm，Letter = 8.5×11in */
+const PAGE_SIZE_TWIP = Object.freeze({
+    A4: Object.freeze({ width: 11906, height: 16838 }),
+    Letter: Object.freeze({ width: 12240, height: 15840 }),
+});
 const CODE_FONT = 'Courier New';
 const CODE_FONT_SIZE_HALF_PT = 20; // 10pt
 const CODE_FILL = 'F5F5F7';
@@ -71,11 +82,18 @@ const UNKNOWN_MIMES = new Set(['', 'application/octet-stream']);
 
 // ---- 入口 ----
 
-async function render(doc) {
+/**
+ * @param {object} doc MarkFlowDocument
+ * @param {object} [options] 经 converters/options.js 归一的选项；省略则全取默认值
+ * @returns {Promise<Buffer>} .docx 二进制
+ */
+async function render(doc, options) {
     if (!doc || typeof doc !== 'object') throw new Error('docx 渲染器需要 doc 对象');
     if (!Array.isArray(doc.warnings)) doc.warnings = [];
+    const docxOptions = normalizeOptions(options).docx;
 
-    const root = downgradeCustomNodes(doc.ir || { type: 'root', children: [] });
+    // 公式降级须在自定义节点降级之前完成：两者互不依赖，合起来把 IR 收敛为纯标准 mdast
+    const root = downgradeCustomNodes(degradeMath(doc.ir || { type: 'root', children: [] }));
     const ctx = { warnings: doc.warnings, quoteDepth: 0, listDepth: 0 };
     const blocks = blocksToDocx(root.children, ctx);
     if (blocks.length === 0) blocks.push(emptyParagraph());
@@ -83,10 +101,41 @@ async function render(doc) {
     const document = new Document({
         creator: 'MarkFlow',
         title: String((doc.meta && doc.meta.title) || ''),
-        styles: { default: { document: { run: { font: DEFAULT_FONT, size: DEFAULT_FONT_SIZE_HALF_PT } } } },
-        sections: [{ children: blocks }],
+        styles: { default: { document: { run: runDefaults(docxOptions) } } },
+        sections: [{ properties: { page: pageProperties(docxOptions) }, children: blocks }],
     });
     return Packer.toBuffer(document);
+}
+
+/** 文档默认 run：西文字体同时用于 hAnsi 与 cs，中文走 eastAsia；字号由 pt 换算为半磅 */
+function runDefaults({ fontSize, fontFamily }) {
+    const ascii = nonEmpty(fontFamily && fontFamily.ascii, DEFAULT_FONT.ascii);
+    const eastAsia = nonEmpty(fontFamily && fontFamily.eastAsia, DEFAULT_FONT.eastAsia);
+    const pt = Number.isFinite(fontSize) && fontSize > 0 ? fontSize : DEFAULT_FONT_SIZE_PT;
+    return { font: { ascii, hAnsi: ascii, eastAsia, cs: ascii }, size: Math.round(pt * 2) };
+}
+
+/** 页面属性：纸张恒定输出，页边距只在 options.docx.margins 非空时输出（null 表示沿用 docx 包默认） */
+function pageProperties({ pageSize, margins }) {
+    const page = { size: { ...(PAGE_SIZE_TWIP[pageSize] || PAGE_SIZE_TWIP.A4) } };
+    if (margins && typeof margins === 'object') {
+        page.margin = {
+            top: inchToTwip(margins.top),
+            bottom: inchToTwip(margins.bottom),
+            left: inchToTwip(margins.left),
+            right: inchToTwip(margins.right),
+        };
+    }
+    return page;
+}
+
+function inchToTwip(inch) {
+    const value = Number(inch);
+    return Math.round((Number.isFinite(value) && value >= 0 ? value : 1) * TWIP_PER_INCH);
+}
+
+function nonEmpty(value, fallback) {
+    return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
 // ---- 块级节点 ----

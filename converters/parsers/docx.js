@@ -1,22 +1,29 @@
 /**
  * DOCX → IR
  *
- * 流程：mammoth（docx → HTML，图片经 convertImage 截获为 Buffer）
+ * 流程：读入 buffer → inspectOoxml（OOXML 预检信息）→ extractMath（OMML 换成哨兵 run）
+ *       → mammoth（docx → HTML，图片经 convertImage 截获为 Buffer）
  *       → turndown('word')（HTML → Markdown）→ remark-parse + remark-gfm（Markdown → mdast）
+ *       → restoreMath（哨兵换回 math 节点）
  *
  * 契约：
- *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, assets, warnings, meta }
- *   - 不写盘、不打印：mammoth 警告与图片读取失败一律推入 warnings
+ *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, data, assets, warnings, meta }
+ *   - 不写盘、不打印：mammoth 警告、图片读取失败、预检与公式抽取异常一律推入 warnings
  *   - 图片按出现顺序编号为 images/image_N.ext（N 从 1 起），IR 中 image 节点 url 与 assets 一一对应
  *   - 标题取首个 <h1> 文本，否则取去扩展名的文件名
+ *   - data.ooxml 为 OOXML 预检信息（采集失败时为 null），meta.sourcePath 为源文件绝对路径
+ *   - 公式一律进 IR 的 math 节点；options.math='text' 的降级由渲染器负责，解析层不降级
  */
 const path = require('path');
+const fsp = require('fs/promises');
 const mammoth = require('mammoth');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
 const { stripExt, getExtFromContentType } = require('../ir/util');
 const { notify, errText } = require('../util');
+const { inspectOoxml } = require('./docx-ooxml');
+const { extractMath, restoreMath } = require('./docx-math');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
@@ -42,7 +49,11 @@ async function parse(input, ctx = {}) {
     const warnings = [];
 
     notify(ctx, 'parsing', PROGRESS_READ);
-    const rawHtml = await convertWithMammoth(source, assets, warnings);
+    const original = source.buffer || await fsp.readFile(source.path);
+    const ooxml = await inspectSafely(original, warnings);
+    const { buffer, formulas } = await extractSafely(original, warnings);
+
+    const rawHtml = await convertWithMammoth({ buffer }, assets, warnings);
     const html = collectInlineBase64Images(rawHtml, assets, warnings);
     notify(ctx, 'parsing', PROGRESS_ASSETS);
 
@@ -50,17 +61,39 @@ async function parse(input, ctx = {}) {
     const markdown = cleanupMarkdown(createTurndownService('word').turndown(html));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
-    const ir = unified().use(remarkParse).use(remarkGfm).parse(markdown);
+    const parsed = unified().use(remarkParse).use(remarkGfm).parse(markdown);
+    const restored = restoreMath(parsed, formulas);
+    warnings.push(...restored.warnings);
     notify(ctx, 'parsing', PROGRESS_IR);
 
     return createDocument({
         kind: 'document',
-        ir,
-        data: null,
-        meta: { title, sourceType: 'docx', sourceName },
+        ir: restored.ir,
+        data: ooxml ? { ooxml } : null,
+        meta: { title, sourceType: 'docx', sourceName, sourcePath: source.path || null },
         assets,
         warnings,
     });
+}
+
+// 预检信息采集失败不阻断解析，只记 warning
+async function inspectSafely(buffer, warnings) {
+    try {
+        return await inspectOoxml(buffer);
+    } catch (err) {
+        warnings.push(`OOXML 预检信息采集失败，已跳过（${errText(err)}）`);
+        return null;
+    }
+}
+
+// 公式抽取失败时按无公式继续，交由 mammoth 决定后续成败
+async function extractSafely(buffer, warnings) {
+    try {
+        return await extractMath(buffer);
+    } catch (err) {
+        warnings.push(`公式抽取失败，已按无公式处理（${errText(err)}）`);
+        return { buffer, formulas: [] };
+    }
 }
 
 function resolveSource(input) {

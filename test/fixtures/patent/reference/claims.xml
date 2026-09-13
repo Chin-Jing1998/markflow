@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd">
+<?xml-stylesheet type="text/xsl" href="/dtdandxsl/showxml.xsl"?>
+<cn-application-body lang="zh" country="CN">
+  <cn-claims>
+    <claim id="cl001" num="1">
+      <claim-text>一种横向校对和输出双层PDF的方法，其特征在于，包括以下步骤：</claim-text>
+      <claim-text>步骤1：从OCR识别引擎记录的每个字符在图像中的外接矩形的位置导入行图像和字符图像的位置；</claim-text>
+      <claim-text>步骤2：按照行基线对字符图像做横向对齐，得到对齐后的字符序列。</claim-text>
+    </claim>
+    <claim id="cl002" num="2">
+      <claim-text>根据权利要求<claim-ref idref="cl001">1</claim-ref>所述的横向校对和输出双层PDF的方法，其特征在于，所述步骤1中的外接矩形以像素为单位记录。</claim-text>
+    </claim>
+    <claim id="cl003" num="3">
+      <claim-text>根据权利要求<claim-ref idref="cl001 cl002">1或2</claim-ref>所述的横向校对和输出双层PDF的方法，其特征在于，所述字符序列按照下式确定偏移量：<maths id="m0001" num="1"><img id="i0001" he="8" wi="42" file="omath-3-1.jpg" img-format="jpg" img-content="drawing" inline="yes"/></maths>。</claim-text>
+    </claim>
+  </cn-claims>
+</cn-application-body>

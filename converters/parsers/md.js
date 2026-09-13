@@ -8,9 +8,12 @@
  *   3) 挂载 remark-gfm —— 缺失它会导致表格、删除线、任务列表退化为原始字面量文本；
  *   4) 宽松标题预处理 —— 兼容 "#标题"（缺空格）与全角 "＃标题" 两种非标准写法；
  *   5) 解析后立即把图片解析为可内嵌资源，挂到 image 节点的 data.asset 上；
- *   6) 其中可被二进制渲染器内嵌的那部分统一编号为 images/image_N.ext 后作为 assets 返回
+ *   6) 凡取到 buffer 的图片（含 svg/webp/tiff 与远程下载所得）统一编号为 images/image_N.ext 后
+ *      作为 assets 返回，并把 image 节点的 url 改写为该资源名、另记 data.assetName
  *      —— 资源名不能沿用 Markdown 里的原始地址，否则 "../x.png"、绝对路径与 http(s) 地址
- *      会被当作落盘路径使用。
+ *      会被当作落盘路径使用；统一走 assets 通道后，图片归一化（assets/image-normalize）与
+ *      html 渲染器的 relative 模式才有唯一可寻址的资源名。data.asset 原样保留，
+ *      docx/pdf 渲染器仍按它取 buffer/absPath。
  */
 const fsp = require('fs').promises;
 const path = require('path');
@@ -21,14 +24,20 @@ const { resolveImages, collectImageNodes } = require('../assets/md-images');
 const { stripFrontMatter } = require('../web/frontmatter');
 const { notify } = require('../util');
 
-// docx 等二进制渲染器可内嵌的图片类型 → 资源扩展名；不在表内的（svg/webp 等）不进 assets，
-// 但 image 节点上的 data.asset 仍保留，HTML 渲染照常可用
-const EMBEDDABLE_EXT_BY_MIME = {
+// mime → 资源扩展名；表外的 mime 退回原地址的扩展名，再退回 .bin
+const EXT_BY_MIME = {
     'image/png': '.png',
     'image/jpeg': '.jpg',
     'image/gif': '.gif',
     'image/bmp': '.bmp',
+    'image/x-ms-bmp': '.bmp',
+    'image/webp': '.webp',
+    'image/tiff': '.tiff',
+    'image/svg+xml': '.svg',
 };
+const FALLBACK_EXT = '.bin';
+// 可用作资源扩展名的原地址后缀：点 + 1–8 位字母数字，排除 data URL 一类的伪扩展名
+const SAFE_EXT_RE = /^\.[a-z0-9]{1,8}$/;
 
 // 行首 1-6 个井号（半角或全角），且后面不再跟井号 —— 即构成合法 ATX 标题前缀
 const HEADING_PREFIX_RE = /^([#＃]{1,6})(?![#＃])/gm;
@@ -138,18 +147,37 @@ function toPlainText(node) {
 // 资源登记
 // ============================================================
 
-// 按文档顺序收集可内嵌图片，统一编号为 images/image_N.ext；同一 url 只登记一次
+/**
+ * 按文档顺序登记图片资源：凡取到 buffer 的图片都统一编号为 images/image_N.ext，
+ * 同一原始地址复用同一资源；登记后把节点 url 改写为资源名并记 data.assetName。
+ * 未取到 buffer 的（远程未下载、越界、读盘失败）保持原 url 不动。
+ */
 function collectAssets(ir) {
     const assets = [];
-    const seen = new Set();
+    const nameByUrl = new Map();
     for (const node of collectImageNodes(ir)) {
         const asset = node.data && node.data.asset;
-        const ext = asset && asset.buffer ? EMBEDDABLE_EXT_BY_MIME[asset.mime] : undefined;
-        if (!ext || seen.has(node.url)) continue;
-        seen.add(node.url);
-        assets.push({ name: `images/image_${assets.length + 1}${ext}`, buffer: asset.buffer, mime: asset.mime });
+        const buffer = asset && asset.buffer;
+        if (!Buffer.isBuffer(buffer) || buffer.length === 0) continue;
+
+        const url = typeof node.url === 'string' ? node.url : '';
+        let name = nameByUrl.get(url);
+        if (name === undefined) {
+            name = `images/image_${assets.length + 1}${extFor(asset, url)}`;
+            nameByUrl.set(url, name);
+            assets.push({ name, buffer, mime: asset.mime });
+        }
+        node.url = name;
+        node.data = { ...node.data, assetName: name };
     }
     return assets;
+}
+
+function extFor(asset, url) {
+    const byMime = EXT_BY_MIME[String((asset && asset.mime) || '').toLowerCase()];
+    if (byMime) return byMime;
+    const ext = path.extname(String(url || '').split('?')[0].split('#')[0]).toLowerCase();
+    return SAFE_EXT_RE.test(ext) ? ext : FALLBACK_EXT;
 }
 
 // ============================================================

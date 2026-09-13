@@ -221,3 +221,73 @@ test('非法输入抛中文错误', async () => {
     await assert.rejects(parse({}), /input\.path|input\.buffer/);
     await assert.rejects(parse({ path: path.join(os.tmpdir(), 'markflow-不存在的文件.docx') }));
 });
+
+// ============================================================
+// 专利样稿夹具（test/fixtures/patent/，由 build-samples.js 生成）
+// ============================================================
+
+const PATENT_FIXTURES = path.join(__dirname, 'fixtures', 'patent');
+
+test('规范样稿：公式进 math 节点、data.ooxml 就位、meta.sourcePath 为绝对路径', async () => {
+    // Arrange
+    const docxPath = path.join(PATENT_FIXTURES, 'sample-patent.docx');
+
+    // Act
+    const doc = await parse({ path: docxPath });
+
+    // Assert：公式
+    const maths = collect(doc.ir, (n) => n.type === 'math');
+    assert.equal(maths.length, 2);
+    assert.deepEqual(maths.map((n) => n.data.display), [false, true]);
+    for (const node of maths) {
+        assert.ok(node.data.mathml && node.data.mathml.includes('http://www.w3.org/1998/Math/MathML'));
+        assert.ok(node.data.omml && node.data.omml.includes('m:oMath'));
+        assert.ok(node.data.text.length > 0);
+    }
+    assert.equal(maths[0].data.text, '(F)/(S)');
+    assert.ok(maths[1].data.text.startsWith('∑_{i=1}^{n}'));
+
+    // Assert：OOXML 预检信息
+    assert.ok(doc.data && doc.data.ooxml, 'data.ooxml 应存在');
+    assert.equal(doc.data.ooxml.paragraphs, 36);
+    assert.equal(doc.data.ooxml.headingStyleParagraphs, 5);
+    assert.equal(doc.data.ooxml.revisions.trackRevisions, false);
+    assert.deepEqual(doc.data.ooxml.oleObjects, []);
+
+    // Assert：源路径与图片
+    assert.equal(doc.meta.sourcePath, docxPath);
+    assert.ok(path.isAbsolute(doc.meta.sourcePath));
+    assert.equal(doc.assets.length, 3);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'image').map((n) => n.url),
+        ['images/image_1.png', 'images/image_2.png', 'images/image_3.png']);
+    assert.deepEqual(doc.warnings, []);
+});
+
+test('无标题样稿：段数与图片数正确，顿号权项与坏引用原样进 IR', async () => {
+    // Arrange
+    const docxPath = path.join(PATENT_FIXTURES, 'sample-patent-notitle.docx');
+
+    // Act
+    const doc = await parse({ path: docxPath });
+
+    // Assert：段落与标题数
+    const top = doc.ir.children;
+    assert.equal(top.length, 23);
+    assert.equal(top.filter((n) => n.type === 'heading').length, 5);
+    assert.equal(top.filter((n) => n.type === 'paragraph').length, 18);
+    assert.equal(doc.data.ooxml.paragraphs, 23);
+
+    // Assert：图片
+    assert.equal(doc.assets.length, 2);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'image').map((n) => n.url),
+        ['images/image_1.png', 'images/image_2.png']);
+    assert.equal(plainText(top[20]), '图1');
+    assert.equal(plainText(top[22]), '图2');
+
+    // Assert：无发明名称段、无四书标题、无段号；权项用顿号编号且第 3 项为坏引用
+    assert.equal(collect(doc.ir, (n) => n.type === 'math').length, 0);
+    assert.ok(plainText(top[0]).startsWith('本实用新型公开了'), '首段即摘要正文');
+    assert.ok(plainText(top[1]).startsWith('1、一种液体容器'));
+    assert.ok(plainText(top[5]).includes('根据权利要求12-3任一项所述'));
+    assert.equal(top.filter((n) => /^\[\d{4}\]/.test(plainText(n))).length, 0, '样稿不应带段号');
+});

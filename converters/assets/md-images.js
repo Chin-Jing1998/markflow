@@ -23,7 +23,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { fileURLToPath } = require('url');
 const { imageSize } = require('image-size');
-const { errText, toBuffer } = require('../util');
+const { errText, toBuffer, isWithinDir, isRealWithinDir } = require('../util');
 const { createTempDirFactory, cleanupStaleTempDirs } = require('../tmp');
 
 // 扩展名 → mime；另两张表由它派生，保证三者始终一致
@@ -192,22 +192,7 @@ async function pickSafePath(url, baseDir) {
     return { absPath: null, blocked };
 }
 
-// 词法判定：absPath 位于 baseDir 之内（含 baseDir 自身）
-function isWithinDir(baseDir, absPath) {
-    const rel = path.relative(path.resolve(baseDir), absPath);
-    if (rel === '') return true;
-    return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
-}
-
-// realpath 判定：解开符号链接后仍在 baseDir 之内；任一端 realpath 失败即视为越界
-async function isRealWithinDir(baseDir, absPath) {
-    try {
-        const [realBase, realTarget] = await Promise.all([fsp.realpath(baseDir), fsp.realpath(absPath)]);
-        return isWithinDir(realBase, realTarget);
-    } catch (err) {
-        return false;
-    }
-}
+// 词法判定 isWithinDir 与 realpath 判定 isRealWithinDir 定义在 converters/util.js（全仓共用），此处引用
 
 function toPathCandidates(url) {
     if (!/^file:\/\//i.test(url)) {

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd">
+<?xml-stylesheet type="text/xsl" href="/dtdandxsl/showxml.xsl"?>
+<cn-application-body lang="zh" country="CN">
+  <description>
+    <invention-title>横向校对和输出双层PDF的方法和装置</invention-title>
+    <heading id="h0001" level="2">技术领域</heading>
+    <p id="p0001" num="0001" Italic="0">本发明属于文字处理领域，涉及一种数据校对和输出双层PDF的方法和装置，具体涉及一种横向校对和输出双层PDF的方法和装置。</p>
+    <heading id="h0002" level="2">背景技术</heading>
+    <p id="p0002" num="0002" Italic="0">现有的双层PDF输出方案在字符层与图像层之间缺少横向对齐约束，导致文本层与图像层出现偏移。</p>
+    <p id="p0003" num="0003" Italic="0">为便于表述，下文以第<sub>i</sub>行、第<sup>j</sup>列表示字符在版面中的位置，其中<b>行基线</b>由OCR识别引擎给出。</p>
+    <heading id="h0003" level="2">发明内容</heading>
+    <p id="p0004" num="0004" Italic="0">本发明要解决的技术问题是：提供一种横向校对方法，使文本层与图像层的横向偏移不超过设定阈值。<br/>技术方案如下所述。</p>
+    <p id="p0005" num="0005" Italic="0">偏移量按下式计算：<maths id="m0001" num="1"><img id="i0001" he="9" wi="46" file="omath-5-1.jpg" img-format="jpg" img-content="drawing" inline="yes"/></maths>，其中分母为该行的字符总数。</p>
+    <p id="p0006" num="0006" Italic="0">各档阈值与对应的校正策略如下表所示。<tables id="t0001" num="1"><img id="i0002" he="38" wi="120" file="table-1.jpg" img-format="jpg" img-content="drawing" inline="no"/></tables></p>
+    <heading id="h0004" level="2">附图说明</heading>
+    <p id="p0007" num="0007" Italic="0"><figref num="1">图1</figref>为本发明实施例的横向校对流程图；</p>
+    <p id="p0008" num="0008" Italic="0"><figref num="2">图2</figref>为本发明实施例的装置结构示意图。</p>
+    <heading id="h0005" level="2">具体实施方式</heading>
+    <p id="p0009" num="0009" Italic="0">下面结合附图对本发明的具体实施方式作进一步说明。</p>
+    <p id="p0010" num="0010" Italic="1">实施例1：横向校对流程。</p>
+    <p id="p0011" num="0011" Italic="0">首先导入行图像与字符图像的位置，然后按行基线对齐，最后输出双层PDF。</p>
+    <p id="l0001" num="XXXX" Italic="0">图中：1、行图像；2、字符图像；11、外接矩形；12、行基线。</p>
+  </description>
+</cn-application-body>

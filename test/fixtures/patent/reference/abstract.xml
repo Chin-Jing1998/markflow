@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd">
+<?xml-stylesheet type="text/xsl" href="/dtdandxsl/showxml.xsl"?>
+<cn-application-body lang="zh" country="CN">
+  <cn-abstract>
+    <p id="p0001" num="0001" Italic="0">本发明公开了一种横向校对和输出双层PDF的方法和装置，属于文字处理领域。该方法从OCR识别引擎导入行图像与字符图像的外接矩形位置，按行基线对字符图像做横向对齐，再输出文本层与图像层对齐的双层PDF。</p>
+    <p id="p0002" num="0002" Italic="0">与现有技术相比，本发明使文本层与图像层的横向偏移不超过设定阈值，提高了双层PDF的检索准确率。</p>
+  </cn-abstract>
+</cn-application-body>
