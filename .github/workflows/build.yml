@@ -1,13 +1,23 @@
-name: 测试
+name: 测试与发布
 
 on:
   push:
     branches: ['**']
+    tags:
+      - 'v*'
   pull_request:
+
+permissions:
+  contents: write
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: 测试（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -21,5 +31,84 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      - name: 运行测试
+      # 真实 Electron 用例在无法启动时自动跳过；装上 xvfb 提供虚拟显示，使其在 Linux 上真正执行
+      - name: 安装 xvfb（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: 运行测试（Linux，经 xvfb）
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm test
+
+      - name: 运行测试（macOS / Windows）
+        if: runner.os != 'Linux'
         run: npm test
+
+  build-mac:
+    name: 打包 macOS
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: macos-latest
+    env:
+      # 本期不做代码签名与公证：关掉 electron-builder 的钥匙串证书自动探测，避免在无证书的运行器上失败
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建 macOS 安装包
+        run: npm run build:mac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传至 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-win:
+    name: 打包 Windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建 Windows 安装包
+        run: npm run build:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传至 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
