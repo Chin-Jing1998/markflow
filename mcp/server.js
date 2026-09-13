@@ -14,6 +14,7 @@ const { z } = require('zod');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const service = require('../converters/service');
+const { OPTION_ENUMS } = require('../converters/options');
 const { errText, isDirectory } = require('../converters/util');
 const pkg = require('../package.json');
 
@@ -21,25 +22,82 @@ const CONCURRENCY = 2;
 const MAX_CONTENT_CHARS = 200000;
 const DEFAULT_EXTRACT_MAX_CHARS = 50000;
 
+// 枚举取值一律取自 converters/options.js，不在本文件重复维护；每处新建实例（同一 zod 对象复用会被转成 $ref），
+// errorMap 让 schema 层的拒绝也带中文说明——SDK 会把该错误包成 isError 结果返回，不抛到调用方
+const enumOf = (values, label) => z.enum([...values], {
+    errorMap: () => ({ message: `${label} 须为 ${values.join(' | ')} 之一` }),
+});
+
 const CONVERT_INPUT = {
     paths: z.array(z.string()).optional().describe('本地文件绝对路径列表'),
     urls: z.array(z.string().url()).optional().describe('网页 URL 列表'),
-    target: z.enum(['bundle', 'docx', 'pdf']).optional().describe('bundle=md+json+images（办公文档/网页），docx|pdf 仅用于 Markdown 输入；省略则按输入类型默认'),
+    target: z.enum(['bundle', 'docx', 'pdf', 'html', 'xml']).optional().describe('bundle=md+json+images（办公文档/网页），docx|pdf 仅用于 Markdown 输入，html|xml 接受全部输入；省略则按输入类型默认'),
     outputDir: z.string().describe('已存在的输出目录绝对路径'),
     returnContent: z.boolean().optional().describe(`为 true 时在结果中附带生成的 Markdown 文本（bundle 目标，最多 ${MAX_CONTENT_CHARS} 字符）`),
+    theme: enumOf(OPTION_ENUMS.htmlThemes, 'theme').optional().describe('html 与 pdf 目标的主题'),
+    xmlProfile: enumOf(OPTION_ENUMS.xmlProfiles, 'xmlProfile').optional()
+        .describe('XML 方言：generic 通用文档结构，patent 国知局专利五书'),
+    patentParts: z.array(enumOf(OPTION_ENUMS.patentParts, 'patentParts')).optional()
+        .describe('patent profile 下输出的五书子集；省略即按识别结果输出'),
+    pdfBackend: enumOf(OPTION_ENUMS.pdfBackends, 'pdfBackend').optional()
+        .describe('PDF 解析后端：auto 有 MinerU 令牌走云端否则本地，mineru 强制云端，local 强制本地'),
+    imageFormat: enumOf(OPTION_ENUMS.imageFormats, 'imageFormat').optional()
+        .describe('图片归一格式：jpg 把位图统一转为 JPEG，keep 保持原格式'),
+    jpegQuality: z.number().int().optional().describe('JPEG 质量，60–100'),
+    math: enumOf(OPTION_ENUMS.mathModes, 'math').optional()
+        .describe('docx 公式：image 栅格为图片，text 降级为线性化文本'),
+    mineru: z.object({
+        model: enumOf(OPTION_ENUMS.mineruModels, 'mineru.model'),
+        ocr: z.boolean(),
+        language: z.string(),
+        pageRanges: z.string(),
+    }).partial().optional()
+        .describe('MinerU 云端解析参数；令牌只取自本机环境变量或 ~/.markflow/config.json，不接受经此传入'),
+    html: z.object({
+        fontFamily: z.string(),
+        fontSize: z.number(),
+        lineHeight: z.number(),
+        contentWidth: z.number().int(),
+        spacing: enumOf(OPTION_ENUMS.spacing, 'html.spacing'),
+        inlineImages: z.boolean(),
+    }).partial().optional().describe('html 目标参数：字体栈、字号（px）、行高、栏宽（px）、段距与图片内联'),
+    docx: z.object({
+        pageSize: enumOf(OPTION_ENUMS.pageSizes, 'docx.pageSize'),
+        fontSize: z.number(),
+        fontAscii: z.string(),
+        fontEastAsia: z.string(),
+    }).partial().optional().describe('docx 目标参数：纸张、正文字号（pt）与中西文字体'),
+    xml: z.object({
+        indent: z.number().int(),
+        numberingStart: z.number().int(),
+        numberingWidth: z.number().int(),
+    }).partial().optional().describe('xml 目标参数：缩进空格数与说明书段号的起始值、补零位数'),
+    validate: z.boolean().optional().describe('xml 目标：渲染后用官方 DTD 校验（patent）或检查 well-formed（generic），结果写入 warnings'),
 };
+// 入参中交给 service.buildOptions 的键；其余（paths/urls/target/outputDir/returnContent）由本文件自行处理
+const OPTION_ARG_KEYS = Object.freeze([
+    'theme', 'xmlProfile', 'patentParts', 'pdfBackend', 'imageFormat', 'jpegQuality', 'math',
+    'mineru', 'html', 'docx', 'xml', 'validate',
+]);
 const RESULT_ITEM = z.object({
-    input: z.string(), target: z.string(), name: z.string(), title: z.string(), outputPath: z.string(),
-    outputs: z.record(z.string()), imagesCount: z.number(), warnings: z.array(z.string()),
+    input: z.string(), target: z.string(), name: z.string(), title: z.string(), sourceType: z.string(),
+    outputPath: z.string(), outputs: z.record(z.string()), imagesCount: z.number(), warnings: z.array(z.string()),
+    options: z.record(z.any()), extras: z.array(z.string()),
+    backends: z.object({ pdfParser: z.string().nullable(), raster: z.string().nullable() }),
     content: z.string().optional(),
 });
 const CONVERT_OUTPUT = {
     ok: z.boolean(), outputDir: z.string(), results: z.array(RESULT_ITEM),
     errors: z.array(z.object({ input: z.string(), error: z.string() })),
 };
+// 后端探测结果；每处调用都新建一份 schema：同一 zod 对象复用两次会被转成 $ref，而 Desktop 客户端不接受 $ref
+const backendStatus = () => z.object({ name: z.string().nullable(), available: z.boolean(), hint: z.string() });
 const CAPABILITIES = z.object({
-    sofficeAvailable: z.boolean(),
-    pdfBackend: z.object({ name: z.string().nullable(), available: z.boolean(), hint: z.string() }),
+    pdfBackend: backendStatus(),
+    raster: backendStatus(),
+    mineru: z.object({ configured: z.boolean(), source: z.string().nullable() }),
+    themes: z.array(z.string()),
+    xmlProfiles: z.array(z.string()),
 });
 const FORMATS_OUTPUT = { targets: z.record(z.any()), capabilities: CAPABILITIES, version: z.string() };
 
@@ -66,6 +124,14 @@ async function handleConvertDocument(args = {}) {
     const outputDir = typeof args.outputDir === 'string' ? args.outputDir : '';
     if (!(await isDirectory(outputDir))) return failure(`输出目录不存在或不是目录：${outputDir}`);
 
+    // 取值范围与中文错误文案由 converters/options.js 的归一层给出，此处只把失败转成 isError 结果
+    let options;
+    try {
+        options = service.buildOptions(pickDefined(args, OPTION_ARG_KEYS));
+    } catch (err) {
+        return failure(errText(err));
+    }
+
     let tasks;
     try {
         tasks = service.planTasks(raws, args.target, process.cwd());
@@ -73,7 +139,7 @@ async function handleConvertDocument(args = {}) {
         return failure(errText(err));
     }
 
-    const payload = await service.runConversion({ tasks, outputDir, concurrency: CONCURRENCY });
+    const payload = await service.runConversion({ tasks, outputDir, concurrency: CONCURRENCY, options });
     return success({
         ...payload,
         results: await Promise.all(payload.results.map((item) => withContent(item, args.returnContent))),
@@ -116,6 +182,11 @@ async function handleExtractArticle(args = {}) {
     });
 }
 
+// 只挑出调用方确实给了的键；未给出的不进 buildOptions，由 options.js 补默认值
+function pickDefined(source, keys) {
+    return Object.fromEntries(keys.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]));
+}
+
 // 只挑出确实有值的字符串字段，空值不进结果
 function pickStrings(source, keys) {
     return Object.fromEntries(
@@ -135,7 +206,8 @@ function createServer() {
     const server = new McpServer({ name: 'markflow', version: pkg.version });
     server.registerTool('convert_document', {
         title: '转换文档',
-        description: '把本地办公文档、PDF、Markdown 或网页转换为 Markdown 包（bundle）、DOCX 或 PDF。',
+        description: '把本地办公文档、PDF、Markdown 或网页转换为 Markdown 包（bundle）、DOCX、PDF、HTML 或 XML；'
+            + '可指定主题、XML profile、图片与公式处理方式以及 MinerU 解析参数，省略的选项取默认值。',
         inputSchema: CONVERT_INPUT,
         outputSchema: CONVERT_OUTPUT,
     }, handleConvertDocument);
@@ -148,7 +220,7 @@ function createServer() {
     // list_formats 不声明 inputSchema：SDK 会给出空对象 schema，且允许调用方省略 arguments
     server.registerTool('list_formats', {
         title: '列出可用格式',
-        description: '返回输入类型与转换目标的对应矩阵，以及本机 LibreOffice 与 PDF 后端的可用性。',
+        description: '返回输入类型与转换目标的对应矩阵、可选主题与 XML profile，以及本机 PDF 后端、栅格化后端与 MinerU 令牌的状态。',
         outputSchema: FORMATS_OUTPUT,
     }, handleListFormats);
     return server;

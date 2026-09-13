@@ -9,35 +9,46 @@
  * classifyInput(raw, cwd)             → { input: { path } | { url }, type }；相对路径按 cwd 解析为绝对路径
  * resolveTarget(inputType, requested) → 目标格式；未指定时按输入类型取默认值，不合法时抛中文错误
  * assertTargetAllowed(target, type)   → 不合法即抛中文错误，供 convert 复用同一套判定与措辞
+ * getTargetRule(target)               → TARGET_RULES 中的规则项（含 layout / ext），未知目标抛中文错误
+ * listTargets({ pdfBackend })         → 能力矩阵，由 TARGET_RULES 派生：pdf 目标仅在 PDF 后端可用时列出
+ *
+ * 目标矩阵（TARGET_RULES）：
+ *   bundle  office、url         folder  {name}/{name}.md + {name}.json + images/
+ *   docx    markup              single  {name}.docx
+ *   pdf     markup              single  {name}.pdf
+ *   html    office、markup、url folder  {name}/{name}.html + images/
+ *   xml     office、markup、url folder  {name}/{name}.xml + images/（patent profile 另有五书与 zip）
  *
  * 本模块只做纯逻辑判断，不触碰文件系统：存在性由调用方（CLI 预检）或 convert 负责。
  */
 const path = require('path');
 
-// 扩展名 → 输入类型
+// 扩展名 → 输入类型；旧二进制格式（.doc/.xls/.ppt）自 v3 起不再受理
 const EXT_TO_TYPE = Object.freeze({
-    '.docx': 'docx', '.doc': 'doc', '.xlsx': 'xlsx', '.xls': 'xls', '.pptx': 'pptx',
-    '.ppt': 'ppt', '.pdf': 'pdf', '.md': 'md', '.markdown': 'md',
+    '.docx': 'docx', '.xlsx': 'xlsx', '.pptx': 'pptx', '.pdf': 'pdf', '.md': 'md', '.markdown': 'md',
 });
 const SUPPORTED_EXTENSIONS = Object.freeze(Object.keys(EXT_TO_TYPE));
 
 // 输入类型 → 输入类别（决定可选目标）；键序即 listTargets().inputs 的键序。
 // 键必须与 detectInputType 的返回值一一对应：.markdown 已归入 md，故此处没有 markdown 键
 const INPUT_CLASS = Object.freeze({
-    docx: 'office', doc: 'office', xlsx: 'office', xls: 'office', pptx: 'office',
-    ppt: 'office', pdf: 'office', md: 'markup', url: 'url',
+    docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', url: 'url',
 });
-// 旧二进制格式依赖 soffice 转码
-const LEGACY_INPUT_TYPES = Object.freeze(['doc', 'xls', 'ppt']);
+// 输入类别的固定顺序，即 listTargets() 中 office / markup / url 三个键的顺序
+const INPUT_CLASSES = Object.freeze(['office', 'markup', 'url']);
 // 输入类别 → 未指定 --to 时的默认目标
 const DEFAULT_TARGET_BY_CLASS = Object.freeze({ office: 'bundle', markup: 'docx', url: 'bundle' });
-// 目标 → { 接受的输入类别, 拒绝时的提示 }；键序即错误提示中「可选」的罗列顺序
+// 目标 → { 接受的输入类别, 落盘布局, 主产物扩展名, 拒绝时的提示 }；键序即错误提示与 listTargets 的罗列顺序
 const TARGET_RULES = Object.freeze({
-    bundle: { classes: ['office', 'url'], hint: 'bundle 仅接受 Office、PDF 文件与网页输入' },
-    docx: { classes: ['markup'], hint: 'docx 仅接受 Markdown 输入' },
-    pdf: { classes: ['markup'], hint: 'pdf 仅接受 Markdown 输入' },
+    bundle: Object.freeze({ classes: Object.freeze(['office', 'url']), layout: 'folder', ext: 'md', hint: 'bundle 仅接受 Office、PDF 文件与网页输入' }),
+    docx: Object.freeze({ classes: Object.freeze(['markup']), layout: 'single', ext: 'docx', hint: 'docx 仅接受 Markdown 输入' }),
+    pdf: Object.freeze({ classes: Object.freeze(['markup']), layout: 'single', ext: 'pdf', hint: 'pdf 仅接受 Markdown 输入' }),
+    html: Object.freeze({ classes: Object.freeze(['office', 'markup', 'url']), layout: 'folder', ext: 'html', hint: 'html 接受全部输入' }),
+    xml: Object.freeze({ classes: Object.freeze(['office', 'markup', 'url']), layout: 'folder', ext: 'xml', hint: 'xml 接受全部输入' }),
 });
 const TARGETS = Object.freeze(Object.keys(TARGET_RULES));
+// 需要 PDF 后端才可用的目标
+const PDF_BACKEND_TARGETS = Object.freeze(['pdf']);
 // 输入类型 → 默认目标，由上面两张表派生，不另行维护
 const DEFAULT_TARGETS = Object.freeze(Object.fromEntries(
     Object.entries(INPUT_CLASS).map(([type, cls]) => [type, DEFAULT_TARGET_BY_CLASS[cls]]),
@@ -45,7 +56,7 @@ const DEFAULT_TARGETS = Object.freeze(Object.fromEntries(
 
 const REMOTE_URL_RE = /^https?:\/\//i;
 
-// 'docx'|'doc'|'xlsx'|'xls'|'pptx'|'ppt'|'pdf'|'md'|'url'|null
+// 'docx'|'xlsx'|'pptx'|'pdf'|'md'|'url'|null
 function detectInputType(pathOrUrl) {
     if (typeof pathOrUrl !== 'string' || !pathOrUrl.trim()) return null;
     const value = pathOrUrl.trim();
@@ -53,9 +64,14 @@ function detectInputType(pathOrUrl) {
     return EXT_TO_TYPE[path.extname(value).toLowerCase()] || null;
 }
 
-function assertTargetAllowed(target, inputType) {
+function getTargetRule(target) {
     const rule = TARGET_RULES[target];
     if (!rule) throw new Error(`不支持的目标格式：${target}（可选：${TARGETS.join('、')}）`);
+    return rule;
+}
+
+function assertTargetAllowed(target, inputType) {
+    const rule = getTargetRule(target);
     if (!rule.classes.includes(INPUT_CLASS[inputType])) {
         throw new Error(`目标 ${target} 不接受 ${inputType} 输入：${rule.hint}`);
     }
@@ -80,7 +96,22 @@ function classifyInput(raw, cwd) {
     return { input: { path: path.resolve(cwd || process.cwd(), value) }, type };
 }
 
+/**
+ * 能力矩阵：按 TARGET_RULES 派生各输入类别可选的目标。
+ * 调用方负责探测 PDF 后端并把探测结果传入；pdfBackend 为假值时不列出 pdf 目标。
+ * @returns {{ office: string[], markup: string[], url: string[], inputs: object, capabilities: { pdfBackend } }}
+ */
+function listTargets({ pdfBackend = null } = {}) {
+    const targetsFor = (cls) => TARGETS.filter((target) =>
+        TARGET_RULES[target].classes.includes(cls) && (pdfBackend || !PDF_BACKEND_TARGETS.includes(target)));
+    return {
+        ...Object.fromEntries(INPUT_CLASSES.map((cls) => [cls, targetsFor(cls)])),
+        inputs: { ...INPUT_CLASS },
+        capabilities: { pdfBackend: pdfBackend || null },
+    };
+}
+
 module.exports = {
-    detectInputType, classifyInput, resolveTarget, assertTargetAllowed,
-    SUPPORTED_EXTENSIONS, INPUT_CLASS, LEGACY_INPUT_TYPES, DEFAULT_TARGETS, TARGETS, REMOTE_URL_RE,
+    detectInputType, classifyInput, resolveTarget, assertTargetAllowed, getTargetRule, listTargets,
+    SUPPORTED_EXTENSIONS, INPUT_CLASS, INPUT_CLASSES, DEFAULT_TARGETS, TARGET_RULES, TARGETS, REMOTE_URL_RE,
 };

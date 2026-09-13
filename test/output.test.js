@@ -1,13 +1,14 @@
 /**
  * converters/output.js 单元测试
- * 覆盖：writeBundle（含/不含 assets、覆盖写、路径穿越防护、参数校验）、writeSingle
+ * 覆盖：writeFolder（files/assets/extras 落盘与 outputs 键、字符串与 Buffer 内容、穿越拒绝、参数校验）、
+ *       writeBundle（含/不含 assets、覆盖写、路径穿越防护、参数校验）、writeSingle
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { writeBundle, writeSingle } = require('../converters/output');
+const { writeFolder, writeBundle, writeSingle, outputKeyFor, NAME_TOKEN } = require('../converters/output');
 
 const TMP_ROOT = path.join(__dirname, 'tmp');
 fs.mkdirSync(TMP_ROOT, { recursive: true });
@@ -120,5 +121,132 @@ describe('writeSingle', () => {
     test('非 Buffer 内容与缺失 ext 拒绝', async () => {
         await assert.rejects(writeSingle({ outputDir: root, name: 'x', ext: 'pdf', buffer: 'text' }), /Buffer/);
         await assert.rejects(writeSingle({ outputDir: root, name: 'x', ext: '', buffer: Buffer.alloc(1) }), /ext/);
+    });
+});
+
+// ============================================================
+// writeFolder
+// ============================================================
+
+describe('writeFolder', () => {
+    test('files + assets + extras：目录结构、{name} 替换、outputs 键（扩展名 / camelCase / imagesDir / <dir>Dir）', async () => {
+        // Act
+        const res = await writeFolder({
+            outputDir: root,
+            name: '专利A',
+            files: {
+                '{name}.xml': '<doc/>',
+                'claims.xml': '<cn-claims/>',
+                'abstract-figure.xml': Buffer.from('<cn-abstract/>'),
+                '{name}.zip': Buffer.from('PK'),
+            },
+            assets: [ASSET],
+            extras: [
+                { name: 'mineru/full.md', buffer: Buffer.from('# full') },
+                { name: 'mineru/layout.json', buffer: Buffer.from('{}') },
+                { name: 'notes.txt', buffer: Buffer.from('n') },
+            ],
+        });
+
+        // Assert
+        const dir = path.join(root, '专利A');
+        assert.deepEqual(res, {
+            outputPath: dir,
+            outputs: {
+                xml: path.join(dir, '专利A.xml'),
+                claims: path.join(dir, 'claims.xml'),
+                abstractFigure: path.join(dir, 'abstract-figure.xml'),
+                zip: path.join(dir, '专利A.zip'),
+                imagesDir: path.join(dir, 'images'),
+                mineruDir: path.join(dir, 'mineru'),
+            },
+        });
+        assert.equal(fs.readFileSync(res.outputs.xml, 'utf8'), '<doc/>');
+        assert.equal(fs.readFileSync(res.outputs.abstractFigure, 'utf8'), '<cn-abstract/>');
+        assert.ok(fs.readFileSync(path.join(res.outputs.imagesDir, 'image_1.png')).equals(PNG));
+        assert.equal(fs.readFileSync(path.join(res.outputs.mineruDir, 'full.md'), 'utf8'), '# full');
+        assert.equal(fs.readFileSync(path.join(dir, 'notes.txt'), 'utf8'), 'n');
+        assert.equal(NAME_TOKEN, '{name}');
+        assert.equal(outputKeyFor('{name}.HTML'), 'html');
+        assert.equal(outputKeyFor('sub/abstract-figure.xml'), 'abstractFigure');
+    });
+
+    test('字符串按 utf8、Buffer 原样、子目录自动创建；无 assets 时不建 images/，返回绝对路径', async () => {
+        // Arrange
+        const relative = path.relative(process.cwd(), root);
+
+        // Act
+        const res = await writeFolder({
+            outputDir: relative,
+            name: '网页B',
+            files: { '{name}.html': '<p>中文</p>', 'assets/site.css': Buffer.from('p{}') },
+        });
+
+        // Assert
+        const dir = path.join(root, '网页B');
+        assert.ok(path.isAbsolute(res.outputPath));
+        assert.deepEqual(res, { outputPath: dir, outputs: { html: path.join(dir, '网页B.html'), site: path.join(dir, 'assets', 'site.css') } });
+        assert.equal(fs.readFileSync(res.outputs.html, 'utf8'), '<p>中文</p>');
+        assert.equal(fs.readFileSync(res.outputs.site, 'utf8'), 'p{}');
+        assert.equal(fs.existsSync(path.join(dir, 'images')), false);
+
+        // 覆盖写
+        const again = await writeFolder({ outputDir: root, name: '网页B', files: { '{name}.html': 'v2' } });
+        assert.equal(fs.readFileSync(again.outputs.html, 'utf8'), 'v2');
+    });
+
+    test('裸文件名的资产平铺在目录根下：不创建 images/，outputs 无 imagesDir；混有 images/ 前缀时仍建目录', async () => {
+        // Act
+        const flat = await writeFolder({
+            outputDir: root, name: '平铺E',
+            files: { 'claims.xml': '<cn-claims/>' },
+            assets: [{ name: 'drawing-1.jpg', buffer: PNG, mime: 'image/jpeg' }],
+        });
+        const mixed = await writeFolder({
+            outputDir: root, name: '平铺F',
+            files: { 'a.xml': '<a/>' },
+            assets: [{ name: 'drawing-1.jpg', buffer: PNG, mime: 'image/jpeg' }, ASSET],
+        });
+
+        // Assert
+        const dir = path.join(root, '平铺E');
+        assert.deepEqual(flat, { outputPath: dir, outputs: { claims: path.join(dir, 'claims.xml') } });
+        assert.ok(fs.readFileSync(path.join(dir, 'drawing-1.jpg')).equals(PNG));
+        assert.equal(fs.existsSync(path.join(dir, 'images')), false);
+        assert.equal(mixed.outputs.imagesDir, path.join(root, '平铺F', 'images'));
+        assert.ok(fs.existsSync(path.join(root, '平铺F', 'images', 'image_1.png')));
+        assert.ok(fs.existsSync(path.join(root, '平铺F', 'drawing-1.jpg')));
+    });
+
+    test('拒绝穿越：files 键与 extras 名的 ../ 与绝对路径、Windows 盘符；校验失败时目录内外都不落盘', async () => {
+        const base = { outputDir: root, name: '穿越C' };
+        const good = { '{name}.html': 'ok' };
+
+        await assert.rejects(writeFolder({ ...base, files: { '../evil.html': 'x' } }), /产物名不得包含 "\.\."：\.\.\/evil\.html/);
+        await assert.rejects(writeFolder({ ...base, files: { '/tmp/evil.html': 'x' } }), /产物名不得为绝对路径/);
+        await assert.rejects(writeFolder({ ...base, files: { 'C:\\\\evil.html': 'x' } }), /产物名不得为绝对路径/);
+        await assert.rejects(writeFolder({ ...base, files: { '{name}/../../x.html': 'x' } }), /产物名不得包含 "\.\."/);
+        await assert.rejects(writeFolder({ ...base, files: good, extras: [{ name: '../evil.txt', buffer: PNG }] }), /附属文件名不得包含 "\.\."/);
+        await assert.rejects(writeFolder({ ...base, files: good, extras: [{ name: '/etc/evil.txt', buffer: PNG }] }), /附属文件名不得为绝对路径/);
+        await assert.rejects(writeFolder({ ...base, files: good, assets: [{ name: '..\\\\evil.png', buffer: PNG }] }), /资源名不得包含 "\.\."/);
+        await assert.rejects(writeFolder({ ...base, files: good, extras: [{ buffer: PNG }] }), /附属文件缺少 name/);
+
+        assert.equal(fs.existsSync(path.join(root, 'evil.html')), false);
+        assert.equal(fs.existsSync(path.join(root, 'evil.txt')), false);
+        assert.equal(fs.existsSync(path.join(root, '穿越C')), false, '校验失败时不得创建产物目录');
+    });
+
+    test('参数校验：files 缺失或为空、内容类型非法、路径重复、outputs 键冲突', async () => {
+        const base = { outputDir: root, name: '校验D' };
+        await assert.rejects(writeFolder({ ...base }), /writeFolder 需要非空的 files 对象/);
+        await assert.rejects(writeFolder({ ...base, files: {} }), /writeFolder 需要非空的 files 对象/);
+        await assert.rejects(writeFolder({ ...base, files: [] }), /writeFolder 需要非空的 files 对象/);
+        await assert.rejects(writeFolder({ ...base, files: { '{name}.html': 42 } }), /产物 \{name\}\.html 的内容须为字符串或 Buffer/);
+        await assert.rejects(writeFolder({ ...base, files: { '{name}.html': 'x' }, extras: [{ name: '{name}.html'.replace('{name}', '校验D'), buffer: PNG }] }), /产物路径重复：校验D\.html/);
+        await assert.rejects(writeFolder({ ...base, files: { 'a-b.xml': 'x', 'aB.xml': 'y' } }), /产物键冲突：aB/);
+        await assert.rejects(writeFolder({ outputDir: root, files: { '{name}.html': 'x' } }), /缺少产物名 name/);
+        await assert.rejects(writeFolder({ ...base, name: 'a/b', files: { '{name}.html': 'x' } }), /产物名不得包含路径分隔符/);
+        await assert.rejects(writeFolder({ name: 'x', files: { '{name}.html': 'x' } }), /缺少输出目录 outputDir/);
+        assert.equal(fs.existsSync(path.join(root, '校验D')), false);
     });
 });

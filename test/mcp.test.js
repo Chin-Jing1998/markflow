@@ -2,7 +2,8 @@
  * mcp/server.js 集成测试
  *
  * 以官方 SDK 的 stdio 客户端连接真实服务进程，覆盖：
- *   工具清单、list_formats 能力矩阵、convert_document 的成功/入参错误/运行期失败、returnContent、
+ *   工具清单与入参 schema（含转换选项、2020-12 方言、无 $ref）、list_formats 能力矩阵、
+ *   convert_document 的成功/选项透传/入参错误/运行期失败、returnContent、
  *   extract_article 的只读提取（结构、截断语义、零落盘）。
  * 客户端在 listTools() 后会用 outputSchema 校验 structuredContent，因此这些用例同时验证了
  * 服务端返回结构与声明的 schema 一致。临时产物一律写入 os.tmpdir()。
@@ -19,6 +20,8 @@ const http = require('node:http');
 
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+
+const { OPTION_ENUMS } = require('../converters/options');
 
 const ROOT = path.resolve(__dirname, '..');
 const SERVER = path.join(ROOT, 'mcp', 'server.js');
@@ -92,20 +95,36 @@ test('工具 schema 声明 2020-12 方言，且不含仅 draft-07 成立的构�
     });
 });
 
-test('convert_document 的 inputSchema 声明 outputDir 为必填', async () => {
+test('convert_document 的 inputSchema 暴露全部转换选项，只有 outputDir 必填', async () => {
     // Act
     const { tools } = await client.listTools();
     const tool = tools.find((item) => item.name === 'convert_document');
+    const { properties } = tool.inputSchema;
 
-    // Assert
-    assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), [
-        'outputDir',
-        'paths',
-        'returnContent',
-        'target',
-        'urls',
-    ]);
+    // Assert：入参键清单
+    assert.deepEqual(Object.keys(properties).sort(), [
+        'docx', 'html', 'imageFormat', 'jpegQuality', 'math', 'mineru', 'outputDir', 'paths',
+        'patentParts', 'pdfBackend', 'returnContent', 'target', 'theme', 'urls', 'validate', 'xml', 'xmlProfile',
+    ].sort());
+    assert.equal(properties.validate.type, 'boolean');
     assert.deepEqual(tool.inputSchema.required, ['outputDir']);
+
+    // Assert：枚举取自 converters/options.js，嵌套段为独立对象（不产生 $ref）
+    assert.deepEqual(properties.target.enum, ['bundle', 'docx', 'pdf', 'html', 'xml']);
+    assert.deepEqual(properties.theme.enum, [...OPTION_ENUMS.htmlThemes]);
+    assert.deepEqual(properties.xmlProfile.enum, [...OPTION_ENUMS.xmlProfiles]);
+    assert.deepEqual(properties.patentParts.items.enum, [...OPTION_ENUMS.patentParts]);
+    assert.deepEqual(properties.pdfBackend.enum, [...OPTION_ENUMS.pdfBackends]);
+    assert.deepEqual(properties.imageFormat.enum, [...OPTION_ENUMS.imageFormats]);
+    assert.deepEqual(properties.math.enum, [...OPTION_ENUMS.mathModes]);
+    assert.deepEqual(Object.keys(properties.mineru.properties), ['model', 'ocr', 'language', 'pageRanges']);
+    assert.deepEqual(Object.keys(properties.html.properties),
+        ['fontFamily', 'fontSize', 'lineHeight', 'contentWidth', 'spacing', 'inlineImages']);
+    assert.deepEqual(Object.keys(properties.docx.properties), ['pageSize', 'fontSize', 'fontAscii', 'fontEastAsia']);
+    assert.deepEqual(Object.keys(properties.xml.properties), ['indent', 'numberingStart', 'numberingWidth']);
+    assert.deepEqual(properties.mineru.required, undefined, '嵌套段各字段均为可选');
+    assert.equal(JSON.stringify(tool.inputSchema).includes('$ref'), false, 'inputSchema 不得出现 $ref');
+    assert.equal(properties.mineru.properties.token, undefined, '令牌不经 MCP 传入');
 });
 
 // ============================================================
@@ -119,12 +138,24 @@ test('list_formats 返回能力矩阵，office 目标含 bundle', async () => {
     // Assert
     assert.notEqual(result.isError, true);
     const { targets, capabilities, version } = result.structuredContent;
-    assert.ok(targets.office.includes('bundle'));
-    assert.ok(targets.url.includes('bundle'));
+    assert.deepEqual(targets.office, ['bundle', 'html', 'xml']);
+    assert.deepEqual(targets.url, ['bundle', 'html', 'xml']);
     assert.ok(targets.markup.includes('docx'));
-    assert.equal(typeof capabilities.sofficeAvailable, 'boolean');
+    assert.ok(targets.markup.includes('html'));
+    assert.deepEqual(Object.keys(capabilities).sort(), ['mineru', 'pdfBackend', 'raster', 'themes', 'xmlProfiles']);
+    assert.equal('sofficeAvailable' in capabilities, false);
     assert.equal(typeof capabilities.pdfBackend.available, 'boolean');
     assert.equal(typeof capabilities.pdfBackend.hint, 'string');
+    assert.equal(typeof capabilities.raster.available, 'boolean');
+    assert.equal(typeof capabilities.raster.hint, 'string');
+    assert.ok(capabilities.raster.name === null || typeof capabilities.raster.name === 'string');
+    assert.equal(typeof capabilities.mineru.configured, 'boolean');
+    assert.deepEqual(capabilities.themes, ['apple', 'apple-dark', 'github', 'academic', 'reader', 'print']);
+    assert.deepEqual(capabilities.xmlProfiles, ['generic', 'patent']);
+    assert.deepEqual(Object.keys(capabilities.mineru), ['configured', 'source'], 'mineru 只报是否配置与来源');
+    for (const name of ['MINERU_TOKEN', 'MINERU_API_TOKEN']) {
+        if (process.env[name]) assert.equal(JSON.stringify(result).includes(process.env[name]), false, `${name} 的取值不得出现在输出中`);
+    }
     assert.equal(version, PKG_VERSION);
     // text 内容与 structuredContent 同源
     assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
@@ -156,21 +187,108 @@ test('convert_document 把 Markdown 转为 docx，产物落盘', async () => {
     assert.equal(item.target, 'docx');
     assert.ok(fs.existsSync(item.outputPath));
     assert.equal(item.content, undefined);
+    assert.equal(item.sourceType, 'md');
+    assert.equal(item.options.imageFormat, 'jpg');
+    assert.equal(item.options.mineru.token, null);
+    assert.deepEqual(item.extras, []);
+    assert.deepEqual(item.backends, { pdfParser: null, raster: null });
+});
+
+test('convert_document 以 target=html 转换 Markdown，产出目录含 html 与 images/', async () => {
+    // Arrange
+    const outputDir = makeOutDir('html-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: { paths: [SAMPLE_MD], target: 'html', outputDir },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const [item] = result.structuredContent.results;
+    assert.equal(item.target, 'html');
+    assert.equal(item.outputs.html, path.join(outputDir, 'sample', 'sample.html'));
+    assert.ok(fs.existsSync(item.outputs.html));
+    assert.ok(fs.existsSync(item.outputs.imagesDir));
+});
+
+test('convert_document 透传转换选项：扁平键与嵌套段都进入结果 options', async () => {
+    // Arrange
+    const outputDir = makeOutDir('options-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: {
+            paths: [SAMPLE_MD], target: 'html', outputDir,
+            theme: 'github', imageFormat: 'keep', jpegQuality: 80, math: 'text', pdfBackend: 'local',
+            xmlProfile: 'patent', patentParts: ['claims', 'description'],
+            mineru: { model: 'vlm', ocr: true, language: 'en', pageRanges: '1-3' },
+            html: { fontSize: 20, spacing: 'loose', inlineImages: false },
+            docx: { pageSize: 'Letter', fontAscii: 'Georgia', fontEastAsia: '宋体' },
+            xml: { indent: 4, numberingStart: 5, numberingWidth: 3 },
+        },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const { options } = result.structuredContent.results[0];
+    assert.equal(options.html.theme, 'github');
+    assert.equal(options.pdf.theme, 'github');
+    assert.equal(options.html.fontSize, 20);
+    assert.equal(options.html.spacing, 'loose');
+    assert.equal(options.imageFormat, 'keep');
+    assert.equal(options.jpegQuality, 80);
+    assert.equal(options.math, 'text');
+    assert.equal(options.pdfBackend, 'local');
+    assert.equal(options.xml.profile, 'patent');
+    assert.deepEqual(options.xml.patent.parts, ['claims', 'description']);
+    assert.deepEqual(options.xml.numbering, { start: 5, width: 3 });
+    assert.equal(options.xml.indent, 4);
+    assert.equal(options.docx.pageSize, 'Letter');
+    // docx 段的 fontAscii / fontEastAsia 由 service.buildOptions 展开为 fontFamily
+    assert.deepEqual(options.docx.fontFamily, { ascii: 'Georgia', eastAsia: '宋体' });
+    assert.equal(options.mineru.model, 'vlm');
+    assert.equal(options.mineru.ocr, true);
+    assert.equal(options.mineru.language, 'en');
+    assert.equal(options.mineru.pageRanges, '1-3');
+    assert.equal(options.mineru.token, null, '令牌不得出现在结果中');
+});
+
+test('省略转换选项时结果 options 取默认值', async () => {
+    // Arrange
+    const outputDir = makeOutDir('defaults-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: { paths: [SAMPLE_MD], target: 'html', outputDir },
+    });
+
+    // Assert
+    const { options } = result.structuredContent.results[0];
+    assert.equal(options.html.theme, 'apple');
+    assert.equal(options.imageFormat, 'jpg');
+    assert.equal(options.jpegQuality, 90);
+    assert.equal(options.xml.profile, 'generic');
 });
 
 test('省略 target 时按输入类型取默认值：PDF 转 bundle', async () => {
     // Arrange
     const outputDir = makeOutDir('bundle-');
 
-    // Act
+    // Act：固定走本地后端，避免用例依赖 MinerU 令牌与外网
     const result = await client.callTool({
         name: 'convert_document',
-        arguments: { paths: [SAMPLE_PDF], outputDir },
+        arguments: { paths: [SAMPLE_PDF], outputDir, pdfBackend: 'local' },
     });
 
     // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
     const [item] = result.structuredContent.results;
     assert.equal(item.target, 'bundle');
+    assert.equal(item.backends.pdfParser, 'pdfjs');
     assert.ok(fs.existsSync(item.outputs.md));
     assert.ok(fs.existsSync(item.outputs.json));
 });
@@ -182,7 +300,7 @@ test('returnContent 为 true 时附带生成的 Markdown 正文', async () => {
     // Act
     const result = await client.callTool({
         name: 'convert_document',
-        arguments: { paths: [SAMPLE_PDF], returnContent: true, outputDir },
+        arguments: { paths: [SAMPLE_PDF], returnContent: true, outputDir, pdfBackend: 'local' },
     });
 
     // Assert
@@ -246,6 +364,32 @@ test('target 与输入类型不匹配时返回 isError', async () => {
     });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /目标 bundle 不接受 md 输入/);
+});
+
+test('xmlProfile 取值非法时返回 isError 与中文说明，不抛异常', async () => {
+    // Act：schema 层即拒绝，SDK 把该错误包成 isError 结果返回
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: { paths: [SAMPLE_MD], target: 'xml', outputDir: tmpDir, xmlProfile: 'cnipa' },
+    });
+
+    // Assert
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /xmlProfile 须为 generic \| patent 之一/);
+    assert.equal(result.structuredContent, undefined);
+});
+
+test('嵌套段取值越界时由 options 归一层拒绝，返回 isError 的中文说明', async () => {
+    // Act：xml.indent 在 schema 层是整数，取值范围由 converters/options.js 把关
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: { paths: [SAMPLE_MD], target: 'xml', outputDir: tmpDir, xml: { indent: 99 } },
+    });
+
+    // Assert
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /选项 xml\.indent 须为 0–8 之间的整数/);
+    assert.equal(result.structuredContent, undefined);
 });
 
 test('不支持的输入扩展名返回 isError', async () => {
