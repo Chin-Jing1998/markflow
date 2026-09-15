@@ -387,12 +387,12 @@ npm start       # 等同 electron .，启动桌面应用
 ## 打包与发布
 
 ```bash
-npm run build:mac    # macOS：未签名 zip
-npm run build:win    # Windows：NSIS 安装包
+npm run build:mac    # macOS：未签名 dmg 与 zip（universal，Intel 与 Apple 芯片通用）
+npm run build:win    # Windows：NSIS 安装包（x64，Windows 10 及以上）
 npm run build:all    # 两个平台一并打包
 ```
 
-产物落在 `dist/`。推送 `v*` 标签时，持续集成在 macOS 与 Windows 运行器上各打一次包，并把 `dist/*.zip` 与 `dist/*.exe` 附到对应 Release。构建不做代码签名与公证。
+产物落在 `dist/`；Windows 安装包也可在 macOS 上直接构建，无需 Wine。推送 `v*` 标签时，持续集成在 macOS 与 Windows 运行器上各打一次包，并把 `dist/*.dmg`、`dist/*.zip` 与 `dist/*.exe` 附到对应 Release。构建不做代码签名与公证。
 
 ## 已知限制
 
