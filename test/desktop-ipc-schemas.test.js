@@ -570,3 +570,52 @@ test('file:action：路径按 sessionId 在预览与阅读会话中取，reveal 
     const bare = createIpcHandlers({ electron, settings, service: realService, scan, log: () => undefined });
     await assert.rejects(bare.handlers['mf:file:action']({}, { sessionId: 'r1', action: 'reveal' }), /文件会话不存在或已关闭/, '模块未就绪时按会话不存在处理');
 });
+
+test('file:action：open 前校验扩展名白名单（LOW-2 纵深防御），白名单外拒绝且不调用 shell.openPath；reveal / copyPath 不受此限', async () => {
+    const dir = fs.mkdtempSync(path.join(root, 'fa-ext-'));
+    const settings = createSettingsStore({ dir, safeStorage: fakeSafeStorage, defaults: { outputDir: path.join(dir, 'out'), libraryRoot: path.join(dir, 'lib') } });
+    settings.load();
+    const revealed = [];
+    const opened = [];
+    const copied = [];
+    const electron = {
+        dialog: {}, nativeTheme: { shouldUseDarkColors: false }, BrowserWindow: { fromWebContents: () => null },
+        shell: { showItemInFolder: (p) => revealed.push(p), openPath: async (p) => { opened.push(p); return ''; }, openExternal: async () => undefined, trashItem: async () => undefined },
+        clipboard: { writeText: (text) => copied.push(text) },
+    };
+    const makeFile = (name) => {
+        const p = path.join(dir, name);
+        fs.writeFileSync(p, 'x');
+        return p;
+    };
+    const blockedPaths = { command: makeFile('run.command'), app: makeFile('Foo.app'), sh: makeFile('run.sh') };
+    const allowedPaths = { docxUpper: makeFile('Report.DOCX'), md: makeFile('note.md') };
+    const otherPath = makeFile('note.txt');
+    const reader = {
+        sessions: new Map([
+            ['command', { path: blockedPaths.command }],
+            ['app', { path: blockedPaths.app }],
+            ['sh', { path: blockedPaths.sh }],
+            ['docxUpper', { path: allowedPaths.docxUpper }],
+            ['md', { path: allowedPaths.md }],
+            ['other', { path: otherPath }],
+        ]),
+        close: async () => ({ closed: false }),
+    };
+    const { handlers } = createIpcHandlers({ electron, settings, service: realService, scan, reader, log: () => undefined });
+    const call = (payload) => handlers['mf:file:action']({}, validatePayload('mf:file:action', payload));
+
+    for (const id of ['command', 'app', 'sh']) {
+        await assert.rejects(call({ sessionId: id, action: 'open' }), /只能用默认应用打开文档类文件/, `${id} 应拒绝 open`);
+    }
+    assert.deepEqual(opened, [], '白名单外的扩展名不应调用 shell.openPath');
+
+    assert.deepEqual(await call({ sessionId: 'docxUpper', action: 'open' }), { ok: true });
+    assert.deepEqual(await call({ sessionId: 'md', action: 'open' }), { ok: true });
+    assert.deepEqual(opened, [allowedPaths.docxUpper, allowedPaths.md], '大写 .DOCX 与 .md 仍可打开');
+
+    assert.deepEqual(await call({ sessionId: 'other', action: 'reveal' }), { ok: true });
+    assert.deepEqual(await call({ sessionId: 'other', action: 'copyPath' }), { ok: true });
+    assert.deepEqual(revealed, [otherPath], '白名单外的扩展名 reveal 不受限');
+    assert.deepEqual(copied, [otherPath], '白名单外的扩展名 copyPath 不受限');
+});

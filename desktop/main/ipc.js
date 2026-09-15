@@ -90,6 +90,8 @@ const CHANNELS = Object.freeze({
 
 /** mf:file:action 的动作：在访达中显示 / 用默认应用打开 / 复制路径 */
 const FILE_ACTIONS = Object.freeze(['reveal', 'open', 'copyPath']);
+/** open 动作的扩展名白名单（LOW-2 纵深防御）：仅文档类文件可交给 shell.openPath，比较不分大小写 */
+const OPENABLE_EXTENSIONS = new Set([...READER_EXTENSIONS, ...BROWSE_EXTENSIONS].map((ext) => ext.toLowerCase()));
 
 // ============================================================
 // schema
@@ -654,6 +656,9 @@ function createIpcHandlers(deps = {}) {
         if (payload.action === 'reveal') {
             shell.showItemInFolder(filePath);
             return { ok: true };
+        }
+        if (!OPENABLE_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
+            throw new Error('只能用默认应用打开文档类文件');
         }
         const failure = await shell.openPath(filePath);
         if (failure) throw new Error(`无法用默认应用打开：${failure}`);

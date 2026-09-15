@@ -12,7 +12,8 @@
  *
  * <img> 属性白名单：
  *   src     仅相对路径、data:image/*、http(s)；先解码实体、剔除控制字符再判定，拒绝 javascript: / vbscript: 等
- *           一切其它协议、协议相对地址（//host）与绝对路径。不合规的 <img> 原样保留为 html 节点
+ *           一切其它协议、协议相对地址（//host）与绝对路径；data:image/* 中另拒绝 svg+xml（不带 +xml 的
+ *           image/svg 同拒，不区分大小写），纵深防御 SVG 内嵌脚本。不合规的 <img> 原样保留为 html 节点
  *   alt / title  纯文本，解码实体
  *   width / height  须匹配 ^\d{1,5}$（px）或 ^\d{1,3}(\.\d+)?%$；另认 style 中的 width / height: Npx；
  *           得到 data.display = { width, height?, unit: 'px' | '%', source }，height 只在宽高都是 px 时记录
@@ -45,6 +46,8 @@ const STYLE_HEIGHT_RE = styleDimensionRe('height');
 
 const SCHEME_RE = /^([a-zA-Z][a-zA-Z0-9+.-]*):/;
 const DATA_IMAGE_RE = /^data:image\/[a-z0-9.+-]+[;,]/i;
+// SVG 可内嵌脚本；经 <img> 引用虽不会执行，仍按纵深防御一律拒绝（不区分大小写，image/svg 与 image/svg+xml 均在内）
+const DATA_IMAGE_SVG_RE = /^data:image\/svg(?:\+xml)?[;,]/i;
 // 浏览器解析 URL 前会剔除的 C0 控制字符与空白，判定协议时一并去掉，防止 "java\tscript:" 一类绕过
 const URL_CONTROL_RE = /[\x00-\x20\x7F-\x9F]/g;
 const TEXT_CONTROL_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
@@ -277,7 +280,7 @@ function safeSrc(raw) {
     if (scheme) {
         const name = scheme[1].toLowerCase();
         if (name === 'http' || name === 'https') return /^https?:\/\/[^/\s]/i.test(probe) ? value : null;
-        if (name === 'data') return DATA_IMAGE_RE.test(probe) ? value : null;
+        if (name === 'data') return DATA_IMAGE_RE.test(probe) && !DATA_IMAGE_SVG_RE.test(probe) ? value : null;
         return null;
     }
     // 协议相对地址、绝对路径与反斜杠开头的路径一律拒绝，只收相对路径

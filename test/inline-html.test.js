@@ -121,6 +121,33 @@ test('src 白名单放行相对路径、http(s) 与 data:image/*', async () => {
     ]);
 });
 
+test('src 白名单拒绝 data:image/svg+xml（含大小写、base64、charset 与实体编码变体），data:image/png 仍放行', async () => {
+    // Arrange
+    const rejected = [
+        '<img src="data:image/svg+xml,%3Csvg%2F%3E">',
+        '<img src="DATA:IMAGE/SVG+XML,%3Csvg%2F%3E">',
+        '<img src="data:image/svg+xml;base64,PHN2Zy8+">',
+        '<img src="data:image/svg+xml;charset=utf-8,%3Csvg%2F%3E">',
+        '<img src="data:image/svg&#x2b;xml,%3Csvg%2F%3E">',
+        '<img src="data:image/svg,%3Csvg%2F%3E">',
+    ];
+
+    for (const tag of rejected) {
+        // Act
+        const tree = await lift(`${tag}\n`);
+
+        // Assert
+        assert.equal(images(tree).length, 0, tag);
+        assert.equal(htmls(tree).length, 1, tag);
+    }
+
+    // Act
+    const allowed = await lift('<img src="data:image/png;base64,iVBORw0KGgo=">\n');
+
+    // Assert
+    assert.deepEqual(images(allowed).map((n) => n.url), ['data:image/png;base64,iVBORw0KGgo=']);
+});
+
 // ============================================================
 // 行内格式标签
 // ============================================================
