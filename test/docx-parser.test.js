@@ -16,7 +16,7 @@ const {
 const { parse } = require('../converters/parsers/docx');
 const mdRenderer = require('../converters/renderers/md');
 const { buildLayoutSample, LAYOUT_EXPECTED } = require('./fixtures/build-layout-sample');
-const { buildTitleSample, TITLE_EXPECTED } = require('./fixtures/build-title-sample');
+const { buildTitleSample, TITLE_EXPECTED, TAB_HEADING_EXPECTED } = require('./fixtures/build-title-sample');
 
 // 不可见字符以码点生成，源码不出现看不见的字面量：U+3000 全角空格，U+EF00–U+EF1F 私用区版面标记
 const IDEO = String.fromCharCode(0x3000);
@@ -377,4 +377,15 @@ test('标题夹具：Title 样式段无文字时 meta.title 回退为首个 H1',
 
     // Assert
     assert.equal(doc.meta.title, TITLE_EXPECTED.heading);
+});
+
+test('标题夹具：H1 标题含制表符时，meta.title 中的制表符标记换成一个空格而非直接删除', async () => {
+    // Act
+    const doc = await parse(
+        { buffer: await buildTitleSample({ title: '', headingTab: true }) },
+        { sourceName: '标题样例.docx' },
+    );
+
+    // Assert
+    assert.equal(doc.meta.title, TAB_HEADING_EXPECTED.expected);
 });

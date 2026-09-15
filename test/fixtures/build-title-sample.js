@@ -21,19 +21,25 @@ const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationship
 
 /** 测试用的期望值：Title 样式段文本与首个 heading 1 的文本 */
 const TITLE_EXPECTED = Object.freeze({ title: '样例评价手册', heading: '第一章 概述' });
+/** headingTab: true 时，heading 1 段落用 <w:tab/> 分隔「第一章」与「总则」，meta.title 的期望值 */
+const TAB_HEADING_EXPECTED = Object.freeze({ expected: '第一章 总则' });
 
 // ---------- document.xml 片段 ----------
 
 const run = (text) => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
+const tabRun = () => '<w:r><w:tab/></w:r>';
 const paragraph = (content, pPr = '') => `<w:p>${pPr ? `<w:pPr>${pPr}</w:pPr>` : ''}${content}</w:p>`;
 const pStyle = (id) => `<w:pStyle w:val="${id}"/>`;
 
-function documentXml(title) {
+function documentXml(title, headingTab) {
+    const headingContent = headingTab
+        ? `${run('第一章')}${tabRun()}${run('总则')}`
+        : run(TITLE_EXPECTED.heading);
     const body = [
         paragraph(''),
         paragraph(title ? run(title) : '', pStyle('a4')),
         paragraph(run('目录')),
-        paragraph(run(TITLE_EXPECTED.heading), pStyle('1')),
+        paragraph(headingContent, pStyle('1')),
         paragraph(run('正文段落。')),
     ].join('');
     return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="${W_NS}" xmlns:r="${R_NS}"><w:body>${body}<w:sectPr/></w:body></w:document>`;
@@ -59,13 +65,17 @@ const relationships = (items) => '<?xml version="1.0" encoding="UTF-8" standalon
     + items.map(([id, type, target]) => `<Relationship Id="${id}" Type="${R_NS}/${type}" Target="${target}"/>`).join('')
     + '</Relationships>';
 
-/** @param {{ title?: string }} [options] title 为 Title 样式段的文本，缺省取 TITLE_EXPECTED.title */
-async function buildTitleSample({ title = TITLE_EXPECTED.title } = {}) {
+/**
+ * @param {{ title?: string, headingTab?: boolean }} [options]
+ *   title 为 Title 样式段的文本，缺省取 TITLE_EXPECTED.title；
+ *   headingTab 为 true 时，heading 1 段落改用 <w:tab/> 分隔「第一章」与「总则」（见 TAB_HEADING_EXPECTED）
+ */
+async function buildTitleSample({ title = TITLE_EXPECTED.title, headingTab = false } = {}) {
     const zip = new JSZip();
     zip.file('[Content_Types].xml', CONTENT_TYPES_XML);
     zip.file('_rels/.rels', relationships([['rId1', 'officeDocument', 'word/document.xml']]));
     zip.file('word/_rels/document.xml.rels', relationships([['rId1', 'styles', 'styles.xml']]));
-    zip.file('word/document.xml', documentXml(title));
+    zip.file('word/document.xml', documentXml(title, headingTab));
     zip.file('word/styles.xml', STYLES_XML);
     return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
 }
@@ -83,4 +93,4 @@ if (require.main === module) {
         });
 }
 
-module.exports = { buildTitleSample, TITLE_EXPECTED };
+module.exports = { buildTitleSample, TITLE_EXPECTED, TAB_HEADING_EXPECTED };

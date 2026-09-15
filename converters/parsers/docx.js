@@ -25,7 +25,7 @@ const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
 const { liftInlineHtml } = require('../ir/inline-html');
-const { restoreMarkers, stripMarkers } = require('../ir/markers');
+const { MARKERS, restoreMarkers, stripMarkers } = require('../ir/markers');
 const { markCaptions } = require('../ir/captions');
 const { stripExt, getExtFromContentType } = require('../ir/util');
 const { notify, errText } = require('../util');
@@ -46,6 +46,8 @@ const INLINE_BASE64_IMG_RE = /<img\b[^>]*?\bsrc="data:image\/([a-z0-9.+-]+);base
 const STRAY_BASE64_RE = /data:image\/[^;]+;base64,[A-Za-z0-9+/=]{50,}/g;
 const H1_RE = /<h1[^>]*>([\s\S]*?)<\/h1>/i;
 const TITLE_P_RE = new RegExp(`<p class="${TITLE_CLASS}">([\\s\\S]*?)</p>`, 'g');
+// 标题文字里连续的 TAB 标记（如「第一章<Tab>总则」）换成一个空格，避免与相邻文字粘连；其余标记仍整段删除
+const TITLE_TAB_RE = new RegExp(`${MARKERS.TAB}+`, 'g');
 // 进度百分比：parser 只报 parsing 阶段，三个节点单调递增且不超过 55（其后由调度器接管）
 const PROGRESS_READ = 20;
 const PROGRESS_ASSETS = 40;
@@ -73,7 +75,7 @@ async function parse(input, ctx = {}) {
     const html = collectInlineBase64Images(rawHtml, assets, warnings);
     notify(ctx, 'parsing', PROGRESS_ASSETS);
 
-    const title = stripMarkers(extractTitle(html)).trim() || stripExt(sourceName);
+    const title = titleText(html) || stripExt(sourceName);
     const markdown = cleanupMarkdown(createTurndownService('word').turndown(html));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
@@ -214,6 +216,12 @@ function collectInlineBase64Images(html, assets, warnings) {
             return tag.replace(/\bsrc="[^"]*"/i, `src="${name}"`);
         })
         .replace(STRAY_BASE64_RE, '');
+}
+
+// 标题最终文本：TAB 标记（连续多个算一处）换成一个空格，其余标记删除，折叠空白后掐头去尾
+function titleText(html) {
+    const withSpaces = extractTitle(html).replace(TITLE_TAB_RE, ' ');
+    return stripMarkers(withSpaces).replace(/\s+/g, ' ').trim();
 }
 
 // Title 样式段中首个有文字的优先（只含版面标记的不算），其次首个 <h1>
