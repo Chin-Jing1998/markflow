@@ -13,7 +13,7 @@
  *   - 不写盘、不打印：mammoth 警告、图片读取失败、预检与公式抽取异常一律推入 warnings
  *   - 图片按出现顺序编号为 images/image_N.ext（N 从 1 起），IR 中 image 节点 url 与 assets 一一对应；
  *     取得到 wp:extent / VML 尺寸的图片带 data.display（px），浮动图另带 data.floating
- *   - 标题取首个 <h1> 文本，否则取去扩展名的文件名
+ *   - 标题取首个有文字的 Title 样式段（正文中仍为普通段落），其次首个 <h1> 文本，否则取去扩展名的文件名
  *   - data.ooxml 为 OOXML 预检信息（采集失败时为 null），meta.sourcePath 为源文件绝对路径
  *   - 公式一律进 IR 的 math 节点；options.math='text' 的降级由渲染器负责，解析层不降级
  *   - 段落文本本身不带全角缩进（由 md 渲染器按 data.indent 插入），专利 XML 等下游不受影响
@@ -35,13 +35,17 @@ const { prepareLayout, parseImageMarker } = require('./docx-layout');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
-// mammoth 默认丢弃下划线；映射为 <u> 后由 turndown 的 word profile 保留、ir/inline-html 提升为 underline
-const STYLE_MAP = Object.freeze(['u => u']);
+// mammoth 默认丢弃下划线；映射为 <u> 后由 turndown 的 word profile 保留、ir/inline-html 提升为 underline。
+// mammoth 默认样式表不认 Title（封面题名常用此样式而非标题 1），标成带类名的普通段落供 extractTitle 采信；
+// turndown 不理会类名，正文输出不变。style-name 按样式名匹配（不分大小写），与样式 ID（中文版 Word 为 a4 等）无关
+const TITLE_CLASS = 'mf-title';
+const STYLE_MAP = Object.freeze(['u => u', `p[style-name='Title'] => p.${TITLE_CLASS}:fresh`]);
 // 残留在 HTML 里的 base64 内嵌图片（正常情况下 convertImage 已截获全部图片，此处兜底）
 const INLINE_BASE64_IMG_RE = /<img\b[^>]*?\bsrc="data:image\/([a-z0-9.+-]+);base64,([^"]*)"[^>]*>/gi;
 // 游离在标签之外的 base64 图片文本
 const STRAY_BASE64_RE = /data:image\/[^;]+;base64,[A-Za-z0-9+/=]{50,}/g;
 const H1_RE = /<h1[^>]*>([\s\S]*?)<\/h1>/i;
+const TITLE_P_RE = new RegExp(`<p class="${TITLE_CLASS}">([\\s\\S]*?)</p>`, 'g');
 // 进度百分比：parser 只报 parsing 阶段，三个节点单调递增且不超过 55（其后由调度器接管）
 const PROGRESS_READ = 20;
 const PROGRESS_ASSETS = 40;
@@ -212,10 +216,18 @@ function collectInlineBase64Images(html, assets, warnings) {
         .replace(STRAY_BASE64_RE, '');
 }
 
+// Title 样式段中首个有文字的优先（只含版面标记的不算），其次首个 <h1>
 function extractTitle(html) {
+    for (const matched of html.matchAll(TITLE_P_RE)) {
+        const text = htmlText(matched[1]);
+        if (stripMarkers(text).trim()) return text;
+    }
     const matched = H1_RE.exec(html);
-    if (!matched) return '';
-    const text = matched[1].replace(/<[^>]+>/g, '')
+    return matched ? htmlText(matched[1]) : '';
+}
+
+function htmlText(inner) {
+    const text = inner.replace(/<[^>]+>/g, '')
         .replace(/&(?:amp|lt|gt|quot|#39|nbsp);/g, (entity) => HTML_ENTITIES[entity] || entity);
     return text.replace(/\s+/g, ' ').trim();
 }

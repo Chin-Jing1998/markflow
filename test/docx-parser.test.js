@@ -16,6 +16,7 @@ const {
 const { parse } = require('../converters/parsers/docx');
 const mdRenderer = require('../converters/renderers/md');
 const { buildLayoutSample, LAYOUT_EXPECTED } = require('./fixtures/build-layout-sample');
+const { buildTitleSample, TITLE_EXPECTED } = require('./fixtures/build-title-sample');
 
 // 不可见字符以码点生成，源码不出现看不见的字面量：U+3000 全角空格，U+EF00–U+EF1F 私用区版面标记
 const IDEO = String.fromCharCode(0x3000);
@@ -352,4 +353,28 @@ test('版面夹具转 Markdown：段首两个全角空格、<img width> 独占�
     assert.equal(lines[lines.indexOf('<img src="images/image_1.png" width="200" alt="示意图甲">') + 2], '图 1 示意图甲');
     assert.ok(lines.includes(`图 2${IDEO}${IDEO}图 3`), markdown);
     assert.ok(lines.includes('<u>下划线文字</u>之后'), markdown);
+});
+
+// ============================================================
+// 标题夹具（test/fixtures/build-title-sample.js 现造）
+// ============================================================
+
+test('标题夹具：Title 样式段（样式 ID 与样式名不同）优先于首个 H1 作 meta.title，正文中仍为普通段落', async () => {
+    // Act
+    const doc = await parse({ buffer: await buildTitleSample() }, { sourceName: '标题样例.docx' });
+
+    // Assert
+    assert.equal(doc.meta.title, TITLE_EXPECTED.title);
+    const titleNode = doc.ir.children.find((n) => plainText(n) === TITLE_EXPECTED.title);
+    assert.equal(titleNode && titleNode.type, 'paragraph', 'Title 样式段在正文中不改成标题');
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'heading').map((n) => [n.depth, plainText(n)]),
+        [[1, TITLE_EXPECTED.heading]]);
+});
+
+test('标题夹具：Title 样式段无文字时 meta.title 回退为首个 H1', async () => {
+    // Act
+    const doc = await parse({ buffer: await buildTitleSample({ title: '' }) }, { sourceName: '标题样例.docx' });
+
+    // Assert
+    assert.equal(doc.meta.title, TITLE_EXPECTED.heading);
 });
