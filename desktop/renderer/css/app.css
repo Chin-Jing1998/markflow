@@ -825,9 +825,19 @@ mf-compare-view .page-sidebar::-webkit-scrollbar-track { background: transparent
 .md-editor-body { display: grid; flex: 1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-width: 0; min-height: 0; }
 .md-editor[data-preview="hidden"] .md-editor-body { grid-template-columns: minmax(0, 1fr); }
 .md-editor[data-preview="hidden"] .md-editor-preview { display: none; }
-.md-editor-input { display: block; width: 100%; height: 100%; min-height: 0; padding: var(--s-4) var(--s-5); border: 0; outline: none; resize: none; background: var(--bg); color: var(--label-primary); font: 13px/1.7 var(--font-mono); tab-size: 4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.md-editor-input { display: block; width: 100%; height: 100%; min-height: 0; border: 0; outline: none; resize: none; background: var(--bg); color: var(--label-primary); }
+/* 编辑区与查找高亮层共用的排版（内边距、字体、行高、制表符宽度、换行规则）：两层逐字重合，改排版只改这一处 */
+.md-editor-input, .md-editor-find-text { padding: var(--s-4) var(--s-5); font: 13px/1.7 var(--font-mono); tab-size: 4; white-space: pre-wrap; overflow-wrap: anywhere; }
 /* 字号缩放：文件库页与阅读页在编辑器容器上写入 --doc-zoom（0.8–1.6）；对比预览不写，保持 13px */
-.md-editor-input { font-size: calc(13px * var(--doc-zoom, 1)); }
+.md-editor-input, .md-editor-find-text { font-size: calc(13px * var(--doc-zoom, 1)); }
+/* 查找高亮层：与 textarea 同处网格第一格并垫在其下（两者都定位，按文档顺序后者在上），文字透明只显命中底色，textarea 同时改透明底；
+   文字块宽度取 textarea.clientWidth（扣除滚动条）、位移跟随其滚动，均由编辑器脚本维护；未查找或无命中时 hidden，不参与布局。
+   textarea 未继承的几项文字属性按其 UA 默认值写死，保证两层折行一致 */
+.md-editor-find-layer { position: relative; grid-area: 1 / 1; min-width: 0; min-height: 0; overflow: hidden; contain: strict; background: var(--bg); pointer-events: none; user-select: none; }
+.md-editor-find-text { position: absolute; top: 0; left: 0; color: transparent; letter-spacing: normal; word-spacing: normal; text-indent: 0; text-transform: none; text-align: start; text-rendering: auto; will-change: transform; }
+.md-editor-find-text > mark { border-radius: 2px; background: var(--find-match-bg); color: transparent; }
+.md-editor-find-text > mark.is-current { background: var(--find-current-bg); }
+.md-editor[data-find="shown"] > .md-editor-body > .md-editor-input { position: relative; grid-area: 1 / 1; background: transparent; }
 .md-editor-preview { position: relative; min-width: 0; min-height: 0; border-left: 1px solid var(--separator); background: var(--bg); }
 .md-editor-preview > .view-frame { position: absolute; inset: 0; }
 .md-editor-preview > .view-frame.is-pending { visibility: hidden; }

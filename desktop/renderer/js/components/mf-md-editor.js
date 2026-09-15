@@ -7,8 +7,13 @@
  *
  * 结构：.md-editor[data-preview] > .md-editor-toolbar[role=toolbar]（按钮只用 data-cmd，不用宿主页面点击委托所认的
  * 动作 / 页签属性，以免被截走）+ .md-editor-banner（冲突 / 失败：覆盖保存、重新载入）+ .md-editor-linkbar
- * （文字、网址两个输入框；Electron 不支持 window.prompt）+ .md-editor-body（textarea + .md-editor-preview）。
- * 工具栏按 Apple 式分组（组间分隔线），栏窄时从末组起收进「…」更多菜单。
+ * （文字、网址两个输入框；Electron 不支持 window.prompt）+ .md-editor-body（查找高亮层 .md-editor-find-layer + textarea +
+ * .md-editor-preview）。工具栏按 Apple 式分组（组间分隔线），栏窄时从末组起收进「…」更多菜单。
+ *
+ * 查找高亮（镜像层）：textarea 下垫一层镜像，排版与 textarea 共用 CSS 规则（含 --doc-zoom 缩放），文字透明、命中处以
+ * <mark> 涂色（全部命中浅色，与选区重合的当前命中深色），查找期间 textarea 改透明底；镜像文字块宽度取 textarea.clientWidth
+ * （扣除滚动条）、位移在 scroll 事件里跟随 scrollTop，尺寸变化由 ResizeObserver 重对齐。文字仍在原生 textarea 中编辑，
+ * 撤销栈、输入法与自动保存不受影响。输入后按帧合并重建（超长文本停手后重建）；编辑区被隐藏时自动撤掉。
  *
  * 快捷键（macOS 用 ⌘，其他平台用 Ctrl）：⌘B 加粗、⌘I 斜体、⌘U 下划线、⌘K 链接、⌘⇧X 删除线、⌘⌥0–6 标题级别、
  * ⌘S 立即保存（挂在编辑器根元素上，工具栏与链接栏里同样生效）。
@@ -22,7 +27,8 @@
  * 事件（均冒泡）：mf-md-change { dirty }（脏状态翻转时）、mf-md-status { state, message, label }、
  * mf-md-saved { text, result }、mf-md-rendered { html }、mf-md-reload-request。
  * API：sessionId、previewVisible、showStatus、setContent(text, { html?, status? })、value、dirty、modified、saving、
- * status、lastHtml、flush(): Promise<boolean>、renderNow()、markExported()、focusEditor()、dispose()。
+ * status、lastHtml、flush(): Promise<boolean>、renderNow()、markExported()、focusEditor()、dispose()；
+ * 查找高亮 highlightFind(query, matches?)、endFind()（撤掉高亮并聚焦编辑区、保留选区）、clearFind()（只撤掉高亮）。
  * disconnectedCallback 只摘全局监听，不清编辑状态（宿主可把编辑器挪到别处再挂回）。
  */
 import { api, platform } from '../api.js';
@@ -32,6 +38,7 @@ import {
     toggleInline, lineStyleAt, setHeading, toggleLinePrefix, insertBlock, buildTable, insertFootnote,
     buildLink, buildImageTag, TABLE_TEMPLATE,
 } from '../md-format.mjs';
+import { findMatches, splitByMatches } from '../doc-tools.mjs';
 import { notify } from './mf-toast.js';
 
 const RENDER_DELAY_MS = 300;
@@ -42,6 +49,10 @@ const MAX_IMAGE_WIDTH = 600;
 const TABLE_GRID = Object.freeze({ rows: 8, cols: 8 });
 const POPOVER_GAP = 4;
 const POPOVER_MARGIN = 8;
+// 查找高亮层：文本不超过 FIND_LIVE_CHARS 时，输入后的下一帧即按新文本重建；更长时输入期间先撤下高亮（旧位置已错开），
+// 停手 FIND_IDLE_MS 后再重建，免得逐键全量重排（实测重建约 0.25 ms / 千字符，32K 字符约 8 ms）
+const FIND_LIVE_CHARS = 32 * 1024;
+const FIND_IDLE_MS = 300;
 const IS_MAC = platform === 'darwin';
 const MOD_LABEL = IS_MAC ? '⌘' : 'Ctrl+';
 
@@ -125,7 +136,20 @@ class MfMdEditor extends HTMLElement {
         this.statusMessage = '';
         this.linkRange = null;
         this.overflowGroups = [];
-        this.onDocumentSelection = () => this.scheduleHeadingSync();
+        // 查找高亮：查询串、按当前文本算出的命中、各命中对应的 <mark>、当前命中下标；findStale 表示镜像层待按新文本重建
+        this.findQuery = '';
+        this.findMatchList = [];
+        this.findMarks = [];
+        this.findCurrent = -1;
+        this.findStale = false;
+        this.findFrame = null;
+        this.findSyncFrame = null;
+        this.findTimer = null;
+        this.findResizeObserver = null;
+        this.onDocumentSelection = () => {
+            this.scheduleHeadingSync();
+            this.scheduleFindSync();
+        };
         this.onDocumentPointer = (event) => this.closeMenusOutside(event);
     }
 
@@ -193,6 +217,7 @@ class MfMdEditor extends HTMLElement {
                 <button class="btn btn-secondary btn-small" type="button" data-cmd="link-cancel">取消</button>
             </div>
             <div class="md-editor-body">
+                <div class="md-editor-find-layer" data-role="find-layer" aria-hidden="true" hidden><div class="md-editor-find-text" data-role="find-text"></div></div>
                 <textarea class="md-editor-input" spellcheck="false" autocomplete="off" aria-label="Markdown 源码"></textarea>
                 <div class="md-editor-preview" data-role="preview" aria-label="实时预览">
                     <p class="md-editor-preview-error" data-role="preview-error" hidden></p>
@@ -200,6 +225,8 @@ class MfMdEditor extends HTMLElement {
             </div>`;
         this.toolbar = this.querySelector('.md-editor-toolbar');
         this.textarea = this.querySelector('.md-editor-input');
+        this.findLayer = this.querySelector('[data-role="find-layer"]');
+        this.findText = this.querySelector('[data-role="find-text"]');
         this.previewHost = this.querySelector('[data-role="preview"]');
         this.headingSelect = this.querySelector('[data-cmd="heading"]');
         this.statusEl = this.querySelector('[data-role="status"]');
@@ -219,6 +246,8 @@ class MfMdEditor extends HTMLElement {
             this.scheduleHeadingSync();
         });
         ta.addEventListener('scroll', () => this.scheduleScrollSync(), { passive: true });
+        // 查找高亮层随编辑区滚动：在 scroll 事件里直接改位移，与本帧绘制对齐
+        ta.addEventListener('scroll', () => this.syncFindScroll(), { passive: true });
         for (const type of ['keyup', 'mouseup', 'focus']) ta.addEventListener(type, () => this.scheduleHeadingSync());
         this.addEventListener('keydown', (event) => this.onKeydown(event));
         this.addEventListener('click', (event) => this.onClick(event));
@@ -329,6 +358,7 @@ class MfMdEditor extends HTMLElement {
         this.hideBanner();
         this.closeLinkBar(false);
         this.closeMenus();
+        this.clearFind();
         this.lastHtml = typeof html === 'string' ? html : '';
         this.mountedHtml = null;
         this.setStatus(status);
@@ -372,6 +402,8 @@ class MfMdEditor extends HTMLElement {
     onInput(event) {
         this.version += 1;
         this.syncDirty();
+        // 查找高亮不受输入法组合影响：组合中的文字已在 value 里，高亮随之重排
+        this.scheduleFindRefresh();
         if (this.composing || (event && event.isComposing)) return;
         this.scheduleRender();
         this.scheduleSave();
@@ -545,6 +577,170 @@ class MfMdEditor extends HTMLElement {
             const next = String(lineStyleAt(this.textarea.value, this.textarea.selectionStart).heading);
             if (this.headingSelect.value !== next) this.headingSelect.value = next;
         });
+    }
+
+    // ---------- 查找高亮 ----------
+
+    /**
+     * 查找高亮：镜像层标出 query 的全部命中，与编辑区选区正好重合的那处为当前命中；query 为空时撤掉高亮。
+     * matches 为调用方按当前文本算好的 findMatches 结果（可省，省去重算）。无命中时镜像层隐藏但记住 query，
+     * 其后编辑出命中时随之显出；编辑区被隐藏（尺寸归零）时自动撤掉，免得查找关闭后回到编辑页仍见旧高亮。
+     */
+    highlightFind(query, matches = null) {
+        this.ensureBuilt();
+        const needle = String(query == null ? '' : query);
+        if (!needle) {
+            this.clearFind();
+            return;
+        }
+        if (!this.findQuery) this.observeFindResize();
+        if (needle !== this.findQuery) this.findStale = true;
+        this.findQuery = needle;
+        this.renderFind(matches);
+    }
+
+    /** 结束查找：撤掉高亮，焦点回到编辑区；查找期间的选区即当前命中（或在编辑区另选的位置），聚焦后原样重设，可直接修改 */
+    endFind() {
+        const ta = this.textarea;
+        if (!ta) return;
+        const { selectionStart, selectionEnd, selectionDirection } = ta;
+        this.clearFind();
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+    }
+
+    /** 撤掉查找高亮并清空查找状态，不动焦点与选区 */
+    clearFind() {
+        cancelAnimationFrame(this.findFrame);
+        cancelAnimationFrame(this.findSyncFrame);
+        clearTimeout(this.findTimer);
+        this.findFrame = null;
+        this.findSyncFrame = null;
+        this.findTimer = null;
+        this.findQuery = '';
+        this.findMatchList = [];
+        this.findMarks = [];
+        this.findCurrent = -1;
+        this.findStale = false;
+        if (this.findResizeObserver) this.findResizeObserver.disconnect();
+        if (this.findText) this.findText.replaceChildren();
+        this.setFindLayerShown(false);
+    }
+
+    /** 按当前文本重建镜像层（文本与查询串都没变时只换当前命中）；有命中且编辑区可见时显出并对齐 */
+    renderFind(matches = null) {
+        cancelAnimationFrame(this.findFrame);
+        clearTimeout(this.findTimer);
+        this.findFrame = null;
+        this.findTimer = null;
+        const ta = this.textarea;
+        if (!this.findQuery || !ta) return;
+        // 先读 textarea 的尺寸、滚动与选区，再改镜像层：改完不再读布局，镜像层只在本帧绘制前排版一次
+        const width = ta.clientWidth;
+        const { scrollTop, scrollLeft, selectionStart, selectionEnd } = ta;
+        if (this.findStale) {
+            const value = ta.value;
+            this.findMatchList = Array.isArray(matches) ? matches : findMatches(value, this.findQuery);
+            this.buildFindLayer(value, this.findMatchIndex(selectionStart, selectionEnd));
+            this.findStale = false;
+        } else {
+            this.setFindCurrent(this.findMatchIndex(selectionStart, selectionEnd));
+        }
+        const shown = width > 0 && this.findMatchList.length > 0;
+        if (shown) this.findText.style.width = `${width}px`;
+        this.setFindLayerShown(shown);
+        if (shown) this.findText.style.transform = `translate(${-scrollLeft}px, ${-scrollTop}px)`;
+    }
+
+    /** 镜像层内容：普通文本为文本节点，命中为 <mark>；文档内容一律经文本节点写入，不拼 HTML。无命中时清空 */
+    buildFindLayer(value, current) {
+        const fragment = document.createDocumentFragment();
+        const marks = [];
+        const segments = this.findMatchList.length > 0 ? splitByMatches(value, this.findMatchList, current) : [];
+        for (const segment of segments) {
+            if (segment.index < 0) {
+                fragment.append(document.createTextNode(segment.text));
+                continue;
+            }
+            const mark = document.createElement('mark');
+            mark.textContent = segment.text;
+            if (segment.current) mark.className = 'is-current';
+            marks[segment.index] = mark;
+            fragment.append(mark);
+        }
+        this.findText.replaceChildren(fragment);
+        this.findMarks = marks;
+        this.findCurrent = current;
+    }
+
+    /** 与区间 [start, end) 正好重合的命中下标；没有时为 -1 */
+    findMatchIndex(start, end) {
+        return this.findMatchList.findIndex((match) => match.start === start && match.end === end);
+    }
+
+    setFindCurrent(next) {
+        if (next === this.findCurrent) return;
+        const previous = this.findMarks[this.findCurrent];
+        if (previous) previous.classList.remove('is-current');
+        if (this.findMarks[next]) this.findMarks[next].classList.add('is-current');
+        this.findCurrent = next;
+    }
+
+    /** 输入后刷新高亮：常规文本在下一帧重建；超长文本先撤下（旧位置已错开），停手 FIND_IDLE_MS 后再重建 */
+    scheduleFindRefresh() {
+        if (!this.findQuery) return;
+        this.findStale = true;
+        if (this.textarea.value.length > FIND_LIVE_CHARS) {
+            this.setFindLayerShown(false);
+            cancelAnimationFrame(this.findFrame);
+            this.findFrame = null;
+            clearTimeout(this.findTimer);
+            this.findTimer = setTimeout(() => this.renderFind(), FIND_IDLE_MS);
+            return;
+        }
+        if (!this.findFrame) this.findFrame = requestAnimationFrame(() => this.renderFind());
+    }
+
+    /** 选区变化后在下一帧按选区换当前命中；镜像层待重建时跳过（重建时自会按选区标出） */
+    scheduleFindSync() {
+        if (!this.findQuery || this.findSyncFrame) return;
+        this.findSyncFrame = requestAnimationFrame(() => {
+            this.findSyncFrame = null;
+            if (!this.findQuery || this.findStale || !this.textarea) return;
+            this.setFindCurrent(this.findMatchIndex(this.textarea.selectionStart, this.textarea.selectionEnd));
+        });
+    }
+
+    setFindLayerShown(shown) {
+        if (!this.findLayer || this.findLayer.hidden === !shown) return;
+        this.findLayer.hidden = !shown;
+        if (shown) this.dataset.find = 'shown';
+        else delete this.dataset.find;
+    }
+
+    /** 镜像文字块宽度取 textarea.clientWidth（已扣除滚动条），两层折行宽度一致；再对齐滚动位置 */
+    syncFindGeometry() {
+        if (!this.findLayer || this.findLayer.hidden) return;
+        this.findText.style.width = `${this.textarea.clientWidth}px`;
+        this.syncFindScroll();
+    }
+
+    syncFindScroll() {
+        if (!this.findLayer || this.findLayer.hidden) return;
+        this.findText.style.transform = `translate(${-this.textarea.scrollLeft}px, ${-this.textarea.scrollTop}px)`;
+    }
+
+    /** 查找期间观察 textarea 尺寸：宽度变化（窗口、分栏、滚动条出没）时重对齐；尺寸归零（编辑页被隐藏）时撤掉高亮 */
+    observeFindResize() {
+        if (typeof ResizeObserver !== 'function' || !this.textarea) return;
+        if (!this.findResizeObserver) {
+            this.findResizeObserver = new ResizeObserver(() => {
+                if (!this.findQuery || !this.textarea) return;
+                if (this.textarea.clientWidth === 0 && this.textarea.clientHeight === 0) this.clearFind();
+                else this.syncFindGeometry();
+            });
+        }
+        this.findResizeObserver.observe(this.textarea);
     }
 
     // ---------- 实时预览 ----------
@@ -854,6 +1050,7 @@ class MfMdEditor extends HTMLElement {
     /** 宿主关闭标签或换会话时调用：停掉计时器与观察器、移出登记表、清空预览帧 */
     dispose() {
         this.clearTimers();
+        this.clearFind();
         this.contentEpoch += 1;
         this.renderSeq += 1;
         this.frameToken += 1;

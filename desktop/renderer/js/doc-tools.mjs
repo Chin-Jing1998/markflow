@@ -6,7 +6,8 @@
  *   大纲：extractMarkdownOutline（ATX 与 Setext，跳过 front matter 与围栏代码块）、extractHtmlOutline（h1–h6），
  *         条目形如 { level, text, index, line? }；headingKey 供帧内按文字匹配标题。
  *   导航历史：不可变结构 { entries, cursor }；visitHistory / findHistoryStep / canStepHistory / moveHistory。
- *   查找：findMatches（不区分大小写，按字面匹配）与 pickMatch（按当前选区决定下一处或上一处，首尾回绕）。
+ *   查找：findMatches（不区分大小写，按字面匹配）与 pickMatch（按当前选区决定下一处或上一处，首尾回绕）；
+ *         splitByMatches（文本按命中切为高亮片段，供编辑页的查找高亮镜像层）。
  *   其他：lineStartOffset（LF 文本的行首偏移）、docLocation（路径 → 所在文件夹与文件夹名）。
  */
 
@@ -253,6 +254,30 @@ export function pickMatch(matches, { selStart = -1, selEnd = -1, backwards = fal
     }
     const next = matches.findIndex((match) => match.start >= (selEnd >= 0 ? selEnd : 0));
     return next >= 0 ? next : 0;
+}
+
+/**
+ * 查找高亮切片：text 按命中切为 [{ text, index, current }]，供编辑页镜像层依次生成文本节点与 <mark>；
+ * index 为该段对应的命中下标（普通文本为 -1），current 标出下标等于 current 的那处命中。
+ * matches 按 start 升序（findMatches 的结果即如此）；与前一处重叠或区间为空的命中跳过，越界终点截到文末；
+ * 不产生空片段，各段依次拼接即原文。
+ */
+export function splitByMatches(text, matches, current = -1) {
+    const value = String(text == null ? '' : text);
+    const list = Array.isArray(matches) ? matches : [];
+    const segments = [];
+    let cursor = 0;
+    for (let index = 0; index < list.length; index += 1) {
+        const match = list[index] || {};
+        const start = Number(match.start);
+        const end = Math.min(value.length, Number(match.end));
+        if (!Number.isInteger(start) || start < cursor || !(end > start)) continue;
+        if (start > cursor) segments.push({ text: value.slice(cursor, start), index: -1, current: false });
+        segments.push({ text: value.slice(start, end), index, current: index === current });
+        cursor = end;
+    }
+    if (cursor < value.length) segments.push({ text: value.slice(cursor), index: -1, current: false });
+    return segments;
 }
 
 // ---------- 其他 ----------

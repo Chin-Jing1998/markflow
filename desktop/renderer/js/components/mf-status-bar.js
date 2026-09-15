@@ -4,7 +4,7 @@
  * 位置贴近红绿灯；侧栏折叠时只留折叠按钮）。该页有打开的文件时（store.libraryDoc / store.readerDoc 非 null）另显文档功能：
  *   左区：三个按钮之后接「后退 / 前进」（⌘[ / ⌘]；焦点在输入框或编辑区时不拦截）；
  *   中区：文件名、Markdown 保存状态与所在文件夹（小字），过长时省略；
- *   右区：视图分段控件、内联查找框（⌘F；Enter 下一个、⇧Enter 上一个、Esc 关闭）、阅读辅助（大纲、查找、A−、A+）、
+ *   右区：视图分段控件、内联查找框（⌘F；Enter 或 ⌘G 下一个、⇧Enter 或 ⇧⌘G 上一个、Esc 关闭）、阅读辅助（大纲、查找、A−、A+）、
  *         当前文件操作（收藏、在访达中显示、用默认应用打开）与「⋯」菜单（复制路径；文件库另有重新转换，阅读页另有关闭文件）。
  *         窗口变窄时先收起文件操作、再收起阅读辅助，均改入「⋯」，视图分段控件保留到最后。
  * 本组件与 <mf-library-page>/<mf-reader-page> 互不直接引用：状态只从 store 读，操作经 window 上的 mf-doc-command 事件
@@ -24,6 +24,8 @@ const ROUTE_FIELDS = Object.freeze({
 });
 const IS_MAC = platform === 'darwin';
 const MOD = IS_MAC ? '⌘' : 'Ctrl+';
+const FIND_NEXT_KEYS = IS_MAC ? '⌘G' : 'Ctrl+G';
+const FIND_PREV_KEYS = IS_MAC ? '⇧⌘G' : 'Ctrl+Shift+G';
 const REVEAL_LABEL = IS_MAC ? '在访达中显示' : (platform === 'win32' ? '在资源管理器中显示' : '在文件管理器中显示');
 // 右区可收进「⋯」的分组，按收起先后排列：先收文件操作，再收阅读辅助
 const COLLAPSIBLE_GROUPS = Object.freeze(['file', 'aids']);
@@ -76,8 +78,8 @@ class MfStatusBar extends HTMLElement {
                 <div class="status-bar-find" data-role="find" role="search" hidden>
                     <input class="input input-slim status-bar-find-input" type="search" data-role="find-input" placeholder="在文档中查找" aria-label="在文档中查找" spellcheck="false">
                     <span class="status-bar-find-count" data-role="find-count" aria-live="polite"></span>
-                    ${docButton('find-prev', 'chevronUp', '上一个（⇧Enter）')}
-                    ${docButton('find-next', 'chevronDown', '下一个（Enter）')}
+                    ${docButton('find-prev', 'chevronUp', `上一个（⇧Enter 或 ${FIND_PREV_KEYS}）`)}
+                    ${docButton('find-next', 'chevronDown', `下一个（Enter 或 ${FIND_NEXT_KEYS}）`)}
                     ${docButton('find-close', 'x', '关闭查找（Esc）')}
                 </div>
                 <div class="status-bar-doc-group" data-group="aids">
@@ -385,12 +387,10 @@ class MfStatusBar extends HTMLElement {
     runFind({ backwards = false, reset = false } = {}) {
         if (!this.findOpen) return;
         const query = this.querySelector('[data-role="find-input"]').value;
-        if (!query) {
-            this.setFindCount('');
-            return;
-        }
+        // 查询串清空时同样下发：编辑页据此撤掉高亮，帧内视图对空串不做处理
         const result = this.command('find', { query, backwards, reset });
-        if (result && result.total > 0) this.setFindCount(`${result.current}/${result.total}`);
+        if (!query) this.setFindCount('');
+        else if (result && result.total > 0) this.setFindCount(`${result.current}/${result.total}`);
         else this.setFindCount('无结果', true);
     }
 
@@ -412,7 +412,7 @@ class MfStatusBar extends HTMLElement {
         }
     }
 
-    /** ⌘F 查找、⌘[ / ⌘] 后退前进、Esc 收起弹层或查找框；焦点在帧内时按键经 doc-view.prepareDocFrame 转发到这里 */
+    /** ⌘F 查找、⌘G / ⇧⌘G 下一处 / 上一处、⌘[ / ⌘] 后退前进、Esc 收起弹层或查找框；焦点在帧内时按键经 doc-view.prepareDocFrame 转发到这里 */
     onShortcut(event) {
         if (event.defaultPrevented || event.isComposing || !this.doc) return;
         if (event.key === 'Escape' && !event.metaKey && !event.ctrlKey) {
@@ -431,6 +431,14 @@ class MfStatusBar extends HTMLElement {
             if (!this.doc.canFind) return;
             event.preventDefault();
             this.openFind();
+            return;
+        }
+        // ⌘G / ⇧⌘G：查找框已开时为下一处 / 上一处（焦点在查找框、编辑区或帧内均可）；未开时与 ⌘F 相同，打开查找框
+        if (String(event.key || '').toLowerCase() === 'g') {
+            if (!this.doc.canFind) return;
+            event.preventDefault();
+            if (this.findOpen) this.runFind({ backwards: event.shiftKey });
+            else this.openFind();
             return;
         }
         const back = event.key === '[' || event.code === 'BracketLeft';

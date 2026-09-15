@@ -48,6 +48,11 @@
     --system-green: oklch(72% 0.18 145);
     --system-orange: oklch(75% 0.16 60);
 
+    /* 编辑区查找高亮（Markdown 编辑页镜像层，垫在原文字下方）：全部命中取浅黄，当前命中取 Apple 系统黄；
+       深色下降低不透明度，原文的浅色字叠在当前命中上仍有约 4.7:1 的对比度 */
+    --find-match-bg: light-dark(color-mix(in srgb, #ffcc00 30%, transparent), color-mix(in srgb, #ffd60a 20%, transparent));
+    --find-current-bg: light-dark(#ffcc00, color-mix(in srgb, #ffd60a 45%, transparent));
+
     /* Continuous Corner（伪 squircle）；--r-xs 供行内小件：链接按钮、树节点与筛选行、清单行 */
     --r-xs: 6px; --r-sm: 10px; --r-md: 14px; --r-lg: 20px; --r-xl: 28px; --r-pill: 999px;
 

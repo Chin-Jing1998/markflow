@@ -5,7 +5,8 @@
  * 父页可读写帧内 DOM、在帧内 window 上挂监听，帧内不执行任何脚本。
  *   字号：readDocZoom / writeDocZoom 读写 localStorage（均 try/catch；存储不可用时回退 100%，改动仅本次生效）。
  *   prepareDocFrame(frame, getZoom)：帧装载后补齐当前字号（装载期间换过字号时以最新值为准），并转发帧内快捷键。
- *   查找：findInFrame / clearFrameFind 以 TreeWalker 拼接文本节点，按匹配建 Range 选中并滚到可见；findInTextarea 在编辑区选中。
+ *   查找：findInFrame / clearFrameFind 以 TreeWalker 拼接文本节点，按匹配建 Range 选中并滚到可见；findInTextarea 在编辑区选中，
+ *         并交所属编辑器的镜像层高亮全部命中（关闭查找时 endFindInView 撤掉高亮、聚焦编辑区并选中当前命中）。
  *   大纲定位：scrollFrameToHeading（渲染视图）、scrollFrameToLine（原文视图）、revealTextareaLine（编辑页）。
  * 帧内 getBoundingClientRect 与 scrollTop 同处 html { zoom } 缩放后的坐标系（Chromium 实测），滚动量可直接相加。
  */
@@ -183,14 +184,29 @@ export function clearFrameFind(frame) {
     if (style) style.remove();
 }
 
-/** 编辑区查找：选中下一处（backwards 为上一处）并滚到可见；焦点仍留在查找框，关闭查找后聚焦编辑区即显出选区 */
+/** textarea 所属的 <mf-md-editor>（提供查找高亮）；不在编辑器内时为 null */
+function editorOf(textarea) {
+    const editor = textarea ? textarea.closest('mf-md-editor') : null;
+    return editor && typeof editor.highlightFind === 'function' ? editor : null;
+}
+
+/**
+ * 编辑区查找：选中下一处（backwards 为上一处）并滚到可见，焦点仍留在查找框。
+ * 失焦 textarea 的选区不绘制，命中改由编辑器的镜像高亮层标出（全部命中浅色、与选区重合的当前命中深色）；
+ * 查询串为空时撤掉高亮，无命中时隐藏高亮层。
+ */
 export function findInTextarea(textarea, query, { backwards = false, reset = false } = {}) {
     if (!textarea) return { total: 0, current: 0 };
+    const editor = editorOf(textarea);
     const matches = findMatches(textarea.value, query);
-    if (matches.length === 0) return { total: 0, current: 0 };
+    if (matches.length === 0) {
+        if (editor) editor.highlightFind(query, matches);
+        return { total: 0, current: 0 };
+    }
     const picked = pickMatch(matches, { selStart: textarea.selectionStart, selEnd: textarea.selectionEnd, backwards, reset });
     textarea.setSelectionRange(matches[picked].start, matches[picked].end);
     revealTextareaOffset(textarea, matches[picked].start);
+    if (editor) editor.highlightFind(query, matches);
     return { total: matches.length, current: picked + 1 };
 }
 
@@ -306,16 +322,19 @@ export function applyDocZoom({ frame = null, editorHost = null } = {}, zoom) {
 /** 查找分派：编辑页在编辑区内查找，其余视图在帧内查找；context = { mode: 'edit' | 'raw' | 'rendered', frame, textarea } */
 export function findInView(context, { query = '', backwards = false, reset = false } = {}) {
     if (!context) return { total: 0, current: 0 };
-    return context.mode === 'edit'
-        ? findInTextarea(context.textarea, query, { backwards, reset })
-        : findInFrame(context.frame, query, { backwards, reset });
+    if (context.mode === 'edit') return findInTextarea(context.textarea, query, { backwards, reset });
+    // 查询串清空时顶部栏也会下发（供编辑页撤掉高亮）：帧内视图不做处理，原选区保留
+    if (!query) return { total: 0, current: 0 };
+    return findInFrame(context.frame, query, { backwards, reset });
 }
 
-/** 关闭查找：编辑页把焦点还给编辑区（选中的命中随之显出），其余视图移除帧内高亮样式 */
+/** 关闭查找：编辑页撤掉镜像高亮，焦点回到编辑区并选中当前命中；其余视图移除帧内高亮样式 */
 export function endFindInView(context) {
     if (!context) return;
     if (context.mode === 'edit') {
-        if (context.textarea) context.textarea.focus({ preventScroll: true });
+        const editor = editorOf(context.textarea);
+        if (editor) editor.endFind();
+        else if (context.textarea) context.textarea.focus({ preventScroll: true });
         return;
     }
     clearFrameFind(context.frame);

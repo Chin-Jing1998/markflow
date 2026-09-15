@@ -2,7 +2,8 @@
  * desktop/renderer/js/doc-tools.mjs 单元测试（渲染层纯逻辑，Node 经 import() 载入）
  * 覆盖：字号百分比的取整、夹紧与步进；Markdown 大纲（ATX、Setext、front matter、围栏代码、闭合井号、行内标记、
  *       列表续行与缩进代码不误判）；HTML 大纲（实体、嵌套标签、脚本与注释剔除）；导航历史（截断前进分支、
- *       跳过失效项与当前项、上限）；查找匹配与选取（不区分大小写、正则元字符按字面、回绕、reset）；行首偏移与所在文件夹。
+ *       跳过失效项与当前项、上限）；查找匹配与选取（不区分大小写、正则元字符按字面、回绕、reset）；查找高亮切片（首尾命中、
+ *       相邻命中、当前命中、换行与制表符、异常区间）；行首偏移与所在文件夹。
  */
 const { test, before } = require('node:test');
 const assert = require('node:assert/strict');
@@ -127,6 +128,30 @@ test('pickMatch：按选区取下一处或上一处并回绕；reset 从选区�
     assert.equal(mod.pickMatch(matches, { selStart: 10, selEnd: 11, reset: true }), 1, 'reset 时选区起点正好是匹配处则保持');
     assert.equal(mod.pickMatch(matches, { selStart: 21, selEnd: 21, reset: true }), 0, 'reset 越过末处回绕');
     assert.equal(mod.pickMatch(matches, { selStart: 12, selEnd: 12, reset: true, backwards: true }), 1);
+});
+
+test('splitByMatches：文本按命中切为高亮片段，拼接即原文，不产生空片段，标出当前命中', () => {
+    const plain = (text) => ({ text, index: -1, current: false });
+    const mark = (text, index, current = false) => ({ text, index, current });
+    assert.deepEqual(mod.splitByMatches('abc', []), [plain('abc')], '无命中时整段为普通文本');
+    assert.deepEqual(mod.splitByMatches('', []), [], '空文本没有片段');
+    assert.deepEqual(mod.splitByMatches(null, undefined), []);
+    const head = 'Foo bar';
+    assert.deepEqual(mod.splitByMatches(head, mod.findMatches(head, 'foo')), [mark('Foo', 0), plain(' bar')], '命中在开头不产生空的前导片段');
+    const tail = 'bar foo';
+    assert.deepEqual(mod.splitByMatches(tail, mod.findMatches(tail, 'foo'), 0), [plain('bar '), mark('foo', 0, true)], '命中在结尾不产生空的尾随片段');
+    assert.deepEqual(mod.splitByMatches('aaaa', mod.findMatches('aaaa', 'aa'), 1), [mark('aa', 0), mark('aa', 1, true)], '相邻命中之间没有空片段');
+    const text = 'x\tfoo\n\nfoo\tFOO\n';
+    const segments = mod.splitByMatches(text, mod.findMatches(text, 'foo'), 1);
+    assert.deepEqual(segments, [plain('x\t'), mark('foo', 0), plain('\n\n'), mark('foo', 1, true), plain('\t'), mark('FOO', 2), plain('\n')], '制表符与换行原样留在片段中');
+    assert.equal(segments.map((segment) => segment.text).join(''), text, '各段依次拼接即原文');
+    assert.equal(mod.splitByMatches(text, mod.findMatches(text, 'foo'), 7).filter((segment) => segment.current).length, 0, '当前下标越界时没有当前命中');
+    assert.equal(mod.splitByMatches(text, mod.findMatches(text, 'foo')).filter((segment) => segment.current).length, 0, '缺省没有当前命中');
+    assert.deepEqual(
+        mod.splitByMatches('abcdef', [{ start: 1, end: 3 }, { start: 2, end: 4 }, { start: 4, end: 4 }, { start: 5, end: 99 }]),
+        [plain('a'), mark('bc', 0), plain('de'), mark('f', 3)],
+        '与前一处重叠的、空区间的命中跳过，越界终点截到文末，index 仍为原下标',
+    );
 });
 
 test('lineStartOffset 与 docLocation', () => {
