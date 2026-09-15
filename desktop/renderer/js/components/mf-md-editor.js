@@ -14,6 +14,7 @@
  * <mark> 涂色（全部命中浅色，与选区重合的当前命中深色），查找期间 textarea 改透明底；镜像文字块宽度取 textarea.clientWidth
  * （扣除滚动条）、位移在 scroll 事件里跟随 scrollTop，尺寸变化由 ResizeObserver 重对齐。文字仍在原生 textarea 中编辑，
  * 撤销栈、输入法与自动保存不受影响。输入后按帧合并重建（超长文本停手后重建）；编辑区被隐藏时自动撤掉。
+ * 重建后或当前命中切换后派发 mf-md-find，顶部栏据此边改边更新查找计数。
  *
  * 快捷键（macOS 用 ⌘，其他平台用 Ctrl）：⌘B 加粗、⌘I 斜体、⌘U 下划线、⌘K 链接、⌘⇧X 删除线、⌘⌥0–6 标题级别、
  * ⌘S 立即保存（挂在编辑器根元素上，工具栏与链接栏里同样生效）。
@@ -25,7 +26,9 @@
  * 结束后若又有保存请求则再存一次。
  *
  * 事件（均冒泡）：mf-md-change { dirty }（脏状态翻转时）、mf-md-status { state, message, label }、
- * mf-md-saved { text, result }、mf-md-rendered { html }、mf-md-reload-request。
+ * mf-md-saved { text, result }、mf-md-rendered { html }、mf-md-reload-request、
+ * mf-md-find { query, total, current, sessionId }（查找高亮重建或当前命中切换后；current 为 0 起下标，无当前命中为 -1；
+ * 编辑区不可见时与 clearFind（含查询串清空）时不派发）。
  * API：sessionId、previewVisible、showStatus、setContent(text, { html?, status? })、value、dirty、modified、saving、
  * status、lastHtml、flush(): Promise<boolean>、renderNow()、markExported()、focusEditor()、dispose()；
  * 查找高亮 highlightFind(query, matches?)、endFind()（撤掉高亮并聚焦编辑区、保留选区）、clearFind()（只撤掉高亮）。
@@ -627,7 +630,10 @@ class MfMdEditor extends HTMLElement {
         this.setFindLayerShown(false);
     }
 
-    /** 按当前文本重建镜像层（文本与查询串都没变时只换当前命中）；有命中且编辑区可见时显出并对齐 */
+    /**
+     * 按当前文本重建镜像层（文本与查询串都没变时只换当前命中）；有命中且编辑区可见时显出并对齐。
+     * 重建后、或当前命中有变时，编辑区可见即派发 mf-md-find，顶部栏据此实时更新计数。
+     */
     renderFind(matches = null) {
         cancelAnimationFrame(this.findFrame);
         clearTimeout(this.findTimer);
@@ -638,18 +644,21 @@ class MfMdEditor extends HTMLElement {
         // 先读 textarea 的尺寸、滚动与选区，再改镜像层：改完不再读布局，镜像层只在本帧绘制前排版一次
         const width = ta.clientWidth;
         const { scrollTop, scrollLeft, selectionStart, selectionEnd } = ta;
+        let changed = true;
         if (this.findStale) {
             const value = ta.value;
             this.findMatchList = Array.isArray(matches) ? matches : findMatches(value, this.findQuery);
             this.buildFindLayer(value, this.findMatchIndex(selectionStart, selectionEnd));
             this.findStale = false;
         } else {
-            this.setFindCurrent(this.findMatchIndex(selectionStart, selectionEnd));
+            changed = this.setFindCurrent(this.findMatchIndex(selectionStart, selectionEnd));
         }
         const shown = width > 0 && this.findMatchList.length > 0;
         if (shown) this.findText.style.width = `${width}px`;
         this.setFindLayerShown(shown);
         if (shown) this.findText.style.transform = `translate(${-scrollLeft}px, ${-scrollTop}px)`;
+        // 编辑区不可见（所在视图已切走、尺寸归零）时不派发：此时的查找已不属于当前视图
+        if (changed && width > 0) this.emitFindState();
     }
 
     /** 镜像层内容：普通文本为文本节点，命中为 <mark>；文档内容一律经文本节点写入，不拼 HTML。无命中时清空 */
@@ -678,12 +687,19 @@ class MfMdEditor extends HTMLElement {
         return this.findMatchList.findIndex((match) => match.start === start && match.end === end);
     }
 
+    /** 把深色标记换到下标 next 的命中上；回 true 表示当前命中有变 */
     setFindCurrent(next) {
-        if (next === this.findCurrent) return;
+        if (next === this.findCurrent) return false;
         const previous = this.findMarks[this.findCurrent];
         if (previous) previous.classList.remove('is-current');
         if (this.findMarks[next]) this.findMarks[next].classList.add('is-current');
         this.findCurrent = next;
+        return true;
+    }
+
+    /** 查找状态经 mf-md-find 通知顶部栏：total 为命中数，current 为当前命中的 0 起下标（无当前命中为 -1）；clearFind 时不派发 */
+    emitFindState() {
+        this.emit('mf-md-find', { query: this.findQuery, total: this.findMatchList.length, current: this.findCurrent, sessionId: this._sessionId });
     }
 
     /** 输入后刷新高亮：常规文本在下一帧重建；超长文本先撤下（旧位置已错开），停手 FIND_IDLE_MS 后再重建 */
@@ -701,13 +717,15 @@ class MfMdEditor extends HTMLElement {
         if (!this.findFrame) this.findFrame = requestAnimationFrame(() => this.renderFind());
     }
 
-    /** 选区变化后在下一帧按选区换当前命中；镜像层待重建时跳过（重建时自会按选区标出） */
+    /** 选区变化后在下一帧按选区换当前命中，有变且编辑区可见时派发 mf-md-find；镜像层待重建时跳过（重建时自会按选区标出） */
     scheduleFindSync() {
         if (!this.findQuery || this.findSyncFrame) return;
         this.findSyncFrame = requestAnimationFrame(() => {
             this.findSyncFrame = null;
-            if (!this.findQuery || this.findStale || !this.textarea) return;
-            this.setFindCurrent(this.findMatchIndex(this.textarea.selectionStart, this.textarea.selectionEnd));
+            const ta = this.textarea;
+            if (!this.findQuery || this.findStale || !ta) return;
+            const visible = ta.clientWidth > 0;
+            if (this.setFindCurrent(this.findMatchIndex(ta.selectionStart, ta.selectionEnd)) && visible) this.emitFindState();
         });
     }
 

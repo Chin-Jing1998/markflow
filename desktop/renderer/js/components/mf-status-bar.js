@@ -9,13 +9,16 @@
  *         窗口变窄时先收起文件操作、再收起阅读辅助，均改入「⋯」，视图分段控件保留到最后。
  * 本组件与 <mf-library-page>/<mf-reader-page> 互不直接引用：状态只从 store 读，操作经 window 上的 mf-doc-command 事件
  * { route, command, value } 下发；需要回包的命令（outline、find）由页面同步写入 event.detail.result。
+ * 查找命令的 value 为 { query, backwards, reset, restore }，回包 { total, current, pending? }；计数文案统一由 findCountLabel 给出，
+ * 编辑页另经编辑器冒泡到 window 的 mf-md-find 事件边改边更新。查找框开着时换视图或换文件，自动按当前查询串重查：
+ * 编辑页只重现高亮与计数、不动选区与滚动；帧内视图同按 Enter，帧未装载完（pending）时限次重发。
  * ⌘+ / ⌘- 不在此绑定，留给应用菜单的整窗缩放。
  */
 import { store } from '../store.js';
 import { icon } from '../icons.js';
 import { platform } from '../api.js';
 import { escapeHtml, escapeAttr } from '../dom.js';
-import { DOC_ZOOM } from '../doc-tools.mjs';
+import { DOC_ZOOM, findCountLabel } from '../doc-tools.mjs';
 
 // 两个路由各自的状态字段名；库与阅读页各自独立，互不影响。
 const ROUTE_FIELDS = Object.freeze({
@@ -33,6 +36,9 @@ const MIN_TITLE_WIDTH = 140;
 const POPOVER_MARGIN = 8;
 const TEXT_ENTRY = 'input, textarea, select, [contenteditable=""], [contenteditable="true"]';
 const MENU_SEPARATOR = '<div class="status-bar-menu-separator" role="separator"></div>';
+// 查找目标还没装载完（帧内视图的帧未装载完，回包 pending）时的重发间隔与次数上限：每 50 ms 一次、最多 200 次（约 10 s），届时仍未装载完则计数留空
+const FIND_RETRY_MS = 50;
+const FIND_RETRY_LIMIT = 200;
 
 const docButton = (action, iconName, label, extra = '') => `<button class="icon-btn icon-btn-sm" type="button" data-action="${action}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}"${extra}>${icon(iconName)}</button>`;
 const menuItem = (command, label, disabled = false) => `<button type="button" role="menuitem" data-menu-command="${command}"${disabled ? ' disabled' : ''}>${escapeHtml(label)}</button>`;
@@ -55,6 +61,8 @@ class MfStatusBar extends HTMLElement {
         this.doc = null;
         this.docKey = '';
         this.findOpen = false;
+        // 查找目标未装载完时的重发计时器；新的查找、换视图或换文件、关闭查找时作废
+        this.findRetryTimer = null;
         // 当前展开的弹层（'' | 'menu' | 'outline'）。字段不可取名 popover：HTMLElement 上同名属性属 Popover API，赋值会把本元素变成弹层
         this.activePopover = '';
         this.activePopoverAnchor = null;
@@ -109,9 +117,12 @@ class MfStatusBar extends HTMLElement {
         };
         // 点进帧内时父页收不到 pointerdown，但窗口会失焦：借此收起弹层
         this.onWindowBlur = () => this.closePopover();
+        // 编辑页实时计数：编辑器重建查找高亮或换当前命中后派发 mf-md-find，冒泡到 window
+        this.onEditorFindEvent = (event) => this.onEditorFind(event.detail);
         document.addEventListener('keydown', this.onDocumentKey);
         document.addEventListener('pointerdown', this.onDocumentPointer, true);
         window.addEventListener('blur', this.onWindowBlur);
+        window.addEventListener('mf-md-find', this.onEditorFindEvent);
         if (typeof ResizeObserver === 'function') {
             this.resizeObserver = new ResizeObserver(() => this.layoutDocTools());
             this.resizeObserver.observe(this);
@@ -125,6 +136,8 @@ class MfStatusBar extends HTMLElement {
         document.removeEventListener('keydown', this.onDocumentKey);
         document.removeEventListener('pointerdown', this.onDocumentPointer, true);
         window.removeEventListener('blur', this.onWindowBlur);
+        window.removeEventListener('mf-md-find', this.onEditorFindEvent);
+        this.stopFindRetry();
         if (this.resizeObserver) this.resizeObserver.disconnect();
     }
 
@@ -211,19 +224,25 @@ class MfStatusBar extends HTMLElement {
         collapseButton.innerHTML = icon(collapsed ? 'panelLeftOpen' : 'panelLeftClose');
     }
 
-    /** 文档三区：无打开文件时全部隐藏（顶部栏保持原样）；换文件或换视图时收起弹层并清空查找计数 */
+    /**
+     * 文档三区：无打开文件时全部隐藏（顶部栏保持原样）；换文件或换视图时收起弹层、清空查找计数并作废尚在等待的重发。
+     * 查找框仍开着且新视图可查找时按当前查询串自动重查（refind）；不可查找时静默收起查找框。
+     */
     syncDoc(doc, route) {
         const hasDoc = Boolean(doc);
         this.classList.toggle('has-doc', hasDoc);
         for (const role of ['doc-nav', 'doc-title', 'doc-tools']) this.querySelector(`[data-role="${role}"]`).hidden = !hasDoc;
         const key = hasDoc ? `${route}|${doc.sessionId}|${doc.activeView}` : '';
-        if (key !== this.docKey) {
+        const switched = key !== this.docKey;
+        if (switched) {
             this.docKey = key;
             this.closePopover();
             this.setFindCount('');
+            this.stopFindRetry();
         }
         this.doc = doc;
         if (!hasDoc || !doc.canFind) this.closeFind({ silent: true });
+        else if (switched && this.findOpen) this.refind();
         if (!hasDoc) return;
         this.renderTitle(doc);
         this.renderViews(doc);
@@ -376,6 +395,7 @@ class MfStatusBar extends HTMLElement {
     /** silent：换到不支持查找的视图或文件关闭时只收起查找框，不再通知页面 */
     closeFind({ silent = false } = {}) {
         if (!this.findOpen) return;
+        this.stopFindRetry();
         this.findOpen = false;
         this.querySelector('[data-role="find"]').hidden = true;
         this.querySelector('[data-role="find-btn"]').setAttribute('aria-pressed', 'false');
@@ -384,14 +404,50 @@ class MfStatusBar extends HTMLElement {
         this.layoutDocTools();
     }
 
-    runFind({ backwards = false, reset = false } = {}) {
+    /**
+     * 下发查找并按回包显示计数。restore 为换视图或换文件后的自动重查：编辑页不动选区与滚动，帧内视图同 reset。
+     * 回包 pending（帧还没装载完）时计数留空，每 FIND_RETRY_MS 重发一次、最多 FIND_RETRY_LIMIT 次；
+     * 每次下发都先作废尚在等待的重发，快速连续的查找或切换只有最后一次生效。
+     */
+    runFind({ backwards = false, reset = false, restore = false } = {}, attempt = 0) {
+        this.stopFindRetry();
         if (!this.findOpen) return;
         const query = this.querySelector('[data-role="find-input"]').value;
         // 查询串清空时同样下发：编辑页据此撤掉高亮，帧内视图对空串不做处理
-        const result = this.command('find', { query, backwards, reset });
-        if (!query) this.setFindCount('');
-        else if (result && result.total > 0) this.setFindCount(`${result.current}/${result.total}`);
-        else this.setFindCount('无结果', true);
+        const result = this.command('find', { query, backwards, reset, restore });
+        if (query && result && result.pending && attempt < FIND_RETRY_LIMIT) {
+            this.findRetryTimer = setTimeout(() => this.runFind({ backwards, reset, restore }, attempt + 1), FIND_RETRY_MS);
+        }
+        this.showFindCount(query, result);
+    }
+
+    /** 换视图或换文件后的重查：延到本轮同步渲染之后下发（页面已挂好新视图、store 通知已走完）；查询串为空时不重查 */
+    refind() {
+        this.stopFindRetry();
+        if (!this.querySelector('[data-role="find-input"]').value) return;
+        this.findRetryTimer = setTimeout(() => this.runFind({ reset: true, restore: true }), 0);
+    }
+
+    stopFindRetry() {
+        clearTimeout(this.findRetryTimer);
+        this.findRetryTimer = null;
+    }
+
+    /**
+     * 编辑页实时计数（mf-md-find）：只认查找框开着、当前路由的文档可查找、事件出自当前文档（同会话）的编辑器、
+     * 且查询串与查找框一致的那次，对比预览等其他编辑器或已失效的查找不改写计数。事件的 current 为 0 起下标（无为 -1）。
+     */
+    onEditorFind(detail) {
+        if (!detail || !this.findOpen || !this.doc || !this.doc.canFind) return;
+        if (String(detail.sessionId || '') !== String(this.doc.sessionId || '')) return;
+        const query = this.querySelector('[data-role="find-input"]').value;
+        if (!query || detail.query !== query) return;
+        this.showFindCount(query, { total: detail.total, current: Number(detail.current) + 1 });
+    }
+
+    showFindCount(query, result) {
+        const { text, empty } = findCountLabel(query, result);
+        this.setFindCount(text, empty);
     }
 
     setFindCount(text, empty = false) {

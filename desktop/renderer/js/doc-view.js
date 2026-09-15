@@ -5,8 +5,9 @@
  * 父页可读写帧内 DOM、在帧内 window 上挂监听，帧内不执行任何脚本。
  *   字号：readDocZoom / writeDocZoom 读写 localStorage（均 try/catch；存储不可用时回退 100%，改动仅本次生效）。
  *   prepareDocFrame(frame, getZoom)：帧装载后补齐当前字号（装载期间换过字号时以最新值为准），并转发帧内快捷键。
- *   查找：findInFrame / clearFrameFind 以 TreeWalker 拼接文本节点，按匹配建 Range 选中并滚到可见；findInTextarea 在编辑区选中，
- *         并交所属编辑器的镜像层高亮全部命中（关闭查找时 endFindInView 撤掉高亮、聚焦编辑区并选中当前命中）。
+ *   查找：findInFrame / clearFrameFind 以 TreeWalker 拼接文本节点，按匹配建 Range 选中并滚到可见（帧尚未装载完时回 pending）；
+ *         findInTextarea 在编辑区选中，并交所属编辑器的镜像层高亮全部命中（restore 时不动选区与滚动、只重现高亮；
+ *         关闭查找时 endFindInView 撤掉高亮、聚焦编辑区并选中当前命中）。
  *   大纲定位：scrollFrameToHeading（渲染视图）、scrollFrameToLine（原文视图）、revealTextareaLine（编辑页）。
  * 帧内 getBoundingClientRect 与 scrollTop 同处 html { zoom } 缩放后的坐标系（Chromium 实测），滚动量可直接相加。
  */
@@ -150,10 +151,22 @@ const firstRect = (range) => (range.getClientRects()[0] || range.getBoundingClie
 
 // ---------- 查找 ----------
 
-/** 帧内查找：选中下一处（backwards 为上一处）并滚到可见；回 { total, current }，无结果时 total 为 0 */
+/**
+ * 帧是否已装载出正文：srcdoc 帧装载完成前 contentDocument 仍是初始的空白文档（about:blank，body 为空），此时查找只会得到 0 处；
+ * 换视图时帧总是重建，须等 readyState 为 complete 且文档已换成 about:srcdoc。
+ */
+function frameLoaded(frame, doc) {
+    if (doc.readyState !== 'complete') return false;
+    return !frame.hasAttribute('srcdoc') || doc.URL === 'about:srcdoc';
+}
+
+/**
+ * 帧内查找：选中下一处（backwards 为上一处）并滚到可见；回 { total, current }，无结果时 total 为 0。
+ * 帧尚未挂上或还没装载完时回 { total: 0, current: 0, pending: true }，由顶部栏稍后重发，不当作无结果。
+ */
 export function findInFrame(frame, query, { backwards = false, reset = false } = {}) {
     const doc = frameDocument(frame);
-    if (!doc) return { total: 0, current: 0 };
+    if (!doc || !frameLoaded(frame, doc)) return { total: 0, current: 0, pending: true };
     const index = textIndex(doc);
     const matches = findMatches(index.text, query);
     const selection = doc.getSelection();
@@ -194,14 +207,20 @@ function editorOf(textarea) {
  * 编辑区查找：选中下一处（backwards 为上一处）并滚到可见，焦点仍留在查找框。
  * 失焦 textarea 的选区不绘制，命中改由编辑器的镜像高亮层标出（全部命中浅色、与选区重合的当前命中深色）；
  * 查询串为空时撤掉高亮，无命中时隐藏高亮层。
+ * restore（切回编辑页后的自动重查）：不动选区与滚动位置，只重现高亮；current 取与选区正好重合的命中，没有时为 0。
  */
-export function findInTextarea(textarea, query, { backwards = false, reset = false } = {}) {
+export function findInTextarea(textarea, query, { backwards = false, reset = false, restore = false } = {}) {
     if (!textarea) return { total: 0, current: 0 };
     const editor = editorOf(textarea);
     const matches = findMatches(textarea.value, query);
     if (matches.length === 0) {
         if (editor) editor.highlightFind(query, matches);
         return { total: 0, current: 0 };
+    }
+    if (restore) {
+        const { selectionStart, selectionEnd } = textarea;
+        if (editor) editor.highlightFind(query, matches);
+        return { total: matches.length, current: matches.findIndex((match) => match.start === selectionStart && match.end === selectionEnd) + 1 };
     }
     const picked = pickMatch(matches, { selStart: textarea.selectionStart, selEnd: textarea.selectionEnd, backwards, reset });
     textarea.setSelectionRange(matches[picked].start, matches[picked].end);
@@ -319,10 +338,13 @@ export function applyDocZoom({ frame = null, editorHost = null } = {}, zoom) {
     for (const preview of editorHost.querySelectorAll('.view-frame')) applyFrameZoom(preview, percent);
 }
 
-/** 查找分派：编辑页在编辑区内查找，其余视图在帧内查找；context = { mode: 'edit' | 'raw' | 'rendered', frame, textarea } */
-export function findInView(context, { query = '', backwards = false, reset = false } = {}) {
+/**
+ * 查找分派：编辑页在编辑区内查找，其余视图在帧内查找；context = { mode: 'edit' | 'raw' | 'rendered', frame, textarea }。
+ * restore 为换视图或换文件后的自动重查：编辑页不动选区与滚动、只重现高亮；帧内视图不认 restore，与按 Enter 相同。
+ */
+export function findInView(context, { query = '', backwards = false, reset = false, restore = false } = {}) {
     if (!context) return { total: 0, current: 0 };
-    if (context.mode === 'edit') return findInTextarea(context.textarea, query, { backwards, reset });
+    if (context.mode === 'edit') return findInTextarea(context.textarea, query, { backwards, reset, restore });
     // 查询串清空时顶部栏也会下发（供编辑页撤掉高亮）：帧内视图不做处理，原选区保留
     if (!query) return { total: 0, current: 0 };
     return findInFrame(context.frame, query, { backwards, reset });

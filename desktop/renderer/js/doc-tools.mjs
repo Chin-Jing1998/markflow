@@ -7,7 +7,8 @@
  *         条目形如 { level, text, index, line? }；headingKey 供帧内按文字匹配标题。
  *   导航历史：不可变结构 { entries, cursor }；visitHistory / findHistoryStep / canStepHistory / moveHistory。
  *   查找：findMatches（不区分大小写，按字面匹配）与 pickMatch（按当前选区决定下一处或上一处，首尾回绕）；
- *         splitByMatches（文本按命中切为高亮片段，供编辑页的查找高亮镜像层）。
+ *         splitByMatches（文本按命中切为高亮片段，供编辑页的查找高亮镜像层）；
+ *         findCountLabel（顶部栏查找计数的文案：n/m、共 m 处、无结果或空串，查找回包与编辑器实时计数共用）。
  *   其他：lineStartOffset（LF 文本的行首偏移）、docLocation（路径 → 所在文件夹与文件夹名）。
  */
 
@@ -278,6 +279,19 @@ export function splitByMatches(text, matches, current = -1) {
     }
     if (cursor < value.length) segments.push({ text: value.slice(cursor), index: -1, current: false });
     return segments;
+}
+
+/**
+ * 顶部栏查找计数的文案 { text, empty }（empty 表示「无结果」的空结果样式）。result 为查找回包 { total, current, pending? }，
+ * current 从 1 起，0 表示有命中但插入符不在任一命中上：有当前命中为「n/m」，否则为「共 m 处」；无命中（含未回包）为「无结果」；
+ * 查询串为空、或目标视图尚未就绪（pending：帧还没装载完）时为空串。
+ */
+export function findCountLabel(query, result) {
+    if (!query || (result && result.pending)) return { text: '', empty: false };
+    const total = result ? Math.floor(Number(result.total)) : 0;
+    if (!(total > 0)) return { text: '无结果', empty: true };
+    const current = Math.floor(Number(result.current));
+    return { text: current >= 1 && current <= total ? `${current}/${total}` : `共 ${total} 处`, empty: false };
 }
 
 // ---------- 其他 ----------

@@ -3,7 +3,8 @@
  * 覆盖：字号百分比的取整、夹紧与步进；Markdown 大纲（ATX、Setext、front matter、围栏代码、闭合井号、行内标记、
  *       列表续行与缩进代码不误判）；HTML 大纲（实体、嵌套标签、脚本与注释剔除）；导航历史（截断前进分支、
  *       跳过失效项与当前项、上限）；查找匹配与选取（不区分大小写、正则元字符按字面、回绕、reset）；查找高亮切片（首尾命中、
- *       相邻命中、当前命中、换行与制表符、异常区间）；行首偏移与所在文件夹。
+ *       相邻命中、当前命中、换行与制表符、异常区间）；查找计数的显示规则（n/m、共 m 处、无结果、空串、未就绪）；
+ *       行首偏移与所在文件夹。
  */
 const { test, before } = require('node:test');
 const assert = require('node:assert/strict');
@@ -152,6 +153,22 @@ test('splitByMatches：文本按命中切为高亮片段，拼接即原文，不
         [plain('a'), mark('bc', 0), plain('de'), mark('f', 3)],
         '与前一处重叠的、空区间的命中跳过，越界终点截到文末，index 仍为原下标',
     );
+});
+
+test('findCountLabel：有当前命中为 n/m，插入符不在命中上为「共 m 处」，无命中为「无结果」，查询串为空或视图未就绪为空串', () => {
+    const label = (text, empty = false) => ({ text, empty });
+    assert.deepEqual(mod.findCountLabel('foo', { total: 5, current: 2 }), label('2/5'), '当前命中序号从 1 起');
+    assert.deepEqual(mod.findCountLabel('foo', { total: 1, current: 1 }), label('1/1'));
+    assert.deepEqual(mod.findCountLabel('foo', { total: 5, current: 0 }), label('共 5 处'), 'current 为 0：有命中但插入符不在命中上');
+    assert.deepEqual(mod.findCountLabel('foo', { total: 5, current: 6 }), label('共 5 处'), '序号越界按不在命中上处理');
+    assert.deepEqual(mod.findCountLabel('foo', { total: 5, current: -1 }), label('共 5 处'));
+    assert.deepEqual(mod.findCountLabel('foo', { total: 0, current: 0 }), label('无结果', true), '无命中为「无结果」空结果样式');
+    assert.deepEqual(mod.findCountLabel('foo', undefined), label('无结果', true), '页面未回包按无命中处理（与改动前一致）');
+    assert.deepEqual(mod.findCountLabel('foo', { total: Number.NaN, current: 1 }), label('无结果', true), '无法解析的总数按无命中处理');
+    assert.deepEqual(mod.findCountLabel('foo', { total: '3', current: '2' }), label('2/3'), '数字串可解析');
+    assert.deepEqual(mod.findCountLabel('', { total: 3, current: 1 }), label(''), '查询串为空时为空串');
+    assert.deepEqual(mod.findCountLabel(null, { total: 3, current: 1 }), label(''));
+    assert.deepEqual(mod.findCountLabel('foo', { total: 0, current: 0, pending: true }), label(''), '目标视图尚未就绪（帧未装载完）时为空串，不显示「无结果」');
 });
 
 test('lineStartOffset 与 docLocation', () => {
