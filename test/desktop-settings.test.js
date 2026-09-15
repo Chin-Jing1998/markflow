@@ -72,6 +72,18 @@ test('set：深合并 + 原子写，重新加载得到同样内容，不留临�
     assert.equal(again.get().theme, 'dark');
 });
 
+test('文件库仓库列表：可保存多个本地仓库并记住当前仓库', async () => {
+    const dir = workDir();
+    const store = makeStore(dir);
+    const repositories = [path.join(dir, 'vault-a'), path.join(dir, 'vault-b')];
+    const next = await store.set({ library: { repositories, activeRepository: repositories[1] } });
+    assert.deepEqual(next.library.repositories, repositories);
+    assert.equal(next.library.activeRepository, repositories[1]);
+    const reloaded = makeStore(dir).load();
+    assert.deepEqual(reloaded.library.repositories, repositories);
+    assert.equal(reloaded.library.activeRepository, repositories[1]);
+});
+
 test('set：非法值与未知键一律拒绝，磁盘不变', async () => {
     const dir = workDir();
     const store = makeStore(dir);

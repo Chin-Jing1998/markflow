@@ -26,7 +26,7 @@
 
 | 目标 | 落盘布局 | 产物 |
 |---|---|---|
-| `bundle` | 目录 | `{名称}/{名称}.md` + `{名称}.json` + `images/`；PDF 走 MinerU 时另有 `mineru/` |
+| `bundle` | 目录 | 仿照 MinerU 结果包：`{名称}/{名称}.md` + `{名称}.json` + `{名称}_content_list.json` + `images/`（原图）；PDF 走 MinerU 时另有 `{名称}_content_list_v2.json`、`{名称}_model.json`、`{名称}_layout.json`、`{名称}_origin.pdf` |
 | `docx` | 单文件 | `{名称}.docx` |
 | `pdf` | 单文件 | `{名称}.pdf` |
 | `html` | 目录 | `{名称}/{名称}.html` + `images/` |
@@ -298,7 +298,7 @@ xmllint --nonet --noout --dtdvalid converters/renderers/xml/dtd/cn-application-b
 
 云端解析失败时不会静默降级为本地解析——回退会悄悄产出一份缺图少版面的文档，显式报错并提示 `--pdf-backend local` 才能把选择权交回使用者。常见错误码（令牌无效、超出 200 MB、超出页数上限、额度耗尽、解析超时）均已中文化，并附具体处置建议；超时文案带 `batch_id` 便于到控制台查任务。
 
-MinerU 的全部产物原样落在产物目录的 `mineru/` 下，包括 `full.md`、`layout.json`、`*_content_list.json`、`*_model.json` 与 `images/`；其中 `full.md` 用于构建中间表示，图片归一后进 `images/`。
+MinerU 结果包按文档名改名后与主产物平铺在同一目录：`*_content_list.json` → `{名称}_content_list.json`（图片块补 `display` 显示尺寸，由 0–1000 归一化 `bbox` × `layout.json` 的 `page_size` × 96/72 算出）、`*_content_list_v2.json` → `{名称}_content_list_v2.json`、`*_model.json` → `{名称}_model.json`、`layout.json` → `{名称}_layout.json`、`*_origin.pdf` → `{名称}_origin.pdf`，其余文件加 `{名称}_` 前缀。`full.md` 只用于构建中间表示、不再落盘；包内图片（含 `full.md` 未引用的表格截图）统一编号为 `images/image_N.*` 并保留原字节，各 JSON 中的哈希图名随之改写为 `images/image_N.*`（`layout` 中为裸文件名）。content_list 的 `image_caption` / `image_footnote` 文字会移到对应图片之后成段。
 
 令牌按以下优先级解析，任一环节取到即停止：
 
@@ -313,6 +313,8 @@ MinerU 的全部产物原样落在产物目录的 `mineru/` 下，包括 `full.m
 ## 图片与公式处理
 
 图片默认统一为 JPG：png、bmp、tiff、webp 与静态 gif 解码后铺白合成，以 `--jpeg-quality`（默认 90）控制压缩质量，并以 `--jpeg-ppi`（默认 330 PPI）写入 JFIF 密度；已是 JPEG 的只补写密度、不重编码。svg、emf、wmf 与动图 gif 保持原格式并告警。`--image-format keep` 关闭整条归一链路。
+
+`bundle` 目标例外：`images/` 存与原件逐字节一致的原图（不转码、不改 JFIF 密度），归一与上述选项只作用于 html、xml 等其它目标；tiff、emf、wmf 原样保留并告警「多数 Markdown 查看器无法显示」。Markdown 中的图片取得到原文档或原网页的显示尺寸时写成 `<img src="images/image_N.ext" width="W" alt="…">`（docx 取 `wp:extent`、pptx 取形状 `a:ext`、网页取 width 属性或样式、MinerU 取 `bbox`），段首缩进写为全角空格，图注为紧随图片的独立段落。
 
 护栏与降级：默认按 `raster.maxWidth`（1600 px）等比缩小，`patent` profile 下禁用缩放以保留原始像素；像素数超过 8000 万或字节数超过 200 MB 的图片保留原图并告警；多页 TIFF 取首页；单张失败只降级为告警，不影响整份转换。`patent` profile 下的 EMF/WMF 先试栅格化后端，再试 LibreOffice，两者皆不可用时告警。
 

@@ -38,6 +38,8 @@ const NOTES_REL_TYPE_RE = /\/notesSlide$/;
 // 进度百分比区间：parser 只报 parsing 阶段，按已解析页数比例映射到该区间
 const PROGRESS_MIN = 20;
 const PROGRESS_MAX = 55;
+// DrawingML 长度单位：1 px（96 dpi）= 9525 EMU
+const EMU_PER_PX = 9525;
 
 let JSZip = null;
 function loadJSZip() {
@@ -79,16 +81,16 @@ async function parse(input, ctx = {}) {
         const slideNum = extractSlideNum(slidePath);
         const { title, bodies, picRefs } = parseSlideXml(await zip.file(slidePath).async('text'));
 
-        // 图片：按 p:pic 出现顺序解析
+        // 图片：按 p:pic 出现顺序解析；显示尺寸取自本页形状的 a:ext（同一媒体在各页可以不同）
         const relMap = await readRels(zip, slidePath);
         const images = [];
-        for (const rid of picRefs) {
-            const asset = await resolveImageAsset({ zip, relMap, rid, slideNum, assets, assetByMedia, warnings });
-            if (asset) images.push(asset.name);
+        for (const ref of picRefs) {
+            const asset = await resolveImageAsset({ zip, relMap, rid: ref.rid, slideNum, assets, assetByMedia, warnings });
+            if (asset) images.push({ name: asset.name, display: displayFromExtent(ref) });
         }
 
         const notes = await readNotes(zip, relMap);
-        slidesData.push({ slideNum, title, bodies, notes, images });
+        slidesData.push({ slideNum, title, bodies, notes, images: images.map((image) => image.name) });
 
         // IR 构建：slideBreak → 正文段落 → 图片段落 → 备注
         ir.children.push(createSlideBreak({ title, index: i, notes }));
@@ -100,9 +102,11 @@ async function parse(input, ctx = {}) {
                 if (trimmed) ir.children.push(createParagraph(trimmed));
             }
         }
-        for (const name of images) {
+        for (const image of images) {
             // 行内 image 节点无工厂函数（schema 只保留块级工厂），按 mdast 结构直接构造
-            ir.children.push(createParagraph([{ type: 'image', url: name, alt: '' }]));
+            const node = { type: 'image', url: image.name, alt: '' };
+            if (image.display) node.data = { display: image.display };
+            ir.children.push(createParagraph([node]));
         }
         if (notes) {
             ir.children.push(createBlockquote([createParagraph(`备注：${notes}`)]));
@@ -223,13 +227,29 @@ function parseSlideXml(xml) {
     // 兜底：没找到 title placeholder 时，把首个 body 升格为 title
     if (!title && bodies.length > 0) title = bodies.shift();
 
+    // 图片引用连同形状的显示尺寸（p:spPr/a:xfrm/a:ext，EMU）一并取出，位置顺序不变
     const picRefs = [];
     $('p\\:pic').each((_, pic) => {
-        const rid = $(pic).find('a\\:blip').first().attr('r:embed');
-        if (rid) picRefs.push(rid);
+        const $pic = $(pic);
+        const rid = $pic.find('a\\:blip').first().attr('r:embed');
+        if (!rid) return;
+        const $ext = $pic.children('p\\:spPr').children('a\\:xfrm').children('a\\:ext').first();
+        picRefs.push({ rid, cx: Number($ext.attr('cx')) || 0, cy: Number($ext.attr('cy')) || 0 });
     });
 
     return { title, bodies, picRefs };
+}
+
+/** a:ext 的 EMU 尺寸 → data.display（px）；取不到宽度返回 null */
+function displayFromExtent({ cx, cy }) {
+    const width = Math.round(cx / EMU_PER_PX);
+    if (!(width >= 1)) return null;
+    const display = { width };
+    const height = Math.round(cy / EMU_PER_PX);
+    if (height >= 1) display.height = height;
+    display.unit = 'px';
+    display.source = 'pptx';
+    return display;
 }
 
 /**

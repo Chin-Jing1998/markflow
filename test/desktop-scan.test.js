@@ -105,3 +105,31 @@ test('空入参与非数组入参返回空结果', async () => {
     assert.deepEqual(await scanPaths([]), { files: [], unsupported: [], truncated: false });
     assert.deepEqual(await scanPaths('not-an-array'), { files: [], unsupported: [], truncated: false });
 });
+
+// ============================================================
+// 文件库浏览范围（mf:paths:expand scope:'browse'）
+// ============================================================
+
+const { BROWSE_EXTENSIONS, READER_EXTENSIONS } = require('../desktop/main/file-kinds');
+const { SUPPORTED_EXTENSIONS } = require('../converters/targets');
+
+const browse = path.join(root, 'browse');
+const browseFiles = ['browse/page.html', 'browse/old.htm', 'browse/sub/data.xml', 'browse/sub/data.json', 'browse/note.md', 'browse/skip.txt'];
+for (const rel of browseFiles) write(rel, 'x');
+
+test('browse 范围列出 .html / .htm / .xml / .json 与转档白名单内的文件', async () => {
+    const { files: found } = await scanPaths([browse], { exts: BROWSE_EXTENSIONS });
+    assert.deepEqual(found.map((entry) => path.relative(root, entry.path).split(path.sep).join('/')).sort(),
+        ['browse/note.md', 'browse/old.htm', 'browse/page.html', 'browse/sub/data.json', 'browse/sub/data.xml']);
+});
+
+test('默认范围（转档入口）仍不含 html / xml / json（回归守卫）', async () => {
+    const { files: found } = await scanPaths([browse]);
+    assert.deepEqual(found.map((entry) => entry.name), ['note.md']);
+    assert.ok(!SUPPORTED_EXTENSIONS.some((ext) => ['.html', '.htm', '.xml', '.json'].includes(ext)), '转档白名单不得放宽');
+});
+
+test('BROWSE_EXTENSIONS ⊇ READER_EXTENSIONS ∪ SUPPORTED_EXTENSIONS', () => {
+    for (const ext of [...READER_EXTENSIONS, ...SUPPORTED_EXTENSIONS]) assert.ok(BROWSE_EXTENSIONS.includes(ext), ext);
+    assert.ok(READER_EXTENSIONS.includes('.json'));
+});

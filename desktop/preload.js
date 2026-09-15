@@ -40,7 +40,7 @@ contextBridge.exposeInMainWorld('markflow', {
     describeFormats: () => invoke('mf:formats:describe'),
     pickFiles: (options) => invoke('mf:dialog:pickFiles', options),
     pickDirectory: (options) => invoke('mf:dialog:pickDirectory', options),
-    expandPaths: (paths) => invoke('mf:paths:expand', { paths }),
+    expandPaths: (paths, options) => invoke('mf:paths:expand', options && options.scope ? { paths, scope: options.scope } : { paths }),
 
     convertRun: (payload) => invoke('mf:convert:run', payload),
     convertCancel: (runId) => invoke('mf:convert:cancel', { runId }),
@@ -51,6 +51,9 @@ contextBridge.exposeInMainWorld('markflow', {
     previewExport: (payload) => invoke('mf:preview:export', payload),
     previewClose: (payload) => invoke('mf:preview:close', payload),
     readerOpen: (payload) => invoke('mf:reader:open', payload),
+    mdRender: (payload) => invoke('mf:md:render', payload),
+    mdSave: (payload) => invoke('mf:md:save', payload),
+    mdInsertImage: (payload) => invoke('mf:md:insertImage', payload),
     onPreviewEvent: (callback) => subscribe('mf:preview:event', callback),
 
     libraryList: (params) => invoke('mf:library:list', params),
@@ -71,4 +74,6 @@ contextBridge.exposeInMainWorld('markflow', {
     onThemeChanged: (callback) => subscribe('mf:theme:changed', callback),
 
     openExternal: (url) => invoke('mf:shell:openExternal', { url }),
+    // 当前文件操作：只传会话与动作，文件路径由主进程按 sessionId 取
+    fileAction: (sessionId, action) => invoke('mf:file:action', { sessionId, action }),
 });

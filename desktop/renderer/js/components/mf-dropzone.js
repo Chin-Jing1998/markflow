@@ -42,10 +42,10 @@ class MfDropzone extends HTMLElement {
             this.emit(paths);
         });
         zone.addEventListener('click', (event) => {
-            const button = event.target instanceof Element ? event.target.closest('button[data-action]') : null;
-            if (!button) return;
+            // 区域内任意位置点击都触发选择文件；只有「选择文件夹」按钮本身例外，走文件夹选择
+            const folderButton = event.target instanceof Element ? event.target.closest('[data-action="folder"]') : null;
             event.stopPropagation();
-            this.pick(button.dataset.action === 'folder');
+            this.pick(Boolean(folderButton));
         });
         zone.addEventListener('keydown', (event) => {
             if (event.key === 'Enter' || event.key === ' ') {

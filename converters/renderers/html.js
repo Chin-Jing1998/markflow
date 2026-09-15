@@ -24,6 +24,7 @@ const { pathToFileURL } = require('url');
 const { stripHtml } = require('../ir/util');
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
+const { stripMarkersTree, applyTextLayout } = require('../ir/markers');
 const { normalizeOptions, DEFAULT_OPTIONS } = require('../options');
 const { buildStyles } = require('./html-themes');
 
@@ -40,6 +41,8 @@ const IMG_SRC_BY_MODE = Object.freeze({
 const IMAGE_MODES = Object.freeze(Object.keys(IMG_SRC_BY_MODE));
 const URL_SCHEME_RE = /^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\//;
 const IMAGE_MIME_RE = /^image\/[a-z0-9.+-]+$/;
+const PX_RE = /^\d{1,5}$/;
+const MAX_PERCENT = 100;
 
 // ============================================================
 // 入口
@@ -58,12 +61,13 @@ async function render(doc, options, context = {}) {
     const resolveSrc = createImageResolver(doc, mode);
 
     const { unified, remarkRehype, rehypeStringify } = await loadUnified();
-    const root = downgradeCustomNodes(doc.ir || { type: 'root', children: [] });
+    // 残留标记兜底剥除；段首缩进与制表符按 md 渲染器的同一约定落为全角空格（HTML 不折叠 U+3000）
+    const root = downgradeCustomNodes(applyTextLayout(stripMarkersTree(doc.ir || { type: 'root', children: [] })));
 
     const hast = await unified()
         .use(remarkRehype, {
             allowDangerousHtml: false,
-            handlers: { image: createImageHandler(resolveSrc), html: htmlHandler, math: mathHandler },
+            handlers: { image: createImageHandler(resolveSrc), html: htmlHandler, math: mathHandler, underline: underlineHandler },
         })
         .run(root);
     // stringify 的 allowDangerousHtml 只影响 raw 节点，而 raw 节点仅由本文件在白名单校验通过后自建；
@@ -170,7 +174,7 @@ function encodeAssetPath(name) {
 // 自定义 handler
 // ============================================================
 
-/** image：按 imageMode 解析 src；无本地来源时不输出 src，只保留 alt 占位 */
+/** image：按 imageMode 解析 src；无本地来源时不输出 src，只保留 alt 占位；有来源时带校验后的显示宽高 */
 function createImageHandler(resolveSrc) {
     return (state, node) => {
         const src = resolveSrc(node) || '';
@@ -178,10 +182,31 @@ function createImageHandler(resolveSrc) {
         if (node.alt !== null && node.alt !== undefined) properties.alt = node.alt;
         // title 仅在图片确有本地来源时保留，无来源的图片降级为纯 alt 占位
         if (src && node.title !== null && node.title !== undefined) properties.title = node.title;
+        if (src) Object.assign(properties, displayAttributes(node));
         const result = { type: 'element', tagName: 'img', properties, children: [] };
         state.patch(node, result);
         return state.applyData(node, result);
     };
+}
+
+/** data.display → width / height 属性：px 为 1–99999 的整数（height 仅 px），百分比为 (0, 100]；不合规不输出 */
+function displayAttributes(node) {
+    const display = node.data && node.data.display;
+    if (!display || !Number.isFinite(display.width) || display.width <= 0) return {};
+    if (display.unit === '%') return display.width <= MAX_PERCENT ? { width: `${display.width}%` } : {};
+    const width = String(Math.round(display.width));
+    if (!PX_RE.test(width)) return {};
+    const attrs = { width };
+    const height = Number.isFinite(display.height) ? String(Math.round(display.height)) : '';
+    if (height && PX_RE.test(height) && Number(height) > 0) attrs.height = height;
+    return attrs;
+}
+
+/** underline：<u> 元素 */
+function underlineHandler(state, node) {
+    const result = { type: 'element', tagName: 'u', properties: {}, children: state.all(node) };
+    state.patch(node, result);
+    return state.applyData(node, result);
 }
 
 /**

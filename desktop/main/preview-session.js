@@ -18,7 +18,17 @@
  *   export({ sessionId, outputDir? })
  *     → { outputPath, outputs, extras, warnings, libraryId, name, title, managed }
  *     以默认图片寻址重渲染后 writeDocument 落盘，再 library.upsertFromResult 写入文件库。
- *   close({ sessionId }) 撤销 sid、删除临时目录。
+ *   close({ sessionId }) 先等挂起的保存与导出跑完，再撤销 sid、删除临时目录。
+ *
+ * 产物 Markdown 编辑（仅 bundle 目标；ipc 按 sessionId 分派到这里）：
+ *   renderMarkdown({ sessionId, text? }) → { sessionId, html, warnings, gen }   首次调用时建编辑区 tempDir/edit
+ *       （bundle 以 relative 寻址渲染，图片写入其中，markdown 初值为 bundle md 原文），预览图片写 tempDir/edit-view/g<gen>/
+ *   saveMarkdown({ sessionId, text, force? }) → 未导出时只暂存，回 { saved:true, staged:true }；
+ *       导出后已绑定到导出的 md，按 md-edit.saveMarkdownFile 原子写盘（带 mtime/size 冲突检测）
+ *   importImage({ sessionId, sourcePath }) → 导入编辑区（已绑定时即导出目录）的 images/
+ *   render 时若有编辑即丢弃（回包带 editDiscarded:true）；export 在 md 有改动或已绑定时走 exportEdited：
+ *       md 逐字写出 + 只带被引用的图片 + 契约 renderBundleSidecars 重建旁路 json → writeDocument → 文件库，
+ *       随后绑定到导出文件（回包带 boundPath）。
  *
  * 标题：每次渲染后若 renderDocument 给出非空 title（patent profile 为发明名称），即回写会话并随
  * open / render 回包下发给页头，export 写入文件库记录时用同一值；渲染器给不出时沿用解析阶段的标题。
@@ -40,10 +50,19 @@ const { normalizeOptions } = require('../../converters/options');
 const { sanitizeHtml } = require('./html-sanitize');
 const { buildXmlView } = require('./xml-view');
 const { buildMarkdownView, writeAssets, assetBaseFor, READER_THEME } = require('./reader');
+const {
+    renderMarkdownText, saveMarkdownFile, buildBundleSidecars, importImage: importImageFile, referencedImages,
+} = require('./md-edit');
+const { MAX_TEXT_BYTES } = require('./file-kinds');
 
 const TEMP_PREFIX = 'markflow-preview-';
 const SOURCE_DIRNAME = 'source';
 const PRODUCT_DIRNAME = 'product';
+/** 产物 Markdown 编辑区（未导出前的 md 图片与插图落在这里，不受 renderProduct 清空产物目录影响） */
+const EDIT_DIRNAME = 'edit';
+/** 编辑器实时预览的图片按渲染代次落在 edit-view/g<gen>/ */
+const EDIT_VIEW_DIRNAME = 'edit-view';
+const NAME_TOKEN = '{name}';
 const PDF_PREVIEW_NAME = 'preview.pdf';
 const PRECHECK_FILE = 'precheck.json';
 const MAX_SESSIONS = 3;
@@ -162,6 +181,9 @@ function createPreviewSessions(deps = {}) {
                 : { kind: 'file', value, name: path.basename(value), dir: path.dirname(value), type },
             type, target, flat: { ...defaultsOf(), ...(payload.options || {}) },
             parseFlat: null, doc: null, name: '', title: '', backends: null,
+            // 产物 Markdown 编辑：edit 为 null 或 { original, markdown, dir, boundPath, base, gen }；
+            // epoch 在每次重渲染丢弃编辑时递增，挂起的建区与保存据此作废；chain 串行化保存与导出
+            edit: null, editInit: null, epoch: 0, chain: Promise.resolve(),
         };
         sessions.set(session.id, session);
 
@@ -345,6 +367,8 @@ function createPreviewSessions(deps = {}) {
         }
         const changedKeys = changedReparseKeys(session.parseFlat, flat);
         session.flat = flat;
+        // 重渲染即丢弃产物 Markdown 的编辑（界面已先征得用户确认）；已绑定到导出文件的修改早已落盘，导出目录不动
+        const editDiscarded = await discardEdit(session);
         let sourceView = null;
         if (changedKeys.length > 0) {
             await parseInto(session);
@@ -355,8 +379,187 @@ function createPreviewSessions(deps = {}) {
             sessionId: session.id, target: session.target, options: { ...session.flat },
             product, reparsed: changedKeys.length > 0, changedKeys,
             ...(sourceView ? { sourceView } : {}),
+            ...(editDiscarded ? { editDiscarded: true } : {}),
             name: session.name, title: session.title, backends: session.backends,
         };
+    }
+
+    // ---------- 产物 Markdown 编辑 ----------
+
+    const noop = () => undefined;
+    const mdCore = mdCoreOf(deps.core, core);
+    const editDirOf = (session) => path.join(session.tempDir, EDIT_DIRNAME);
+
+    /** 首次调用 md 接口时建编辑区，并发调用共用同一次建区；仅 bundle 目标可编辑 */
+    function ensureEdit(session) {
+        if (session.edit) return Promise.resolve(session.edit);
+        if (!session.editInit) {
+            session.editInit = beginEdit(session).catch((err) => {
+                session.editInit = null;
+                throw err;
+            });
+        }
+        return session.editInit;
+    }
+
+    /** 以 relative 寻址渲染 bundle：图片写进 tempDir/edit，markdown 初值为 bundle md 原文（含 front matter） */
+    async function beginEdit(session) {
+        if (session.target !== 'bundle') throw new Error('只有「MD 包」目标的产物可以编辑，请先把目标切换为 MD 包');
+        const epoch = session.epoch;
+        const dir = editDirOf(session);
+        await resetDir(dir);
+        const rendered = await core.renderDocument(session.doc, 'bundle', optionsFor(session.flat), { imageMode: 'relative' });
+        await writeAssets(dir, rendered.assets);
+        if (session.epoch !== epoch) throw new Error('产物已重新渲染，请重试');
+        const mdName = Object.keys(rendered.files).find((key) => key.endsWith('.md'));
+        const original = mdName ? String(rendered.files[mdName]) : '';
+        session.edit = { original, markdown: original, dir, boundPath: null, base: null, gen: 0 };
+        return session.edit;
+    }
+
+    /** 丢弃编辑：删临时编辑区与预览代次目录；已绑定时 dir 是导出目录，绝不删除 */
+    async function discardEdit(session) {
+        session.epoch += 1;
+        session.editInit = null;
+        const edit = session.edit;
+        session.edit = null;
+        await tmp.removeTempDir(path.join(session.tempDir, EDIT_VIEW_DIRNAME));
+        if (!edit) return false;
+        if (edit.dir === editDirOf(session)) await tmp.removeTempDir(edit.dir);
+        return true;
+    }
+
+    /** 编辑器实时预览：baseDir 为编辑区（或已绑定的导出目录），图片按代次写 edit-view/g<gen>/，主题同产物预览 */
+    async function renderMarkdown(payload = {}) {
+        const session = require_(payload.sessionId);
+        const edit = await ensureEdit(session);
+        const text = typeof payload.text === 'string' ? payload.text : edit.markdown;
+        edit.gen += 1;
+        const gen = edit.gen;
+        const viewRoot = path.join(session.tempDir, EDIT_VIEW_DIRNAME);
+        const options = optionsFor(session.flat);
+        const built = await renderMarkdownText({
+            text, baseDir: edit.dir, sourceName: `${session.name}.md`,
+            assetDir: path.join(viewRoot, `g${gen}`), assetBase: `${assetBaseFor(session.sid)}${EDIT_VIEW_DIRNAME}/g${gen}/`,
+            theme: options.html.theme, options, core: mdCore,
+        });
+        if (gen > 2) await tmp.removeTempDir(path.join(viewRoot, `g${gen - 2}`));
+        return { sessionId: session.id, html: built.html, warnings: built.warnings, gen };
+    }
+
+    function assertTextSize(text) {
+        const bytes = Buffer.byteLength(text, 'utf8');
+        if (bytes > MAX_TEXT_BYTES) throw new Error(`文本过大（${(bytes / 1024 / 1024).toFixed(1)} MB），保存上限为 ${MAX_TEXT_BYTES / 1024 / 1024} MB`);
+    }
+
+    /** 保存与编辑后导出串行：同一会话同一时刻只有一个写操作 */
+    function exclusive(session, task) {
+        const run = session.chain.then(task);
+        session.chain = run.then(noop, noop);
+        return run;
+    }
+
+    /** 未绑定时只暂存（回 staged:true）；导出后已绑定则对导出的 md 走带冲突检测的原子写 */
+    async function saveMarkdown(payload = {}) {
+        const session = require_(payload.sessionId);
+        const text = String(payload.text == null ? '' : payload.text);
+        assertTextSize(text);
+        const epoch = session.epoch;
+        return exclusive(session, async () => {
+            if (session.epoch !== epoch) return { sessionId: session.id, saved: false, conflict: false, missing: false, discarded: true, warnings: [] };
+            const edit = await ensureEdit(session);
+            if (!edit.boundPath) {
+                edit.markdown = text;
+                return { sessionId: session.id, saved: true, staged: true, conflict: false, missing: false, warnings: [] };
+            }
+            const result = await saveMarkdownFile({ filePath: edit.boundPath, text, base: edit.base, force: Boolean(payload.force), core: mdCore, log });
+            if (result.saved) {
+                edit.base = result.base;
+                edit.markdown = text;
+            }
+            return { sessionId: session.id, staged: false, boundPath: edit.boundPath, ...result };
+        });
+    }
+
+    async function importImage(payload = {}) {
+        const session = require_(payload.sessionId);
+        const edit = await ensureEdit(session);
+        return importImageFile({ sourcePath: payload.sourcePath, docDir: edit.dir });
+    }
+
+    /** 插图对话框的默认目录：已绑定取导出目录，否则取来源文件所在目录（网页来源不给） */
+    function imageDialogDir(payload = {}) {
+        const session = require_(payload.sessionId);
+        if (session.edit && session.edit.boundPath) return path.dirname(session.edit.boundPath);
+        return session.source.kind === 'file' ? session.source.dir : undefined;
+    }
+
+    const hasEditedMarkdown = (session) => Boolean(session.edit && session.target === 'bundle'
+        && (session.edit.boundPath || session.edit.markdown !== session.edit.original));
+
+    async function registerLibrary(result, { managed, dir }) {
+        if (!library) return null;
+        try {
+            const record = await library.upsertFromResult(result, { managed, outputDir: dir });
+            return record.id;
+        } catch (err) {
+            log(`[desktop] 预览导出写入文件库失败：${errText(err)}`);
+            return null;
+        }
+    }
+
+    /**
+     * 编辑后的导出：md 按编辑器文本逐字写出，只带出被引用的图片，旁路 json 由契约函数按新文本重建；
+     * 仍交 core.writeDocument 复用路径校验，再登记文件库；随后把编辑区绑定到导出文件，此后保存直接写盘。
+     */
+    async function exportEdited(session, { dir, managed }) {
+        const edit = session.edit;
+        const text = edit.markdown;
+        const warnings = [...asArray(session.doc.warnings)];
+        const files = { [`${NAME_TOKEN}.md`]: text };
+        try {
+            const sidecars = await buildBundleSidecars({
+                text, baseDir: edit.dir, sourceName: `${session.name}.md`, previousMeta: session.doc.meta, name: session.name, core: mdCore,
+            });
+            if (sidecars) {
+                files[`${NAME_TOKEN}.json`] = sidecars.json;
+                files[`${NAME_TOKEN}_content_list.json`] = sidecars.contentList;
+            } else {
+                warnings.push('当前转换内核未提供 renderBundleSidecars，本次导出未附带旁路 JSON');
+            }
+        } catch (err) {
+            warnings.push(`旁路 JSON 重建失败：${errText(err)}`);
+        }
+        const images = await referencedImages(text, edit.dir);
+        const assets = await Promise.all(images.map(async (item) => ({ name: item.name, buffer: await fsp.readFile(item.absPath) })));
+        const written = await core.writeDocument({ rendered: { files, assets, extras: [] }, target: 'bundle', outputDir: dir, name: session.name });
+        const result = {
+            input: session.source.value, target: 'bundle', name: session.name, title: session.title, sourceType: session.type,
+            outputPath: written.outputPath, outputs: written.outputs, imagesCount: assets.length, warnings,
+            options: core.redactOptions(optionsFor(session.flat)), extras: written.extras || [],
+            backends: session.backends || { pdfParser: null, raster: null },
+        };
+        const libraryId = await registerLibrary(result, { managed, dir });
+        const boundPath = await bindEdit(session, edit, written);
+        if (!boundPath) warnings.push('导出成功，但未能定位导出的 Markdown 文件，之后的修改需再次导出');
+        return {
+            outputPath: written.outputPath, outputs: written.outputs, extras: written.extras || [],
+            warnings, libraryId, managed, name: session.name, title: session.title, target: 'bundle',
+            ...(boundPath ? { boundPath } : {}),
+        };
+    }
+
+    async function bindEdit(session, edit, written) {
+        const outputs = written && written.outputs ? written.outputs : {};
+        const mdPath = typeof outputs.md === 'string' ? outputs.md : path.join(written.outputPath, `${session.name}.md`);
+        const stat = await fsp.stat(mdPath).catch(() => null);
+        if (!stat || !stat.isFile() || session.edit !== edit) return null;
+        const previousDir = edit.dir;
+        edit.dir = written.outputPath;
+        edit.boundPath = mdPath;
+        edit.base = { mtimeMs: stat.mtimeMs, size: stat.size };
+        if (previousDir === editDirOf(session)) await tmp.removeTempDir(previousDir);
+        return mdPath;
     }
 
     // ---------- export ----------
@@ -368,6 +571,7 @@ function createPreviewSessions(deps = {}) {
         const dir = payload.outputDir
             || (managed ? library.managedOutputDir({ root: current.library.root }) : current.outputDir);
         await fsp.mkdir(dir, { recursive: true });
+        if (hasEditedMarkdown(session)) return exclusive(session, () => exportEdited(session, { dir, managed }));
 
         const options = optionsFor(session.flat);
         const rendered = await core.renderDocument(session.doc, session.target, options);
@@ -383,15 +587,7 @@ function createPreviewSessions(deps = {}) {
             options: core.redactOptions(options), extras: written.extras,
             backends: session.backends || { pdfParser: null, raster: null },
         };
-        let libraryId = null;
-        if (library) {
-            try {
-                const record = await library.upsertFromResult(result, { managed, outputDir: dir });
-                libraryId = record.id;
-            } catch (err) {
-                log(`[desktop] 预览导出写入文件库失败：${errText(err)}`);
-            }
-        }
+        const libraryId = await registerLibrary(result, { managed, dir });
         return {
             outputPath: written.outputPath, outputs: written.outputs, extras: written.extras,
             warnings, libraryId, managed, name: session.name, title: result.title, target: session.target,
@@ -400,18 +596,34 @@ function createPreviewSessions(deps = {}) {
 
     // ---------- close ----------
 
+    /** 先等该会话挂起的保存与导出跑完，再撤销授权、删临时目录 */
     async function close(payload = {}) {
         const session = sessions.get(String(payload.sessionId || ''));
         if (!session) return { closed: false };
+        await session.chain.catch(noop);
         await dispose(session);
         return { closed: true };
     }
 
     async function closeAll() {
-        for (const session of [...sessions.values()]) await dispose(session);
+        for (const session of [...sessions.values()]) {
+            await session.chain.catch(noop);
+            await dispose(session);
+        }
     }
 
-    return { open, render, export: exportProduct, close, closeAll, sessions };
+    return {
+        open, render, export: exportProduct, close, closeAll,
+        renderMarkdown, saveMarkdown, importImage, imageDialogDir, sessions,
+    };
+}
+
+/** md-edit 用的内核：渲染沿用会话内核（测试桩同样生效）；parseMarkdown / renderBundleSidecars 仅在注入时覆盖 */
+function mdCoreOf(raw, loaded) {
+    const out = { renderDocument: loaded.renderDocument };
+    if (raw && typeof raw.parseMarkdown === 'function') out.parseMarkdown = raw.parseMarkdown;
+    if (raw && Object.prototype.hasOwnProperty.call(raw, 'renderBundleSidecars')) out.renderBundleSidecars = raw.renderBundleSidecars;
+    return out;
 }
 
 // ============================================================

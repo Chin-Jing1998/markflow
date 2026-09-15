@@ -3,15 +3,25 @@
  *
  * profile 取值与行为来源：
  *   'basic' — 通用 HTML：基础选项 + 移除 script/style/noscript（源自 ir/util.js:78）
- *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img（源自 旧版 word.js:130）
- *   'url'   — 网页正文：基础选项 + 内联样式识别 + figure/figcaption + section 透传
+ *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img + 保留 <u>（mammoth 经 styleMap 'u => u' 产出，
+ *             由 ir/inline-html 提升为 underline 节点）
+ *   'url'   — 网页正文：基础选项 + 内联样式识别 + figure/figcaption + section 块级
  *             + 移除 script/style/noscript/iframe/nav/footer/aside（源自 旧版 url.js:239）
- *             + 表格转 GFM（legacy 未挂此规则；turndown 核心不含表格支持，缺失时网页表格
- *               退化为逐行纯文本，IR 得不到 table 节点，故此处补挂）
+ *             + 表格转 GFM（turndown 核心不含表格支持，缺失时网页表格退化为逐行纯文本，IR 得不到 table 节点）
+ *
+ * url profile 的输出约定（与 ir/markers、ir/inline-html 配套）：
+ *   - 粗体、斜体、删除线一律输出 <strong>/<em>/<del> HTML 而非 ** / * / ~~：CommonMark 的 flanking 规则在中文
+ *     标点旁失效（如「依据**《词典》**的」），字面星号会被 md 渲染器转义成 \*\*；HTML 标签由 ir/inline-html
+ *     在 remark 解析后还原为 strong/emphasis/delete 节点，与标点无关
+ *   - <section> 按块级输出（\n\n…\n\n）：微信正文全由 section 构成，透传会使整篇塌成一段
+ *   - <br> 输出 BR 标记，由 parsers/url 的 collapseBreakMarkers 折叠：双 BR 分段、单 BR 转硬换行
+ *   - 图注（figcaption、微信小字图注）输出 CAPTION 标记开头的独立段落，由 ir/markers 还原为 data.role
+ *   - 带 data-mf-display 的 <img> 输出 <img src alt width>，由 ir/inline-html 还原为带 data.display 的 image 节点
  *
  * 表格规则 convertTableToMarkdown 为本文件内部函数，不再在其他文件重复实现。
  */
 const TurndownService = require('turndown');
+const { MARKERS } = require('./markers');
 
 const BASE_OPTIONS = {
     headingStyle: 'atx',
@@ -32,6 +42,11 @@ const STRIKE_STYLE_RE = /text-decoration\s*:\s*line-through/i;
 // 微信图片说明：字号 ≤ 14px 的小字
 const SMALL_FONT_RE = /font-size\s*:\s*(1[0-4]|[0-9])px/i;
 const CAPTION_MAX_LENGTH = 100;
+const CAPTION_TAGS = new Set(['SPAN', 'P', 'SECTION']);
+// 分块包裹时不套标签的 Markdown 块语法（标题、引用、列表、表格、代码围栏）
+const BLOCK_SYNTAX_RE = /^(?:#{1,6}\s|>|[-*+]\s|\d{1,9}[.)]\s|\||```|~~~)/;
+// data-mf-display 的取值：'677' | '677x300' | '50%'（见 web/image-display.formatDisplayAttr）
+const DISPLAY_ATTR_RE = /^(\d{1,5})(?:x(\d{1,5}))?$|^(\d{1,3}(?:\.\d+)?)%$/;
 
 /** @param {'basic'|'word'|'url'} profile @returns {TurndownService} */
 function createTurndownService(profile = 'basic') {
@@ -47,7 +62,7 @@ function createTurndownService(profile = 'basic') {
 // ---------- 规则辅助 ----------
 
 function styleOf(node) {
-    return (node.getAttribute && node.getAttribute('style')) || '';
+    return (node && node.getAttribute && node.getAttribute('style')) || '';
 }
 
 function wrapTrimmed(content, marker) {
@@ -55,18 +70,35 @@ function wrapTrimmed(content, marker) {
     return text ? `${marker}${text}${marker}` : '';
 }
 
-// 图片说明统一转为独立成行的斜体
-const italicLine = (content) => (content.trim() ? `\n*${content.trim()}*\n` : '');
+/**
+ * 以 HTML 标签包裹：内容含空行（块级内容）时逐块包裹，Markdown 块语法开头的块不包，
+ * 避免开闭标签落在不同段落里失配
+ */
+function wrapHtml(content, open, close) {
+    const text = content.trim();
+    if (!text) return '';
+    if (!/\n\s*\n/.test(text)) return `${open}${text}${close}`;
+    return text.split(/\n\s*\n/)
+        .map((chunk) => chunk.trim())
+        .filter(Boolean)
+        .map((chunk) => (BLOCK_SYNTAX_RE.test(chunk) ? chunk : `${open}${chunk}${close}`))
+        .join('\n\n');
+}
 
-// 微信公众号图片说明：紧跟在图片后面、字号较小的短文本
+// 图注：CAPTION 标记开头的独立段落（不再转斜体，md 中与 MinerU full.md 一样是图片后的普通段落）
+const captionBlock = (content) => (content.trim() ? `\n\n${MARKERS.CAPTION}${content.trim()}\n\n` : '');
+
+// 微信公众号图片说明：紧跟在图片后面、字号较小的短文本；小字样式可能写在元素自身或其首个子元素上
 function isWxImageCaption(node) {
-    if (node.nodeName !== 'SPAN' && node.nodeName !== 'P') return false;
+    if (!CAPTION_TAGS.has(node.nodeName)) return false;
     const text = node.textContent.trim();
     if (!text || text.length >= CAPTION_MAX_LENGTH) return false;
-    if (!SMALL_FONT_RE.test(styleOf(node))) return false;
+    if (node.querySelector && node.querySelector('img')) return false;
+    const first = node.firstElementChild;
+    if (!SMALL_FONT_RE.test(styleOf(node)) && !SMALL_FONT_RE.test(styleOf(first))) return false;
     const prev = node.previousElementSibling
         || (node.parentNode && node.parentNode.previousElementSibling);
-    return !!(prev && prev.querySelector && prev.querySelector('img'));
+    return !!(prev && (prev.nodeName === 'IMG' || (prev.querySelector && prev.querySelector('img'))));
 }
 
 function addTableRule(service) {
@@ -74,6 +106,27 @@ function addTableRule(service) {
         filter: 'table',
         replacement: (content, node) => convertTableToMarkdown(node),
     });
+}
+
+// 带显示尺寸的图片：<img src alt width [height]>（属性值转义；无 src 的图片交默认规则）
+function imageHtml(node) {
+    const matched = DISPLAY_ATTR_RE.exec(String(node.getAttribute('data-mf-display') || '').trim());
+    const src = String(node.getAttribute('src') || '').trim();
+    if (!matched || !src) return null;
+    const attrs = [`src="${escapeAttr(src)}"`];
+    const alt = String(node.getAttribute('alt') || '').trim();
+    if (alt) attrs.push(`alt="${escapeAttr(alt)}"`);
+    if (matched[3]) {
+        attrs.push(`width="${matched[3]}%"`);
+    } else {
+        attrs.push(`width="${matched[1]}"`);
+        if (matched[2]) attrs.push(`height="${matched[2]}"`);
+    }
+    return `<img ${attrs.join(' ')}>`;
+}
+
+function escapeAttr(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ---------- 各 profile 配置 ----------
@@ -88,26 +141,40 @@ function configureWord(service) {
         filter: (node) => node.nodeName === 'IMG' && !node.getAttribute('src'),
         replacement: () => '',
     });
+    service.keep(['u']);
 }
 
-// [规则名, filter, 包裹符]；turndown 后注册的规则优先级更高，顺序不可调整
+// [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整
 const URL_WRAP_RULES = [
-    ['inlineBold', (node) => ['SPAN', 'P', 'SECTION'].includes(node.nodeName) && BOLD_STYLE_RE.test(styleOf(node)), '**'],
-    ['inlineItalic', (node) => node.nodeName === 'SPAN' && ITALIC_STYLE_RE.test(styleOf(node)), '*'],
-    ['inlineStrikethrough', (node) => STRIKE_STYLE_RE.test(styleOf(node)), '~~'],
-    ['delTag', ['del', 's'], '~~'],
-    ['mark', 'mark', '=='],
+    ['inlineBold', (node) => ['SPAN', 'P', 'SECTION'].includes(node.nodeName) && BOLD_STYLE_RE.test(styleOf(node)), '<strong>', '</strong>'],
+    ['inlineItalic', (node) => node.nodeName === 'SPAN' && ITALIC_STYLE_RE.test(styleOf(node)), '<em>', '</em>'],
+    ['inlineStrikethrough', (node) => STRIKE_STYLE_RE.test(styleOf(node)), '<del>', '</del>'],
+    ['delTag', ['del', 's'], '<del>', '</del>'],
+    ['htmlStrong', ['strong', 'b'], '<strong>', '</strong>'],
+    ['htmlEmphasis', ['em', 'i'], '<em>', '</em>'],
 ];
 
 function configureUrl(service) {
-    service.addRule('lineBreak', { filter: 'br', replacement: () => '\n' });
-    for (const [name, filter, marker] of URL_WRAP_RULES) {
-        service.addRule(name, { filter, replacement: (content) => wrapTrimmed(content, marker) });
+    // 最先注册、优先级最低：带样式的 section（加粗、图注）由后注册的规则接管
+    service.addRule('sectionBlock', { filter: 'section', replacement: (content) => `\n\n${content}\n\n` });
+    service.addRule('lineBreak', { filter: 'br', replacement: () => MARKERS.BR });
+    for (const [name, filter, open, close] of URL_WRAP_RULES) {
+        service.addRule(name, {
+            filter,
+            replacement: (content, node) => {
+                const wrapped = wrapHtml(content, open, close);
+                return node.isBlock && wrapped ? `\n\n${wrapped}\n\n` : wrapped;
+            },
+        });
     }
-    service.addRule('figcaption', { filter: 'figcaption', replacement: italicLine });
-    service.addRule('figure', { filter: 'figure', replacement: (content) => `\n${content.trim()}\n` });
-    service.addRule('wxImgCaption', { filter: isWxImageCaption, replacement: italicLine });
-    service.addRule('sectionPassthrough', { filter: 'section', replacement: (content) => content });
+    service.addRule('mark', { filter: 'mark', replacement: (content) => wrapTrimmed(content, '==') });
+    service.addRule('figcaption', { filter: 'figcaption', replacement: captionBlock });
+    service.addRule('figure', { filter: 'figure', replacement: (content) => `\n\n${content.trim()}\n\n` });
+    service.addRule('wxImgCaption', { filter: isWxImageCaption, replacement: captionBlock });
+    service.addRule('imgDisplay', {
+        filter: (node) => node.nodeName === 'IMG' && Boolean(node.getAttribute('data-mf-display')) && Boolean(node.getAttribute('src')),
+        replacement: (content, node) => imageHtml(node) || '',
+    });
     addTableRule(service);
     service.remove(URL_REMOVED_TAGS);
 }

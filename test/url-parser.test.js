@@ -7,8 +7,20 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const zlib = require('node:zlib');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const { parse } = require('../converters/parsers/url');
+const { _setLookup } = require('../converters/net/fetch-guard');
+const mdRenderer = require('../converters/renderers/md');
+
+// 按真实公众号文章裁剪的结构夹具（section 嵌套、小字图注、相邻 strong、单双 br、text-indent、段首 NBSP）
+const WECHAT_FIXTURE = fs.readFileSync(path.join(__dirname, 'fixtures', 'web', 'wechat-collapse.html'));
+// 最小合法 GIF：签名 + 1×1 逻辑屏幕
+const GIF_1X1 = Buffer.concat([Buffer.from('GIF89a', 'ascii'), Buffer.from([0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00])]);
+// 不可见字符以码点生成，源码不出现看不见的字面量
+const MARKER_RE = new RegExp(`[${String.fromCharCode(0xEF00)}-${String.fromCharCode(0xEF1F)}]`);
+const IDEO = String.fromCharCode(0x3000);
 
 // ============================================================
 // 测试夹具：手工生成合法 PNG
@@ -182,8 +194,18 @@ function startServer() {
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(WECHAT_PAGE);
                 return;
+            // 微信夹具：经 _setLookup 把 mp.weixin.qq.com 解析到本机，站点选择器按主机名命中
+            case '/mp.weixin.qq.com/s/fixture':
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(WECHAT_FIXTURE);
+                return;
+            case '/wx/banner.gif':
+                res.writeHead(200, { 'Content-Type': 'image/gif' });
+                res.end(GIF_1X1);
+                return;
             case '/a.png':
             case '/qr.png':
+            case '/wx/figure.png':
                 res.writeHead(200, { 'Content-Type': 'image/png' });
                 res.end(PNG);
                 return;
@@ -511,4 +533,80 @@ test('站点选择器按主机名匹配：子域命中，查询串与伪造子�
     for (const [url, domain, expected] of cases) {
         assert.equal(matchesHost(hostnameOf(url), domain), expected, `${url} 对 ${domain} 的判定应为 ${expected}`);
     }
+});
+
+// ============================================================
+// 转档保真：微信正文结构、换行、缩进、图片显示尺寸与图注
+// ============================================================
+
+async function parseWechatFixture(t) {
+    const server = await startServer();
+    t.after(() => server.close());
+    _setLookup(async () => [{ address: '127.0.0.1', family: 4 }]);
+    t.after(() => _setLookup(null));
+    const { port } = new URL(server.base);
+    return parse({ url: `http://mp.weixin.qq.com:${port}/mp.weixin.qq.com/s/fixture` }, { allowPrivateNetwork: true });
+}
+
+const paragraphOf = (doc, prefix) => doc.ir.children.find((n) => n.type === 'paragraph' && plainText(n).startsWith(prefix));
+
+test('微信夹具：section 各自成段；图片独立成段并带显示宽度（超栏与 100% 均按 677px 栏宽）；图注紧随图片', async (t) => {
+    // Act
+    const doc = await parseWechatFixture(t);
+    const top = doc.ir.children;
+
+    // Assert：命中站点选择器，整篇不再塌成一段
+    assert.equal(doc.meta.extraction, 'site:mp.weixin.qq.com');
+    assert.ok(top.length >= 8, `块数应不少于 8，实际 ${top.length}`);
+
+    // Assert：每张图片独占一个段落，display 为 677px
+    const imageParagraphs = top.filter((n) => n.type === 'paragraph' && n.children.some((c) => c.type === 'image'));
+    assert.equal(imageParagraphs.length, 3);
+    for (const node of imageParagraphs) {
+        assert.equal(node.children.length, 1, JSON.stringify(node.children));
+        assert.deepEqual(node.children[0].data.display, { width: 677, unit: 'px', source: 'web' });
+    }
+    assert.deepEqual(doc.assets.map((a) => a.name), ['images/image_1.gif', 'images/image_2.png', 'images/image_3.png']);
+
+    // Assert：小字 section 图注成为紧随第二张图的 caption 段落
+    const at = top.indexOf(imageParagraphs[1]);
+    assert.deepEqual(top[at + 1].data, { role: 'caption' });
+    assert.equal(plainText(top[at + 1]), '图｜夹具的第一张配图');
+    assert.ok(!MARKER_RE.test(JSON.stringify(doc.ir)), 'IR 中不得残留私用区标记');
+});
+
+test('微信夹具：粗体还原为 strong（相邻 strong 合并）；单 br 为硬换行、双 br 分段；text-indent 与段首 NBSP 成为 data.indent', async (t) => {
+    // Act
+    const doc = await parseWechatFixture(t);
+
+    // Assert：粗体
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'strong').map(plainText), ['《夹具词典》', '前一半粗体后一半粗体，另一个是能力。']);
+
+    // Assert：换行
+    assert.deepEqual(paragraphOf(doc, '单个换行之前').children.map((n) => n.type), ['text', 'break', 'text']);
+    assert.equal(plainText(paragraphOf(doc, '两个换行之前')), '两个换行之前');
+    assert.equal(plainText(paragraphOf(doc, '两个换行之后')), '两个换行之后');
+
+    // Assert：缩进（文本本身不带全角空格）
+    for (const prefix of ['首行缩进两字的段落', '四个不换行空格起首的段落']) {
+        const node = paragraphOf(doc, prefix);
+        assert.ok(node, prefix);
+        assert.equal(node.data && node.data.indent, 2, prefix);
+    }
+});
+
+test('微信夹具转 Markdown：无 \\* 与字符引用，<img width> 独占一行，缩进为段首两个全角空格，单换行为反斜杠硬换行', async (t) => {
+    // Act
+    const markdown = await mdRenderer.render(await parseWechatFixture(t));
+    const lines = markdown.split('\n');
+
+    // Assert
+    assert.ok(!markdown.includes('\\*'), markdown);
+    assert.ok(!markdown.includes('&#x'), markdown);
+    assert.ok(lines.includes('<img src="images/image_2.png" width="677" alt="">'), markdown);
+    assert.equal(lines[lines.indexOf('<img src="images/image_2.png" width="677" alt="">') + 2], '图｜夹具的第一张配图');
+    assert.ok(markdown.includes('依据<strong>《夹具词典》</strong>的解释'), markdown);
+    assert.ok(lines.includes(`${IDEO}${IDEO}首行缩进两字的段落，来自 text-indent。`), markdown);
+    assert.ok(lines.includes(`${IDEO}${IDEO}四个不换行空格起首的段落。`), markdown);
+    assert.ok(lines.includes('单个换行之前\\'), markdown);
 });

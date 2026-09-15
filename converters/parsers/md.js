@@ -13,7 +13,8 @@
  *      —— 资源名不能沿用 Markdown 里的原始地址，否则 "../x.png"、绝对路径与 http(s) 地址
  *      会被当作落盘路径使用；统一走 assets 通道后，图片归一化（assets/image-normalize）与
  *      html 渲染器的 relative 模式才有唯一可寻址的资源名。data.asset 原样保留，
- *      docx/pdf 渲染器仍按它取 buffer/absPath。
+ *      docx/pdf 渲染器仍按它取 buffer/absPath。原始地址记在资源条目的 sourceUrl 上，
+ *      桌面端编辑后重建旁路文件时据此把 data URL 等图片还原为 Markdown 里的原样地址。
  */
 const fsp = require('fs').promises;
 const path = require('path');
@@ -21,6 +22,7 @@ const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { stripExt } = require('../ir/util');
 const { resolveImages, collectImageNodes } = require('../assets/md-images');
+const { liftInlineHtml } = require('../ir/inline-html');
 const { stripFrontMatter } = require('../web/frontmatter');
 const { notify } = require('../util');
 
@@ -56,7 +58,8 @@ async function parse(input, ctx = {}) {
     const sourceName = ctx.sourceName || (absPath ? path.basename(absPath) : undefined);
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
-    const ir = unified().use(remarkParse).use(remarkGfm).parse(preprocess(body));
+    // <img width>、<u>、<strong> 等行内 HTML 先提升为节点：<img> 由此进入下方的资源收集（受 baseDir 越界检查约束）
+    const ir = liftInlineHtml(unified().use(remarkParse).use(remarkGfm).parse(preprocess(body)), { source: 'html' });
     notify(ctx, 'parsing', 30);
 
     const title = pickTitle(frontMatter, ir, sourceName);
@@ -151,6 +154,8 @@ function toPlainText(node) {
  * 按文档顺序登记图片资源：凡取到 buffer 的图片都统一编号为 images/image_N.ext，
  * 同一原始地址复用同一资源；登记后把节点 url 改写为资源名并记 data.assetName。
  * 未取到 buffer 的（远程未下载、越界、读盘失败）保持原 url 不动。
+ * 原始地址只记在资源条目的 sourceUrl 上、不写进节点 data：json 产物因此不变，也不与
+ * bundle-sidecars 按 data.sourcePath / asset.sourcePath 做的路径改写相混。
  */
 function collectAssets(ir) {
     const assets = [];
@@ -165,7 +170,7 @@ function collectAssets(ir) {
         if (name === undefined) {
             name = `images/image_${assets.length + 1}${extFor(asset, url)}`;
             nameByUrl.set(url, name);
-            assets.push({ name, buffer, mime: asset.mime });
+            assets.push({ name, buffer, mime: asset.mime, sourceUrl: url });
         }
         node.url = name;
         node.data = { ...node.data, assetName: name };

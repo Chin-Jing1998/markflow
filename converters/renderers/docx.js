@@ -30,11 +30,13 @@ const {
     AlignmentType,
     BorderStyle,
     ShadingType,
+    Tab,
 } = require('docx');
 const { imageSize } = require('image-size');
 const { stripHtml, collectText } = require('../ir/util');
 const { toBuffer } = require('../util');
 const { downgradeCustomNodes, degradeMath } = require('../ir/schema');
+const { stripMarkersTree } = require('../ir/markers');
 const { normalizeOptions } = require('../options');
 
 // ---- 常量 ----
@@ -66,6 +68,7 @@ const INDENT_STEP_TWIP = 720; // 0.5 英寸
 const HANGING_TWIP = 360;
 const MAX_LIST_DEPTH = 5;
 const MAX_IMAGE_WIDTH_PX = 600;
+const PERCENT_BASE = 100;
 const TASK_CHECKED_PREFIX = '☑ ';
 const TASK_UNCHECKED_PREFIX = '☐ ';
 
@@ -92,8 +95,8 @@ async function render(doc, options) {
     if (!Array.isArray(doc.warnings)) doc.warnings = [];
     const docxOptions = normalizeOptions(options).docx;
 
-    // 公式降级须在自定义节点降级之前完成：两者互不依赖，合起来把 IR 收敛为纯标准 mdast
-    const root = downgradeCustomNodes(degradeMath(doc.ir || { type: 'root', children: [] }));
+    // 公式降级须在自定义节点降级之前完成：两者互不依赖，合起来把 IR 收敛为纯标准 mdast；残留标记兜底剥除
+    const root = downgradeCustomNodes(degradeMath(stripMarkersTree(doc.ir || { type: 'root', children: [] })));
     const ctx = { warnings: doc.warnings, quoteDepth: 0, listDepth: 0 };
     const blocks = blocksToDocx(root.children, ctx);
     if (blocks.length === 0) blocks.push(emptyParagraph());
@@ -330,13 +333,15 @@ function inlineToRun(node, ctx, fmt) {
     if (!node || typeof node !== 'object') return [];
     switch (node.type) {
         case 'text':
-            return [makeRun({ ...fmt, text: String(node.value || '') }, ctx)];
+            return textRuns(String(node.value || ''), ctx, fmt);
         case 'strong':
             return inlineToRuns(node.children, ctx, { ...fmt, bold: true });
         case 'emphasis':
             return inlineToRuns(node.children, ctx, { ...fmt, italics: true });
         case 'delete':
             return inlineToRuns(node.children, ctx, { ...fmt, strike: true });
+        case 'underline':
+            return inlineToRuns(node.children, ctx, { ...fmt, underline: {} });
         case 'inlineCode':
             return [makeRun({ ...fmt, text: String(node.value || ''), font: CODE_FONT }, ctx)];
         case 'break':
@@ -354,6 +359,17 @@ function inlineToRun(node, ctx, fmt) {
             return text ? [makeRun({ ...fmt, text }, ctx)] : [];
         }
     }
+}
+
+/** 文本中的 \t 拆成真正的 Word 制表符（w:tab），其余文字照常成 run */
+function textRuns(value, ctx, fmt) {
+    if (!value.includes('\t')) return [makeRun({ ...fmt, text: value }, ctx)];
+    const runs = [];
+    value.split('\t').forEach((part, index) => {
+        if (index > 0) runs.push(makeRun({ ...fmt, children: [new Tab()] }, ctx));
+        if (part) runs.push(makeRun({ ...fmt, text: part }, ctx));
+    });
+    return runs;
 }
 
 function linkToDocx(node, ctx, fmt) {
@@ -379,7 +395,7 @@ function imageToDocx(node, ctx, fmt) {
     if (!asset || !data || data.length === 0) return degrade(`缺少可用的图片数据（${node.url || '无地址'}）`);
     const type = resolveImageType(asset.mime, data);
     if (!type) return degrade(`不支持的图片格式 ${asset.mime || '未知'}，仅支持 png/jpg/gif/bmp`);
-    const size = resolveImageSize(asset, data);
+    const size = resolveImageSize(asset, data, node.data && node.data.display);
     if (!size) return degrade('无法解析图片尺寸');
 
     try {
@@ -403,8 +419,11 @@ function resolveImageType(mime, data) {
     return (sniffed && IMAGE_TYPE_BY_SNIFF[sniffed.type]) || null;
 }
 
-/** 优先用 asset 自带尺寸，缺失时用 image-size 解析；宽超 600px 按比例缩放 */
-function resolveImageSize(asset, data) {
+/**
+ * 显示尺寸（data.display）优先：px 直接取，百分比按 600px 栏宽折算，缺高度时按像素宽高比补；
+ * 其次 asset 自带尺寸，缺失时用 image-size 解析。宽超 600px 按比例缩放
+ */
+function resolveImageSize(asset, data, display) {
     let width = positiveInt(asset.width);
     let height = positiveInt(asset.height);
     if (!width || !height) {
@@ -412,12 +431,26 @@ function resolveImageSize(asset, data) {
         width = measured && positiveInt(measured.width);
         height = measured && positiveInt(measured.height);
     }
+    const shown = displaySize(display, width && height ? { width, height } : null);
+    if (shown) ({ width, height } = shown);
     if (!width || !height) return null;
     if (width > MAX_IMAGE_WIDTH_PX) {
         height = Math.max(1, Math.round((height * MAX_IMAGE_WIDTH_PX) / width));
         width = MAX_IMAGE_WIDTH_PX;
     }
     return { width, height };
+}
+
+function displaySize(display, natural) {
+    if (!display || !(Number(display.width) > 0)) return null;
+    const width = display.unit === '%'
+        ? Math.round((Number(display.width) * MAX_IMAGE_WIDTH_PX) / PERCENT_BASE)
+        : positiveInt(display.width);
+    if (!width) return null;
+    const explicit = display.unit === '%' ? null : positiveInt(display.height);
+    if (explicit) return { width, height: explicit };
+    if (!natural) return null;
+    return { width, height: Math.max(1, Math.round((natural.height * width) / natural.width)) };
 }
 
 function measure(data) {

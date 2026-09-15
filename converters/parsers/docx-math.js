@@ -210,4 +210,5 @@ function pushText(pieces, value) {
     pieces.push({ type: 'text', value });
 }
 
-module.exports = { extractMath, restoreMath };
+// findBlocks / findCloseTag / readTag 供 parsers/docx-layout 复用同一套字符串定位
+module.exports = { extractMath, restoreMath, findBlocks, findCloseTag, readTag };

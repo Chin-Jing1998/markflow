@@ -18,7 +18,7 @@ const loadedAtStartup = Object.keys(require.cache).filter((k) => HEAVY_MODULE_RE
 const { createDocument, createRoot, createHeading, createParagraph } = require('../converters/ir/schema');
 
 const {
-    convert, parseDocument, renderDocument, writeDocument,
+    convert, parseDocument, renderDocument, renderBundleSidecars, writeDocument,
     listTargets, detectInputType, SUPPORTED_EXTENSIONS, runBatch, _setModuleLoader, _reset,
 } = converters;
 
@@ -303,6 +303,7 @@ describe('convert：bundle / pdf（桩 parser 与 renderer）', () => {
         assert.deepEqual(res.outputs, {
             md: path.join(dir, '季度 报告.md'),
             json: path.join(dir, '季度 报告.json'),
+            contentList: path.join(dir, '季度 报告_content_list.json'),
             imagesDir: path.join(dir, 'images'),
         });
         assert.equal(res.imagesCount, 1);
@@ -314,15 +315,15 @@ describe('convert：bundle / pdf（桩 parser 与 renderer）', () => {
             md,
             /^---\ntitle: "来自 H1 的标题"\nsource: "季度 报告\.docx"\nsourceType: "docx"\nconvertedAt: "[^"]+"\n---\n\n# 来自 H1 的标题/,
         );
-        // 图片经默认的 JPG 归一化改名为 image_1.jpg，Markdown 引用同步
-        assert.match(md, /!\[图\]\(images\/image_1\.jpg\)/);
+        // bundle 不做 JPG 归一：images/ 存原图（字节一致），Markdown 引用原资源名
+        assert.match(md, /!\[图\]\(images\/image_1\.png\)/);
         const json = JSON.parse(fs.readFileSync(res.outputs.json, 'utf8'));
         assert.deepEqual(Object.keys(json), ['schemaVersion', 'kind', 'ir', 'data', 'meta']);
         assert.equal(json.meta.title, '来自 H1 的标题');
-        assert.equal(
-            fs.readFileSync(path.join(res.outputs.imagesDir, 'image_1.jpg')).subarray(0, 2).toString('hex'),
-            'ffd8',
-        );
+        assert.ok(fs.readFileSync(path.join(res.outputs.imagesDir, 'image_1.png')).equals(PNG));
+        const contentList = JSON.parse(fs.readFileSync(res.outputs.contentList, 'utf8'));
+        assert.deepEqual(contentList.map((block) => block.type), ['text', 'text', 'image']);
+        assert.equal(contentList[2].img_path, 'images/image_1.png');
     });
 
     test('meta.title 优先于 H1，渲染前已写回 doc.meta.title；无 assets 时不建 images/', async () => {
@@ -754,6 +755,7 @@ describe('convert：v3 契约（桩 parser / renderer）', () => {
         assert.deepEqual(res.outputs, {
             md: path.join(dir, '扫描件.md'),
             json: path.join(dir, '扫描件.json'),
+            contentList: path.join(dir, '扫描件_content_list.json'),
             mineruDir: path.join(dir, 'mineru'),
         });
         assert.deepEqual(res.extras, ['mineru/full.md', 'mineru/images/p1.jpg']);
@@ -1100,5 +1102,137 @@ describe('convert：批内产物名登记（桩 parser 与 renderer）', () => {
         assert.deepEqual(fs.readdirSync(outputDir).sort(), ['sample', 'sample.docx']);
         assert.equal(fs.statSync(folder.outputPath).isDirectory(), true);
         assert.equal(fs.statSync(single.outputPath).isFile(), true);
+    });
+});
+
+// ============================================================
+// bundle：MinerU 式结果包（原图、content_list、附属文件改名与路径改写）
+// ============================================================
+
+describe('bundle：MinerU 式结果包（桩 parser）', () => {
+    let stubs = {};
+
+    function stubLoader(rel) {
+        if (!Object.prototype.hasOwnProperty.call(stubs, rel)) return require(path.join(CONVERTERS_DIR, rel));
+        return stubs[rel];
+    }
+
+    before(() => _setModuleLoader(stubLoader));
+    beforeEach(() => { stubs = {}; });
+    after(() => _reset());
+
+    const DISPLAY = Object.freeze({ width: 320, height: 160, unit: 'px', source: 'docx' });
+    const IMG_LINE = '<img src="images/image_1.png" width="320" alt="图">';
+    const docxDoc = () => createDocument({
+        ir: createRoot([
+            createHeading(1, '结果包'),
+            { type: 'paragraph', children: [{ type: 'image', url: 'images/image_1.png', alt: '图', data: { display: { ...DISPLAY } } }] },
+            { type: 'paragraph', data: { role: 'caption' }, children: [{ type: 'text', value: '图 1 示意' }] },
+        ]),
+        meta: { sourceType: 'docx' },
+        assets: [{ name: 'images/image_1.png', buffer: PNG, mime: 'image/png' }],
+    });
+
+    test('docx → bundle：<img width> 独占一行、{name}_content_list.json 带图注与 display、images/ 与原图逐字节一致', async () => {
+        // Arrange
+        const inputPath = path.join(root, '结果包.docx');
+        fs.writeFileSync(inputPath, 'PK');
+        stubs['./parsers/docx'] = { parse: async () => docxDoc() };
+        const outDir = fs.mkdtempSync(path.join(root, 'bundle-'));
+
+        // Act
+        const res = await convert({ input: { path: inputPath }, target: 'bundle', outputDir: outDir });
+
+        // Assert
+        const dir = path.join(outDir, '结果包');
+        assert.deepEqual(res.outputs, {
+            md: path.join(dir, '结果包.md'),
+            json: path.join(dir, '结果包.json'),
+            contentList: path.join(dir, '结果包_content_list.json'),
+            imagesDir: path.join(dir, 'images'),
+        });
+        const lines = fs.readFileSync(res.outputs.md, 'utf8').split('\n');
+        assert.ok(lines.includes(IMG_LINE), lines.join('\n'));
+        assert.equal(lines[lines.indexOf(IMG_LINE) + 2], '图 1 示意');
+        const blocks = JSON.parse(fs.readFileSync(res.outputs.contentList, 'utf8'));
+        assert.deepEqual(blocks[1], {
+            type: 'image', img_path: 'images/image_1.png', image_caption: ['图 1 示意'], image_footnote: [], content: '', display: { ...DISPLAY }, page_idx: 0,
+        });
+        assert.ok(fs.readFileSync(path.join(dir, 'images', 'image_1.png')).equals(PNG));
+    });
+
+    test('先解析后导出（桌面端路径）：无目标解析时图片已归一为 JPG，渲染 bundle 时换回原图与原资源名', async () => {
+        // Arrange
+        const inputPath = path.join(root, '先解析.docx');
+        fs.writeFileSync(inputPath, 'PK');
+        stubs['./parsers/docx'] = { parse: async () => docxDoc() };
+
+        // Act
+        const parsed = await parseDocument({ input: { path: inputPath } });
+        const rendered = await renderDocument(parsed.doc, 'bundle', parsed.options, { imageMode: 'relative' });
+
+        // Assert
+        assert.equal(parsed.doc.assets[0].name, 'images/image_1.jpg', '无目标解析照常归一');
+        assert.deepEqual(rendered.assets.map((a) => a.name), ['images/image_1.png']);
+        assert.ok(rendered.assets[0].buffer.equals(PNG));
+        assert.ok(rendered.files['{name}.md'].includes(IMG_LINE));
+        assert.equal(JSON.parse(rendered.files['{name}_content_list.json'])[1].img_path, 'images/image_1.png');
+    });
+
+    test('renderBundleSidecars：返回 json 与 contentList 字符串，与 bundle 渲染产出逐字一致', async () => {
+        // Act
+        const doc = docxDoc();
+        const sidecars = await renderBundleSidecars(doc, { name: '结果包', options: {} });
+        const rendered = await renderDocument(doc, 'bundle');
+
+        // Assert
+        assert.deepEqual(Object.keys(sidecars).sort(), ['contentList', 'json']);
+        assert.equal(sidecars.json, rendered.files['{name}.json']);
+        assert.equal(sidecars.contentList, rendered.files['{name}_content_list.json']);
+        await assert.rejects(renderBundleSidecars(null), /renderBundleSidecars 需要有效的 IR 文档/);
+    });
+
+    test('MinerU 来源：原件 content_list 取代生成版本，附属 JSON 的哈希图名改写为产物路径（layout 用裸名），outputs 带附属键', async () => {
+        // Arrange
+        const inputPath = path.join(root, '扫描件二.pdf');
+        fs.writeFileSync(inputPath, '%PDF');
+        const sha = '0123456789abcdef'.repeat(4);
+        const display = { width: 397, unit: 'px', source: 'mineru' };
+        const list = [{ type: 'image', img_path: `images/${sha}.jpg`, image_caption: [], image_footnote: [], bbox: [0, 0, 500, 500], page_idx: 0, display }];
+        stubs['./parsers/pdf'] = {
+            parse: async () => createDocument({
+                ir: createRoot([{ type: 'paragraph', children: [{ type: 'image', url: 'images/image_1.png', alt: '', data: { sourcePath: `images/${sha}.jpg`, display } }] }]),
+                meta: { sourceType: 'pdf', pdfParser: 'mineru' },
+                assets: [{ name: 'images/image_1.png', buffer: PNG, mime: 'image/png', sourcePath: `images/${sha}.jpg` }],
+                extras: [
+                    { name: '{name}_content_list.json', buffer: Buffer.from(JSON.stringify(list, null, 4)) },
+                    { name: '{name}_layout.json', buffer: Buffer.from(JSON.stringify({ pdf_info: [{ image_path: `${sha}.jpg`, page_size: [595, 842] }] })) },
+                    { name: '{name}_origin.pdf', buffer: Buffer.from('%PDF-origin') },
+                ],
+            }),
+        };
+        const outDir = fs.mkdtempSync(path.join(root, 'mineru-bundle-'));
+
+        // Act
+        const res = await convert({ input: { path: inputPath }, target: 'bundle', outputDir: outDir });
+
+        // Assert
+        const dir = path.join(outDir, '扫描件二');
+        assert.deepEqual(res.outputs, {
+            md: path.join(dir, '扫描件二.md'),
+            json: path.join(dir, '扫描件二.json'),
+            contentList: path.join(dir, '扫描件二_content_list.json'),
+            imagesDir: path.join(dir, 'images'),
+            layout: path.join(dir, '扫描件二_layout.json'),
+            originPdf: path.join(dir, '扫描件二_origin.pdf'),
+        });
+        assert.deepEqual([...res.extras].sort(), ['扫描件二_layout.json', '扫描件二_origin.pdf']);
+        const contentList = JSON.parse(fs.readFileSync(res.outputs.contentList, 'utf8'));
+        assert.equal(contentList[0].img_path, 'images/image_1.png');
+        assert.deepEqual(contentList[0].bbox, [0, 0, 500, 500], '原件字段保留');
+        assert.equal(JSON.parse(fs.readFileSync(res.outputs.layout, 'utf8')).pdf_info[0].image_path, 'image_1.png');
+        for (const file of fs.readdirSync(dir).filter((name) => name.endsWith('.json'))) {
+            assert.ok(!/[0-9a-f]{64}/.test(fs.readFileSync(path.join(dir, file), 'utf8')), `${file} 不应残留哈希图名`);
+        }
     });
 });

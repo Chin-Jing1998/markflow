@@ -223,15 +223,16 @@ describe('增删改查', () => {
         assert.equal(readIndex(dir).records.length, 1);
     });
 
-    test('update 改 tags/favorite/title 并刷新 updatedAt；未知字段与不存在的 id 抛中文错误', async () => {
+    test('update 改 tags/favorite/highlighted/title 并刷新 updatedAt；未知字段与不存在的 id 抛中文错误', async () => {
         const { lib, clock } = makeLibrary('update');
         const added = await lib.add(recordOf());
         clock.advance(60_000);
 
-        const updated = await lib.update('r1', { tags: [' 季报 ', '财务', '季报'], favorite: true, title: '甲（终稿）' });
+        const updated = await lib.update('r1', { tags: [' 季报 ', '财务', '季报'], favorite: true, highlighted: true, title: '甲（终稿）' });
 
         assert.deepEqual(updated.tags, ['季报', '财务'], '标签去空白并去重');
         assert.equal(updated.favorite, true);
+        assert.equal(updated.highlighted, true);
         assert.equal(updated.title, '甲（终稿）');
         assert.equal(updated.createdAt, added.createdAt);
         assert.notEqual(updated.updatedAt, added.updatedAt);
@@ -438,7 +439,7 @@ describe('转换结果入库', () => {
     test('同一 outputPath 再次转换：合并为同一条，保留 id/createdAt/标签，刷新 updatedAt 与产物字段', async () => {
         const { lib, clock } = makeLibrary('upsert-merge');
         const first = await lib.upsertFromResult(fileResult());
-        await lib.update(first.id, { tags: ['季报'], favorite: true });
+        await lib.update(first.id, { tags: ['季报'], favorite: true, highlighted: true });
         clock.advance(3_600_000);
 
         const again = await lib.upsertFromResult(fileResult({ imagesCount: 9, title: '季度报告 Q3（修订）' }));
@@ -448,6 +449,7 @@ describe('转换结果入库', () => {
         assert.notEqual(again.updatedAt, first.updatedAt);
         assert.equal(again.imagesCount, 9);
         assert.equal(again.title, '季度报告 Q3（修订）');
+        assert.equal(again.highlighted, true);
         assert.deepEqual(again.tags, ['季报']);
         assert.equal(again.favorite, true);
         assert.equal((await lib.list()).total, 1);

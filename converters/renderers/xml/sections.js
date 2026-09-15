@@ -9,7 +9,7 @@
  *   1. 官方显式标记先剥离：私用区标记码位（U+E200–U+E20F）一律删除；「名…名」→ 发明名称，「题…题」→ 标题，
  *      「段号[0001]号…」→ 保留 [0001] 交段号模块复用，「条号1.号…」→ 保留 1. 交权项模块，「号图1号」→ 图1。
  *   2. 候选标题 = heading 节点，或（sectionDetection 为 auto 时）整段加粗 / 纯文本 ≤ 12 字的段落；
- *      候选标题命中四书正则（允许字间空白）即为分节标题：权利要求书 / 说明书 / 说明书附图|附图 /
+ *      候选标题命中书目正则（允许字间空白）即为分节标题：权利要求书 / 说明书 / 说明书附图|附图 /
  *      说明书摘要|摘要 / 摘要附图；sectionDetection 为 headings 时只认 heading 节点。
  *   3. 无标题的前导区域按位置推定：权利要求块 = 自首个「N、」「N.」编号段起、至首个五部分标题（或文末附图块）
  *      之前，且必须位于说明书之前；权利要求块之前 ≤ 3 段、无编号、无图表的前导正文推定为摘要，否则并入
@@ -18,7 +18,7 @@
  *   4. 说明书内：五部分标题（技术领域 / 背景技术 / 发明内容|实用新型内容 / 附图说明 / 具体实施方式|实施例）
  *      不论 heading 深度或普通段一律 role 'heading'（输出 level="2"）；heading 节点同样为 heading。
  *   5. 发明名称回退链：「发明名称：X」字段 → 说明书首个标题段 → 文首文档标题 → 权利要求 1 主题（warning）
- *      → doc.meta.title（warning，须不是四书或五部分标题文本）→ 缺失（warning，不输出 invention-title）。
+ *      → doc.meta.title（warning，须不是书目或五部分标题文本）→ 缺失（warning，不输出 invention-title）。
  */
 const { runsText, trimRuns, stripPrefix, textRun } = require('./inline');
 const { ISSUE_CODES, createIssue } = require('./precheck');
@@ -264,7 +264,7 @@ function classifyLeading(leading, { books, issues, explicit, inferred, hasBodyAf
         return;
     }
     books.description.push(...leading);
-    issues.push(createIssue(ISSUE_CODES.SECTION_UNCLASSIFIED, `${leading.length} 个前导块无法归类（无四书标题），已并入说明书`));
+    issues.push(createIssue(ISSUE_CODES.SECTION_UNCLASSIFIED, `${leading.length} 个前导块无法归类（无书目标题），已并入说明书`));
 }
 
 // ============================================================

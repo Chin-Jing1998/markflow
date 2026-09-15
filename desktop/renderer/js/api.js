@@ -16,7 +16,8 @@ export const api = {
     describeFormats: () => call('describeFormats'),
     pickFiles: (options) => call('pickFiles', options),
     pickDirectory: (options) => call('pickDirectory', options),
-    expandPaths: (paths) => call('expandPaths', paths),
+    /** options.scope：'browse' 为文件库仓库树（另列 html / xml / json），缺省为转档入口的白名单 */
+    expandPaths: (paths, options) => call('expandPaths', paths, options),
     convertRun: (payload) => call('convertRun', payload),
     convertCancel: (runId) => call('convertCancel', runId),
     libraryList: (params) => call('libraryList', params),
@@ -38,6 +39,12 @@ export const api = {
     previewExport: (payload) => call('previewExport', payload),
     previewClose: (sessionId) => call('previewClose', { sessionId }),
     readerOpen: (payload) => call('readerOpen', payload),
+    /** Markdown 编辑：写入路径一律由主进程按 sessionId 取，渲染层只给文本 */
+    mdRender: (payload) => call('mdRender', payload),
+    mdSave: (payload) => call('mdSave', payload),
+    mdInsertImage: (sessionId) => call('mdInsertImage', { sessionId }),
+    /** 当前文件操作（action：reveal 在访达中显示 | open 用默认应用打开 | copyPath 复制路径）：路径由主进程按 sessionId 取 */
+    fileAction: (sessionId, action) => call('fileAction', sessionId, action),
 };
 
 export function pathForFile(file) {

@@ -30,8 +30,11 @@ class MfSourcePane extends HTMLElement {
         this.addEventListener('click', (event) => this.onClick(event));
     }
 
+    /** 同一视图对象重复赋值时不重建帧（对比页任何 store 变化都会走到这里） */
     set view(value) {
-        this._view = value || null;
+        const next = value || null;
+        if (next === this._view) return;
+        this._view = next;
         this.tab = 'rendered';
         this.sync();
     }
@@ -73,13 +76,13 @@ class MfSourcePane extends HTMLElement {
 
         const hasRaw = view.kind === 'md' && typeof view.raw === 'string';
         tabs.innerHTML = hasRaw
-            ? Object.entries(TABS).map(([key, text]) => `<button class="pane-tab${this.tab === key ? ' is-active' : ''}" type="button" role="tab" data-tab="${key}">${text}</button>`).join('')
+            ? Object.entries(TABS).map(([key, text]) => `<button class="pane-tab${this.tab === key ? ' is-active' : ''}" type="button" role="tab" data-tab="${key}" aria-selected="${this.tab === key}">${text}</button>`).join('')
             : '';
 
         const mountCompareFrame = (options) => mountFrame(host, { ...options, scrollbar: true, sameOrigin: true });
         if (view.kind === 'pdf') mountCompareFrame({ src: view.url, title: '来源 PDF' });
-        else if (hasRaw && this.tab === 'raw') mountCompareFrame({ srcdoc: textDocument(view.raw, { title: 'Markdown 原文' }), title: '来源原文' });
-        else mountCompareFrame({ srcdoc: view.html || '', title: '来源' });
+        else if (hasRaw && this.tab === 'raw') mountCompareFrame({ srcdoc: textDocument(view.raw, { title: 'Markdown 原文' }), title: '来源原文', appearance: 'adaptive' });
+        else mountCompareFrame({ srcdoc: view.html || '', title: '来源', appearance: 'adaptive' });
 
         foot.hidden = !view.structured;
         if (view.structured) foot.textContent = '该格式没有可直接还原的版式，左栏显示的是解析所得的结构视图。';

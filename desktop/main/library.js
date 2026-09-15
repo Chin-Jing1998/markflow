@@ -1,7 +1,7 @@
 /**
  * 文件库索引（纯逻辑内核，不依赖 Electron）
  *
- * 方案 §3.4.8 的主进程实现：索引读写、分面、搜索、标签/收藏、缺失标记与托管目录推导。
+ * 方案 §3.4.8 的主进程实现：索引读写、分面、搜索、标签/收藏/高亮、缺失标记与托管目录推导。
  * 只依赖 node 内置模块与 converters/ 的纯工具，普通 Node 中 require 无副作用，可直接单测。
  *
  * createLibrary({ dir, now = Date.now, idFactory }) → 实例，方法一律异步（warnings 除外）：
@@ -9,7 +9,7 @@
  *   list(params)                → { items（含 missing 布尔）, total, facets }
  *   get(id)                     → 记录副本 | null
  *   add(record)                 → 记录副本；id / createdAt / updatedAt 缺省时自动补齐
- *   update(id, patch)           patch 仅接受 { tags, favorite, title }，→ 记录副本
+ *   update(id, patch)           patch 仅接受 { tags, favorite, highlighted, title }，→ 记录副本
  *   remove(id)                  → boolean（只删索引条目，不动文件）
  *   paths(id)                   → 该记录涉及的绝对路径（outputPath、outputs、extras；去重）
  *   upsertFromResult(result, { managed, outputDir }) → 记录副本，按 outputPath 判定是否同一条产物
@@ -45,7 +45,7 @@ const MONTH_LENGTH = 7; // 'YYYY-MM' 在 ISO 字符串中的长度
 const SORT_FIELDS = Object.freeze(['createdAt', 'updatedAt', 'title']);
 const SORT_ORDERS = Object.freeze(['asc', 'desc']);
 const FACET_KEYS = Object.freeze(['sourceType', 'target', 'month', 'sourceDir', 'tag', 'favorite']);
-const PATCH_KEYS = Object.freeze(['tags', 'favorite', 'title']);
+const PATCH_KEYS = Object.freeze(['tags', 'favorite', 'title', 'highlighted']);
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -231,6 +231,7 @@ function createLibrary({ dir, now = Date.now, idFactory = randomUUID } = {}) {
         const next = { ...current, updatedAt: nowIso() };
         if ('tags' in patch) next.tags = normalizeTags(patch.tags);
         if ('favorite' in patch) next.favorite = Boolean(patch.favorite);
+        if ('highlighted' in patch) next.highlighted = Boolean(patch.highlighted);
         if ('title' in patch) next.title = normalizeTitle(patch.title, current.name);
         state.records = replaceAt(state.records, index, next);
         await persist();
@@ -258,7 +259,7 @@ function createLibrary({ dir, now = Date.now, idFactory = randomUUID } = {}) {
             return exportRecord(created);
         }
         const current = state.records[index];
-        // 重新转换：保留人工标注（tags / favorite）与原始 id、createdAt，其余字段以本次结果为准
+        // 重新转换：保留人工标注（tags / favorite / highlighted）与原始 id、createdAt，其余字段以本次结果为准
         const next = normalizeStoredRecord({
             ...draft,
             id: current.id,
@@ -266,6 +267,7 @@ function createLibrary({ dir, now = Date.now, idFactory = randomUUID } = {}) {
             updatedAt: stamp,
             tags: current.tags,
             favorite: current.favorite,
+            highlighted: current.highlighted,
         });
         state.records = replaceAt(state.records, index, next);
         await persist();
@@ -329,7 +331,7 @@ function createLibrary({ dir, now = Date.now, idFactory = randomUUID } = {}) {
 
 /**
  * 把 converters/service.js 的 describeResult 结果转成文件库记录。
- * options：{ managed = false, outputDir, id, createdAt, updatedAt, tags, favorite }；
+ * options：{ managed = false, outputDir, id, createdAt, updatedAt, tags, favorite, highlighted }；
  * 未给 id / createdAt / updatedAt 时不产出这三个字段，由 add()、upsertFromResult() 补齐。
  * outputDir 只用于把相对的 outputPath 补成绝对路径（桌面端恒传绝对路径，此处仅作兜底）。
  */
@@ -360,6 +362,7 @@ function recordFromResult(result, options = {}) {
         warnings: normalizeStringList(result.warnings),
         tags: normalizeTags(options.tags),
         favorite: Boolean(options.favorite),
+        highlighted: Boolean(options.highlighted),
         managed: Boolean(options.managed),
     };
     // 三个元字段只在调用方给出时出现，保证本函数不依赖时钟
@@ -421,6 +424,7 @@ function normalizeStoredRecord(raw) {
         warnings: normalizeStringList(raw.warnings),
         tags: normalizeTags(raw.tags),
         favorite: Boolean(raw.favorite),
+        highlighted: Boolean(raw.highlighted),
         managed: Boolean(raw.managed),
     };
 }

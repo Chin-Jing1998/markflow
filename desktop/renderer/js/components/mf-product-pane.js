@@ -1,16 +1,21 @@
 /**
  * <mf-product-pane>：对比预览右栏 —— 产物视图（方案 §3.4.7）
  *
- * 用法：pane.product = mf:preview:open / render 回包里的 product。
+ * 用法：pane.sessionId = 预览会话 id；pane.product = mf:preview:open / render 回包里的 product。
  *   html   → { kind:'html', html }                 渲染与源码两个页签
  *   xml    → { kind:'xml', xml, structuredHtml, parts, precheck, profile }
  *            结构视图 / 原文两个页签 + 分文件切换 + 预检清单（patent profile 的 precheck.json 与
  *            带「预检：」「分节：」「发明名称：」「权项：」「段号：」「附图：」「栅格化：」「DTD 校验：」前缀的 warnings）
- *   md     → { kind:'md', html, raw }              bundle 目标：渲染与 Markdown 原文两个页签
+ *   md     → { kind:'md', html, raw }              bundle 目标：渲染 / Markdown 原文 / 编辑 三个页签
  *   pdf    → { kind:'pdf', url }                   临时 PDF 交 Chromium 内置阅读器（该帧不带 sandbox）
  * 页脚列出本次将导出的文件名与渲染告警；docx 目标另提示「快速预览由生成的 DOCX 反读而来」。
+ *
+ * 编辑页签：挂一个常驻的 <mf-md-editor>（栏窄，内置预览默认收起，保存状态由对比页显示在标题旁），切页签只改 hidden；
+ * md 有改动时「渲染」页签显示编辑器最近一次的实时渲染；产物对象更换（改选项后）时编辑器载入新产物，换会话则销毁编辑器。
+ * 帧键（产物版本 | 页签 | 分文件 | 编辑器渲染版本）未变时不重建 iframe。
  */
 import { escapeHtml, escapeAttr, mountFrame, textDocument } from '../dom.js';
+import './mf-md-editor.js';
 
 const LEVEL_LABELS = Object.freeze({ blocking: '阻断', error: '阻断', warning: '提示', info: '说明' });
 
@@ -20,6 +25,9 @@ class MfProductPane extends HTMLElement {
         this.dataset.ready = '1';
         this.tab = 'rendered';
         this.partIndex = 0;
+        this.productRev = this.productRev || 0;
+        this.editorHtmlRev = 0;
+        this.frameKey = '';
         this.innerHTML = `
             <header class="pane-header">
                 <span class="pane-title">产物</span>
@@ -28,6 +36,7 @@ class MfProductPane extends HTMLElement {
                 <select class="select select-slim pane-parts" hidden aria-label="分文件"></select>
             </header>
             <div class="pane-frame-host"></div>
+            <div class="md-editor-host" data-role="editor-host" hidden></div>
             <section class="precheck" hidden></section>
             <footer class="pane-foot" hidden></footer>`;
         this.addEventListener('click', (event) => {
@@ -41,18 +50,39 @@ class MfProductPane extends HTMLElement {
             this.partIndex = Number(event.target.value) || 0;
             this.sync();
         });
+        this.addEventListener('mf-md-rendered', () => { this.editorHtmlRev += 1; });
+        if (this._product) this.sync();
+    }
+
+    /** 预览会话 id：换会话时销毁旧编辑器（其暂存的修改随旧会话一并作废） */
+    set sessionId(value) {
+        const next = value ? String(value) : null;
+        if (next === this._sessionId) return;
+        this._sessionId = next;
+        this.disposeEditor();
+    }
+
+    get sessionId() {
+        return this._sessionId || null;
     }
 
     set product(value) {
         const next = value || null;
+        if (next === this._product) return;
         const sameTarget = this._product && next && this._product.target === next.target;
         this._product = next;
+        this.productRev = (this.productRev || 0) + 1;
         if (!sameTarget) {
             this.tab = 'rendered';
             // 切目标时回到主视图（xml 为说明书那一份）；属性名不能叫 part —— Element.part 是 DOMTokenList
             this.partIndex = Number(next && next.view && next.view.primary) || 0;
         }
-        this.sync();
+        if (this.editor) {
+            const view = next && next.view;
+            if (view && view.kind === 'md') this.editor.setContent(view.raw || '', { html: view.html || '', status: 'idle' });
+            else this.disposeEditor();
+        }
+        if (this.dataset.ready) this.sync();
     }
 
     get product() {
@@ -73,7 +103,10 @@ class MfProductPane extends HTMLElement {
             const part = this.activePart;
             return part && part.structuredHtml ? [['rendered', '结构视图'], ['raw', 'XML 原文']] : [['raw', 'XML 原文']];
         }
-        if (view.kind === 'md') return [['rendered', '渲染'], ['raw', 'Markdown 原文']];
+        if (view.kind === 'md') {
+            const tabs = [['rendered', '渲染'], ['raw', 'Markdown 原文']];
+            return this.product && this.product.target === 'bundle' ? [...tabs, ['edit', '编辑']] : tabs;
+        }
         if (view.kind === 'html') return [['rendered', '渲染'], ['raw', 'HTML 源码']];
         return [];
     }
@@ -85,6 +118,7 @@ class MfProductPane extends HTMLElement {
         const tabs = this.querySelector('.pane-tabs');
         const parts = this.querySelector('.pane-parts');
         const host = this.querySelector('.pane-frame-host');
+        const editorHost = this.querySelector('[data-role="editor-host"]');
         const foot = this.querySelector('.pane-foot');
         const precheck = this.querySelector('.precheck');
         if (!view) {
@@ -92,6 +126,9 @@ class MfProductPane extends HTMLElement {
             tabs.replaceChildren();
             parts.hidden = true;
             host.replaceChildren();
+            host.hidden = false;
+            editorHost.hidden = true;
+            this.frameKey = '';
             foot.hidden = true;
             precheck.hidden = true;
             return;
@@ -100,21 +137,23 @@ class MfProductPane extends HTMLElement {
         label.innerHTML = `<span class="chip chip-target">${escapeHtml(String(product.target || '').toUpperCase())}</span>${view.profile ? `<span class="chip">${escapeHtml(view.profile)}</span>` : ''}`;
         const available = this.tabsFor(view);
         if (!available.some(([key]) => key === this.tab)) this.tab = available.length > 0 ? available[0][0] : 'rendered';
-        tabs.innerHTML = available.map(([key, text]) => `<button class="pane-tab${this.tab === key ? ' is-active' : ''}" type="button" role="tab" data-tab="${key}">${escapeHtml(text)}</button>`).join('');
+        tabs.innerHTML = available.map(([key, text]) => `<button class="pane-tab${this.tab === key ? ' is-active' : ''}" type="button" role="tab" data-tab="${key}" aria-selected="${this.tab === key}">${escapeHtml(text)}</button>`).join('');
 
         this.syncParts(view, parts);
-        this.mount(view, host);
+        const editing = this.tab === 'edit' && view.kind === 'md';
+        host.hidden = editing;
+        editorHost.hidden = !editing;
+        if (editing) this.showEditor(view, editorHost);
+        else this.mount(view, host);
         this.syncPrecheck(view, precheck);
 
-        const files = Array.isArray(product.files) ? product.files : [];
         const warnings = Array.isArray(product.warnings) ? product.warnings : [];
         const hint = view.hint ? `<p class="pane-hint">${escapeHtml(view.hint)}</p>` : '';
-        const fileLine = files.length > 0 ? `<p class="pane-files">导出后得到：${files.map((name) => `<code>${escapeHtml(name)}</code>`).join('、')}</p>` : '';
         const warnLine = warnings.length > 0
             ? `<details class="pane-warnings"><summary>转换提示 ${warnings.length} 条</summary><ul>${warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></details>`
             : '';
-        foot.innerHTML = `${hint}${fileLine}${warnLine}`;
-        foot.hidden = !hint && !fileLine && !warnLine;
+        foot.innerHTML = `${hint}${warnLine}`;
+        foot.hidden = !hint && !warnLine;
     }
 
     syncParts(view, select) {
@@ -125,7 +164,39 @@ class MfProductPane extends HTMLElement {
         select.innerHTML = list.map((part, index) => `<option value="${index}"${index === this.partIndex ? ' selected' : ''}>${escapeHtml(part.name)}</option>`).join('');
     }
 
+    /** 编辑页签：首次进入时建常驻编辑器并载入产物 md 原文；之后切页签只改 hidden */
+    showEditor(view, host) {
+        if (this.editor) return;
+        const editor = document.createElement('mf-md-editor');
+        editor.frameAppearance = 'paper';
+        editor.previewVisible = false;
+        editor.showStatus = false;
+        editor.sessionId = this._sessionId;
+        host.append(editor);
+        this.editor = editor;
+        editor.setContent(view.raw || '', { html: view.html || '', status: 'idle' });
+    }
+
+    disposeEditor() {
+        if (!this.editor) return;
+        this.editor.dispose();
+        this.editor.remove();
+        this.editor = null;
+        this.editorHtmlRev = 0;
+        this.frameKey = '';
+    }
+
+    /** md 有改动时「渲染」显示编辑器的实时渲染；否则显示产物本身 */
+    renderedHtml(view) {
+        if (view.kind === 'md' && this.editor && this.editor.modified && this.editor.lastHtml) return { html: this.editor.lastHtml, rev: `e${this.editorHtmlRev}` };
+        return { html: view.html || '', rev: 'p' };
+    }
+
     mount(view, host) {
+        const rendered = this.tab === 'rendered' ? this.renderedHtml(view) : null;
+        const key = [this.productRev, this.tab, this.partIndex, rendered ? rendered.rev : ''].join('|');
+        if (key === this.frameKey && host.firstElementChild) return;
+        this.frameKey = key;
         const mountCompareFrame = (options) => mountFrame(host, { ...options, scrollbar: true, sameOrigin: true });
         if (view.kind === 'pdf') {
             mountCompareFrame({ src: view.url, title: '产物 PDF' });
@@ -142,7 +213,7 @@ class MfProductPane extends HTMLElement {
             mountCompareFrame({ srcdoc: textDocument(raw || '', { title: '原文' }), title: '产物原文' });
             return;
         }
-        mountCompareFrame({ srcdoc: view.html || '', title: '产物' });
+        mountCompareFrame({ srcdoc: rendered ? rendered.html : (view.html || ''), title: '产物', appearance: 'paper' });
     }
 
     /** 预检清单：patent profile 的 precheck.json，按 blocking / warning 分组显示，并附 DTD 校验结果 */

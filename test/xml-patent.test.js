@@ -492,7 +492,7 @@ describe('patent profile：parts、预检、zip 与落盘', () => {
             },
         };
         const children = [
-            h(2, '说明书'), h(1, '技术领域'), p('含私用区与控制字符。'),
+            h(2, '说明书'), h(1, '技术领域'), p('含私用区\uE123与控制\x07字符。'),
             createParagraph([createMath({ text: 'a+b，' })]),
         ];
         const assets = [asset('images/image_1.png', PNG, 'image/png'), asset('images/image_2.jpg', makeJpeg({ width: 10, height: 10, dpi: 600 })), asset('images/image_3.jpg', makeJpeg({ width: 10, height: 10 }))];

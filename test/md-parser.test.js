@@ -302,3 +302,38 @@ test('资源名不沿用 Markdown 中的原始地址，子目录与中文文件�
     assert.deepEqual(doc.assets.map((a) => a.name), ['images/image_1.png']);
     assert.equal(collect(doc.ir, (n) => n.type === 'image')[0].url, 'images/image_1.png');
 });
+
+test('<img width> 进 assets 并统一编号，保留 data.asset.absPath 与 data.display；<u> 成 underline；越界与脚本协议不收', async () => {
+    // Arrange
+    const { dir } = makeFixture();
+    const md = [
+        '<img src="images/pic.png" width="300" alt="示意">', '',
+        '行内<img src="images/pic.png" width="50%">与<u>下划线</u>', '',
+        '<img src="../outside.png" width="100">', '',
+        '<img src="javascript:alert(1)">', '',
+    ].join('\n');
+
+    // Act
+    const doc = await parse({ text: md }, { baseDir: dir });
+    const images = collect(doc.ir, (n) => n.type === 'image');
+
+    // Assert：两处引用同一文件，只登记一份资源
+    assert.deepEqual(doc.assets.map((a) => a.name), ['images/image_1.png']);
+    assert.equal(images.length, 3);
+    const [block, inline, outside] = images;
+    assert.equal(block.url, 'images/image_1.png');
+    assert.equal(block.alt, '示意');
+    assert.equal(block.data.asset.absPath, path.join(dir, 'images', 'pic.png'));
+    assert.deepEqual(block.data.display, { width: 300, unit: 'px', source: 'html' });
+    assert.equal(inline.url, 'images/image_1.png');
+    assert.deepEqual(inline.data.display, { width: 50, unit: '%', source: 'html' });
+
+    // Assert：越出 baseDir 的 <img> 与 Markdown 图片一样被拒，不登记
+    assert.equal(outside.url, '../outside.png');
+    assert.equal(outside.data.asset, undefined);
+    assert.ok(doc.warnings.some((w) => w.includes('超出文档目录')), JSON.stringify(doc.warnings));
+
+    // Assert：<u> 提升为 underline；脚本协议的 <img> 不提升，留作 html 由渲染器剥离
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'underline').map(plainText), ['下划线']);
+    assert.ok(collect(doc.ir, (n) => n.type === 'html').some((n) => n.value.includes('javascript:')));
+});

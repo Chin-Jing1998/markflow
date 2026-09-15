@@ -40,12 +40,14 @@ test('所有 §3.3.5 通道均有 schema，未知通道拒绝', () => {
         'mf:formats:describe', 'mf:dialog:pickFiles', 'mf:dialog:pickDirectory', 'mf:paths:expand',
         'mf:convert:run', 'mf:convert:cancel',
         'mf:preview:open', 'mf:preview:render', 'mf:preview:export', 'mf:preview:close', 'mf:reader:open',
+        'mf:md:render', 'mf:md:save', 'mf:md:insertImage',
         'mf:library:list', 'mf:library:update', 'mf:library:remove', 'mf:library:reveal', 'mf:library:open', 'mf:library:reconvert', 'mf:library:migrate',
         'mf:settings:get', 'mf:settings:set', 'mf:settings:setMineruToken', 'mf:settings:testMineru',
-        'mf:theme:get', 'mf:theme:set', 'mf:shell:openExternal',
+        'mf:theme:get', 'mf:theme:set', 'mf:shell:openExternal', 'mf:file:action',
     ];
     for (const channel of expected) assert.ok(SCHEMAS[channel], `缺少 schema：${channel}`);
     assert.equal(Object.keys(SCHEMAS).length, expected.length);
+    assert.equal(expected.length, 29, '通道总数为 29');
     assert.ok(!SCHEMAS['mf:library:relocate'], 'relocate 不暴露为 IPC 通道');
     assert.throws(() => validatePayload('mf:library:relocate', {}), /未知的 IPC 通道/);
     assert.equal(CHANNELS.convertEvent, 'mf:convert:event');
@@ -99,6 +101,24 @@ const REJECTS = [
     ['mf:shell:openExternal', { url: 'javascript:alert(1)' }, 'javascript 外链'],
     ['mf:shell:openExternal', { url: 'mailto:a@b.c' }, 'mailto 外链'],
     ['mf:formats:describe', { extra: true }, '多余键'],
+    ['mf:md:render', {}, '缺 sessionId'],
+    ['mf:md:render', { sessionId: '' }, '空 sessionId'],
+    ['mf:md:render', { sessionId: 's1', extra: 1 }, '多余键'],
+    ['mf:md:render', { sessionId: 's1', text: 5 }, 'text 非字符串'],
+    ['mf:md:save', { sessionId: 's1' }, '缺 text'],
+    ['mf:md:save', { text: 'x' }, '缺 sessionId'],
+    ['mf:md:save', { sessionId: 's1', text: 'x', force: 'yes' }, 'force 非布尔'],
+    ['mf:md:save', { sessionId: 's1', text: 'x', path: '/etc/passwd' }, '渲染层不得指定写入路径'],
+    ['mf:md:insertImage', {}, '缺 sessionId'],
+    ['mf:md:insertImage', { sessionId: 's1', path: '/x.png' }, '渲染层不得指定图片路径'],
+    ['mf:paths:expand', { paths: ['/a'], scope: 'all' }, '非法 scope'],
+    ['mf:dialog:pickFiles', { purpose: 'x' }, '非法 purpose'],
+    ['mf:file:action', undefined, '缺入参'],
+    ['mf:file:action', { action: 'reveal' }, '缺 sessionId'],
+    ['mf:file:action', { sessionId: '', action: 'reveal' }, '空 sessionId'],
+    ['mf:file:action', { sessionId: 'r1' }, '缺 action'],
+    ['mf:file:action', { sessionId: 'r1', action: 'delete' }, '非法 action'],
+    ['mf:file:action', { sessionId: 'r1', action: 'open', path: '/etc/passwd' }, '渲染层不得指定文件路径'],
 ];
 
 for (const [channel, payload, label] of REJECTS) {
@@ -115,13 +135,24 @@ test('schema 放行合法入参并原样返回', () => {
     assert.equal(run.options.jpegPpi, 420);
     assert.deepEqual(validatePayload('mf:convert:run', { items: [{ id: 'u1', url: 'HTTP://Example.com/页面?q=1', target: 'html' }] }).items, [{ id: 'u1', url: 'HTTP://Example.com/页面?q=1', target: 'html' }]);
     assert.deepEqual(validatePayload('mf:library:list', { query: 'x', facets: { favorite: true, tag: 't' }, limit: 10, offset: 0 }).facets, { favorite: true, tag: 't' });
+    assert.deepEqual(validatePayload('mf:library:update', { id: 'r1', patch: { favorite: true, highlighted: true } }).patch, { favorite: true, highlighted: true });
     assert.deepEqual(validatePayload('mf:settings:setMineruToken', { token: null }), { token: null });
     assert.deepEqual(validatePayload('mf:settings:set', { patch: { defaults: { theme: null } } }), { patch: { defaults: { theme: null } } });
+    assert.deepEqual(validatePayload('mf:settings:set', { patch: { library: { repositories: ['/vault-a', '/vault-b'], activeRepository: '/vault-b' } } }).patch.library, { repositories: ['/vault-a', '/vault-b'], activeRepository: '/vault-b' });
     assert.deepEqual(validatePayload('mf:shell:openExternal', { url: 'HTTPS://example.com/a?b=1' }), { url: 'HTTPS://example.com/a?b=1' });
     assert.deepEqual(validatePayload('mf:library:migrate', { dryRun: true }), { dryRun: true });
     // validate：专利 XML 的 DTD 校验开关，转换与预览两条通道共用同一套扁平选项
     assert.deepEqual(validatePayload('mf:convert:run', { items: [{ path: '/a.docx', target: 'xml' }], options: { xmlProfile: 'patent', validate: true } }).options, { xmlProfile: 'patent', validate: true });
     assert.deepEqual(validatePayload('mf:preview:render', { sessionId: 's1', options: { validate: false } }).options, { validate: false });
+    // Markdown 编辑：只收 sessionId（与文本、force），写入路径一律由主进程按会话取
+    assert.deepEqual(validatePayload('mf:md:render', { sessionId: 'reader-1' }), { sessionId: 'reader-1' });
+    assert.deepEqual(validatePayload('mf:md:render', { sessionId: 'reader-1', text: '# 标题\n' }), { sessionId: 'reader-1', text: '# 标题\n' });
+    assert.deepEqual(validatePayload('mf:md:save', { sessionId: 'p1', text: '', force: true }), { sessionId: 'p1', text: '', force: true });
+    assert.deepEqual(validatePayload('mf:md:insertImage', { sessionId: 'p1' }), { sessionId: 'p1' });
+    assert.deepEqual(validatePayload('mf:paths:expand', { paths: ['/a'], scope: 'browse' }), { paths: ['/a'], scope: 'browse' });
+    assert.deepEqual(validatePayload('mf:paths:expand', { paths: ['/a'], scope: 'convert' }), { paths: ['/a'], scope: 'convert' });
+    assert.deepEqual(validatePayload('mf:dialog:pickFiles', { purpose: 'read' }), { purpose: 'read' });
+    assert.deepEqual(validatePayload('mf:dialog:pickFiles', { directory: true, purpose: 'convert' }), { directory: true, purpose: 'convert' });
 });
 
 test('validate 经 service.buildOptions 映射到 xml.validate', () => {
@@ -143,7 +174,7 @@ test('pickTarget 与 stripToken', () => {
 // 处理器
 // ============================================================
 
-function makeHarness({ library = 'default', runDelayMs = 5, preview = null, reader = null } = {}) {
+function makeHarness({ library = 'default', runDelayMs = 5, preview = null, reader = null, dialog = {}, scanModule = scan } = {}) {
     const dir = fs.mkdtempSync(path.join(root, 'h-'));
     const settings = createSettingsStore({ dir, safeStorage: fakeSafeStorage, defaults: { outputDir: path.join(dir, 'out'), libraryRoot: path.join(dir, 'lib') } });
     settings.load();
@@ -182,12 +213,12 @@ function makeHarness({ library = 'default', runDelayMs = 5, preview = null, read
     const opened = [];
     const applied = [];
     const electron = {
-        dialog: {},
+        dialog,
         shell: { openExternal: async (url) => { opened.push(url); }, showItemInFolder: () => undefined, openPath: async () => '', trashItem: async () => undefined },
         nativeTheme: { shouldUseDarkColors: false },
         BrowserWindow: { fromWebContents: () => null },
     };
-    const { handlers, channels } = createIpcHandlers({ electron, settings, library: libraryStub, libraryMigrate: null, service, scan, preview, reader, applyTheme: (theme) => applied.push(theme), log: () => undefined });
+    const { handlers, channels } = createIpcHandlers({ electron, settings, library: libraryStub, libraryMigrate: null, service, scan: scanModule, preview, reader, applyTheme: (theme) => applied.push(theme), log: () => undefined });
     const call = (channel, payload, event) => handlers[channel](event || makeEvent().event, validatePayload(channel, payload));
     return { dir, settings, handlers, channels, call, seenOptions, seenTasks, seenAllowPrivate, upserts, opened, applied };
 }
@@ -415,4 +446,127 @@ test('registerIpc：逐通道注册并在处理前校验', async () => {
     assert.deepEqual([...registered.keys()], ['mf:theme:set']);
     assert.equal(await registered.get('mf:theme:set')({}, { theme: 'dark' }), 'dark');
     await assert.rejects(registered.get('mf:theme:set')({}, { theme: 'blue' }), /参数不合法/);
+});
+
+// ============================================================
+// Markdown 编辑与文件库浏览
+// ============================================================
+
+const { BROWSE_EXTENSIONS, READER_EXTENSIONS } = require('../desktop/main/file-kinds');
+
+function mdOwners() {
+    const seen = [];
+    const owner = (label, id) => ({
+        sessions: new Map([[id, {}]]),
+        renderMarkdown: async (payload) => { seen.push([label, 'render', payload]); return { html: `<p>${label}</p>` }; },
+        saveMarkdown: async (payload) => { seen.push([label, 'save', payload]); return { saved: true }; },
+        importImage: async (payload) => { seen.push([label, 'import', payload]); return { relPath: 'images/a.png', width: 10, height: 5, alt: 'a' }; },
+        imageDialogDir: () => `/docs/${label}`,
+        close: async () => ({ closed: false }),
+    });
+    return { seen, preview: owner('preview', 'p1'), reader: owner('reader', 'r1') };
+}
+
+test('md 通道按 sessionId 分派到预览或阅读会话，未知会话给中文错误', async () => {
+    const { seen, preview, reader } = mdOwners();
+    const h = makeHarness({ preview, reader });
+    assert.deepEqual(await h.call('mf:md:render', { sessionId: 'p1', text: '# a' }), { html: '<p>preview</p>' });
+    assert.deepEqual(await h.call('mf:md:render', { sessionId: 'r1' }), { html: '<p>reader</p>' });
+    assert.deepEqual(await h.call('mf:md:save', { sessionId: 'r1', text: 'x', force: true }), { saved: true });
+    assert.deepEqual(seen.map(([label, kind]) => `${label}:${kind}`), ['preview:render', 'reader:render', 'reader:save']);
+    assert.deepEqual(seen[2][2], { sessionId: 'r1', text: 'x', force: true });
+    for (const [channel, payload] of [['mf:md:render', { sessionId: 'zz' }], ['mf:md:save', { sessionId: 'zz', text: '' }], ['mf:md:insertImage', { sessionId: 'zz' }]]) {
+        await assert.rejects(h.call(channel, payload), /编辑会话不存在或已关闭，请重新打开文件/);
+    }
+    const bare = makeHarness();
+    await assert.rejects(bare.call('mf:md:render', { sessionId: 'p1' }), /编辑会话不存在或已关闭/);
+});
+
+test('md:insertImage：主进程弹图片对话框（默认文档目录），取消回 { canceled:true }，选中后交会话导入', async () => {
+    const { seen, preview, reader } = mdOwners();
+    const dialogs = [];
+    let answer = { canceled: true, filePaths: [] };
+    const dialog = { showOpenDialog: async (win, options) => { dialogs.push(options); return answer; } };
+    const h = makeHarness({ preview, reader, dialog });
+    assert.deepEqual(await h.call('mf:md:insertImage', { sessionId: 'r1' }), { canceled: true });
+    assert.equal(seen.length, 0, '取消时不导入');
+    assert.equal(dialogs[0].defaultPath, '/docs/reader');
+    assert.deepEqual(dialogs[0].properties, ['openFile']);
+    const exts = dialogs[0].filters[0].extensions;
+    assert.ok(exts.includes('png') && exts.includes('jpg') && exts.includes('svg'));
+    assert.ok(!exts.includes('*') && !exts.includes('exe'), '只接受图片扩展名');
+    answer = { canceled: false, filePaths: ['/pics/a.png'] };
+    assert.deepEqual(await h.call('mf:md:insertImage', { sessionId: 'p1' }), { canceled: false, relPath: 'images/a.png', width: 10, height: 5, alt: 'a' });
+    assert.deepEqual(seen[0], ['preview', 'import', { sessionId: 'p1', sourcePath: '/pics/a.png' }]);
+});
+
+test('paths:expand 的 scope 透传到 scan：browse 另列 html / xml / json，缺省与 convert 沿用转档白名单', async () => {
+    const calls = [];
+    const scanStub = { scanPaths: async (...args) => { calls.push(args); return { files: [], unsupported: [], truncated: false }; } };
+    const h = makeHarness({ scanModule: scanStub });
+    await h.call('mf:paths:expand', { paths: ['/repo'], scope: 'browse' });
+    await h.call('mf:paths:expand', { paths: ['/in'] });
+    await h.call('mf:paths:expand', { paths: ['/in'], scope: 'convert' });
+    assert.deepEqual(calls[0], [['/repo'], { exts: BROWSE_EXTENSIONS }]);
+    assert.deepEqual(calls[1], [['/in']], '转档入口不带 exts，沿用默认白名单');
+    assert.deepEqual(calls[2], [['/in']]);
+});
+
+test('dialog:pickFiles：purpose read 为单选「选择要打开的文件」与可阅读文档过滤器；缺省仍是转换对话框', async () => {
+    const dialogs = [];
+    const dialog = { showOpenDialog: async (win, options) => { dialogs.push(options); return { canceled: false, filePaths: ['/a.md', '/b.json'] }; } };
+    const h = makeHarness({ dialog });
+    assert.deepEqual(await h.call('mf:dialog:pickFiles', { purpose: 'read' }), { canceled: false, paths: ['/a.md'] });
+    assert.equal(dialogs[0].title, '选择要打开的文件');
+    assert.deepEqual(dialogs[0].properties, ['openFile']);
+    assert.equal(dialogs[0].filters[0].name, '可阅读的文档');
+    assert.deepEqual(dialogs[0].filters[0].extensions, READER_EXTENSIONS.map((ext) => ext.slice(1)));
+    assert.deepEqual(dialogs[0].filters[1], { name: '全部文件', extensions: ['*'] });
+    await h.call('mf:dialog:pickFiles', undefined);
+    assert.equal(dialogs[1].title, '选择要转换的文件');
+    assert.deepEqual(dialogs[1].properties, ['openFile', 'multiSelections']);
+});
+
+// ============================================================
+// 当前文件操作（顶部栏：在访达中显示 / 用默认应用打开 / 复制路径）
+// ============================================================
+
+test('file:action：路径按 sessionId 在预览与阅读会话中取，reveal / open / copyPath 各走 shell 与剪贴板，失败给中文错误', async () => {
+    assert.deepEqual(validatePayload('mf:file:action', { sessionId: 'reader-1', action: 'copyPath' }), { sessionId: 'reader-1', action: 'copyPath' });
+    const dir = fs.mkdtempSync(path.join(root, 'fa-'));
+    const settings = createSettingsStore({ dir, safeStorage: fakeSafeStorage, defaults: { outputDir: path.join(dir, 'out'), libraryRoot: path.join(dir, 'lib') } });
+    settings.load();
+    const revealed = [];
+    const opened = [];
+    const copied = [];
+    let openFailure = '';
+    const electron = {
+        dialog: {}, nativeTheme: { shouldUseDarkColors: false }, BrowserWindow: { fromWebContents: () => null },
+        shell: { showItemInFolder: (p) => revealed.push(p), openPath: async (p) => { opened.push(p); return openFailure; }, openExternal: async () => undefined, trashItem: async () => undefined },
+        clipboard: { writeText: (text) => copied.push(text) },
+    };
+    const missing = path.join(dir, 'gone.md');
+    const preview = { sessions: new Map([['p1', { input: { path: SAMPLE_MD } }], ['p2', { input: { url: 'https://example.com/' } }]]), close: async () => ({ closed: false }) };
+    const reader = { sessions: new Map([['r1', { path: SAMPLE_MD }], ['r2', { path: missing }]]), close: async () => ({ closed: false }) };
+    const { handlers } = createIpcHandlers({ electron, settings, service: realService, scan, preview, reader, log: () => undefined });
+    const call = (payload) => handlers['mf:file:action']({}, validatePayload('mf:file:action', payload));
+
+    assert.deepEqual(await call({ sessionId: 'r1', action: 'reveal' }), { ok: true });
+    assert.deepEqual(revealed, [SAMPLE_MD], '阅读会话取所开文件');
+    assert.deepEqual(await call({ sessionId: 'p1', action: 'open' }), { ok: true });
+    assert.deepEqual(opened, [SAMPLE_MD], '预览会话取来源文件');
+    assert.deepEqual(await call({ sessionId: 'r2', action: 'copyPath' }), { ok: true });
+    assert.deepEqual(copied, [missing], '复制路径不要求文件仍在');
+
+    openFailure = 'No application knows how to open';
+    await assert.rejects(call({ sessionId: 'r1', action: 'open' }), /无法用默认应用打开：No application knows how to open/);
+    await assert.rejects(call({ sessionId: 'r2', action: 'reveal' }), /文件不存在或已被移动/);
+    await assert.rejects(call({ sessionId: 'p2', action: 'reveal' }), /网页/);
+    await assert.rejects(call({ sessionId: 'nope', action: 'copyPath' }), /文件会话不存在或已关闭/);
+    assert.equal(revealed.length, 1, '失败的 reveal 不调用 shell');
+
+    const noClipboard = createIpcHandlers({ electron: { ...electron, clipboard: undefined }, settings, service: realService, scan, reader, log: () => undefined });
+    await assert.rejects(noClipboard.handlers['mf:file:action']({}, { sessionId: 'r1', action: 'copyPath' }), /剪贴板不可用/);
+    const bare = createIpcHandlers({ electron, settings, service: realService, scan, log: () => undefined });
+    await assert.rejects(bare.handlers['mf:file:action']({}, { sessionId: 'r1', action: 'reveal' }), /文件会话不存在或已关闭/, '模块未就绪时按会话不存在处理');
 });

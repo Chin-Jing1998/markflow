@@ -1,5 +1,5 @@
 /**
- * <mf-sidebar>：左标签栏导航（转换 / 文件库 / 阅读 / 预览 / 设置）。路由为 hash（#/convert 等）。
+ * <mf-sidebar>：左标签栏导航（转换 / 文件库 / 知识库 / 预览 / 设置）。路由为 hash（#/convert 等）。
  */
 import { store } from '../store.js';
 import { icon } from '../icons.js';
@@ -7,7 +7,7 @@ import { icon } from '../icons.js';
 const NAV = Object.freeze([
     { route: 'convert', label: '转换', icon: 'convert' },
     { route: 'library', label: '文件库', icon: 'library' },
-    { route: 'reader', label: '阅读', icon: 'reader' },
+    { route: 'reader', label: '知识库', icon: 'reader' },
     { route: 'preview', label: '预览', icon: 'preview' },
 ]);
 const FOOT = Object.freeze([{ route: 'settings', label: '设置', icon: 'settings' }]);

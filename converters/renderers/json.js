@@ -6,6 +6,8 @@
  * IR 内挂载的二进制（如 image 节点 data.asset.buffer）一律略过，避免字节数组灌入 JSON。
  */
 
+const { stripMarkersTree } = require('../ir/markers');
+
 const JSON_INDENT = 2;
 
 async function render(doc) {
@@ -15,7 +17,8 @@ async function render(doc) {
     const payload = {
         schemaVersion: doc.schemaVersion,
         kind: doc.kind,
-        ir: doc.ir,
+        // 残留的私用区版面标记（ir/markers）兜底剥除
+        ir: stripMarkersTree(doc.ir),
         data: doc.data === undefined ? null : doc.data,
         meta: doc.meta || {},
     };

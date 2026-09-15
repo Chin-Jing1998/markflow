@@ -13,9 +13,17 @@
  *   3) 轮询 `GET /extract-results/batch/{batch_id}`（Bearer 鉴权，3 s 起指数退避至 30 s，总时长受
  *      options.mineru.timeoutSec 约束），读 state / extract_progress / err_msg / full_zip_url；
  *   4) done 后流式下载 full_zip_url（只接受 https，上限 1 GB）到 tmp.makeTempDir 的一次性目录，
- *      jszip 解包：**全部条目**原样进 doc.extras（名字为 `mineru/<zip 内相对路径>`），
- *      full.md 交 parsers/md.parse({ text }, { baseDir }) 构 IR，图片经 md-images 读成 assets；
- *   5) IR 里 MinerU 写成原始 HTML 的表格交 ir/sanitize-table 处理（规则表转 mdast，合并单元格白名单清洗）。
+ *      jszip 解包；full.md 交 parsers/md.parse({ text }, { baseDir }) 构 IR，图片经 md-images 读成 assets；
+ *   5) IR 里 MinerU 写成原始 HTML 的表格交 ir/sanitize-table 处理（规则表转 mdast，合并单元格白名单清洗）；
+ *   6) 仿照 MinerU 结果包整理产物（产物名占位符 {name} 由 converters/output.js 替换）：
+ *      - 图片：*_content_list.json 的 0–1000 归一化 bbox × layout.json 的 page_size（pt）× 96/72 → data.display（px），
+ *        原始路径记 data.sourcePath；content_list 的 image_caption / image_footnote 文字相同的段落从正文移出，
+ *        改为紧随图片的 caption / image_footnote 段落（找不到则补一段）；
+ *        full.md 未引用的包内图片（表格截图、印章等）续编号进 assets，使附属 JSON 的每个图片路径都有着落；
+ *      - 附属文件按 packageNameFor 改名：full.md 与 images/* 丢弃（已进 IR 与 assets），
+ *        *_content_list.json → {name}_content_list.json（补 display），*_content_list_v2.json → {name}_content_list_v2.json，
+ *        *_model.json → {name}_model.json，layout.json → {name}_layout.json，*_origin.pdf → {name}_origin.pdf，
+ *        其余 → {name}_<文件名>；其中的哈希图名由 converters/index.js 渲染时改写为 images/image_N.*（layout 为裸名）。
  *
  * 落盘的临时目录在函数返回前一律删除：解包内容此时已全部在内存里（extras 的 buffer 与图片 asset 的
  * buffer），留着只会在长驻进程（MCP server）里累积。
@@ -35,8 +43,10 @@ const { pipeline } = require('stream/promises');
 
 const { createDocument } = require('../ir/schema');
 const { sanitizeTables } = require('../ir/sanitize-table');
-const { stripExt } = require('../ir/util');
+const { stripExt, collectText } = require('../ir/util');
 const { normalizeOptions } = require('../options');
+const { NAME_TOKEN } = require('../output');
+const { detectIndent } = require('../bundle-sidecars');
 const { getMineruToken } = require('../config');
 const { makeTempDir, removeTempDir } = require('../tmp');
 const { notify, statOrNull } = require('../util');
@@ -53,9 +63,20 @@ const POLL_MAX_MS = 30000;
 const TEMP_PREFIX = 'markflow-mineru-';
 const ZIP_FILENAME = 'result.zip';
 const EXTRACT_DIRNAME = 'extract';
-/** extras 内的顶层目录名；output.writeFolder 据此把它记为 outputs.mineruDir */
-const EXTRAS_PREFIX = 'mineru';
 const DATA_ID_PREFIX = 'markflow-';
+/** content_list 的 bbox 为 0–1000 归一化坐标，page_size 为 pt；显示尺寸按 96 dpi 折算 px */
+const BBOX_SCALE = 1000;
+const PX_PER_PT = 96 / 72;
+const CONTENT_LIST_RE = /_content_list\.json$/i;
+const CONTENT_LIST_V2_RE = /_content_list_v2\.json$/i;
+const IMAGE_DIR_RE = /^images\//;
+const IMAGE_ENTRY_RE = /^images\/[^/]+\.(?:jpe?g|png|gif|webp|bmp|tiff?)$/i;
+const IMAGE_MIME_BY_EXT = Object.freeze({
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+    '.webp': 'image/webp', '.bmp': 'image/bmp', '.tif': 'image/tiff', '.tiff': 'image/tiff',
+});
+/** 图注回填时在图片前后各看几段 */
+const CAPTION_SEARCH_WINDOW = 3;
 const DATA_ID_HASH_LEN = 16;
 /** HTTP 错误里保留的响应体长度 */
 const HTTP_BODY_LIMIT = 300;
@@ -346,7 +367,9 @@ async function buildDocument({ remote, ctx, options, sourceName }) {
         { ...ctx, baseDir, sourceName, onProgress: undefined },
     );
     const { tree } = sanitizeTables(mdDoc.ir);
-    const ir = alignImageNames(tree, mdDoc.assets);
+    const layoutWarnings = [];
+    const layout = readPackageLayout(entries, layoutWarnings);
+    const ir = placeCaptions(locateImages(alignImageNames(tree, mdDoc.assets), baseDir, layout), layout);
 
     return createDocument({
         kind: 'document',
@@ -367,10 +390,213 @@ async function buildDocument({ remote, ctx, options, sourceName }) {
             pdfParser: 'mineru',
             mineruModel: options.mineru.model,
         },
-        assets: mdDoc.assets,
-        extras: entries.map((entry) => ({ name: `${EXTRAS_PREFIX}/${entry.name}`, buffer: entry.buffer })),
-        warnings: [...(mdDoc.warnings || []), ...warnings],
+        assets: packageAssets(mdDoc.assets, ir, entries),
+        extras: packageExtras(entries, markdown, layout),
+        warnings: [...(mdDoc.warnings || []), ...warnings, ...layoutWarnings],
     });
+}
+
+// ============================================================
+// MinerU 结果包整理：显示尺寸、图注、附属文件改名
+// ============================================================
+
+/** 读 *_content_list.json（非 v2）与 layout.json 的 page_size，得到「图片路径 → 块与显示尺寸」 */
+function readPackageLayout(entries, warnings) {
+    const listEntry = entries.find((entry) => CONTENT_LIST_RE.test(entry.name) && !CONTENT_LIST_V2_RE.test(entry.name)) || null;
+    const layoutEntry = entries.find((entry) => path.posix.basename(entry.name) === 'layout.json') || null;
+    const parsedList = parseJsonEntry(listEntry, warnings);
+    const contentList = Array.isArray(parsedList) ? parsedList : null;
+    const layoutJson = parseJsonEntry(layoutEntry, warnings);
+    const pageSizes = new Map();
+    const pages = layoutJson && Array.isArray(layoutJson.pdf_info) ? layoutJson.pdf_info : [];
+    pages.forEach((page, index) => {
+        const size = page && page.page_size;
+        if (!Array.isArray(size) || size.length < 2) return;
+        pageSizes.set(Number.isInteger(page.page_idx) ? page.page_idx : index, [Number(size[0]), Number(size[1])]);
+    });
+    const byPath = new Map();
+    for (const block of contentList || []) {
+        if (!block || typeof block.img_path !== 'string' || !block.img_path || byPath.has(block.img_path)) continue;
+        byPath.set(block.img_path, { block, display: displayFromBbox(block, pageSizes) });
+    }
+    return { listEntry, contentList, byPath };
+}
+
+function parseJsonEntry(entry, warnings) {
+    if (!entry) return null;
+    try {
+        return JSON.parse(entry.buffer.toString('utf8'));
+    } catch (err) {
+        warnings.push(`MinerU 结果包中的 ${entry.name} 不是合法 JSON，图片尺寸与图注按缺失处理`);
+        return null;
+    }
+}
+
+function displayFromBbox(block, pageSizes) {
+    const bbox = Array.isArray(block.bbox) ? block.bbox.map(Number) : [];
+    if (bbox.length < 4 || bbox.some((value) => !Number.isFinite(value))) return null;
+    const size = pageSizes.get(Number.isInteger(block.page_idx) ? block.page_idx : 0);
+    if (!size || !(size[0] > 0) || !(size[1] > 0)) return null;
+    const [x0, y0, x1, y1] = bbox;
+    const width = Math.round(((x1 - x0) / BBOX_SCALE) * size[0] * PX_PER_PT);
+    const height = Math.round(((y1 - y0) / BBOX_SCALE) * size[1] * PX_PER_PT);
+    if (!(width >= 1)) return null;
+    const display = { width };
+    if (height >= 1) display.height = height;
+    display.unit = 'px';
+    display.source = 'mineru';
+    return display;
+}
+
+/** 图片节点记下包内原始路径（data.sourcePath，由 data.asset.absPath 反推）与 content_list 给出的显示尺寸 */
+function locateImages(tree, baseDir, layout) {
+    const mapNode = (node) => {
+        if (!node || typeof node !== 'object') return node;
+        if (node.type === 'image') {
+            const sourcePath = sourcePathOf(node, baseDir);
+            if (!sourcePath) return node;
+            const info = layout.byPath.get(sourcePath);
+            const data = { ...(node.data || {}), sourcePath };
+            if (info && info.display) data.display = info.display;
+            // 解包目录在本模块返回前删除，absPath 随之失效；置空以免把本机临时路径写进 {name}.json
+            if (data.asset) data.asset = { ...data.asset, absPath: null };
+            return { ...node, data };
+        }
+        if (!Array.isArray(node.children)) return node;
+        const children = node.children.map(mapNode);
+        return children.some((child, i) => child !== node.children[i]) ? { ...node, children } : node;
+    };
+    return mapNode(tree);
+}
+
+function sourcePathOf(node, baseDir) {
+    const absPath = node.data && node.data.asset && node.data.asset.absPath;
+    if (typeof absPath !== 'string' || !absPath) return null;
+    const rel = path.relative(baseDir, absPath);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    return rel.split(path.sep).join('/');
+}
+
+/**
+ * content_list 的 image_caption / image_footnote 归位：与之文字相同的段落（图片前后 3 段内）移出正文，
+ * 改为紧随图片的 caption / image_footnote 段落；找不到时补一段
+ */
+function placeCaptions(tree, layout) {
+    if (!tree || !Array.isArray(tree.children) || layout.byPath.size === 0) return tree;
+    const out = [...tree.children];
+    let changed = false;
+    for (let index = 0; index < out.length; index += 1) {
+        const info = layout.byPath.get(imageSourceOfParagraph(out[index]));
+        const block = info && info.block;
+        if (!block) continue;
+        const groups = [[textList(block.image_caption), 'caption'], [textList(block.image_footnote), 'image_footnote']];
+        const inserted = [];
+        for (const [texts, role] of groups) {
+            for (const text of texts) {
+                const at = findParagraphNear(out, index, text);
+                let paragraph = { type: 'paragraph', children: [{ type: 'text', value: text }] };
+                if (at >= 0) {
+                    [paragraph] = out.splice(at, 1);
+                    if (at < index) index -= 1;
+                }
+                inserted.push({ ...paragraph, data: { ...(paragraph.data || {}), role } });
+            }
+        }
+        if (inserted.length === 0) continue;
+        out.splice(index + 1, 0, ...inserted);
+        index += inserted.length;
+        changed = true;
+    }
+    return changed ? { ...tree, children: out } : tree;
+}
+
+// 只含一张图片的段落 → 该图片的 sourcePath；否则 null
+function imageSourceOfParagraph(node) {
+    if (!node || node.type !== 'paragraph' || !Array.isArray(node.children)) return null;
+    const visible = node.children.filter((child) => !(child.type === 'text' && !String(child.value || '').trim()));
+    if (visible.length !== 1 || visible[0].type !== 'image') return null;
+    return (visible[0].data && visible[0].data.sourcePath) || null;
+}
+
+const textList = (value) => (Array.isArray(value) ? value : [])
+    .filter((item) => typeof item === 'string' && item.trim())
+    .map((item) => item.trim());
+const normalizeText = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+
+function findParagraphNear(list, index, text) {
+    const target = normalizeText(text);
+    for (let offset = 1; offset <= CAPTION_SEARCH_WINDOW; offset += 1) {
+        for (const at of [index + offset, index - offset]) {
+            const node = list[at];
+            if (node && node.type === 'paragraph' && normalizeText(collectText(node)) === target) return at;
+        }
+    }
+    return -1;
+}
+
+/** assets 标注包内原始路径（sourcePath）；full.md 未引用的包内图片续编号补入，保证附属 JSON 的图片路径都有着落 */
+function packageAssets(mdAssets, ir, entries) {
+    const sourceByName = new Map();
+    walkImages(ir, (node) => {
+        const sourcePath = node.data && node.data.sourcePath;
+        const name = (node.data && node.data.assetName) || node.url;
+        if (sourcePath && name && !sourceByName.has(name)) sourceByName.set(name, sourcePath);
+    });
+    const assets = (mdAssets || []).map((asset) => (sourceByName.has(asset.name) ? { ...asset, sourcePath: sourceByName.get(asset.name) } : asset));
+    const known = new Set(assets.map((asset) => asset.sourcePath).filter(Boolean));
+    for (const entry of entries) {
+        if (!IMAGE_ENTRY_RE.test(entry.name) || known.has(entry.name)) continue;
+        const ext = path.posix.extname(entry.name).toLowerCase();
+        assets.push({ name: `images/image_${assets.length + 1}${ext}`, buffer: entry.buffer, mime: IMAGE_MIME_BY_EXT[ext] || 'application/octet-stream', sourcePath: entry.name });
+        known.add(entry.name);
+    }
+    return assets;
+}
+
+function walkImages(node, visit) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'image') visit(node);
+    if (Array.isArray(node.children)) for (const child of node.children) walkImages(child, visit);
+}
+
+/** 附属文件：丢弃 full.md 与 images/*，其余按 packageNameFor 改名；content_list 补上 display */
+function packageExtras(entries, markdownEntry, layout) {
+    const used = new Set();
+    const extras = [];
+    for (const entry of entries) {
+        if (entry === markdownEntry || IMAGE_DIR_RE.test(entry.name)) continue;
+        let name = packageNameFor(entry.name);
+        if (used.has(name)) name = `${NAME_TOKEN}_${entry.name.replace(/\//g, '_')}`;
+        if (used.has(name)) continue;
+        used.add(name);
+        const buffer = entry === layout.listEntry ? contentListWithDisplay(entry, layout) : entry.buffer;
+        extras.push({ name, buffer });
+    }
+    return extras;
+}
+
+function packageNameFor(entryName) {
+    const base = path.posix.basename(entryName);
+    if (CONTENT_LIST_V2_RE.test(base)) return `${NAME_TOKEN}_content_list_v2.json`;
+    if (CONTENT_LIST_RE.test(base)) return `${NAME_TOKEN}_content_list.json`;
+    if (/_model\.json$/i.test(base)) return `${NAME_TOKEN}_model.json`;
+    if (base === 'layout.json') return `${NAME_TOKEN}_layout.json`;
+    if (/_origin\.pdf$/i.test(base)) return `${NAME_TOKEN}_origin.pdf`;
+    return `${NAME_TOKEN}_${base}`;
+}
+
+function contentListWithDisplay(entry, layout) {
+    if (!layout.contentList) return entry.buffer;
+    let changed = false;
+    const list = layout.contentList.map((block) => {
+        if (!block || block.type !== 'image' || typeof block.img_path !== 'string') return block;
+        const info = layout.byPath.get(block.img_path);
+        if (!info || !info.display) return block;
+        changed = true;
+        return { ...block, display: info.display };
+    });
+    if (!changed) return entry.buffer;
+    return Buffer.from(JSON.stringify(list, null, detectIndent(entry.buffer.toString('utf8'))), 'utf8');
 }
 
 /** 正文优先取根目录的 full.md，其次任意 *full.md，最后任意 .md */

@@ -9,8 +9,10 @@
  *
  * 通道一览：
  *   mf:formats:describe                      → describeFormats() + options 描述树 + 进程内后端状态
- *   mf:dialog:pickFiles / pickDirectory      → 原生对话框
- *   mf:paths:expand { paths }                → { files, unsupported, truncated }
+ *   mf:dialog:pickFiles { directory?, purpose? } → 原生对话框；purpose 'read' 为「选择要打开的文件」（单选、可阅读文档过滤器）
+ *   mf:dialog:pickDirectory                  → 原生对话框
+ *   mf:paths:expand { paths, scope? }        → { files, unsupported, truncated }；scope 缺省 / 'convert' 按转档白名单，
+ *       'browse'（文件库仓库树）另列 .html .htm .xml .json
  *   mf:convert:run { items, outputDir?, options? } → { runId, outputDir, tasks }；进度经 mf:convert:event 推送
  *       事件形状：{ runId, taskId, status: 'queued'|'running'|'done'|'failed'|'cancelled', phase, pct, result?, libraryId?, error? }
  *       整批结束：{ runId, taskId: null, status: 'finished', summary }；菜单「打开文件…」：{ runId: null, type: 'enqueue', files, unsupported }
@@ -26,6 +28,8 @@
  *   mf:settings:get/set/setMineruToken/testMineru → 设置与令牌（回包永不含令牌）
  *   mf:theme:get/set                         → 主题；变化经 mf:theme:changed 广播
  *   mf:shell:openExternal { url }            → 仅 http(s)
+ *   mf:file:action { sessionId, action }     → 顶部栏的当前文件操作：reveal 在访达中显示 / open 用默认应用打开 / copyPath 复制路径；
+ *                                              渲染层不传路径，主进程依次在预览会话（来源文件）与阅读会话（所开文件）中按 sessionId 取
  */
 const path = require('path');
 const fsp = require('fs').promises;
@@ -35,6 +39,7 @@ const { TARGETS, INPUT_CLASS, DEFAULT_TARGETS, SUPPORTED_EXTENSIONS, assertTarge
 const { OPTION_ENUMS, describeOptions } = require('../../converters/options');
 const { errText, statOrNull, hostnameOf } = require('../../converters/util');
 const { THEMES, LIBRARY_MODES, SettingsPatchSchema } = require('./settings');
+const { BROWSE_EXTENSIONS, READER_EXTENSIONS, IMAGE_IMPORT_EXTENSIONS, MAX_TEXT_BYTES } = require('./file-kinds');
 
 const CONVERT_CONCURRENCY = 2;
 const MAX_ITEMS_PER_RUN = 500;
@@ -62,6 +67,9 @@ const CHANNELS = Object.freeze({
     previewClose: 'mf:preview:close',
     previewEvent: 'mf:preview:event',
     readerOpen: 'mf:reader:open',
+    mdRender: 'mf:md:render',
+    mdSave: 'mf:md:save',
+    mdInsertImage: 'mf:md:insertImage',
     libraryList: 'mf:library:list',
     libraryUpdate: 'mf:library:update',
     libraryRemove: 'mf:library:remove',
@@ -77,7 +85,11 @@ const CHANNELS = Object.freeze({
     themeSet: 'mf:theme:set',
     themeChanged: 'mf:theme:changed',
     shellOpenExternal: 'mf:shell:openExternal',
+    fileAction: 'mf:file:action',
 });
+
+/** mf:file:action 的动作：在访达中显示 / 用默认应用打开 / 复制路径 */
+const FILE_ACTIONS = Object.freeze(['reveal', 'open', 'copyPath']);
 
 // ============================================================
 // schema
@@ -152,9 +164,9 @@ const FacetQuerySchema = z.object({
 
 const SCHEMAS = Object.freeze({
     [CHANNELS.formatsDescribe]: NoPayload,
-    [CHANNELS.dialogPickFiles]: z.object({ directory: z.boolean().optional() }).strict().optional(),
+    [CHANNELS.dialogPickFiles]: z.object({ directory: z.boolean().optional(), purpose: z.enum(['convert', 'read']).optional() }).strict().optional(),
     [CHANNELS.dialogPickDirectory]: z.object({ defaultPath: absPath.optional(), title: z.string().max(200).optional() }).strict().optional(),
-    [CHANNELS.pathsExpand]: z.object({ paths: z.array(absPath).max(MAX_PATHS_PER_EXPAND) }).strict(),
+    [CHANNELS.pathsExpand]: z.object({ paths: z.array(absPath).max(MAX_PATHS_PER_EXPAND), scope: z.enum(['convert', 'browse']).optional() }).strict(),
     [CHANNELS.convertRun]: z.object({
         items: z.array(ConvertItemSchema).min(1).max(MAX_ITEMS_PER_RUN),
         outputDir: absPath.optional(),
@@ -170,6 +182,9 @@ const SCHEMAS = Object.freeze({
     [CHANNELS.previewExport]: z.object({ sessionId: recordId, outputDir: absPath.optional() }).strict(),
     [CHANNELS.previewClose]: z.object({ sessionId: recordId }).strict(),
     [CHANNELS.readerOpen]: z.object({ path: absPath }).strict(),
+    [CHANNELS.mdRender]: z.object({ sessionId: recordId, text: z.string().max(MAX_TEXT_BYTES).optional() }).strict(),
+    [CHANNELS.mdSave]: z.object({ sessionId: recordId, text: z.string().max(MAX_TEXT_BYTES), force: z.boolean().optional() }).strict(),
+    [CHANNELS.mdInsertImage]: z.object({ sessionId: recordId }).strict(),
     [CHANNELS.libraryList]: z.object({
         query: z.string().max(200).optional(),
         facets: FacetQuerySchema.optional(),
@@ -183,6 +198,7 @@ const SCHEMAS = Object.freeze({
         patch: z.object({
             tags: z.array(z.string().min(1).max(60)).max(50).optional(),
             favorite: z.boolean().optional(),
+            highlighted: z.boolean().optional(),
             title: z.string().max(300).optional(),
         }).strict(),
     }).strict(),
@@ -198,6 +214,8 @@ const SCHEMAS = Object.freeze({
     [CHANNELS.themeGet]: NoPayload,
     [CHANNELS.themeSet]: z.object({ theme: themeEnum }).strict(),
     [CHANNELS.shellOpenExternal]: z.object({ url: z.string().max(MAX_PATH_LENGTH).regex(EXTERNAL_URL_RE, '仅接受 http(s) 网址') }).strict(),
+    // 渲染层只给会话与动作，不给路径：路径一律由主进程按 sessionId 在预览会话与阅读会话中取
+    [CHANNELS.fileAction]: z.object({ sessionId: recordId, action: z.enum([...FILE_ACTIONS]) }).strict(),
 });
 
 function formatIssues(error) {
@@ -293,6 +311,17 @@ function createIpcHandlers(deps = {}) {
     // ---------- 对话框与路径 ----------
 
     async function dialogPickFiles(event, payload = {}) {
+        if (payload && payload.purpose === 'read') {
+            const picked = await dialog.showOpenDialog(parentWindow(event), {
+                title: '选择要打开的文件',
+                properties: ['openFile'],
+                filters: [
+                    { name: '可阅读的文档', extensions: READER_EXTENSIONS.map((ext) => ext.slice(1)) },
+                    { name: '全部文件', extensions: ['*'] },
+                ],
+            });
+            return { canceled: Boolean(picked.canceled), paths: picked.canceled ? [] : picked.filePaths.slice(0, 1) };
+        }
         const directory = Boolean(payload && payload.directory);
         const result = await dialog.showOpenDialog(parentWindow(event), {
             title: directory ? '选择要转换的文件夹' : '选择要转换的文件',
@@ -314,7 +343,10 @@ function createIpcHandlers(deps = {}) {
         return { canceled: Boolean(result.canceled) || result.filePaths.length === 0, path: result.canceled ? null : (result.filePaths[0] || null) };
     }
 
-    const pathsExpand = (event, payload) => scan.scanPaths(payload.paths);
+    /** 转档入口（缺省 / convert）仍按转档白名单展开；文件库仓库树（browse）另列 html / htm / xml / json */
+    const pathsExpand = (event, payload) => (payload.scope === 'browse'
+        ? scan.scanPaths(payload.paths, { exts: BROWSE_EXTENSIONS })
+        : scan.scanPaths(payload.paths));
 
     // ---------- 转换 ----------
 
@@ -435,6 +467,34 @@ function createIpcHandlers(deps = {}) {
     }
 
     const readerOpen = async (event, payload) => requireModule(reader).open(payload);
+
+    // ---------- Markdown 编辑 ----------
+
+    /** 按 sessionId 找编辑会话的归属：预览会话优先，其次阅读会话；都不在即中文报错 */
+    function mdOwner(sessionId) {
+        const id = String(sessionId || '');
+        if (preview && preview.sessions && preview.sessions.has(id)) return preview;
+        if (reader && reader.sessions && reader.sessions.has(id)) return reader;
+        throw new Error('编辑会话不存在或已关闭，请重新打开文件');
+    }
+
+    const mdRender = async (event, payload) => mdOwner(payload.sessionId).renderMarkdown(payload);
+    const mdSave = async (event, payload) => mdOwner(payload.sessionId).saveMarkdown(payload);
+
+    /** 插图：由主进程弹原生对话框（仅图片扩展名，默认目录为文档目录），写入路径同样由主进程按会话决定 */
+    async function mdInsertImage(event, payload) {
+        const owner = mdOwner(payload.sessionId);
+        const defaultPath = typeof owner.imageDialogDir === 'function' ? owner.imageDialogDir(payload) : undefined;
+        const picked = await dialog.showOpenDialog(parentWindow(event), {
+            title: '插入图片',
+            ...(defaultPath ? { defaultPath } : {}),
+            properties: ['openFile'],
+            filters: [{ name: '图片', extensions: IMAGE_IMPORT_EXTENSIONS.map((ext) => ext.slice(1)) }],
+        });
+        if (!picked || picked.canceled || !Array.isArray(picked.filePaths) || picked.filePaths.length === 0) return { canceled: true };
+        const imported = await owner.importImage({ sessionId: payload.sessionId, sourcePath: picked.filePaths[0] });
+        return { canceled: false, ...imported };
+    }
 
     // ---------- 文件库 ----------
 
@@ -565,6 +625,41 @@ function createIpcHandlers(deps = {}) {
         return { ok: true };
     }
 
+    // ---------- 当前文件操作（顶部栏） ----------
+
+    /** 按 sessionId 取会话对应的本地文件：先查预览会话（取来源文件，网页来源没有本地文件），再查阅读会话（取所开文件） */
+    function sessionFilePath(sessionId) {
+        const id = String(sessionId || '');
+        const previewSession = preview && preview.sessions ? preview.sessions.get(id) : null;
+        if (previewSession) {
+            const filePath = previewSession.input && previewSession.input.path;
+            if (!filePath) throw new Error('当前预览来自网页，没有对应的本地文件');
+            return filePath;
+        }
+        const readerSession = reader && reader.sessions ? reader.sessions.get(id) : null;
+        if (readerSession && readerSession.path) return readerSession.path;
+        throw new Error('文件会话不存在或已关闭，请重新打开文件');
+    }
+
+    /** reveal 用 shell.showItemInFolder，open 用 shell.openPath（失败回中文错误），copyPath 用主进程剪贴板；复制路径不要求文件仍在 */
+    async function fileAction(event, payload) {
+        const filePath = sessionFilePath(payload.sessionId);
+        if (payload.action === 'copyPath') {
+            const { clipboard } = electron;
+            if (!clipboard || typeof clipboard.writeText !== 'function') throw new Error('剪贴板不可用');
+            clipboard.writeText(filePath);
+            return { ok: true };
+        }
+        if (!(await statOrNull(filePath))) throw new Error(`文件不存在或已被移动：${path.basename(filePath)}`);
+        if (payload.action === 'reveal') {
+            shell.showItemInFolder(filePath);
+            return { ok: true };
+        }
+        const failure = await shell.openPath(filePath);
+        if (failure) throw new Error(`无法用默认应用打开：${failure}`);
+        return { ok: true };
+    }
+
     const handlers = {
         [CHANNELS.formatsDescribe]: formatsDescribe,
         [CHANNELS.dialogPickFiles]: dialogPickFiles,
@@ -577,6 +672,9 @@ function createIpcHandlers(deps = {}) {
         [CHANNELS.previewExport]: previewExport,
         [CHANNELS.previewClose]: previewClose,
         [CHANNELS.readerOpen]: readerOpen,
+        [CHANNELS.mdRender]: mdRender,
+        [CHANNELS.mdSave]: mdSave,
+        [CHANNELS.mdInsertImage]: mdInsertImage,
         [CHANNELS.libraryList]: libraryList,
         [CHANNELS.libraryUpdate]: libraryUpdate,
         [CHANNELS.libraryRemove]: libraryRemove,
@@ -591,6 +689,7 @@ function createIpcHandlers(deps = {}) {
         [CHANNELS.themeGet]: themeGet,
         [CHANNELS.themeSet]: themeSet,
         [CHANNELS.shellOpenExternal]: shellOpenExternal,
+        [CHANNELS.fileAction]: fileAction,
     };
     return { handlers, channels: CHANNELS, runs };
 }

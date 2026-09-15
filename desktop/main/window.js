@@ -9,7 +9,8 @@
  *   共同：show:false 配合 ready-to-show（1.5 s 显示兜底），backgroundColor 按深浅色取 #1c1c1e / #f5f5f7 避免深色启动闪白；
  *   webPreferences：contextIsolation / sandbox / webSecurity 开，nodeIntegration 关，plugins 开（阶段 5 内置 PDF 阅读器）。
  * createMainWindow(electron, { preloadPath, url, isDark, onClosed }) → BrowserWindow
- *   仅 http(s) 外链交 shell.openExternal 且一律 deny 新窗口；will-navigate 全拒。
+ *   仅 http(s) 外链交 shell.openExternal 且一律 deny 新窗口；will-navigate 全拒；
+ *   will-prevent-unload（渲染层因 Markdown 修改未保存完毕拦下卸载）弹「取消 / 仍然关闭」，选关闭则放行（createUnloadGuard）。
  * applyWindowTheme(win, { platform, isDark })：切换主题时同步底色与（非 macOS 的）标题栏按钮配色。
  */
 const os = require('os');
@@ -92,9 +93,31 @@ function createMainWindow(electron, { preloadPath, url, isDark = false, platform
     });
     win.webContents.on('will-navigate', (event) => event.preventDefault());
     win.webContents.on('will-attach-webview', (event) => event.preventDefault());
+    win.webContents.on('will-prevent-unload', createUnloadGuard(electron.dialog, win));
 
     win.loadURL(url).catch((err) => log(`加载主页面失败：${err && err.message ? err.message : err}`));
     return win;
+}
+
+/**
+ * will-prevent-unload 处理器：渲染进程的 beforeunload 因「仍有 Markdown 修改未保存完毕」拦下卸载时询问用户，
+ * 选「仍然关闭」则 preventDefault 放行卸载，选「取消」保持窗口。dialog 可注入桩以便单测。
+ */
+function createUnloadGuard(dialog, win) {
+    return (event) => {
+        if (!dialog || typeof dialog.showMessageBoxSync !== 'function') return;
+        const options = {
+            type: 'warning',
+            buttons: ['取消', '仍然关闭'],
+            defaultId: 0,
+            cancelId: 0,
+            message: '仍有 Markdown 修改未保存完毕',
+            detail: '正在保存或尚未导出的修改会丢失。',
+        };
+        const owner = win && typeof win.isDestroyed === 'function' && !win.isDestroyed() ? win : null;
+        const choice = owner ? dialog.showMessageBoxSync(owner, options) : dialog.showMessageBoxSync(options);
+        if (choice === 1) event.preventDefault();
+    };
 }
 
 function applyWindowTheme(win, { platform = process.platform, isDark = false } = {}) {
@@ -107,6 +130,6 @@ function applyWindowTheme(win, { platform = process.platform, isDark = false } =
 }
 
 module.exports = {
-    windowOptionsFor, createMainWindow, applyWindowTheme, supportsMica, windowsBuildOf, backgroundFor, overlayFor,
+    windowOptionsFor, createMainWindow, applyWindowTheme, createUnloadGuard, supportsMica, windowsBuildOf, backgroundFor, overlayFor,
     DARK_BACKGROUND, LIGHT_BACKGROUND, TITLEBAR_HEIGHT, SHOW_FALLBACK_MS, WIN11_MICA_MIN_BUILD,
 };

@@ -171,6 +171,40 @@ describe('writeFolder', () => {
         assert.equal(outputKeyFor('sub/abstract-figure.xml'), 'abstractFigure');
     });
 
+    test('extras 名中的 {name} 替换为产物名；根目录 {name}_ 附属文件进 outputs（camelCase，非 json 接扩展名），其余根目录附属文件不进', async () => {
+        // Act
+        const res = await writeFolder({
+            outputDir: root,
+            name: '包G',
+            files: { '{name}.md': '# G', '{name}_content_list.json': '[]' },
+            extras: [
+                { name: '{name}_content_list_v2.json', buffer: Buffer.from('[]') },
+                { name: '{name}_model.json', buffer: Buffer.from('[]') },
+                { name: '{name}_layout.json', buffer: Buffer.from('{}') },
+                { name: '{name}_origin.pdf', buffer: Buffer.from('%PDF') },
+                { name: 'notes.txt', buffer: Buffer.from('n') },
+                { name: 'sub/{name}_x.json', buffer: Buffer.from('{}') },
+            ],
+        });
+
+        // Assert
+        const dir = path.join(root, '包G');
+        assert.deepEqual(res.outputs, {
+            md: path.join(dir, '包G.md'),
+            contentList: path.join(dir, '包G_content_list.json'),
+            contentListV2: path.join(dir, '包G_content_list_v2.json'),
+            model: path.join(dir, '包G_model.json'),
+            layout: path.join(dir, '包G_layout.json'),
+            originPdf: path.join(dir, '包G_origin.pdf'),
+            subDir: path.join(dir, 'sub'),
+        });
+        assert.equal(fs.readFileSync(res.outputs.originPdf, 'utf8'), '%PDF');
+        assert.ok(fs.existsSync(path.join(dir, 'sub', '包G_x.json')));
+        assert.ok(fs.existsSync(path.join(dir, 'notes.txt')));
+        assert.equal(outputKeyFor('{name}_content_list_v2.json'), 'contentListV2');
+        assert.equal(outputKeyFor('{name}_origin.pdf'), 'originPdf');
+    });
+
     test('字符串按 utf8、Buffer 原样、子目录自动创建；无 assets 时不建 images/，返回绝对路径', async () => {
         // Arrange
         const relative = path.relative(process.cwd(), root);

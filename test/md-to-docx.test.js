@@ -370,3 +370,20 @@ test('带 data.safeTable 的 html 节点按文本处理（已知限制：不重�
     assert.ok(documentXml.includes('甲') && documentXml.includes('乙'));
     assert.ok(!documentXml.includes('&lt;table'), '不应残留 HTML 标签');
 });
+
+test('underline 输出下划线 run；带 display 的图片按显示宽度内嵌（缺高度时按像素宽高比补）；\\t 输出为 w:tab', async () => {
+    // Arrange：IR 经 ir/inline-html 提升（与 md 解析器同一链路）
+    const { liftInlineHtml } = require('../converters/ir/inline-html');
+    const ir = liftInlineHtml(await parseMarkdown('<img src="images/pic.png" width="300">\n\n前<u>下划线</u>后\n\n图 1\t图 2\n'));
+    const [image] = collect(ir, (n) => n.type === 'image');
+    attachAsset(image, { buffer: makePng(100, 50), width: 100, height: 50 });
+
+    // Act
+    const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert
+    assert.ok(documentXml.includes(`cx="${300 * EMU_PER_PX}"`), '宽度取显示宽度 300px');
+    assert.ok(documentXml.includes(`cy="${150 * EMU_PER_PX}"`), '高度按像素宽高比补为 150px');
+    assert.match(documentXml, /<w:u w:val="single"\/>/);
+    assert.ok(documentXml.includes('<w:tab/>'), '制表符应为 w:tab');
+});

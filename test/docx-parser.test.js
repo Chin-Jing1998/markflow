@@ -14,6 +14,12 @@ const {
 } = require('docx');
 
 const { parse } = require('../converters/parsers/docx');
+const mdRenderer = require('../converters/renderers/md');
+const { buildLayoutSample, LAYOUT_EXPECTED } = require('./fixtures/build-layout-sample');
+
+// 不可见字符以码点生成，源码不出现看不见的字面量：U+3000 全角空格，U+EF00–U+EF1F 私用区版面标记
+const IDEO = String.fromCharCode(0x3000);
+const LAYOUT_RESIDUE_RE = new RegExp(`[${IDEO}${String.fromCharCode(0xEF00)}-${String.fromCharCode(0xEF1F)}]`);
 
 // ============================================================
 // 测试夹具：手工生成合法 PNG（避免引入二进制测试资源）
@@ -290,4 +296,60 @@ test('无标题样稿：段数与图片数正确，顿号权项与坏引用原�
     assert.ok(plainText(top[1]).startsWith('1、一种液体容器'));
     assert.ok(plainText(top[5]).includes('根据权利要求12-3任一项所述'));
     assert.equal(top.filter((n) => /^\[\d{4}\]/.test(plainText(n))).length, 0, '样稿不应带段号');
+});
+
+// ============================================================
+// 版面夹具（test/fixtures/build-layout-sample.js 现造）
+// ============================================================
+
+test('版面夹具：首行缩进（段落与样式链）进 data.indent，标题与悬挂缩进跳过；制表符保留为 \\t；文本不带全角空格与标记', async () => {
+    // Act
+    const doc = await parse({ buffer: await buildLayoutSample() }, { sourceName: '版面样例.docx' });
+    const top = doc.ir.children;
+    const byText = (prefix) => top.find((n) => plainText(n).startsWith(prefix));
+
+    // Assert
+    assert.equal(top[0].type, 'heading');
+    assert.equal(top[0].data, undefined, '标题段不加缩进');
+    assert.equal(byText('首行缩进两字').data.indent, 2);
+    assert.equal(byText('样式链继承').data.indent, 2);
+    assert.equal(byText('悬挂缩进').data, undefined);
+    assert.equal(plainText(byText('制表符')), '制表符\t之后');
+    assert.ok(!LAYOUT_RESIDUE_RE.test(JSON.stringify(doc.ir)), '段落文本本身不带全角缩进与私用区标记');
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'underline').map(plainText), ['下划线文字']);
+});
+
+test('版面夹具：图片显示尺寸取自 wp:extent 且按资产名对位（无 blip 的 drawing 不致错位），浮动图排在文字之后，题注成段', async () => {
+    // Act
+    const doc = await parse({ buffer: await buildLayoutSample() }, { sourceName: '版面样例.docx' });
+    const top = doc.ir.children;
+    const images = collect(doc.ir, (n) => n.type === 'image');
+
+    // Assert：尺寸、alt 与资产一一对应，字节与夹具原图一致
+    assert.deepEqual(
+        images.map((n) => [n.url, n.alt, n.data.display.width, n.data.display.height, Boolean(n.data.floating)]),
+        LAYOUT_EXPECTED.images.map((i) => [i.name, i.alt, i.width, i.height, i.floating]),
+    );
+    assert.deepEqual(doc.assets.map((a) => a.name), LAYOUT_EXPECTED.images.map((i) => i.name));
+    LAYOUT_EXPECTED.images.forEach((image, i) => assert.ok(doc.assets[i].buffer.equals(image.buffer), image.name));
+
+    // Assert：题注样式段与「图 2\t图 3」均为 caption，且紧随图片段
+    const captions = top.filter((n) => n.data && n.data.role === 'caption');
+    assert.deepEqual(captions.map(plainText), ['图 1 示意图甲', '图 2\t图 3']);
+    const label = top.findIndex((n) => plainText(n) === '【示例】');
+    assert.deepEqual(top.slice(label + 1, label + 4).map((n) => (n.children[0].type === 'image' ? n.children[0].url : plainText(n))),
+        ['images/image_2.png', 'images/image_3.png', '图 2\t图 3']);
+});
+
+test('版面夹具转 Markdown：段首两个全角空格、<img width> 独占一行、制表符为两个全角空格、下划线为 <u>', async () => {
+    // Act
+    const markdown = await mdRenderer.render(await parse({ buffer: await buildLayoutSample() }, { sourceName: '版面样例.docx' }));
+    const lines = markdown.split('\n');
+
+    // Assert
+    assert.ok(lines.includes(`${IDEO}${IDEO}首行缩进两字（firstLineChars）。`), markdown);
+    assert.ok(lines.includes('<img src="images/image_1.png" width="200" alt="示意图甲">'), markdown);
+    assert.equal(lines[lines.indexOf('<img src="images/image_1.png" width="200" alt="示意图甲">') + 2], '图 1 示意图甲');
+    assert.ok(lines.includes(`图 2${IDEO}${IDEO}图 3`), markdown);
+    assert.ok(lines.includes('<u>下划线文字</u>之后'), markdown);
 });

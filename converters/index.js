@@ -10,6 +10,11 @@
  *     → { source, doc, name, title, options, backends: { pdfParser, raster } }
  *   renderDocument(doc, target, options?, { imageMode? } = {})
  *     → { files, assets, extras, warnings, title, layout }（title 为渲染器给出的标题，无则 null）
+ *   renderBundleSidecars(doc, { name?, options? } = {})
+ *     → { json: string, contentList: string }：bundle 的 {name}.json 与 {name}_content_list.json 正文，
+ *     转档 bundle 渲染与桌面端「编辑后保存 / 导出」共用，保证两处产出一致。content_list 的 img_path 直接取
+ *     IR 图片节点的 url，调用方负责让 url 为产物内的真实相对路径；MinerU 来源改用其原件 content_list
+ *     （附属文件 {name}_content_list.json，已补 display），图片路径按 sourcePath → url 改写
  *   writeDocument({ rendered, target, outputDir, name })
  *     → { outputPath, outputs, extras }
  *   convert({ input: { path? | url? }, target, outputDir, options?, onProgress?, allowPrivateNetwork?, nameRegistry?, order? }) 依次组合三者
@@ -31,9 +36,15 @@
  *   imageMode 由目标推导（pdf → 'file'，html → 'inline' 或 'relative'，其余 'relative'），调用方可显式覆盖。
  *   渲染器模块尚未提供（如阶段 2 才有的 xml）时抛中文错误。
  *
- * 固定管线（parseDocument 内）：parser → 标题/命名 → normalizeImages（assets/image-normalize）
- *   → rasterizeNodes（raster/rasterize-nodes，仅当 options.math === 'image' 或 patent profile 命中时）。
- *   两者均经 moduleLoader 懒加载，阶段 1A / 1C 只替换各自模块文件，不改本文件。
+ * 固定管线（parseDocument 内）：parser → 标题/命名 → normalizeImages（assets/image-normalize；目标为 bundle 时
+ *   跳过，images/ 存与原件逐字节一致的原图）→ rasterizeNodes（raster/rasterize-nodes，仅当 options.math === 'image'
+ *   或 patent profile 命中时）。两者均经 moduleLoader 懒加载，阶段 1A / 1C 只替换各自模块文件，不改本文件。
+ *
+ * bundle 产物（MinerU 式结果包）：{name}.md（带 front matter）+ {name}.json + {name}_content_list.json + images/（原图），
+ *   MinerU 来源另有 {name}_content_list_v2.json、{name}_model.json、{name}_layout.json、{name}_origin.pdf。
+ *   renderBundle 依次：restoreOriginals（先解析后导出的路径上把已归一的图片换回原图）→ md 渲染 → renderBundleSidecars
+ *   → finalizeMineruExtras（附属 JSON 中的 MinerU 哈希图名改写为 images/image_N.*，layout 用裸名）；
+ *   EMF / WMF / TIFF 保留原件并告警「多数 Markdown 查看器无法显示」。其它目录布局目标的附属 JSON 同样改写图片路径。
  *
  * 进度协议：onProgress(phase, pct) 依次收到 ('parsing',20) → ('rendering',60) → ('writing',90) → ('writing',100)；
  * parser 内部的细粒度进度会插在前两者之间，且一律归一为 phase='parsing'、pct 钳制到 [0,55] 并在同一次转换内
@@ -50,6 +61,9 @@ const { normalizeOptions, redactOptions } = require('./options');
 const { prependFrontMatter } = require('./web/frontmatter');
 const output = require('./output');
 const { runBatch } = require('./batch');
+const {
+    CONTENT_LIST_NAME, findOriginalContentList, imagePathMap, rewriteJsonText, finalizeMineruExtras,
+} = require('./bundle-sidecars');
 
 // 需要内嵌远程图片的目标
 const BINARY_TARGETS = Object.freeze(['docx', 'pdf']);
@@ -59,6 +73,9 @@ const PROGRESS = Object.freeze({ PARSING: 20, RENDERING: 60, WRITING: 90, DONE: 
 // parser 上报进度的允许区间：上界须低于 RENDERING，避免解析阶段的百分比越过渲染阶段
 const PARSER_PCT = Object.freeze({ MIN: 0, MAX: 55 });
 const { NAME_TOKEN } = output;
+// bundle 保留原图时，这些格式多数 Markdown 查看器无法显示，须告警
+const VIEWER_UNFRIENDLY_MIMES = new Set(['image/tiff', 'image/emf', 'image/x-emf', 'image/wmf', 'image/x-wmf', 'application/emf', 'application/x-msmetafile', 'windows/metafile']);
+const VIEWER_UNFRIENDLY_EXT_RE = /\.(?:tiff?|emf|wmf)$/i;
 
 const asArray = (value) => (Array.isArray(value) ? value : []);
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value) && !Buffer.isBuffer(value);
@@ -142,7 +159,8 @@ async function parseResolved({ source, target, options, allowPrivateNetwork, emi
         warnings: [...asArray(parsed.warnings)],
     };
 
-    doc = applyStep(doc, await getImageNormalizer().normalizeImages(doc, options), '图片归一化');
+    // bundle 的 images/ 存原图（字节与原件一致、不改 JFIF 密度），故不做归一；「图片格式」只作用于其它目标
+    if (target !== 'bundle') doc = applyStep(doc, await getImageNormalizer().normalizeImages(doc, options), '图片归一化');
     const kinds = rasterKinds(options, target);
     let raster = null;
     if (kinds.length > 0) {
@@ -256,11 +274,13 @@ async function renderDocument(doc, target, rawOptions, { imageMode } = {}) {
         : normalizeRendered(await getRenderer(target).render(doc, options, { imageMode: mode }), target, rule);
     const count = Object.keys(rendered.files).length;
     if (rule.layout === 'single' && count !== 1) throw new Error(`目标 ${target} 为单文件布局，渲染器却产出了 ${count} 个文件`);
+    // 附属 JSON 里的来源图片路径（MinerU 哈希图名）改写为产物图片路径；bundle 已自行处理（omitDocExtras）
+    const docExtras = rendered.omitDocExtras ? [] : finalizeMineruExtras(asArray(doc.extras), doc);
     return {
         files: rendered.files,
         // 渲染器声明 omitDocAssets（如 patent profile 把图片改名平铺）时，文档资产以其返回的 assets 为准
         assets: [...(rendered.omitDocAssets ? [] : asArray(doc.assets)), ...asArray(rendered.assets)],
-        extras: [...asArray(doc.extras), ...asArray(rendered.extras)],
+        extras: [...docExtras, ...asArray(rendered.extras)],
         warnings: asArray(rendered.warnings),
         // 渲染器给出非空 title（patent profile 的发明名称）时覆盖结果信封的标题；解析阶段的 title 不变
         title: rendered.title || null,
@@ -268,17 +288,55 @@ async function renderDocument(doc, target, rawOptions, { imageMode } = {}) {
     };
 }
 
-// Markdown 产物统一带 YAML front matter，便于知识库按元数据检索；
-// docx/pdf 这类单文件目标不加，否则 YAML 会变成正文里的一段文字
+/**
+ * MinerU 式结果包：{name}.md + {name}.json + {name}_content_list.json + images/（原图）+ 附属文件。
+ * Markdown 产物统一带 YAML front matter，便于知识库按元数据检索；docx/pdf 这类单文件目标不加，
+ * 否则 YAML 会变成正文里的一段文字
+ */
 async function renderBundle(doc, options, imageMode) {
-    const md = await getRenderer('md').render(doc, options, { imageMode });
-    const json = await getRenderer('json').render(doc, options, { imageMode });
+    const restored = restoreOriginalImages(doc);
+    const md = await getRenderer('md').render(restored, options, { imageMode });
+    const sidecars = await renderBundleSidecars(restored, { options });
+    const original = findOriginalContentList(restored.extras);
+    const extras = finalizeMineruExtras(asArray(restored.extras).filter((extra) => extra !== original), restored);
     return {
         files: {
-            [`${NAME_TOKEN}.md`]: prependFrontMatter(String(md), doc.meta),
-            [`${NAME_TOKEN}.json`]: String(json),
+            [`${NAME_TOKEN}.md`]: prependFrontMatter(String(md), restored.meta),
+            [`${NAME_TOKEN}.json`]: sidecars.json,
+            [CONTENT_LIST_NAME]: sidecars.contentList,
         },
+        assets: asArray(restored.assets),
+        extras,
+        warnings: viewerWarnings(restored.assets),
+        omitDocAssets: true,
+        omitDocExtras: true,
     };
+}
+
+/** bundle 旁路文件正文（契约见文件头）；name 仅用于识别已替换占位符的 MinerU content_list 附属文件名 */
+async function renderBundleSidecars(doc, { name, options: rawOptions } = {}) {
+    if (!doc || typeof doc !== 'object' || !doc.ir) throw new Error('renderBundleSidecars 需要有效的 IR 文档');
+    const options = normalizeOptions(rawOptions);
+    // 来源包内的原始图片路径（MinerU 的哈希图名）一律改写为产物路径，旁路文件里不留指向不存在文件的引用
+    const pathMap = imagePathMap(doc);
+    const json = rewriteJsonText(String(await getRenderer('json').render(doc, options, { imageMode: 'relative' })), pathMap);
+    const original = findOriginalContentList(doc.extras, name);
+    const contentList = original
+        ? rewriteJsonText(toBuffer(original.buffer).toString('utf8'), pathMap)
+        : String(await getRenderer('content-list').render(doc, options, { imageMode: 'relative' }));
+    return { json, contentList };
+}
+
+// 先解析后导出的路径上（桌面端预览按无目标解析，图片已归一）把资产换回原图；模块未提供还原时原样返回
+function restoreOriginalImages(doc) {
+    const normalizer = getImageNormalizer();
+    return typeof normalizer.restoreOriginals === 'function' ? normalizer.restoreOriginals(doc) : doc;
+}
+
+function viewerWarnings(assets) {
+    return asArray(assets)
+        .filter((asset) => asset && (VIEWER_UNFRIENDLY_MIMES.has(String(asset.mime || '').toLowerCase()) || VIEWER_UNFRIENDLY_EXT_RE.test(String(asset.name || ''))))
+        .map((asset) => `图片 ${asset.name} 保持原格式：多数 Markdown 查看器无法显示`);
 }
 
 // 渲染器返回值归一为 { files, assets, extras, warnings, omitDocAssets }
@@ -330,7 +388,8 @@ async function writeDocument({ rendered, target, outputDir, name } = {}) {
 
     const extras = asArray(rendered.extras);
     const written = await output.writeFolder({ outputDir, name, files: rendered.files, assets: asArray(rendered.assets), extras });
-    return { outputPath: written.outputPath, outputs: written.outputs, extras: extras.map((item) => item.name) };
+    // 附属文件名中的 {name} 已由 writeFolder 替换，这里返回实际落盘的相对路径
+    return { outputPath: written.outputPath, outputs: written.outputs, extras: extras.map((item) => String(item.name).split(NAME_TOKEN).join(name)) };
 }
 
 // ============================================================
@@ -404,7 +463,7 @@ function _setModuleLoader(fn) { moduleLoader = typeof fn === 'function' ? fn : r
 function _reset() { moduleLoader = require; }
 
 module.exports = {
-    convert, parseDocument, renderDocument, writeDocument,
+    convert, parseDocument, renderDocument, renderBundleSidecars, writeDocument,
     listTargets, detectInputType, SUPPORTED_EXTENSIONS, runBatch,
     _setModuleLoader, _reset,
 };

@@ -22,7 +22,7 @@
  *   { version: 1, theme: 'system'|'light'|'dark', outputDir,
  *     defaultTargets: { office, markup, url },
  *     defaults: { theme?, imageFormat?, jpegQuality?, jpegPpi?, math?, pdfBackend?, mineruModel?, xmlProfile? }（扁平转换选项，交 service.buildOptions），
- *     library: { mode: 'index'|'managed', root } }
+ *     library: { mode: 'index'|'managed', root, repositories?, activeRepository? } }
  * secrets.json：{ mineruToken: <base64 密文> }。令牌永不进入 settings.json、日志与 IPC 回包。
  */
 const fs = require('fs');
@@ -41,6 +41,7 @@ const SECRETS_FILENAME = 'secrets.json';
 const SECRET_KEY = 'mineruToken';
 const SECRETS_MODE = 0o600;
 const MAX_TOKEN_LENGTH = 512;
+const MAX_REPOSITORIES = 32;
 const JSON_INDENT = 2;
 const THEMES = Object.freeze(['system', 'light', 'dark']);
 const LIBRARY_MODES = Object.freeze(['index', 'managed']);
@@ -70,7 +71,12 @@ const DefaultsSchema = z.object(Object.fromEntries(Object.entries(DEFAULTS_FIELD
 // patch 形态：null 表示删除该默认项
 const DefaultsPatchSchema = z.object(Object.fromEntries(Object.entries(DEFAULTS_FIELDS).map(([key, schema]) => [key, schema.nullable().optional()]))).strict();
 const DefaultTargetsSchema = z.object({ office: targetEnum, markup: targetEnum, url: targetEnum }).strict();
-const LibrarySchema = z.object({ mode: z.enum([...LIBRARY_MODES]), root: nonEmptyPath }).strict();
+const LibrarySchema = z.object({
+    mode: z.enum([...LIBRARY_MODES]),
+    root: nonEmptyPath,
+    repositories: z.array(nonEmptyPath).max(MAX_REPOSITORIES).optional(),
+    activeRepository: nonEmptyPath.optional(),
+}).strict();
 
 const SettingsSchema = z.object({
     version: z.literal(SETTINGS_VERSION),
@@ -229,6 +235,10 @@ function createSettingsStore({ dir, safeStorage, defaults } = {}) {
         if (patch.library) {
             next.library = { ...next.library, ...patch.library };
             next.library.root = path.resolve(next.library.root);
+            if (Array.isArray(next.library.repositories)) {
+                next.library.repositories = [...new Set(next.library.repositories.map((item) => path.resolve(item)))].slice(0, MAX_REPOSITORIES);
+            }
+            if (next.library.activeRepository !== undefined) next.library.activeRepository = path.resolve(next.library.activeRepository);
         }
         if (patch.defaults) {
             const merged = { ...next.defaults };

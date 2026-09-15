@@ -86,18 +86,151 @@ function withFrameScrollbar(srcdoc) {
         : `${FRAME_SCROLLBAR_STYLE}${documentHtml}`;
 }
 
-/** 每次换视图都重建 iframe：sandbox 属性无法在已加载的帧上切换，PDF 帧也应随视图关闭一并移除 */
-export function mountFrame(host, { srcdoc = null, src = null, title = '预览', scrollbar = false, sameOrigin = false }) {
-    host.replaceChildren();
+/**
+ * 视图帧外观（createViewFrame / mountFrame 的 appearance 选项）：
+ *   'adaptive' —— 注入 FRAME_APPEARANCE_STYLE：应用为深色时，帧内文档改用与 --doc-surface 一致的深色纸面；
+ *                 用于来源栏的 srcdoc 帧、文件库与阅读页的 md 渲染视图及编辑页实时预览、各类原文文本视图（textDocument）。
+ *   'paper'    —— 不注入，帧底色固定白纸（--doc-paper），与帧内浅色文档一致：对比预览产物栏（含其编辑页预览）、html 原样渲染。
+ *   缺省       —— 不注入，帧底色取 --doc-surface：PDF 帧、自带深色样式的 XML 结构视图。
+ * 帧内 prefers-color-scheme 与应用主题一致（用户固定主题时主进程同步 nativeTheme.themeSource），注入样式只需一条媒体查询。
+ * 注入只作用于应用内显示，导出的 HTML 与主题 CSS 不变。
+ */
+const FRAME_APPEARANCES = Object.freeze(['adaptive', 'paper']);
+
+const FRAME_APPEARANCE_STYLE = `<style data-markflow-appearance>
+@media (prefers-color-scheme: dark) {
+    :root { color-scheme: dark; }
+    html, body { background: #1c1c1e !important; color: #e6e6ea !important; }
+    a { color: #4da3ff; }
+    blockquote { color: #a1a1a6; border-left-color: rgba(255, 255, 255, 0.24); }
+    hr { border-top-color: rgba(255, 255, 255, 0.16); }
+    th, td { border-color: rgba(255, 255, 255, 0.16); }
+    th { background: rgba(255, 255, 255, 0.06); }
+    code, pre { background: rgba(255, 255, 255, 0.08); }
+    pre code { background: none; }
+    img { background-color: #ffffff; }
+}
+</style>`;
+
+/** 向 srcdoc 注入深色覆盖样式（写法同 withFrameScrollbar）：有 </head> 时插在其前，否则前置 */
+export function withFrameAppearance(srcdoc) {
+    const documentHtml = String(srcdoc || '');
+    return /<\/head\s*>/i.test(documentHtml)
+        ? documentHtml.replace(/<\/head\s*>/i, `${FRAME_APPEARANCE_STYLE}</head>`)
+        : `${FRAME_APPEARANCE_STYLE}${documentHtml}`;
+}
+
+/** 把一段 <style> 注入 srcdoc：有 </head> 时插在其前，否则前置（与 withFrameScrollbar / withFrameAppearance 同法） */
+function injectFrameStyle(srcdoc, styleTag) {
+    const documentHtml = String(srcdoc || '');
+    return /<\/head\s*>/i.test(documentHtml)
+        ? documentHtml.replace(/<\/head\s*>/i, () => `${styleTag}</head>`)
+        : `${styleTag}${documentHtml}`;
+}
+
+/**
+ * 视图帧版式（createViewFrame / mountFrame 的 layout 选项）：只用于文件库页与阅读页的帧；对比预览用于对照导出保真，不注入。
+ *   'compact'      —— Markdown 渲染视图：取消主题的窄栏 max-width 与居中外边距，内边距收到 16px 22px 40px；
+ *   'compact-text' —— 原文文本视图（textDocument）、JSON 与 XML 结构视图：内边距收到 12px 14px 32px。
+ * 注入只作用于应用内显示，导出的 HTML、主题 CSS 与 xml-view 自带样式不变。
+ */
+const FRAME_LAYOUT_ATTR = 'data-markflow-layout';
+const FRAME_LAYOUT_CSS = Object.freeze({
+    compact: 'html > body { max-width: none !important; margin: 0 !important; padding: 16px 22px 40px !important; }',
+    'compact-text': 'html > body { padding: 12px 14px 32px !important; }',
+});
+
+const layoutCss = (layout) => (Object.prototype.hasOwnProperty.call(FRAME_LAYOUT_CSS, layout) ? FRAME_LAYOUT_CSS[layout] : '');
+
+/** 同源帧的文档；帧不可访问（非同源或已卸载）时为 null */
+function sameOriginDocument(frame) {
+    try {
+        const doc = frame ? frame.contentDocument : null;
+        return doc && doc.documentElement ? doc : null;
+    } catch (err) {
+        return null;
+    }
+}
+
+export function withFrameLayout(srcdoc, layout) {
+    const css = layoutCss(layout);
+    return css ? injectFrameStyle(srcdoc, `<style ${FRAME_LAYOUT_ATTR}="${layout}">${css}</style>`) : String(srcdoc || '');
+}
+
+/** 同源帧装载后补注版式：Markdown 编辑器的实时预览帧由编辑器自建，宿主在其 load 时经此注入同一份样式；已注入时不重复 */
+export function applyFrameLayout(frame, layout) {
+    const css = layoutCss(layout);
+    const doc = sameOriginDocument(frame);
+    if (!css || !doc) return false;
+    if (doc.querySelector(`style[${FRAME_LAYOUT_ATTR}]`)) return true;
+    const style = doc.createElement('style');
+    style.setAttribute(FRAME_LAYOUT_ATTR, layout);
+    style.textContent = css;
+    (doc.head || doc.documentElement).append(style);
+    return true;
+}
+
+/**
+ * 视图帧字号（createViewFrame 的 zoom 选项，百分比）：注入 html { zoom }；同源帧可经 applyFrameZoom 实时改写，无需重建帧。
+ * 帧内 getBoundingClientRect 与 scrollTop 同处缩放后的坐标系，滚动定位无需换算。
+ */
+const FRAME_ZOOM_ATTR = 'data-markflow-zoom';
+
+function zoomFactor(percent) {
+    const value = Number(percent);
+    return Number.isFinite(value) && value > 0 ? Math.round(value) / 100 : null;
+}
+
+export function withFrameZoom(srcdoc, percent) {
+    const factor = zoomFactor(percent);
+    return factor === null ? String(srcdoc || '') : injectFrameStyle(srcdoc, `<style ${FRAME_ZOOM_ATTR}>html { zoom: ${factor}; }</style>`);
+}
+
+/** 同源帧实时换字号：改写（或补建）帧内的缩放样式，并按滚动比例保持阅读位置；帧不可访问时回 false */
+export function applyFrameZoom(frame, percent) {
+    const factor = zoomFactor(percent);
+    const doc = sameOriginDocument(frame);
+    if (!doc || factor === null) return false;
+    const scroller = doc.scrollingElement || doc.documentElement;
+    const span = scroller.scrollHeight - scroller.clientHeight;
+    const ratio = span > 0 ? scroller.scrollTop / span : 0;
+    let style = doc.querySelector(`style[${FRAME_ZOOM_ATTR}]`);
+    if (!style) {
+        style = doc.createElement('style');
+        style.setAttribute(FRAME_ZOOM_ATTR, '');
+        (doc.head || doc.documentElement).append(style);
+    }
+    style.textContent = `html { zoom: ${factor}; }`;
+    scroller.scrollTop = ratio * Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    return true;
+}
+
+/**
+ * 建一个视图帧但不挂载：调用方可先隐藏装载、load 后再替换旧帧（Markdown 编辑器的实时预览据此避免闪烁）。
+ * sandbox 规则同 mountFrame：srcdoc 帧只放开 allow-popups（sameOrigin 时加 allow-same-origin），从不放开脚本；src 帧（PDF）不带 sandbox。
+ * appearance 见 FRAME_APPEARANCES 注释：写入 data-appearance 供 CSS 取帧底色；仅 'adaptive' 的 srcdoc 帧注入深色覆盖样式。
+ * layout 见 FRAME_LAYOUT_STYLES，zoom 见 withFrameZoom：均只注入 srcdoc 帧，缺省不注入。
+ */
+export function createViewFrame({ srcdoc = null, src = null, title = '预览', scrollbar = false, sameOrigin = false, layout = null, zoom = null, appearance = null } = {}) {
     const frame = document.createElement('iframe');
     frame.className = 'view-frame';
     frame.title = title;
     frame.referrerPolicy = 'no-referrer';
+    if (FRAME_APPEARANCES.includes(appearance)) frame.dataset.appearance = appearance;
     if (src) frame.src = src;
     else {
         frame.setAttribute('sandbox', [FRAME_SANDBOX, sameOrigin ? 'allow-same-origin' : ''].filter(Boolean).join(' '));
-        frame.srcdoc = scrollbar ? withFrameScrollbar(srcdoc) : (srcdoc || '');
+        const scrolled = scrollbar ? withFrameScrollbar(srcdoc) : (srcdoc || '');
+        const documentHtml = withFrameZoom(withFrameLayout(scrolled, layout), zoom);
+        frame.srcdoc = appearance === 'adaptive' ? withFrameAppearance(documentHtml) : documentHtml;
     }
+    return frame;
+}
+
+/** 每次换视图都重建 iframe：sandbox 属性无法在已加载的帧上切换，PDF 帧也应随视图关闭一并移除 */
+export function mountFrame(host, options = {}) {
+    host.replaceChildren();
+    const frame = createViewFrame(options);
     host.append(frame);
     return frame;
 }
@@ -108,7 +241,7 @@ export function textDocument(text, { title = '原文' } = {}) {
 :root { color-scheme: light dark; }
 body { margin: 0; padding: 16px 18px 40px; background: #ffffff; color: #1c1c1e; }
 @media (prefers-color-scheme: dark) { body { background: #1c1c1e; color: #e6e6ea; } }
-pre { margin: 0; font: 12.5px/1.7 ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+body > pre { margin: 0; background: none; font: 12.5px/1.7 ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 </style></head><body><pre>${escapeHtml(text)}</pre></body></html>`;
 }
 

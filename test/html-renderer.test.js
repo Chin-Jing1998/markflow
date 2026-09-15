@@ -433,3 +433,23 @@ test('省略 options 时按打印场景取值：print 主题 + file 寻址', asy
     assert.equal(omitted, explicit);
     assert.ok(omitted.includes('@page { margin: 1.5cm; }'));
 });
+
+test('<u> 渲染为 u 元素、<img width> 带校验后的宽度；白名单外的 HTML 仍被剥离', async () => {
+    // Arrange：IR 经 ir/inline-html 提升（与 md 解析器同一链路）
+    const { liftInlineHtml } = require('../converters/ir/inline-html');
+    const ir = liftInlineHtml(await parseMarkdown([
+        '<img src="images/image_1.png" width="300" alt="示意">', '',
+        '正文<u>下划线</u>与<span onclick="x()">外来标签</span>', '',
+        '<img src="images/image_1.png" width="50%">', '',
+    ].join('\n')));
+
+    // Act
+    const html = await htmlRenderer.render(makeDoc(ir, {}, [IMAGE_ASSET]), HTML_OPTIONS(), { imageMode: 'relative' });
+
+    // Assert
+    assert.ok(html.includes('<img src="images/image_1.png" alt="示意" width="300">'), html);
+    assert.ok(html.includes('<img src="images/image_1.png" alt="" width="50%">'), html);
+    assert.ok(html.includes('<u>下划线</u>'), html);
+    assert.ok(!html.includes('onclick') && !html.includes('<span'), '白名单外的 HTML 应剥离');
+    assert.ok(html.includes('外来标签'), '剥离后保留文字');
+});

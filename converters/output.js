@@ -6,10 +6,13 @@
  *   目录 {outputDir}/{name}/。files 为 { '<posix 相对路径>': string | Buffer }（字符串按 utf8 写入），
  *   键中的 {name} 占位符（NAME_TOKEN）替换为产物名；assets 按 assets[].name 写入（形如 images/image_1.png，
  *   仅当某个资产名以 images/ 开头才创建 images/ 并报告 imagesDir；裸文件名的资产平铺在目录根下）；
- *   extras 为 [{ name, buffer }] 的附属文件（sidecar），按 name 原样写入。
- *   outputs 的键（方案 §3.3.3）：主产物（键为 {name}.<ext>）取 ext（md / json / html / xml / zip），
- *   其余文件取去扩展名的文件名并转 camelCase（claims.xml → claims，abstract-figure.xml → abstractFigure）；
- *   写入了 images/ 则有 imagesDir；extras 的每个顶层目录记为 <目录名>Dir（mineru/full.md → mineruDir）。
+ *   extras 为 [{ name, buffer }] 的附属文件（sidecar），name 中的 {name} 同样替换为产物名后写入。
+ *   outputs 的键（方案 §3.3.3）：主产物（键为 {name}.<ext>）取 ext（md / json / html / xml / zip）；
+ *   以 {name}_ 开头的文件（files 或根目录 extras）取 {name}_ 之后主干的 camelCase，非 json 再接上扩展名
+ *   （{name}_content_list.json → contentList，{name}_content_list_v2.json → contentListV2，
+ *   {name}_origin.pdf → originPdf）；其余文件取去扩展名的文件名并转 camelCase（claims.xml → claims，
+ *   abstract-figure.xml → abstractFigure）；写入了 images/ 则有 imagesDir；extras 的每个顶层目录记为
+ *   <目录名>Dir（mineru/full.md → mineruDir）；根目录下不以 {name}_ 开头的 extras 不进 outputs。
  * writeBundle({ outputDir, name, md, json, assets })
  *   → { dir, mdPath, jsonPath, imagesDir | null }，writeFolder 的薄封装，保留 v2 返回形状
  * writeSingle({ outputDir, name, ext, buffer })
@@ -26,6 +29,8 @@ const { toBuffer } = require('./util');
 
 const IMAGES_DIRNAME = 'images';
 const NAME_TOKEN = '{name}';
+// 旁路文件（MinerU 式产物包的 {name}_content_list.json 等）的命名前缀
+const SIDECAR_PREFIX = `${NAME_TOKEN}_`;
 const WINDOWS_DRIVE_RE = /^[A-Za-z]:/;
 
 async function writeFolder({ outputDir, name, files, assets = [], extras = [] } = {}) {
@@ -35,7 +40,7 @@ async function writeFolder({ outputDir, name, files, assets = [], extras = [] } 
 
     const fileJobs = planFiles(dir, name, files);
     const assetJobs = planEntries(dir, assets, '资源');
-    const extraJobs = planEntries(dir, extras, '附属文件');
+    const extraJobs = planEntries(dir, extras, '附属文件', name);
     assertNoDuplicateTargets([...fileJobs, ...assetJobs, ...extraJobs]);
     const outputs = buildOutputs(dir, { fileJobs, assetJobs, extraJobs });
 
@@ -90,14 +95,17 @@ function planFiles(dir, name, files) {
     });
 }
 
-// assets / extras → [{ rel, target, buffer }]
-function planEntries(dir, list, label) {
+// assets / extras → [{ key, rel, target, buffer }]；给出 name 时把名字中的 {name} 占位符替换为产物名，
+// key 为替换前的原名（供 outputs 取键）
+function planEntries(dir, list, label, name) {
     const entries = Array.isArray(list) ? list : [];
     return entries.map((entry) => {
-        const target = resolveInsidePath(dir, entry && entry.name, label);
+        const raw = entry && entry.name;
+        const rel = typeof raw === 'string' && name ? raw.split(NAME_TOKEN).join(name) : raw;
+        const target = resolveInsidePath(dir, rel, label);
         const buffer = toBuffer(entry && entry.buffer);
-        if (!buffer) throw new Error(`${label} ${entry && entry.name} 缺少 Buffer 内容`);
-        return { rel: normalizeSlashes(entry.name.trim()), target, buffer };
+        if (!buffer) throw new Error(`${label} ${raw} 缺少 Buffer 内容`);
+        return { key: raw.trim(), rel: normalizeSlashes(rel.trim()), target, buffer };
     });
 }
 
@@ -128,18 +136,29 @@ function buildOutputs(dir, { fileJobs, assetJobs, extraJobs }) {
     };
     for (const job of fileJobs) put(outputKeyFor(job.key), job.target);
     if (hasImagesDir(assetJobs)) put('imagesDir', path.join(dir, IMAGES_DIRNAME));
+    for (const job of extraJobs) {
+        if (!job.rel.includes('/') && job.key.startsWith(SIDECAR_PREFIX)) put(outputKeyFor(job.key), job.target);
+    }
     for (const top of topLevelDirs(extraJobs)) put(`${camelCase(top)}Dir`, path.join(dir, top));
     return outputs;
 }
 
-// {name}.md → md；claims.xml → claims；abstract-figure.xml → abstractFigure
+// {name}.md → md；{name}_content_list.json → contentList；{name}_origin.pdf → originPdf；
+// claims.xml → claims；abstract-figure.xml → abstractFigure
 function outputKeyFor(key) {
     const base = path.posix.basename(normalizeSlashes(key));
     const ext = path.posix.extname(base);
     const stem = ext ? base.slice(0, -ext.length) : base;
     if (stem === NAME_TOKEN && ext) return ext.slice(1).toLowerCase();
+    if (stem.startsWith(SIDECAR_PREFIX) && stem.length > SIDECAR_PREFIX.length) {
+        const core = camelCase(stem.slice(SIDECAR_PREFIX.length));
+        const suffix = ext && ext.toLowerCase() !== '.json' ? capitalize(ext.slice(1).toLowerCase()) : '';
+        return core ? `${core}${suffix}` : 'file';
+    }
     return camelCase(stem) || camelCase(base) || 'file';
 }
+
+const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
 
 function topLevelDirs(jobs) {
     const dirs = new Set();

@@ -11,6 +11,7 @@
  * profile 实现按需 require。
  */
 const { normalizeOptions } = require('../options');
+const { stripMarkersTree } = require('../ir/markers');
 
 const PROFILE_MODULES = Object.freeze({ generic: './xml/generic', patent: './xml/patent' });
 
@@ -19,7 +20,9 @@ async function render(doc, options, context = {}) {
     const normalized = normalizeOptions(options);
     const request = PROFILE_MODULES[normalized.xml.profile];
     if (!request) throw new Error(`未知的 xml profile：${String(normalized.xml.profile)}`);
-    const result = await require(request).render(doc, normalized, context);
+    // 残留的私用区版面标记（ir/markers）兜底剥除；无残留时 ir 为原引用
+    const ir = stripMarkersTree(doc.ir);
+    const result = await require(request).render(ir === doc.ir ? doc : { ...doc, ir }, normalized, context);
     return {
         files: result.files,
         assets: Array.isArray(result.assets) ? result.assets : [],

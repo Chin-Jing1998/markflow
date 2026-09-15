@@ -8,6 +8,18 @@
  *   - math          公式（docx 的 OMML 等）：{ type: 'math', data: { omml, mathml, text, display } }
  *                   display=true 表示独立成段的公式，须放在块级位置；false 表示行内公式，须放在段落内。
  *                   不支持公式的渲染器先经 degradeMath 把它降为线性化文本。
+ * 另有一个行内扩展节点 underline（下划线）：{ type: 'underline', children }，由 ir/inline-html 从 <u> 提升而来。
+ * downgradeCustomNodes 按普通容器原样递归保留它；md / html / docx / xml 各渲染器均有专门处理
+ * （<u>、u 元素、下划线 run、u 标记），新增渲染器须同样认识它。
+ *
+ * 节点 data 上的版面约定（解析器写入，渲染器读取）：
+ *   image.data.display   = { width, height?, unit: 'px' | '%', source }   显示尺寸，与原文档 / 原网页一致；
+ *                          source 为 'web' | 'docx' | 'pptx' | 'mineru' | 'html'（Markdown 输入的 <img>）。
+ *                          与栅格化用的像素尺寸 data.{width, height, dpi}（raster/rasterize-nodes 写入）分开存放
+ *   image.data.floating  = true   docx 浮动图（wp:anchor）；ir/captions 据此把它从文字中取出
+ *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
+ *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入
+ *   paragraph.data.role   = 'caption' | 'image_footnote'   图注 / 图片脚注；与图片靠「紧随其后」对应，不存图片名
  *
  * 顶层包装结构（MarkFlowDocument）：
  * {
@@ -17,7 +29,8 @@
  *   data: <格式特有数据快照，无则 null>,
  *   meta: { title?, sourceType, sourceName?, baseDir? },
  *   assets:   [{ name: 'images/image_1.png', buffer, mime }],
- *   extras:   [{ name: 'mineru/full.md', buffer }],   // sidecar 附属文件：落盘时按 name（posix 相对路径）原样写入产物目录
+ *   extras:   [{ name: '{name}_layout.json', buffer }],   // sidecar 附属文件：落盘时按 name（posix 相对路径）写入产物目录，
+ *                                                        // 其中的 {name} 占位符替换为产物名（见 converters/output.js）
  *   warnings: [string],
  * }
  *

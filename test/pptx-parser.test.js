@@ -89,11 +89,16 @@ function shapeXml(text, phType) {
     );
 }
 
-function picXml(rid) {
+// ref 为 rId 字符串，或 { rid, cx, cy }（形状的显示尺寸，EMU）
+function picXml(ref) {
+    const { rid, cx, cy } = typeof ref === 'string' ? { rid: ref } : ref;
+    const spPr = cx
+        ? `<p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm></p:spPr>`
+        : '<p:spPr/>';
     return (
         '<p:pic><p:nvPicPr><p:cNvPr id="3" name="pic"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>' +
         `<p:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>` +
-        '<p:spPr/></p:pic>'
+        `${spPr}</p:pic>`
     );
 }
 
@@ -568,4 +573,28 @@ test('onProgress 只报 parsing 阶段，百分比单调且落在 20–55', asyn
     const pcts = calls.map(([, pct]) => pct);
     assert.deepEqual(pcts, [...pcts].sort((a, b) => a - b), '百分比应单调不降');
     assert.ok(pcts.every((pct) => pct >= 20 && pct <= 55), JSON.stringify(pcts));
+});
+
+test('图片显示尺寸取自形状的 a:ext（EMU / 9525 = px）：同一媒体在各页可有不同尺寸，无 a:ext 时不设 display', async () => {
+    // Arrange：同一张 8×8 PNG，第一页显示为 200×100，第二页一处 100×50、一处未给尺寸
+    const rels = [{ id: 'rId2', target: '../media/image1.png' }];
+    const { filePath } = await makePptxFile({
+        slides: [
+            { title: '甲', picRids: [{ rid: 'rId2', cx: 1905000, cy: 952500 }], rels },
+            { title: '乙', picRids: [{ rid: 'rId2', cx: 952500, cy: 476250 }, 'rId2'], rels },
+        ],
+    });
+
+    // Act
+    const doc = await parse({ path: filePath });
+
+    // Assert
+    const displays = collect(doc.ir, (n) => n.type === 'image').map((n) => n.data && n.data.display);
+    assert.deepEqual(displays, [
+        { width: 200, height: 100, unit: 'px', source: 'pptx' },
+        { width: 100, height: 50, unit: 'px', source: 'pptx' },
+        undefined,
+    ]);
+    assert.equal(doc.assets.length, 1, '同一媒体只存一份');
+    assert.deepEqual(doc.data.slides.map((s) => s.images), [['images/image_1.png'], ['images/image_1.png', 'images/image_1.png']]);
 });

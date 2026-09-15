@@ -116,7 +116,7 @@ const mammothStub = {
     convertToHtml: async (input) => ({ value: `<p>mammoth 直转：${input.path ? 'path' : 'buffer'}</p><img src="images/image_1.jpg">`, messages: [] }),
 };
 
-function makeHarness({ libraryMode = 'index', withLibrary = true, token = TOKEN } = {}) {
+function makeHarness({ libraryMode = 'index', withLibrary = true, token = TOKEN, coreOverrides = null } = {}) {
     const dir = fs.mkdtempSync(path.join(root, 'h-'));
     const outputDir = path.join(dir, 'out');
     fs.mkdirSync(outputDir, { recursive: true });
@@ -136,6 +136,7 @@ function makeHarness({ libraryMode = 'index', withLibrary = true, token = TOKEN 
     };
     const grants = createAssetGrants();
     const core = makeCore();
+    if (typeof coreOverrides === 'function') Object.assign(core, coreOverrides(core));
     const preview = createPreviewSessions({ grants, settings, library, core, mammoth: mammothStub, log: () => undefined });
     const harness = { preview, grants, core, upserts, outputDir, dir, settings };
     harnesses.push(harness);
@@ -436,4 +437,147 @@ test('MinerU 令牌注入 buildOptions，却不出现在任何回包与会话选
     assert.ok(!JSON.stringify(session.parseFlat).includes(TOKEN), '解析快照不得含令牌');
     assert.ok(!JSON.stringify(h.upserts[0].result.options).includes(TOKEN), '文件库记录不得含令牌');
     assert.equal(opened.options.theme, 'github', '回包须给出面板生效的扁平选项');
+});
+
+// ============================================================
+// 产物 Markdown 编辑（仅 bundle）
+// ============================================================
+
+const { writeFolder } = require('../converters/output');
+
+function pngHeader(width, height) {
+    const buffer = Buffer.alloc(33);
+    Buffer.from('89504e470d0a1a0a', 'hex').copy(buffer, 0);
+    buffer.writeUInt32BE(13, 8);
+    buffer.write('IHDR', 12, 'ascii');
+    buffer.writeUInt32BE(width, 16);
+    buffer.writeUInt32BE(height, 20);
+    buffer.writeUInt8(8, 24);
+    buffer.writeUInt8(6, 25);
+    return buffer;
+}
+
+/** 真正落盘的 writeDocument（复用 output.writeFolder 的路径校验）与契约函数 renderBundleSidecars 的桩 */
+function editingCore(core) {
+    const sidecarCalls = [];
+    return {
+        sidecarCalls,
+        writeDocument: async ({ rendered, target, outputDir, name }) => {
+            core.calls.write.push({ target, outputDir, name, files: Object.keys(rendered.files), assets: (rendered.assets || []).map((asset) => asset.name) });
+            const written = await writeFolder({ outputDir, name, files: rendered.files, assets: rendered.assets || [] });
+            return { ...written, extras: [] };
+        },
+        renderBundleSidecars: async (doc, { name }) => {
+            sidecarCalls.push({ name, doc: JSON.parse(JSON.stringify(doc)) });
+            return { json: JSON.stringify({ schemaVersion: 1, kind: 'document', ir: doc.ir, meta: doc.meta }), contentList: '[]' };
+        },
+    };
+}
+
+const openBundle = (h) => h.preview.open({ path: SOURCE_DOCX, type: 'docx', target: 'bundle' });
+
+test('bundle 编辑：暂存 → 插图 → 导出，md 与暂存文本逐字节相同、只落盘被引用的图片、旁路文件已写、登记一次并绑定', async () => {
+    const h = makeHarness({ coreOverrides: editingCore });
+    const opened = await openBundle(h);
+    const session = h.preview.sessions.get(opened.sessionId);
+
+    const view = await h.preview.renderMarkdown({ sessionId: opened.sessionId });
+    assert.ok(view.html.includes(`mf-asset://${session.sid}/edit-view/g1/`), `实时预览图片未走 edit-view 代次目录：${view.html}`);
+    assert.ok(fs.existsSync(path.join(session.tempDir, 'edit', 'images', 'image_1.jpg')), '编辑区带着产物图片');
+    assert.equal(session.edit.markdown, opened.product.view.raw, '初值为 bundle md 原文');
+
+    const picDir = fs.mkdtempSync(path.join(root, 'pics-'));
+    const pic = path.join(picDir, 'pic.png');
+    const orphan = path.join(picDir, 'orphan.png');
+    fs.writeFileSync(pic, pngHeader(320, 200));
+    fs.writeFileSync(orphan, pngHeader(8, 8));
+    assert.deepEqual(await h.preview.importImage({ sessionId: opened.sessionId, sourcePath: pic }), { relPath: 'images/pic.png', width: 320, height: 200, alt: 'pic' });
+    await h.preview.importImage({ sessionId: opened.sessionId, sourcePath: orphan });
+    assert.equal(h.preview.imageDialogDir({ sessionId: opened.sessionId }), root, '未导出时插图对话框默认来源文件所在目录');
+
+    const text = `${opened.product.view.raw}\n编辑后的段落\n\n<img src="images/pic.png" width="320" alt="pic">\n`;
+    const staged = await h.preview.saveMarkdown({ sessionId: opened.sessionId, text });
+    assert.equal(staged.saved, true);
+    assert.equal(staged.staged, true);
+    assert.equal(h.core.calls.write.length, 0, '暂存不落盘');
+
+    const exported = await h.preview.export({ sessionId: opened.sessionId });
+    const outDir = path.join(h.outputDir, '样例文档');
+    assert.equal(exported.outputPath, outDir);
+    assert.equal(exported.boundPath, path.join(outDir, '样例文档.md'));
+    assert.deepEqual(fs.readFileSync(exported.boundPath), Buffer.from(text, 'utf8'), 'md 与暂存文本逐字节相同');
+    assert.deepEqual(fs.readdirSync(path.join(outDir, 'images')).sort(), ['image_1.jpg', 'pic.png'], '只落盘被引用的图片');
+    assert.ok(fs.existsSync(path.join(outDir, '样例文档.json')), '旁路 json 已写');
+    assert.ok(fs.existsSync(path.join(outDir, '样例文档_content_list.json')), 'content_list 已写');
+    assert.equal(h.core.sidecarCalls.length, 1);
+    assert.equal(h.core.sidecarCalls[0].name, '样例文档');
+    assert.ok(!JSON.stringify(h.core.sidecarCalls[0].doc).includes(session.tempDir), '旁路文件的输入不含临时目录绝对路径');
+    assert.equal(h.core.sidecarCalls[0].doc.meta.title, '样例', '标题取编辑后文本');
+    assert.equal(h.upserts.length, 1, '文件库登记一次');
+    assert.equal(h.upserts[0].result.target, 'bundle');
+    assert.equal(h.upserts[0].result.outputPath, outDir);
+    assert.equal(h.upserts[0].result.imagesCount, 2);
+    assert.equal(fs.existsSync(path.join(session.tempDir, 'edit')), false, '绑定后删掉临时编辑区');
+    assert.equal(h.preview.imageDialogDir({ sessionId: opened.sessionId }), outDir, '绑定后插图对话框默认导出目录');
+    assert.ok(!JSON.stringify(exported).includes(TOKEN), '导出回包不含令牌');
+});
+
+test('bundle 编辑：绑定后保存直接写盘（重建旁路 json），外部修改报冲突；重渲染回 editDiscarded 且不删导出目录', async () => {
+    const h = makeHarness({ coreOverrides: editingCore });
+    const opened = await openBundle(h);
+    const session = h.preview.sessions.get(opened.sessionId);
+    const text = `${opened.product.view.raw}\n第一次修改\n`;
+    await h.preview.saveMarkdown({ sessionId: opened.sessionId, text });
+    const exported = await h.preview.export({ sessionId: opened.sessionId });
+
+    const text2 = `${text}\n绑定后的修改\n`;
+    const saved = await h.preview.saveMarkdown({ sessionId: opened.sessionId, text: text2 });
+    assert.equal(saved.saved, true);
+    assert.equal(saved.staged, false);
+    assert.equal(saved.boundPath, exported.boundPath);
+    assert.equal(fs.readFileSync(exported.boundPath, 'utf8'), text2);
+    assert.equal(h.core.sidecarCalls.length, 2, '已绑定的保存按新文本重建旁路 json');
+
+    fs.writeFileSync(exported.boundPath, 'external');
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(exported.boundPath, future, future);
+    const conflict = await h.preview.saveMarkdown({ sessionId: opened.sessionId, text: 'mine' });
+    assert.equal(conflict.saved, false);
+    assert.equal(conflict.conflict, true);
+    assert.equal(fs.readFileSync(exported.boundPath, 'utf8'), 'external');
+
+    const again = await h.preview.export({ sessionId: opened.sessionId });
+    assert.equal(again.boundPath, exported.boundPath, '已绑定时再次导出仍走编辑后的导出');
+
+    const rerendered = await h.preview.render({ sessionId: opened.sessionId, options: { theme: 'academic' } });
+    assert.equal(rerendered.editDiscarded, true);
+    assert.equal(session.edit, null);
+    assert.ok(fs.existsSync(path.dirname(exported.boundPath)), '已绑定的导出目录不随丢弃编辑删除');
+    const plain = await h.preview.render({ sessionId: opened.sessionId, options: { theme: 'academic' } });
+    assert.equal(plain.editDiscarded, undefined, '没有编辑时回包不带 editDiscarded');
+});
+
+test('bundle 编辑：未导出的修改在重渲染时丢弃并删临时编辑区；未改动时导出走常规路径', async () => {
+    const h = makeHarness({ coreOverrides: editingCore });
+    const opened = await openBundle(h);
+    const session = h.preview.sessions.get(opened.sessionId);
+    await h.preview.saveMarkdown({ sessionId: opened.sessionId, text: '# 改过\n' });
+    assert.ok(fs.existsSync(path.join(session.tempDir, 'edit')));
+    const rerendered = await h.preview.render({ sessionId: opened.sessionId, target: 'bundle' });
+    assert.equal(rerendered.editDiscarded, true);
+    assert.equal(fs.existsSync(path.join(session.tempDir, 'edit')), false);
+
+    await h.preview.renderMarkdown({ sessionId: opened.sessionId });
+    const exported = await h.preview.export({ sessionId: opened.sessionId });
+    assert.equal(exported.boundPath, undefined, '文本未改动时不绑定');
+    assert.equal(h.core.sidecarCalls.length, 0, '常规导出不经编辑路径重建旁路文件');
+    assert.deepEqual(h.core.calls.write[0].files, ['{name}.md', '{name}.json'], '常规导出沿用 renderDocument 的产物');
+});
+
+test('非 bundle 目标调编辑接口报错', async () => {
+    const h = makeHarness({ coreOverrides: editingCore });
+    const opened = await openDocx(h);
+    await assert.rejects(h.preview.renderMarkdown({ sessionId: opened.sessionId }), /只有「MD 包」目标的产物可以编辑/);
+    await assert.rejects(h.preview.saveMarkdown({ sessionId: opened.sessionId, text: 'x' }), /只有「MD 包」目标的产物可以编辑/);
+    await assert.rejects(h.preview.renderMarkdown({ sessionId: 'nope' }), /预览会话不存在/);
 });

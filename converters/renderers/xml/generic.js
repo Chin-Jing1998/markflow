@@ -122,6 +122,7 @@ function inlineNode(node, doc) {
         case 'strong': return [el('b', {}, inline(node.children, doc))];
         case 'emphasis': return [el('i', {}, inline(node.children, doc))];
         case 'delete': return [el('s', {}, inline(node.children, doc))];
+        case 'underline': return [el('u', {}, inline(node.children, doc))];
         case 'inlineCode': return [el('code', {}, [String(node.value == null ? '' : node.value)])];
         case 'link': return [el('a', { href: node.url || null }, inline(node.children, doc))];
         case 'break': return [el('br')];
@@ -140,12 +141,26 @@ function image(node, doc) {
     const assetName = typeof data.assetName === 'string' && data.assetName ? data.assetName : (typeof node.url === 'string' ? node.url : '');
     const asset = (Array.isArray(doc.assets) ? doc.assets : []).find((item) => item && item.name === assetName) || null;
     const attrs = { src: assetName || null, alt: node.alt || null };
-    const width = data.width || (asset && asset.width) || null;
-    const height = data.height || (asset && asset.height) || null;
+    const { width, height } = imageSize(data, asset);
     if (Number.isFinite(width)) attrs.width = String(width);
     if (Number.isFinite(height)) attrs.height = String(height);
     if (data.role) attrs.role = String(data.role);
     return el('image', attrs);
+}
+
+// 显示尺寸（data.display 的 px）优先，缺高度时按像素宽高比补；其次栅格化记下的像素尺寸，再次资源自带尺寸
+function imageSize(data, asset) {
+    const naturalWidth = data.width || (asset && asset.width) || (data.asset && data.asset.width) || null;
+    const naturalHeight = data.height || (asset && asset.height) || (data.asset && data.asset.height) || null;
+    const display = data.display;
+    if (display && display.unit === 'px' && Number.isFinite(display.width) && display.width > 0) {
+        const width = Math.round(display.width);
+        if (Number.isFinite(display.height) && display.height > 0) return { width, height: Math.round(display.height) };
+        const height = Number.isFinite(naturalWidth) && Number.isFinite(naturalHeight) && naturalWidth > 0
+            ? Math.round((naturalHeight * width) / naturalWidth) : null;
+        return { width, height };
+    }
+    return { width: naturalWidth, height: naturalHeight };
 }
 
 // MathML 经 cheerio（xmlMode）解析后按元素重建，保证输出 well-formed：根 <math> 合并 display 属性并补

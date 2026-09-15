@@ -52,6 +52,9 @@ const EMPTY_TAGS = 'p, div, section, span, li, blockquote, h1, h2, h3, h4, h5, h
 // 这些后代视为「有内容」，即便没有文本也不能删
 const CONTENT_DESCENDANTS = 'img, video, audio, iframe, table, embed, object, svg, canvas, picture, source';
 const EMPTY_SWEEP_ROUNDS = 3;
+// 行内包装元素：只包着 <br> 时拆包、只含不换行空格或全角空格时保留（见 removeEmptyElements）
+const INLINE_WRAPPERS = new Set(['span', 'a']);
+const ASCII_SPACE_ONLY_RE = /^[ \t\r\n\f]*$/;
 // 连续 <br> 最多保留的个数
 const MAX_CONSECUTIVE_BR = 2;
 // 安全阀：命中噪声规则的元素若占据正文过半文本，视为误判，保留不删
@@ -160,20 +163,31 @@ function collapseLineBreaks($) {
     });
 }
 
-// 迭代若干轮：删掉内层空元素后，外层容器可能随之变空
+// 迭代若干轮：删掉内层空元素后，外层容器可能随之变空。
+// 行内包装元素（span、a）区别对待：只包着 <br> 的拆包保留换行（微信把换行写成 <span leaf><br></span>），
+// 只含不换行空格或全角空格的保留（段首缩进与词间空格由它们承载，交 parsers/url 识别）；
+// 块级元素只剩 <br> 或空白时仍视为间隔段落整块删除
 function removeEmptyElements($) {
     for (let round = 0; round < EMPTY_SWEEP_ROUNDS; round += 1) {
-        let removed = 0;
+        let changed = 0;
         $(EMPTY_TAGS).each((_, el) => {
             if (!isAttached(el)) return;
             const $el = $(el);
             if ($el.text().trim()) return;
             if ($el.find(CONTENT_DESCENDANTS).length > 0) return;
+            if (INLINE_WRAPPERS.has(el.tagName)) {
+                if (!ASCII_SPACE_ONLY_RE.test($el.text())) return;
+                if ($el.find('br').length > 0) {
+                    $el.replaceWith($el.contents());
+                    changed += 1;
+                    return;
+                }
+            }
             $el.remove();
-            removed += 1;
+            changed += 1;
         });
-        if (removed === 0) return;
+        if (changed === 0) return;
     }
 }
 
-module.exports = { cleanNoise, tokensOf, NOISE_ATTR_RULES, NOISE_TEXT_RULES };
+module.exports = { cleanNoise, tokensOf, isAttached, NOISE_ATTR_RULES, NOISE_TEXT_RULES };

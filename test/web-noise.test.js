@@ -151,6 +151,24 @@ test('连续 br 削减为两个，空元素被迭代删除', () => {
     assert.ok(!/<p><\/p>/.test(result), '空段落应被删除');
 });
 
+test('只包着 <br> 的行内元素拆包保留换行；只含不换行空格或全角空格的行内元素保留；块级间隔段落仍删除', () => {
+    // Arrange：微信把换行写成 <span leaf><br></span>，把段首缩进写成只含 NBSP 的 span（全角空格以码点生成）
+    const ideo = String.fromCharCode(0x3000);
+    const html = '<div><p>甲<span leaf=""><br></span>乙</p><section><span leaf=""><br></span></section>'
+        + `<p><span>&nbsp;&nbsp;</span>丙</p><p><span>${ideo}${ideo}</span>丁</p><p><a href="#"><br></a>戊</p><p>&nbsp;</p></div>`;
+
+    // Act
+    const result = cleanNoise(html);
+
+    // Assert
+    assert.ok(result.includes('甲<br>乙'), `只包 br 的 span 应拆包，实际：${result}`);
+    assert.ok(!result.includes('<section'), `只剩 br 的块级间隔应删除，实际：${result}`);
+    assert.match(result, /<span>(?:&nbsp;|\xA0){2}<\/span>丙/, '只含 NBSP 的 span 应保留');
+    assert.match(result, new RegExp(`<span>${ideo}${ideo}</span>丁`), '只含全角空格的 span 应保留');
+    assert.ok(result.includes('<p><br>戊</p>'), `只包 br 的 a 应拆包，实际：${result}`);
+    assert.ok(!/<p>(?:&nbsp;|\xA0)<\/p>/.test(result), '只含 NBSP 的块级间隔段落应删除');
+});
+
 test('表格单元格即使为空也不删除，结构不被破坏', () => {
     // Arrange
     const html = '<table><tr><th>列一</th><th></th></tr><tr><td>1</td><td></td></tr></table>';

@@ -139,7 +139,7 @@ describe('generic profile', () => {
 
     test('非法控制字符被剔除、保留 TAB/LF，属性与文本实体转义；indent=0 整份单行', async () => {
         const children = [
-            createParagraph([createText('前 中后￾末\t制表 < & >')]),
+            createParagraph([createText('前\x00中\x07后\x1F\uFFFE末\t制表 < & >')]),
             { type: 'paragraph', children: [{ type: 'link', url: 'https://x.y/?a=1&b="2"<', children: [createText('链')] }] },
         ];
 
@@ -148,7 +148,7 @@ describe('generic profile', () => {
 
         assert.ok(xml.includes('<p>前中后末\t制表 &lt; &amp; &gt;</p>'), xml);
         assert.ok(xml.includes('href="https://x.y/?a=1&amp;b=&quot;2&quot;&lt;"'), xml);
-        assert.equal(builder.cleanText('a b\uD800c'), 'abc');
+        assert.equal(builder.cleanText('a\x00b\uD800c'), 'abc');
         assert.deepEqual(compact.split('\n').map((line) => line.slice(0, 5)), ['<?xml', '<docu', ''], 'indent=0 时声明一行、文档一行、末尾换行');
         assert.ok(compact.startsWith('<?xml version="1.0" encoding="UTF-8"?>\n<document xmlns="urn:markflow:document:1" version="1"><meta>'));
     });

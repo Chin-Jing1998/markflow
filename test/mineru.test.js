@@ -21,6 +21,7 @@ const JSZip = require('jszip');
 const mineru = require('../converters/pdf/mineru');
 const config = require('../converters/config');
 const { normalizeOptions } = require('../converters/options');
+const { renderDocument } = require('../converters');
 
 // 离线可复现：空环境变量 + 空用户目录，令牌来源只可能是用例显式传入的那一个
 const EMPTY_HOME = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'markflow-mineru-home-'));
@@ -176,22 +177,17 @@ function collect(node, predicate, out = []) {
 // 产物完整性
 // ============================================================
 
-test('zip 内全部条目原样进 extras，名字带 mineru/ 前缀', async () => {
+test('附属文件仿 MinerU 结果包改名：full.md 与 images/* 丢弃，其余改为 {name}_…，无 mineru/ 目录', async () => {
     // Arrange & Act
     const { doc } = await run();
 
     // Assert
     const names = doc.extras.map((item) => item.name).sort();
-    assert.deepEqual(names, [
-        'mineru/full.md',
-        'mineru/images/pic.png',
-        'mineru/layout.json',
-        'mineru/sample_content_list.json',
-        'mineru/sample_model.json',
-    ]);
-    const layout = doc.extras.find((item) => item.name === 'mineru/layout.json');
+    assert.deepEqual(names, ['{name}_content_list.json', '{name}_layout.json', '{name}_model.json']);
+    const layout = doc.extras.find((item) => item.name === '{name}_layout.json');
     assert.equal(layout.buffer.toString('utf8'), '{"pdf_info":[]}');
     assert.ok(doc.extras.every((item) => Buffer.isBuffer(item.buffer)));
+    assert.ok(!doc.extras.some((item) => item.name.startsWith('mineru/') || item.name.endsWith('full.md')));
 });
 
 test('data.mineru 记录 model / batchId / pages / files，meta 标注解析后端', async () => {
@@ -228,7 +224,7 @@ test('done 响应不带 extract_progress 时，页数取轮询期间见过的最
     assert.equal(doc.data.numPages, 7);
 });
 
-test('IR 中的图片引用与 extras 内的图片一致，且已登记为 assets', async () => {
+test('IR 中的图片引用对齐资源名并记下包内原始路径（sourcePath），资源字节即包内图片，临时 absPath 置空', async () => {
     // Arrange & Act
     const { doc } = await run();
 
@@ -236,15 +232,90 @@ test('IR 中的图片引用与 extras 内的图片一致，且已登记为 asset
     assert.equal(doc.assets.length, 1);
     assert.equal(doc.assets[0].name, 'images/image_1.png');
     assert.ok(doc.assets[0].buffer.equals(PIC_PNG));
+    assert.equal(doc.assets[0].sourcePath, 'images/pic.png');
 
     const images = collect(doc.ir, (n) => n.type === 'image');
     assert.equal(images.length, 1);
     assert.equal(images[0].url, 'images/image_1.png', 'IR 引用须对齐资源名，否则产物 md 指向不存在的文件');
     assert.equal(images[0].data.assetName, 'images/image_1.png');
-
-    const packed = doc.extras.find((item) => item.name === 'mineru/images/pic.png');
-    assert.ok(packed.buffer.equals(doc.assets[0].buffer), 'extras 内的图片与 assets 应是同一份字节');
+    assert.equal(images[0].data.sourcePath, 'images/pic.png');
+    assert.equal(images[0].data.asset.absPath, null, '解包目录已删除，不得把临时路径写进产物');
     assert.deepEqual(doc.warnings, []);
+});
+
+// ============================================================
+// MinerU 式产物：显示尺寸、图注归位、路径改写
+// ============================================================
+
+const SHA_FIGURE = '0123456789abcdef'.repeat(4);
+const SHA_TABLE = 'fedcba9876543210'.repeat(4);
+
+/** 带 64 位哈希图名、content_list / v2 / layout / origin 的结果包；表格截图不在 full.md 中引用 */
+async function makeHashedZip() {
+    const zip = new JSZip();
+    zip.file('full.md', ['# 哈希图名', '', `![](images/${SHA_FIGURE}.jpg)`, '', '图 1 夹具示意', '', '正文。', ''].join('\n'));
+    zip.file(`images/${SHA_FIGURE}.jpg`, PIC_PNG);
+    zip.file(`images/${SHA_TABLE}.jpg`, PIC_PNG);
+    zip.file('abc_content_list.json', JSON.stringify([
+        { type: 'text', text: '哈希图名', text_level: 1, bbox: [100, 50, 900, 80], page_idx: 0 },
+        { type: 'image', img_path: `images/${SHA_FIGURE}.jpg`, image_caption: ['图 1 夹具示意'], image_footnote: [], bbox: [100, 100, 600, 400], page_idx: 0 },
+        { type: 'table', img_path: `images/${SHA_TABLE}.jpg`, table_caption: [], table_footnote: [], table_body: '<table><tr><td>甲</td></tr></table>', bbox: [100, 500, 900, 600], page_idx: 0 },
+    ], null, 4));
+    zip.file('abc_content_list_v2.json', JSON.stringify([[{ type: 'image', content: { image_source: { path: `images/${SHA_FIGURE}.jpg` } } }]], null, 4));
+    zip.file('abc_model.json', '[]');
+    zip.file('layout.json', JSON.stringify({
+        pdf_info: [{ page_idx: 0, page_size: [600, 800], para_blocks: [{ type: 'image', image_path: `${SHA_FIGURE}.jpg` }, { type: 'table', image_path: `${SHA_TABLE}.jpg` }] }],
+    }));
+    zip.file('abc_origin.pdf', '%PDF-origin');
+    return zip.generateAsync({ type: 'nodebuffer' });
+}
+
+const FIGURE_DISPLAY = Object.freeze({ width: 400, height: 320, unit: 'px', source: 'mineru' });
+
+test('MinerU 结果包：bbox × page_size × 96/72 得显示尺寸，图注从正文移到图片之后，未引用的包内图片续编号进 assets', async () => {
+    // Arrange & Act：bbox 宽 500/1000 × 600pt = 300pt = 400px，高 300/1000 × 800pt = 240pt = 320px
+    const { doc } = await run({ zip: await makeHashedZip() });
+
+    // Assert
+    const images = collect(doc.ir, (n) => n.type === 'image');
+    assert.deepEqual(images[0].data.display, { ...FIGURE_DISPLAY });
+    assert.equal(images[0].data.sourcePath, `images/${SHA_FIGURE}.jpg`);
+    const top = doc.ir.children;
+    const at = top.findIndex((n) => Array.isArray(n.children) && n.children.some((c) => c.type === 'image'));
+    assert.deepEqual(top[at + 1].data, { role: 'caption' });
+    const captionTexts = top.filter((n) => collect(n, (x) => x.type === 'text').map((x) => x.value).join('') === '图 1 夹具示意');
+    assert.equal(captionTexts.length, 1, '图注只出现一次');
+    assert.deepEqual(doc.assets.map((a) => [a.name, a.sourcePath]), [
+        ['images/image_1.jpg', `images/${SHA_FIGURE}.jpg`],
+        ['images/image_2.jpg', `images/${SHA_TABLE}.jpg`],
+    ]);
+    assert.deepEqual(doc.extras.map((e) => e.name).sort(), [
+        '{name}_content_list.json', '{name}_content_list_v2.json', '{name}_layout.json', '{name}_model.json', '{name}_origin.pdf',
+    ]);
+    const list = JSON.parse(doc.extras.find((e) => e.name === '{name}_content_list.json').buffer.toString('utf8'));
+    assert.deepEqual(list[1].display, { ...FIGURE_DISPLAY });
+});
+
+test('MinerU 结果包渲染为 bundle：所有 JSON 内无 64 位哈希图名，content_list 与 layout 的图片路径指向产物 images/', async () => {
+    // Arrange
+    const { doc } = await run({ zip: await makeHashedZip() });
+
+    // Act
+    const rendered = await renderDocument(doc, 'bundle');
+
+    // Assert
+    const jsonTexts = [
+        ...Object.entries(rendered.files).filter(([name]) => name.endsWith('.json')).map(([, text]) => String(text)),
+        ...rendered.extras.filter((e) => e.name.endsWith('.json')).map((e) => e.buffer.toString('utf8')),
+    ];
+    assert.equal(jsonTexts.length, 5, '{name}.json、{name}_content_list.json 与 v2 / layout / model 三个附属 JSON');
+    for (const text of jsonTexts) assert.ok(!/[0-9a-f]{64}/.test(text), text.slice(0, 200));
+    const list = JSON.parse(rendered.files['{name}_content_list.json']);
+    assert.deepEqual(list.map((b) => b.img_path), [undefined, 'images/image_1.jpg', 'images/image_2.jpg']);
+    assert.ok(!rendered.extras.some((e) => e.name === '{name}_content_list.json'), 'content_list 只出现在 files 中');
+    const layout = JSON.parse(rendered.extras.find((e) => e.name === '{name}_layout.json').buffer.toString('utf8'));
+    assert.deepEqual(layout.pdf_info[0].para_blocks.map((b) => b.image_path), ['image_1.jpg', 'image_2.jpg']);
+    assert.ok(String(rendered.files['{name}.md']).includes('<img src="images/image_1.jpg" width="400" alt="">'));
 });
 
 test('full.md 中的规则表被转成 mdast table 进入 IR', async () => {

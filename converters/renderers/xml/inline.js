@@ -42,6 +42,7 @@ function walk(nodes, marks, state, runs) {
                 break;
             case 'strong': walk(node.children || [], new Set([...marks, 'b']), state, runs); break;
             case 'emphasis': walk(node.children || [], new Set([...marks, 'i']), state, runs); break;
+            case 'underline': walk(node.children || [], new Set([...marks, 'u']), state, runs); break;
             case 'inlineCode': runs.push(textRun(String(node.value == null ? '' : node.value), current())); break;
             case 'break': runs.push({ kind: 'br' }); break;
             case 'image': runs.push({ kind: 'image', node }); break;
