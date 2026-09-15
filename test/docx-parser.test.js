@@ -16,7 +16,9 @@ const {
 const { parse } = require('../converters/parsers/docx');
 const mdRenderer = require('../converters/renderers/md');
 const { buildLayoutSample, LAYOUT_EXPECTED } = require('./fixtures/build-layout-sample');
-const { buildTitleSample, TITLE_EXPECTED, TAB_HEADING_EXPECTED } = require('./fixtures/build-title-sample');
+const {
+    buildTitleSample, TITLE_EXPECTED, TAB_HEADING_EXPECTED, TITLE_LIST_EXPECTED,
+} = require('./fixtures/build-title-sample');
 
 // 不可见字符以码点生成，源码不出现看不见的字面量：U+3000 全角空格，U+EF00–U+EF1F 私用区版面标记
 const IDEO = String.fromCharCode(0x3000);
@@ -388,4 +390,56 @@ test('标题夹具：H1 标题含制表符时，meta.title 中的制表符标记
 
     // Assert
     assert.equal(doc.meta.title, TAB_HEADING_EXPECTED.expected);
+});
+
+// 列表结构摘要（有序性、各项首段文字、嵌套列表），断言失败时整体可读
+function summarizeList(list) {
+    return {
+        ordered: list.ordered,
+        items: list.children.map((item) => ({
+            text: plainText(item.children[0]),
+            nested: item.children.filter((n) => n.type === 'list').map(summarizeList),
+        })),
+    };
+}
+
+// titleList 夹具的期望结构：同一个顶层列表里，Title 项内嵌下级段，同级段接续为第 2 项
+function expectedTitleList(ordered) {
+    return [{
+        ordered,
+        items: [
+            { text: TITLE_EXPECTED.title, nested: [{ ordered, items: [{ text: TITLE_LIST_EXPECTED.child, nested: [] }] }] },
+            { text: TITLE_LIST_EXPECTED.sibling, nested: [] },
+        ],
+    }];
+}
+
+test('标题夹具：Title 段带有序编号时在正文中为列表项，meta.title 仍取该段文字，md 中为不带类名与 HTML 的普通列表项', async () => {
+    // Act
+    const doc = await parse({ buffer: await buildTitleSample({ titleList: 'ordered' }) }, { sourceName: '标题样例.docx' });
+    const markdown = await mdRenderer.render(doc);
+
+    // Assert
+    assert.equal(doc.meta.title, TITLE_EXPECTED.title);
+    const items = collect(doc.ir, (n) => n.type === 'listItem');
+    assert.ok(items.some((item) => plainText(item.children[0]) === TITLE_EXPECTED.title), 'Title 段文字应位于列表项内');
+    assert.ok(markdown.split('\n').includes(`1. ${TITLE_EXPECTED.title}`), markdown);
+    assert.doesNotMatch(markdown, /mf-title|<\/?(?:p|ol|ul|li|span)\b/);
+});
+
+test('标题夹具：同一编号定义下，带编号的 Title 段与相邻普通编号段同属一个列表（下级段嵌在其列表项内，同级段接续为第 2 项）', async () => {
+    // Act
+    const doc = await parse({ buffer: await buildTitleSample({ titleList: 'ordered' }) }, { sourceName: '标题样例.docx' });
+
+    // Assert
+    assert.deepEqual(doc.ir.children.filter((n) => n.type === 'list').map(summarizeList), expectedTitleList(true));
+});
+
+test('标题夹具：Title 段带项目符号时与同一编号定义下的普通段同属一个无序列表，meta.title 仍取该段文字', async () => {
+    // Act
+    const doc = await parse({ buffer: await buildTitleSample({ titleList: 'unordered' }) }, { sourceName: '标题样例.docx' });
+
+    // Assert
+    assert.equal(doc.meta.title, TITLE_EXPECTED.title);
+    assert.deepEqual(doc.ir.children.filter((n) => n.type === 'list').map(summarizeList), expectedTitleList(false));
 });

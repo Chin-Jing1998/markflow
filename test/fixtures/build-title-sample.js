@@ -11,6 +11,8 @@
  *   3. 普通段「目录」
  *   4. heading 1 段「第一章 概述」
  *   5. 普通段正文
+ * titleList 为 'ordered' / 'unordered' 时，第 2 段另带编号（numId 1、ilvl 0），其后插入同一编号定义下的
+ * 下级段「适用范围」（ilvl 1）与同级段「编写说明」（ilvl 0），并附 numbering.xml 部件及其关系与内容类型
  */
 const fs = require('fs');
 const path = require('path');
@@ -23,6 +25,8 @@ const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationship
 const TITLE_EXPECTED = Object.freeze({ title: '样例评价手册', heading: '第一章 概述' });
 /** headingTab: true 时，heading 1 段落用 <w:tab/> 分隔「第一章」与「总则」，meta.title 的期望值 */
 const TAB_HEADING_EXPECTED = Object.freeze({ expected: '第一章 总则' });
+/** titleList 模式下插入的两个普通编号段：child 为下级段（ilvl 1），sibling 为同级段（ilvl 0） */
+const TITLE_LIST_EXPECTED = Object.freeze({ child: '适用范围', sibling: '编写说明' });
 
 // ---------- document.xml 片段 ----------
 
@@ -30,14 +34,20 @@ const run = (text) => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
 const tabRun = () => '<w:r><w:tab/></w:r>';
 const paragraph = (content, pPr = '') => `<w:p>${pPr ? `<w:pPr>${pPr}</w:pPr>` : ''}${content}</w:p>`;
 const pStyle = (id) => `<w:pStyle w:val="${id}"/>`;
+const NUM_ID = 1;
+const numPr = (ilvl) => `<w:numPr><w:ilvl w:val="${ilvl}"/><w:numId w:val="${NUM_ID}"/></w:numPr>`;
 
-function documentXml(title, headingTab) {
+function documentXml(title, headingTab, numbered) {
     const headingContent = headingTab
         ? `${run('第一章')}${tabRun()}${run('总则')}`
         : run(TITLE_EXPECTED.heading);
+    const listParagraphs = numbered
+        ? [paragraph(run(TITLE_LIST_EXPECTED.child), numPr(1)), paragraph(run(TITLE_LIST_EXPECTED.sibling), numPr(0))]
+        : [];
     const body = [
         paragraph(''),
-        paragraph(title ? run(title) : '', pStyle('a4')),
+        paragraph(title ? run(title) : '', `${pStyle('a4')}${numbered ? numPr(0) : ''}`),
+        ...listParagraphs,
         paragraph(run('目录')),
         paragraph(headingContent, pStyle('1')),
         paragraph(run('正文段落。')),
@@ -52,6 +62,18 @@ const STYLES_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:st
     + '<w:style w:type="paragraph" w:styleId="a4"><w:name w:val="Title"/><w:basedOn w:val="a"/><w:rPr><w:sz w:val="72"/></w:rPr></w:style>'
     + '</w:styles>';
 
+// ---------- numbering.xml（仅 titleList 模式）----------
+
+// titleList 取值 → 各级 numFmt；mammoth 以 numFmt 是否为 bullet 判定有序或无序
+const LIST_NUM_FMT = Object.freeze({ ordered: 'decimal', unordered: 'bullet' });
+
+// 定义 ilvl 0、1 两级，夹具只用到这两级
+const numberingXml = (numFmt) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="${W_NS}">`
+    + '<w:abstractNum w:abstractNumId="0">'
+    + [0, 1].map((ilvl) => `<w:lvl w:ilvl="${ilvl}"><w:start w:val="1"/><w:numFmt w:val="${numFmt}"/>`
+        + `<w:lvlText w:val="${numFmt === 'bullet' ? '-' : `%${ilvl + 1}.`}"/></w:lvl>`).join('')
+    + `</w:abstractNum><w:num w:numId="${NUM_ID}"><w:abstractNumId w:val="0"/></w:num></w:numbering>`;
+
 const CONTENT_TYPES_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
     + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
@@ -59,24 +81,38 @@ const CONTENT_TYPES_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"
     + '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
     + '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
     + '</Types>';
+const NUMBERING_OVERRIDE = '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>';
 
 const relationships = (items) => '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     + items.map(([id, type, target]) => `<Relationship Id="${id}" Type="${R_NS}/${type}" Target="${target}"/>`).join('')
     + '</Relationships>';
 
+function listNumFmt(titleList) {
+    if (titleList === null) return null;
+    if (!Object.hasOwn(LIST_NUM_FMT, titleList)) {
+        throw new Error(`titleList 只接受 'ordered'、'unordered' 或 null，收到 ${String(titleList)}`);
+    }
+    return LIST_NUM_FMT[titleList];
+}
+
 /**
- * @param {{ title?: string, headingTab?: boolean }} [options]
+ * @param {{ title?: string, headingTab?: boolean, titleList?: 'ordered' | 'unordered' | null }} [options]
  *   title 为 Title 样式段的文本，缺省取 TITLE_EXPECTED.title；
- *   headingTab 为 true 时，heading 1 段落改用 <w:tab/> 分隔「第一章」与「总则」（见 TAB_HEADING_EXPECTED）
+ *   headingTab 为 true 时，heading 1 段落改用 <w:tab/> 分隔「第一章」与「总则」（见 TAB_HEADING_EXPECTED）；
+ *   titleList 为 'ordered' / 'unordered' 时，Title 段带有序 / 无序编号，并插入两个同一编号定义下的普通段
+ *   （见 TITLE_LIST_EXPECTED）；缺省 null，不带编号、不生成 numbering.xml
  */
-async function buildTitleSample({ title = TITLE_EXPECTED.title, headingTab = false } = {}) {
+async function buildTitleSample({ title = TITLE_EXPECTED.title, headingTab = false, titleList = null } = {}) {
+    const numFmt = listNumFmt(titleList);
+    const documentRels = [['rId1', 'styles', 'styles.xml']];
     const zip = new JSZip();
-    zip.file('[Content_Types].xml', CONTENT_TYPES_XML);
+    zip.file('[Content_Types].xml', numFmt ? CONTENT_TYPES_XML.replace('</Types>', `${NUMBERING_OVERRIDE}</Types>`) : CONTENT_TYPES_XML);
     zip.file('_rels/.rels', relationships([['rId1', 'officeDocument', 'word/document.xml']]));
-    zip.file('word/_rels/document.xml.rels', relationships([['rId1', 'styles', 'styles.xml']]));
-    zip.file('word/document.xml', documentXml(title, headingTab));
+    zip.file('word/_rels/document.xml.rels', relationships(numFmt ? [...documentRels, ['rId2', 'numbering', 'numbering.xml']] : documentRels));
+    zip.file('word/document.xml', documentXml(title, headingTab, Boolean(numFmt)));
     zip.file('word/styles.xml', STYLES_XML);
+    if (numFmt) zip.file('word/numbering.xml', numberingXml(numFmt));
     return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
 }
 
@@ -93,4 +129,4 @@ if (require.main === module) {
         });
 }
 
-module.exports = { buildTitleSample, TITLE_EXPECTED, TAB_HEADING_EXPECTED };
+module.exports = { buildTitleSample, TITLE_EXPECTED, TAB_HEADING_EXPECTED, TITLE_LIST_EXPECTED };

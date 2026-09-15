@@ -13,7 +13,8 @@
  *   - 不写盘、不打印：mammoth 警告、图片读取失败、预检与公式抽取异常一律推入 warnings
  *   - 图片按出现顺序编号为 images/image_N.ext（N 从 1 起），IR 中 image 节点 url 与 assets 一一对应；
  *     取得到 wp:extent / VML 尺寸的图片带 data.display（px），浮动图另带 data.floating
- *   - 标题取首个有文字的 Title 样式段（正文中仍为普通段落），其次首个 <h1> 文本，否则取去扩展名的文件名
+ *   - 标题取首个有文字的 Title 样式段（不带编号的在正文中仍为普通段落，带编号的与同一编号定义下的普通段同为列表项），
+ *     其次首个 <h1> 文本，否则取去扩展名的文件名
  *   - data.ooxml 为 OOXML 预检信息（采集失败时为 null），meta.sourcePath 为源文件绝对路径
  *   - 公式一律进 IR 的 math 节点；options.math='text' 的降级由渲染器负责，解析层不降级
  *   - 段落文本本身不带全角缩进（由 md 渲染器按 data.indent 插入），专利 XML 等下游不受影响
@@ -39,13 +40,24 @@ const DEFAULT_IMAGE_MIME = 'image/png';
 // mammoth 默认样式表不认 Title（封面题名常用此样式而非标题 1），标成带类名的普通段落供 extractTitle 采信；
 // turndown 不理会类名，正文输出不变。style-name 按样式名匹配（不分大小写），与样式 ID（中文版 Word 为 a4 等）无关
 const TITLE_CLASS = 'mf-title';
-const STYLE_MAP = Object.freeze(['u => u', `p[style-name='Title'] => p.${TITLE_CLASS}:fresh`]);
+// 带编号的 Title 段按默认列表映射的同一路径输出为列表项：自定义映射排在默认映射之前、先匹配者生效，须先于普通 Title 映射截住。
+// 层级 1–5 与 mammoth 默认样式表（lib/options-reader.js）一致，超出者与普通编号段一样不成列表，仍走普通 Title 映射。
+// 类名放在 li 内的 span 上而非 li 本身：li 带属性后与其后下级编号段路径中的 li 属性不同，mammoth 不再合并，
+// 下级列表会另起一个空列表项、打乱后续编号；span 由 turndown 按内容输出，md 中不留痕迹
+const LIST_LEVELS = Object.freeze([1, 2, 3, 4, 5]);
+const titleListItemPath = (listTag, level) => `${'ul|ol > li > '.repeat(level - 1)}${listTag} > li:fresh > span.${TITLE_CLASS}`;
+const TITLE_LIST_MAP = LIST_LEVELS.flatMap((level) => [
+    `p[style-name='Title']:ordered-list(${level}) => ${titleListItemPath('ol', level)}`,
+    `p[style-name='Title']:unordered-list(${level}) => ${titleListItemPath('ul', level)}`,
+]);
+const STYLE_MAP = Object.freeze(['u => u', ...TITLE_LIST_MAP, `p[style-name='Title'] => p.${TITLE_CLASS}:fresh`]);
 // 残留在 HTML 里的 base64 内嵌图片（正常情况下 convertImage 已截获全部图片，此处兜底）
 const INLINE_BASE64_IMG_RE = /<img\b[^>]*?\bsrc="data:image\/([a-z0-9.+-]+);base64,([^"]*)"[^>]*>/gi;
 // 游离在标签之外的 base64 图片文本
 const STRAY_BASE64_RE = /data:image\/[^;]+;base64,[A-Za-z0-9+/=]{50,}/g;
 const H1_RE = /<h1[^>]*>([\s\S]*?)<\/h1>/i;
-const TITLE_P_RE = new RegExp(`<p class="${TITLE_CLASS}">([\\s\\S]*?)</p>`, 'g');
+// Title 样式段的文字：不带编号的在 <p class> 内，带编号的在列表项的 <span class> 内（见 STYLE_MAP）
+const TITLE_P_RE = new RegExp(`<(p|span) class="${TITLE_CLASS}">([\\s\\S]*?)</\\1>`, 'g');
 // 标题文字里连续的 TAB 标记（如「第一章<Tab>总则」）换成一个空格，避免与相邻文字粘连；其余标记仍整段删除
 const TITLE_TAB_RE = new RegExp(`${MARKERS.TAB}+`, 'g');
 // 进度百分比：parser 只报 parsing 阶段，三个节点单调递增且不超过 55（其后由调度器接管）
@@ -227,7 +239,7 @@ function titleText(html) {
 // Title 样式段中首个有文字的优先（只含版面标记的不算），其次首个 <h1>
 function extractTitle(html) {
     for (const matched of html.matchAll(TITLE_P_RE)) {
-        const text = htmlText(matched[1]);
+        const text = htmlText(matched[2]);
         if (stripMarkers(text).trim()) return text;
     }
     const matched = H1_RE.exec(html);
