@@ -26,6 +26,9 @@
  *       主进程 → 渲染进程的推送走 mf:preview:event：{ type: 'reader-open', path } 由菜单「打开文件…」触发
  *   mf:library:list/update/remove/reveal/open/reconvert/migrate → 文件库（模块未就绪时抛「文件库模块未就绪」）
  *   mf:settings:get/set/setMineruToken/testMineru → 设置与令牌（回包永不含令牌）
+ *   mf:update:check { force? }               → 向 GitHub 取最新 release 与当前版本比对，回
+ *       { status: 'latest'|'update-available'|'unknown'|'failed', message, latestVersion, url, checkedAt, currentVersion, cached }；
+ *       目标地址在 update-check.js 内写死，本通道不接受任何 URL 入参；force 为假时命中 24 小时缓存直接返回、不发请求
  *   mf:theme:get/set                         → 主题；变化经 mf:theme:changed 广播
  *   mf:shell:openExternal { url }            → 仅 http(s)
  *   mf:file:action { sessionId, action }     → 顶部栏的当前文件操作：reveal 在访达中显示 / open 用默认应用打开 / copyPath 复制路径；
@@ -51,6 +54,7 @@ const MINERU_AUTH_STATUSES = new Set([401, 403]);
 const MINERU_TASK_NOT_FOUND = '-60012';
 const LIBRARY_NOT_READY = '文件库模块未就绪';
 const PREVIEW_NOT_READY = '预览与阅读模块未就绪';
+const UPDATE_NOT_READY = '更新检测模块未就绪';
 const EXTERNAL_URL_RE = /^https?:\/\//i;
 
 const CHANNELS = Object.freeze({
@@ -81,6 +85,7 @@ const CHANNELS = Object.freeze({
     settingsSet: 'mf:settings:set',
     settingsSetMineruToken: 'mf:settings:setMineruToken',
     settingsTestMineru: 'mf:settings:testMineru',
+    updateCheck: 'mf:update:check',
     themeGet: 'mf:theme:get',
     themeSet: 'mf:theme:set',
     themeChanged: 'mf:theme:changed',
@@ -213,6 +218,8 @@ const SCHEMAS = Object.freeze({
     [CHANNELS.settingsSet]: z.object({ patch: SettingsPatchSchema }).strict(),
     [CHANNELS.settingsSetMineruToken]: z.object({ token: z.string().max(512).nullable() }).strict(),
     [CHANNELS.settingsTestMineru]: z.object({ token: z.string().min(1).max(512).optional() }).strict().optional(),
+    // 只收一个「是否无视缓存」开关：请求地址在主进程写死，渲染层不得指定任何 URL
+    [CHANNELS.updateCheck]: z.object({ force: z.boolean().optional() }).strict().optional(),
     [CHANNELS.themeGet]: NoPayload,
     [CHANNELS.themeSet]: z.object({ theme: themeEnum }).strict(),
     [CHANNELS.shellOpenExternal]: z.object({ url: z.string().max(MAX_PATH_LENGTH).regex(EXTERNAL_URL_RE, '仅接受 http(s) 网址') }).strict(),
@@ -283,7 +290,7 @@ const scrubAll = (text, tokens) => tokens.filter(Boolean).reduce((out, token) =>
 function createIpcHandlers(deps = {}) {
     const {
         electron, settings, library = null, libraryMigrate = null, service, scan,
-        preview = null, reader = null,
+        preview = null, reader = null, update = null,
         backendStatus = { pdf: false, raster: false }, getMainWindow = () => null, applyTheme = () => undefined,
         log = (line) => process.stderr.write(`${line}\n`),
     } = deps;
@@ -614,6 +621,14 @@ function createIpcHandlers(deps = {}) {
         return { ok: false, status: 'error', message: `MinerU 返回异常：HTTP ${res.status}${detail ? ` — ${detail}` : ''}` };
     }
 
+    // ---------- 更新检测 ----------
+
+    /** 渲染层只能触发检测并读结果；请求地址与护栏都在 update-check.js 内，本通道不透传任何 URL */
+    async function updateCheck(event, payload) {
+        if (!update) throw new Error(UPDATE_NOT_READY);
+        return update.check({ force: Boolean(payload && payload.force) });
+    }
+
     const themeGet = async () => ({ theme: settings.get().theme, shouldUseDarkColors: Boolean(nativeTheme && nativeTheme.shouldUseDarkColors) });
 
     async function themeSet(event, payload) {
@@ -691,6 +706,7 @@ function createIpcHandlers(deps = {}) {
         [CHANNELS.settingsSet]: settingsSet,
         [CHANNELS.settingsSetMineruToken]: settingsSetMineruToken,
         [CHANNELS.settingsTestMineru]: settingsTestMineru,
+        [CHANNELS.updateCheck]: updateCheck,
         [CHANNELS.themeGet]: themeGet,
         [CHANNELS.themeSet]: themeSet,
         [CHANNELS.shellOpenExternal]: shellOpenExternal,
@@ -707,5 +723,5 @@ function registerIpc(ipcMain, handlers) {
 
 module.exports = {
     createIpcHandlers, registerIpc, validatePayload, pickTarget, stripToken,
-    CHANNELS, SCHEMAS, FlatOptionsSchema, CONVERT_CONCURRENCY, PREVIEW_NOT_READY, LIBRARY_NOT_READY, LIBRARY_MODES,
+    CHANNELS, SCHEMAS, FlatOptionsSchema, CONVERT_CONCURRENCY, PREVIEW_NOT_READY, LIBRARY_NOT_READY, UPDATE_NOT_READY, LIBRARY_MODES,
 };

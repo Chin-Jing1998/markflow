@@ -15,6 +15,8 @@
  *   getMineruToken()       解密令牌；不可用或解密失败返回 null，绝不抛出
  *   setMineruToken(token)  加密后写入 secrets.json；token 为 null / 空串时清除；
  *                          safeStorage.isEncryptionAvailable() 为 false 时拒绝并抛中文错误
+ *   getUpdateCache()       最近一次更新检测的结果（深拷贝）；无缓存或已损坏返回 null
+ *   setUpdateCache(entry)  校验后写入 settings.json 的 update 段（与 set 同一把写队列与原子写）
  *   describe()             { settings, mineruTokenConfigured, encryptionAvailable, paths, warnings }（供 IPC 回包，不含令牌）
  *   warnings()             最近一次 load 的警告
  *
@@ -22,8 +24,12 @@
  *   { version: 1, theme: 'system'|'light'|'dark', outputDir,
  *     defaultTargets: { office, markup, url },
  *     defaults: { theme?, imageFormat?, jpegQuality?, jpegPpi?, math?, pdfBackend?, mineruModel?, xmlProfile? }（扁平转换选项，交 service.buildOptions），
- *     library: { mode: 'index'|'managed', root, repositories?, activeRepository? } }
+ *     library: { mode: 'index'|'managed', root, repositories?, activeRepository? },
+ *     update?: { checkedAt, status, message, latestVersion, url }（更新检测缓存，仅主进程写） }
  * secrets.json：{ mineruToken: <base64 密文> }。令牌永不进入 settings.json、日志与 IPC 回包。
+ *
+ * update 段不在 SettingsPatchSchema 内，渲染层经 mf:settings:set 无法写入；损坏时按缺失处理（.catch），
+ * 不让一段缓存把整份设置退回默认值。
  */
 const fs = require('fs');
 const fsp = fs.promises;
@@ -45,6 +51,11 @@ const MAX_REPOSITORIES = 32;
 const JSON_INDENT = 2;
 const THEMES = Object.freeze(['system', 'light', 'dark']);
 const LIBRARY_MODES = Object.freeze(['index', 'managed']);
+/** 更新检测结果的四态：已是最新 / 有新版 / 版本号无法判定 / 检测失败 */
+const UPDATE_STATUSES = Object.freeze(['latest', 'update-available', 'unknown', 'failed']);
+const MAX_UPDATE_MESSAGE = 500;
+const MAX_UPDATE_VERSION = 100;
+const MAX_UPDATE_URL = 2048;
 
 const noop = () => undefined;
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -78,6 +89,14 @@ const LibrarySchema = z.object({
     activeRepository: nonEmptyPath.optional(),
 }).strict();
 
+const UpdateCacheSchema = z.object({
+    checkedAt: z.number().int().min(0),
+    status: z.enum([...UPDATE_STATUSES]),
+    message: z.string().max(MAX_UPDATE_MESSAGE),
+    latestVersion: z.string().max(MAX_UPDATE_VERSION).nullable(),
+    url: z.string().max(MAX_UPDATE_URL).nullable(),
+}).strict();
+
 const SettingsSchema = z.object({
     version: z.literal(SETTINGS_VERSION),
     theme: themeEnum,
@@ -85,6 +104,8 @@ const SettingsSchema = z.object({
     defaultTargets: DefaultTargetsSchema,
     defaults: DefaultsSchema,
     library: LibrarySchema,
+    // 缓存损坏按缺失处理，不牵连其余设置项
+    update: UpdateCacheSchema.optional().catch(undefined),
 }).strict();
 
 const SettingsPatchSchema = z.object({
@@ -295,6 +316,24 @@ function createSettingsStore({ dir, safeStorage, defaults } = {}) {
         return true;
     });
 
+    // ---------- 更新检测缓存（settings.json 的 update 段；只由主进程写） ----------
+
+    function getUpdateCache() {
+        if (!state.loaded) load();
+        const parsed = UpdateCacheSchema.safeParse(state.settings.update);
+        return parsed.success ? clone(parsed.data) : null;
+    }
+
+    const setUpdateCache = (entry) => enqueue(async () => {
+        if (!state.loaded) load();
+        const checked = UpdateCacheSchema.safeParse(entry);
+        if (!checked.success) throw new Error(`更新检测缓存不合法：${formatIssues(checked.error)}`);
+        const next = { ...clone(state.settings), update: checked.data };
+        await writeJsonAtomic(settingsPath, next);
+        state.settings = next;
+        return clone(checked.data);
+    });
+
     function describe() {
         return {
             settings: get(),
@@ -314,7 +353,7 @@ function createSettingsStore({ dir, safeStorage, defaults } = {}) {
     }
 
     return {
-        load, get, set, hasMineruToken, getMineruToken, setMineruToken, describe,
+        load, get, set, hasMineruToken, getMineruToken, setMineruToken, getUpdateCache, setUpdateCache, describe,
         warnings: () => [...state.warnings],
         paths: { dir: baseDir, settingsPath, secretsPath },
     };
@@ -325,6 +364,6 @@ const targetClassOf = (inputType) => INPUT_CLASS[inputType] || null;
 
 module.exports = {
     createSettingsStore, buildDefaultSettings, targetClassOf,
-    SettingsSchema, SettingsPatchSchema, DefaultsPatchSchema,
-    THEMES, LIBRARY_MODES, SETTINGS_VERSION, SETTINGS_FILENAME, SECRETS_FILENAME,
+    SettingsSchema, SettingsPatchSchema, DefaultsPatchSchema, UpdateCacheSchema,
+    THEMES, LIBRARY_MODES, UPDATE_STATUSES, SETTINGS_VERSION, SETTINGS_FILENAME, SECRETS_FILENAME,
 };

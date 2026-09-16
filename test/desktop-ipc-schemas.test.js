@@ -42,12 +42,12 @@ test('所有 §3.3.5 通道均有 schema，未知通道拒绝', () => {
         'mf:preview:open', 'mf:preview:render', 'mf:preview:export', 'mf:preview:close', 'mf:reader:open',
         'mf:md:render', 'mf:md:save', 'mf:md:insertImage',
         'mf:library:list', 'mf:library:update', 'mf:library:remove', 'mf:library:reveal', 'mf:library:open', 'mf:library:reconvert', 'mf:library:migrate',
-        'mf:settings:get', 'mf:settings:set', 'mf:settings:setMineruToken', 'mf:settings:testMineru',
+        'mf:settings:get', 'mf:settings:set', 'mf:settings:setMineruToken', 'mf:settings:testMineru', 'mf:update:check',
         'mf:theme:get', 'mf:theme:set', 'mf:shell:openExternal', 'mf:file:action',
     ];
     for (const channel of expected) assert.ok(SCHEMAS[channel], `缺少 schema：${channel}`);
     assert.equal(Object.keys(SCHEMAS).length, expected.length);
-    assert.equal(expected.length, 29, '通道总数为 29');
+    assert.equal(expected.length, 30, '通道总数为 30');
     assert.ok(!SCHEMAS['mf:library:relocate'], 'relocate 不暴露为 IPC 通道');
     assert.throws(() => validatePayload('mf:library:relocate', {}), /未知的 IPC 通道/);
     assert.equal(CHANNELS.convertEvent, 'mf:convert:event');
@@ -96,6 +96,8 @@ const REJECTS = [
     ['mf:settings:setMineruToken', { token: 123 }, 'token 非字符串'],
     ['mf:settings:setMineruToken', {}, '缺 token'],
     ['mf:settings:testMineru', { token: '' }, '空 token'],
+    ['mf:update:check', { force: 'yes' }, 'force 非布尔'],
+    ['mf:update:check', { url: 'https://evil.example/latest' }, '渲染层不得指定检测地址'],
     ['mf:theme:set', { theme: 'blue' }, '非法主题'],
     ['mf:shell:openExternal', { url: 'file:///etc/passwd' }, 'file 外链'],
     ['mf:shell:openExternal', { url: 'javascript:alert(1)' }, 'javascript 外链'],
@@ -153,6 +155,8 @@ test('schema 放行合法入参并原样返回', () => {
     assert.deepEqual(validatePayload('mf:paths:expand', { paths: ['/a'], scope: 'convert' }), { paths: ['/a'], scope: 'convert' });
     assert.deepEqual(validatePayload('mf:dialog:pickFiles', { purpose: 'read' }), { purpose: 'read' });
     assert.deepEqual(validatePayload('mf:dialog:pickFiles', { directory: true, purpose: 'convert' }), { directory: true, purpose: 'convert' });
+    assert.deepEqual(validatePayload('mf:update:check', undefined), undefined);
+    assert.deepEqual(validatePayload('mf:update:check', { force: true }), { force: true });
 });
 
 test('validate 经 service.buildOptions 映射到 xml.validate', () => {

@@ -68,6 +68,8 @@ contextBridge.exposeInMainWorld('markflow', {
     settingsSet: (patch) => invoke('mf:settings:set', { patch }),
     setMineruToken: (token) => invoke('mf:settings:setMineruToken', { token: token == null ? null : String(token) }),
     testMineru: (token) => invoke('mf:settings:testMineru', token ? { token: String(token) } : undefined),
+    // 更新检测：渲染层只给「是否无视缓存」，请求地址与护栏都在主进程
+    updateCheck: (force) => invoke('mf:update:check', { force: Boolean(force) }),
 
     themeGet: () => invoke('mf:theme:get'),
     themeSet: (theme) => invoke('mf:theme:set', { theme }),

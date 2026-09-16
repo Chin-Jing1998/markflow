@@ -21,6 +21,7 @@ const { createMainWindow, applyWindowTheme } = require('./window');
 const { installMenu } = require('./menu');
 const { createChromiumJobs } = require('./chromium-jobs');
 const { createIpcHandlers, registerIpc, CHANNELS } = require('./ipc');
+const { createUpdateChecker } = require('./update-check');
 const { scanPaths } = require('./scan');
 const { createReader, isReaderPath, READER_EXTENSIONS } = require('./reader');
 const { createPreviewSessions } = require('./preview-session');
@@ -99,6 +100,7 @@ function bootstrap(electron) {
     nativeTheme.themeSource = settings.get().theme;
 
     const grants = createAssetGrants();
+    const updateChecker = createUpdateChecker({ settings, currentVersion: pkg.version, log });
     const state = {
         mainWindow: null, chromiumJobs: null, library: null, libraryMigrate: null,
         preview: null, reader: null, backendStatus: { pdf: false, raster: false },
@@ -151,6 +153,20 @@ function bootstrap(electron) {
             },
         });
         return state.mainWindow;
+    }
+
+    /**
+     * 启动时自动检测一次更新：等窗口内容加载完再异步触发，不占用启动路径；
+     * 失败静默（只记 stderr，不弹窗），结果写入设置文件，设置页打开时读缓存显示。
+     * 24 小时内重复启动不会重复请求 GitHub——有效期判定在 update-check.js 内。
+     */
+    function scheduleStartupUpdateCheck(win) {
+        if (!win) return;
+        const run = () => {
+            updateChecker.check({ force: false }).catch((err) => log(`[desktop] 自动检测更新失败：${errText(err)}`));
+        };
+        if (win.webContents.isLoading()) win.webContents.once('did-finish-load', run);
+        else run();
     }
 
     function focusMainWindow() {
@@ -259,7 +275,7 @@ function bootstrap(electron) {
         const { handlers } = createIpcHandlers({
             electron, settings, grants,
             library: state.library, libraryMigrate: state.libraryMigrate,
-            preview: state.preview, reader: state.reader,
+            preview: state.preview, reader: state.reader, update: updateChecker,
             service: require('../../converters/service'),
             scan: { scanPaths },
             backendStatus: state.backendStatus,
@@ -269,7 +285,7 @@ function bootstrap(electron) {
         registerIpc(ipcMain, handlers);
         rebuildMenu();
         if (process.platform === 'darwin' && !app.isPackaged && app.dock && fs.existsSync(ICON_PNG)) app.dock.setIcon(ICON_PNG);
-        createWindow();
+        scheduleStartupUpdateCheck(createWindow());
         app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
     }).catch((err) => {
         reportFatal('初始化失败', err);

@@ -31,6 +31,8 @@ export const api = {
     settingsSet: (patch) => call('settingsSet', patch),
     setMineruToken: (token) => call('setMineruToken', token),
     testMineru: (token) => call('testMineru', token),
+    /** 更新检测：force 为真时无视 24 小时缓存立即向 GitHub 请求；地址由主进程写死 */
+    updateCheck: (force) => call('updateCheck', force),
     themeGet: () => call('themeGet'),
     themeSet: (theme) => call('themeSet', theme),
     openExternal: (url) => call('openExternal', url),
