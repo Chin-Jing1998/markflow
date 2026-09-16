@@ -6,7 +6,8 @@
  *
  * PPTX 是 zip 包，涉及的关键成员：ppt/slides/slideN.xml（p:sp 形状文本 + p:pic 图片）、
  * ppt/slides/_rels/slideN.xml.rels（r:embed → ../media/imageN.png；notesSlide 关系）、
- * ppt/media/*（图片实体）、ppt/notesSlides/*（备注，可选）、docProps/core.xml（含 dc:title）。
+ * ppt/media/*（图片实体）、ppt/notesSlides/*（备注，可选）、docProps/core.xml（dc:title 取标题、
+ * dc:creator 取作者，经 ir/util.normalizeAuthor 归一；作者为空或是占位名时 meta 不设 author 键）。
  *
  * 解析策略（cheerio xmlMode）：遍历每个 p:sp，按 p:ph type='title'/'ctrTitle' 判断标题
  * （subTitle 属副标题，仍作正文），收集 a:t 文本并按 a:p 分段，找不到标题占位符时首段升格
@@ -23,7 +24,7 @@ const fsp = require('fs').promises;
 const path = require('path');
 const cheerio = require('cheerio');
 const { createDocument, createRoot, createParagraph, createSlideBreak, createBlockquote } = require('../ir/schema');
-const { stripExt } = require('../ir/util');
+const { stripExt, normalizeAuthor } = require('../ir/util');
 const { notify } = require('../util');
 
 /** 图片扩展名 → MIME，未收录的回退 application/octet-stream */
@@ -116,12 +117,15 @@ async function parse(input, ctx = {}) {
         notify(ctx, 'parsing', PROGRESS_MIN + Math.round(ratio * (PROGRESS_MAX - PROGRESS_MIN)));
     }
 
+    const core = await readCoreProps(zip);
     return createDocument({
         kind: 'presentation',
         ir,
         data: { slides: slidesData, slideCount: slidesData.length },
         meta: {
-            title: await resolveTitle(zip, slidesData, sourceName),
+            title: resolveTitle(core.title, slidesData, sourceName),
+            // 作者为空时不设该键：meta 与 front matter 均与引入作者之前逐字节一致
+            ...(core.creator ? { author: core.creator } : {}),
             sourceType: 'pptx',
             sourceName,
             slideCount: slidesData.length,
@@ -270,23 +274,27 @@ async function readNotes(zip, relMap) {
 }
 
 /** 标题优先级：docProps 的 dc:title → 首页标题 → 去扩展名的文件名 */
-async function resolveTitle(zip, slidesData, sourceName) {
-    const coreFile = zip.file('docProps/core.xml');
-    if (coreFile) {
-        // 用 XML 解析而非正则，否则 &amp; 等实体不会被还原
-        const embedded = await readCoreTitle(await coreFile.async('text'));
-        if (embedded) return embedded;
-    }
+function resolveTitle(coreTitle, slidesData, sourceName) {
+    if (coreTitle) return coreTitle;
     const firstSlideTitle = slidesData[0] && slidesData[0].title;
     return (firstSlideTitle && firstSlideTitle.trim()) || stripExt(sourceName);
 }
 
-/** 从 docProps/core.xml 取 dc:title，解析失败按无标题处理 */
-async function readCoreTitle(xml) {
+/**
+ * 从 docProps/core.xml 取 dc:title 与 dc:creator；标题去首尾空白，作者经 normalizeAuthor 归一
+ * （去首尾空白并滤掉占位名）。core.xml 缺失或解析失败一律按空串处理
+ */
+async function readCoreProps(zip) {
+    const empty = { title: '', creator: '' };
+    const coreFile = zip.file('docProps/core.xml');
+    if (!coreFile) return empty;
+    const xml = await coreFile.async('text');
     try {
-        return cheerio.load(xml, { xmlMode: true })('dc\\:title').first().text().trim();
+        // 用 XML 解析而非正则，否则 &amp; 等实体不会被还原
+        const $ = cheerio.load(xml, { xmlMode: true });
+        return { title: $('dc\\:title').first().text().trim(), creator: normalizeAuthor($('dc\\:creator').first().text()) };
     } catch (err) {
-        return '';
+        return empty;
     }
 }
 

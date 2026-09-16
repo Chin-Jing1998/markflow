@@ -1,6 +1,7 @@
 /**
  * converters/parsers/docx.js 单元测试
- * 覆盖：标题 / 加粗 / 图片 / 表格进入 IR，图片进入 assets，不写盘、不打印，title 回退，进度回调
+ * 覆盖：标题 / 加粗 / 图片 / 表格进入 IR，图片进入 assets，不写盘、不打印，title 回退，进度回调，
+ *       meta.author（docProps/core.xml 的 dc:creator）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -442,4 +443,53 @@ test('标题夹具：Title 段带项目符号时与同一编号定义下的普�
     // Assert
     assert.equal(doc.meta.title, TITLE_EXPECTED.title);
     assert.deepEqual(doc.ir.children.filter((n) => n.type === 'list').map(summarizeList), expectedTitleList(false));
+});
+
+// ============================================================
+// 作者：docProps/core.xml 的 dc:creator
+// ============================================================
+
+test('meta.author 取 docProps/core.xml 的 dc:creator（实体还原、首尾空白裁剪），进入 front matter 时位于 title 之后', async () => {
+    // Arrange
+    const buffer = await Packer.toBuffer(new Document({ creator: ' 张三 & 李四 ', sections: [{ children: [new Paragraph('正文')] }] }));
+
+    // Act
+    const doc = await parse({ buffer }, { sourceName: '甲.docx' });
+
+    // Assert
+    assert.equal(doc.meta.author, '张三 & 李四');
+    const { prependFrontMatter } = require('../converters/web/frontmatter');
+    assert.match(
+        prependFrontMatter('正文\n', doc.meta, { convertedAt: 'T' }),
+        /^---\ntitle: "甲"\nauthor: "张三 & 李四"\nsource: "甲\.docx"\nsourceType: "docx"\nconvertedAt: "T"\n---\n\n正文\n$/,
+    );
+});
+
+test('dc:creator 为空或缺少 core.xml 时 meta 不含 author，字段与改动前一致', async () => {
+    // Arrange
+    const JSZip = require('jszip');
+    const empty = await Packer.toBuffer(new Document({ creator: '', sections: [{ children: [new Paragraph('正文')] }] }));
+    const zip = await JSZip.loadAsync(empty);
+    zip.remove('docProps/core.xml');
+    const noCore = await zip.generateAsync({ type: 'nodebuffer' });
+
+    // Act
+    const docs = [await parse({ buffer: empty }, { sourceName: '乙.docx' }), await parse({ buffer: noCore }, { sourceName: '丙.docx' })];
+
+    // Assert
+    for (const doc of docs) assert.deepEqual(Object.keys(doc.meta), ['title', 'sourceType', 'sourceName', 'sourcePath']);
+});
+
+test('占位作者名不写入 meta：docx 库缺省的 Un-named 视为无作者，含占位词的真实姓名照旧写入', async () => {
+    // Arrange：不传 creator 时 docx 库写入缺省值 Un-named
+    const placeholder = await Packer.toBuffer(new Document({ sections: [{ children: [new Paragraph('正文')] }] }));
+    const real = await Packer.toBuffer(new Document({ creator: 'un-named 张三', sections: [{ children: [new Paragraph('正文')] }] }));
+
+    // Act
+    const docA = await parse({ buffer: placeholder }, { sourceName: '丁.docx' });
+    const docB = await parse({ buffer: real }, { sourceName: '戊.docx' });
+
+    // Assert
+    assert.equal('author' in docA.meta, false);
+    assert.equal(docB.meta.author, 'un-named 张三');
 });

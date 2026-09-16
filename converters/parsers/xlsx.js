@@ -15,6 +15,8 @@
  *   - 公式取 result 值（不重算）
  *   - 富文本只取 text 字段
  *   - 不提取内嵌图片，assets 恒为空数组
+ *   - meta.author 取 exceljs 从 docProps/core.xml 读出的 dc:creator，经 ir/util.normalizeAuthor 归一
+ *     （去首尾空白、滤掉占位名）；为空或是占位名时不设该键
  */
 const fsp = require('fs').promises;
 const path = require('path');
@@ -27,7 +29,7 @@ const {
     createTableCell,
     createText,
 } = require('../ir/schema');
-const { stripExt } = require('../ir/util');
+const { stripExt, normalizeAuthor } = require('../ir/util');
 const { notify } = require('../util');
 
 // 进度百分比区间：parser 只报 parsing 阶段，按已解析 sheet 比例映射到该区间
@@ -95,12 +97,16 @@ async function parse(input, ctx = {}) {
         notify(ctx, 'parsing', PROGRESS_MIN + Math.round((sheetIdx / sheetTotal) * (PROGRESS_MAX - PROGRESS_MIN)));
     });
 
+    // 作者取 exceljs 从 docProps/core.xml 读出的 dc:creator，经 normalizeAuthor 去空白并滤掉占位名
+    // （exceljs 写出时缺省填 Unknown）；为空时不设该键，meta 与 front matter 均与引入作者之前一致
+    const author = normalizeAuthor(wb.creator);
     return createDocument({
         kind: 'workbook',
         ir,
         data: { sheets: sheetsData },
         meta: {
             title: stripExt(sourceName),
+            ...(author ? { author } : {}),
             sourceType: 'xlsx',
             sourceName,
             sheetCount: sheetsData.length,

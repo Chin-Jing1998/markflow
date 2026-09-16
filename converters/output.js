@@ -1,7 +1,7 @@
 /**
  * 产物落盘
  *
- * writeFolder({ outputDir, name, files, assets, extras })
+ * writeFolder({ outputDir, name, files, assets, extras, clean })
  *   → { outputPath, outputs }
  *   目录 {outputDir}/{name}/。files 为 { '<posix 相对路径>': string | Buffer }（字符串按 utf8 写入），
  *   键中的 {name} 占位符（NAME_TOKEN）替换为产物名；assets 按 assets[].name 写入（形如 images/image_1.png，
@@ -13,6 +13,8 @@
  *   {name}_origin.pdf → originPdf）；其余文件取去扩展名的文件名并转 camelCase（claims.xml → claims，
  *   abstract-figure.xml → abstractFigure）；写入了 images/ 则有 imagesDir；extras 的每个顶层目录记为
  *   <目录名>Dir（mineru/full.md → mineruDir）；根目录下不以 {name}_ 开头的 extras 不进 outputs。
+ *   clean 为 true 时，全部路径与内容校验通过之后、写入之前，先清理产物目录中 MarkFlow 会生成的旧文件（范围见下）；
+ *   缺省不清理。
  * writeBundle({ outputDir, name, md, json, assets })
  *   → { dir, mdPath, jsonPath, imagesDir | null }，writeFolder 的薄封装，保留 v2 返回形状
  * writeSingle({ outputDir, name, ext, buffer })
@@ -20,7 +22,16 @@
  *
  * 三者的相对路径均限定在目标目录之内：拒绝绝对路径、Windows 盘符与 ".." 穿越；
  * 全部路径与内容先校验再统一写盘，避免半途失败留下部分产物。
- * 均覆盖写、全部使用 fs.promises、不删除任何既有文件。
+ * 均覆盖写、全部使用 fs.promises；除 writeFolder 的 clean 之外不删除任何既有文件。
+ *
+ * clean 的清理范围只限产物目录 {outputDir}/{name}/ 本层（名称区分大小写，{name} 为产物名）：
+ *   目录 images/（整体删除；为符号链接时只删链接本身，不触及链接目标）；
+ *   文件 {name}.md、{name}.json、{name}.html、{name}.xml、{name}.zip、{name}_content_list*.json、{name}_model.json、
+ *   {name}_layout.json、{name}_origin.pdf，专利五书 claims.xml、description.xml、drawings.xml、abstract.xml、
+ *   abstract-figure.xml 与 precheck.json，patent profile 平铺在根下的图片 drawing-N、table-N、omath-N-N、image_N
+ *   （可带 -K 冲突后缀）。与上述文件同名的子目录、其余文件与子目录（用户放入的笔记等）一律保留，
+ *   产物目录之外的任何文件都不触碰；产物目录不存在时不做任何事；产物目录本身是符号链接时拒绝清理并抛中文错误，
+ *   以免删到链接目标中的文件。
  */
 const path = require('path');
 const fsp = require('fs').promises;
@@ -32,8 +43,18 @@ const NAME_TOKEN = '{name}';
 // 旁路文件（MinerU 式产物包的 {name}_content_list.json 等）的命名前缀
 const SIDECAR_PREFIX = `${NAME_TOKEN}_`;
 const WINDOWS_DRIVE_RE = /^[A-Za-z]:/;
+// clean 按原名删除的产物文件（{name} 为产物名占位符）
+const CLEAN_FILES = Object.freeze([
+    `${NAME_TOKEN}.md`, `${NAME_TOKEN}.json`, `${NAME_TOKEN}.html`, `${NAME_TOKEN}.xml`, `${NAME_TOKEN}.zip`,
+    `${NAME_TOKEN}_model.json`, `${NAME_TOKEN}_layout.json`, `${NAME_TOKEN}_origin.pdf`,
+    'claims.xml', 'description.xml', 'drawings.xml', 'abstract.xml', 'abstract-figure.xml', 'precheck.json',
+]);
+// clean 按前缀删除的旁路 JSON：{name}_content_list.json、{name}_content_list_v2.json 等
+const CLEAN_CONTENT_LIST_PREFIX = `${NAME_TOKEN}_content_list`;
+// patent profile 平铺在产物目录根下的图片：附图 drawing-N、栅格化的 table-N 与 omath-段-序、段内图片 image_N，冲突时带 -K
+const PATENT_FLAT_IMAGE_RE = /^(?:drawing-\d+|table-\d+|omath-\d+-\d+|image_\d+)(?:-\d+)?\.[A-Za-z0-9]+$/;
 
-async function writeFolder({ outputDir, name, files, assets = [], extras = [] } = {}) {
+async function writeFolder({ outputDir, name, files, assets = [], extras = [], clean = false } = {}) {
     const baseDir = resolveOutputDir(outputDir);
     assertName(name);
     const dir = path.join(baseDir, name);
@@ -44,6 +65,7 @@ async function writeFolder({ outputDir, name, files, assets = [], extras = [] } 
     assertNoDuplicateTargets([...fileJobs, ...assetJobs, ...extraJobs]);
     const outputs = buildOutputs(dir, { fileJobs, assetJobs, extraJobs });
 
+    if (clean === true) await cleanFolder(dir, name);
     await ensureDir(dir);
     if (hasImagesDir(assetJobs)) await ensureDir(path.join(dir, IMAGES_DIRNAME));
     await writeJobs([...fileJobs, ...assetJobs, ...extraJobs]);
@@ -122,6 +144,42 @@ async function writeJobs(jobs) {
         await ensureDir(path.dirname(target));
         await fsp.writeFile(target, buffer);
     }));
+}
+
+// ============================================================
+// clean：重跑前清理旧产物（范围见文件头）
+// ============================================================
+
+async function cleanFolder(dir, name) {
+    const stat = await lstatOrNull(dir);
+    if (!stat) return;
+    if (stat.isSymbolicLink()) throw new Error(`清理中止：产物目录是符号链接，为免误删链接目标中的文件，未做任何清理：${dir}`);
+    if (!stat.isDirectory()) return;
+    const exactNames = new Set(CLEAN_FILES.map((file) => file.split(NAME_TOKEN).join(name)));
+    const contentListPrefix = CLEAN_CONTENT_LIST_PREFIX.split(NAME_TOKEN).join(name);
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    const doomed = entries.filter((entry) => isCleanTarget(entry, exactNames, contentListPrefix));
+    // images 为目录时整体删除；为符号链接时 fs.rm 只删链接本身（按 lstat 判定，不跟随链接）
+    await Promise.all(doomed.map((entry) => fsp.rm(path.join(dir, entry.name), { recursive: entry.name === IMAGES_DIRNAME, force: true })));
+}
+
+// Dirent 按 lstat 语义给出类型：images 须为目录或符号链接，其余须为文件或符号链接，同名的子目录一律保留
+function isCleanTarget(entry, exactNames, contentListPrefix) {
+    if (entry.name === IMAGES_DIRNAME) return entry.isDirectory() || entry.isSymbolicLink();
+    if (!entry.isFile() && !entry.isSymbolicLink()) return false;
+    return exactNames.has(entry.name)
+        || (entry.name.startsWith(contentListPrefix) && entry.name.endsWith('.json'))
+        || PATENT_FLAT_IMAGE_RE.test(entry.name);
+}
+
+// 路径不存在返回 null；其余错误（权限等）原样抛出，不做静默处理
+async function lstatOrNull(target) {
+    try {
+        return await fsp.lstat(target);
+    } catch (err) {
+        if (err && err.code === 'ENOENT') return null;
+        throw err;
+    }
 }
 
 // ============================================================

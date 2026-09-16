@@ -16,19 +16,23 @@
  *   - 标题取首个有文字的 Title 样式段（不带编号的在正文中仍为普通段落，带编号的与同一编号定义下的普通段同为列表项），
  *     其次首个 <h1> 文本，否则取去扩展名的文件名
  *   - data.ooxml 为 OOXML 预检信息（采集失败时为 null），meta.sourcePath 为源文件绝对路径
+ *   - meta.author 取 docProps/core.xml 的 dc:creator，经 ir/util.normalizeAuthor 归一（去首尾空白、滤掉占位名）；
+ *     为空、缺失或是占位名时不设该键，front matter 随之不写 author 行
  *   - 公式一律进 IR 的 math 节点；options.math='text' 的降级由渲染器负责，解析层不降级
  *   - 段落文本本身不带全角缩进（由 md 渲染器按 data.indent 插入），专利 XML 等下游不受影响
  */
 const path = require('path');
 const fsp = require('fs/promises');
 const mammoth = require('mammoth');
+const JSZip = require('jszip');
+const cheerio = require('cheerio');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
 const { liftInlineHtml } = require('../ir/inline-html');
 const { MARKERS, restoreMarkers, stripMarkers } = require('../ir/markers');
 const { markCaptions } = require('../ir/captions');
-const { stripExt, getExtFromContentType } = require('../ir/util');
+const { stripExt, getExtFromContentType, normalizeAuthor } = require('../ir/util');
 const { notify, errText } = require('../util');
 const { inspectOoxml } = require('./docx-ooxml');
 const { extractMath, restoreMath } = require('./docx-math');
@@ -36,6 +40,8 @@ const { prepareLayout, parseImageMarker } = require('./docx-layout');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
+// 作者等核心属性所在的 OOXML 部件
+const CORE_PROPS_PATH = 'docProps/core.xml';
 // mammoth 默认丢弃下划线；映射为 <u> 后由 turndown 的 word profile 保留、ir/inline-html 提升为 underline。
 // mammoth 默认样式表不认 Title（封面题名常用此样式而非标题 1），标成带类名的普通段落供 extractTitle 采信；
 // turndown 不理会类名，正文输出不变。style-name 按样式名匹配（不分大小写），与样式 ID（中文版 Word 为 a4 等）无关
@@ -98,14 +104,30 @@ async function parse(input, ctx = {}) {
     const ir = markCaptions(restoreMarkers(lifted));
     notify(ctx, 'parsing', PROGRESS_IR);
 
+    const author = await readCoreCreator(original);
     return createDocument({
         kind: 'document',
         ir,
         data: ooxml ? { ooxml } : null,
-        meta: { title, sourceType: 'docx', sourceName, sourcePath: source.path || null },
+        // 作者为空时不设该键：meta 与 front matter 均与引入作者之前逐字节一致
+        meta: { title, ...(author ? { author } : {}), sourceType: 'docx', sourceName, sourcePath: source.path || null },
         assets,
         warnings,
     });
+}
+
+// docProps/core.xml 的 dc:creator（XML 实体经 cheerio 还原，再经 normalizeAuthor 去空白并滤掉占位名）。
+// 作者是可选元数据：core.xml 缺失、字段为空、是占位名或读取失败一律按无作者处理，不记 warning
+// （包体本身损坏时 mammoth 自会报错）
+async function readCoreCreator(buffer) {
+    try {
+        const zip = await JSZip.loadAsync(buffer);
+        const core = zip.file(CORE_PROPS_PATH);
+        if (!core) return '';
+        return normalizeAuthor(cheerio.load(await core.async('text'), { xmlMode: true })('dc\\:creator').first().text());
+    } catch (err) {
+        return '';
+    }
 }
 
 // 预检信息采集失败不阻断解析，只记 warning

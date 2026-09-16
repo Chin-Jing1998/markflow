@@ -1,6 +1,7 @@
 /**
  * converters/batch.js 单元测试
- * 覆盖：空数组、并发上限、事件顺序、单项失败隔离、结果排序、展示名、回调异常、参数校验
+ * 覆盖：空数组、并发上限、事件顺序、单项失败隔离、结果排序、展示名、回调异常、参数校验、
+ *       signal 取消（预先中止、运行中中止、fn 收到 signal、非法 signal）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -136,4 +137,68 @@ test('onEvent 抛错不影响批处理；同步抛错的 fn 同样被隔离', as
 test('非法参数抛中文错误', async () => {
     await assert.rejects(runBatch(null, {}, async () => {}), /数组/);
     await assert.rejects(runBatch([], {}, null), /fn/);
+});
+
+// ============================================================
+// 取消（signal）
+// ============================================================
+
+test('signal 预先中止：不执行任何任务，全部以「已取消」记入 errors，done 带 cancelled 计数', async () => {
+    // Arrange
+    const controller = new AbortController();
+    controller.abort();
+    const events = [];
+    let calls = 0;
+
+    // Act
+    const out = await runBatch(['a', 'b'], { signal: controller.signal, onEvent: (e) => events.push(e) }, async () => { calls += 1; });
+
+    // Assert：未开始的任务不发 start，只发带 cancelled 标记的 item
+    assert.equal(calls, 0);
+    assert.deepEqual(out.results, []);
+    assert.deepEqual(out.errors.map((e) => [e.idx, e.error.message, e.cancelled]), [[0, '已取消', true], [1, '已取消', true]]);
+    assert.deepEqual(events.map((e) => e.type), ['item', 'item', 'done']);
+    assert.deepEqual(events.slice(0, 2).map((e) => [e.idx, e.ok, e.cancelled, e.error.message]), [[0, false, true, '已取消'], [1, false, true, '已取消']]);
+    assert.deepEqual(events.at(-1), { type: 'done', total: 2, succeeded: 0, failed: 2, cancelled: 2 });
+});
+
+test('运行中中止：在跑的任务允许跑完，未领取的记为已取消，结果与错误仍按 idx 升序', async () => {
+    // Arrange
+    const controller = new AbortController();
+    const started = [];
+
+    // Act
+    const out = await runBatch([0, 1, 2, 3, 4], { concurrency: 2, signal: controller.signal }, async (item) => {
+        started.push(item);
+        if (item === 1) controller.abort();
+        await sleep(5);
+        return item;
+    });
+
+    // Assert
+    assert.deepEqual(started, [0, 1]);
+    assert.deepEqual(out.results, [{ idx: 0, result: 0 }, { idx: 1, result: 1 }]);
+    assert.deepEqual(out.errors.map((e) => e.idx), [2, 3, 4]);
+    assert.ok(out.errors.every((e) => e.cancelled === true && e.error.message === '已取消'));
+});
+
+test('fn 的第三个参数为传入的 signal；未取消时 done 事件与 errors 形状不变', async () => {
+    const controller = new AbortController();
+    const seen = [];
+    const events = [];
+
+    const out = await runBatch([1, 2], { signal: controller.signal, onEvent: (e) => events.push(e) }, async (item, onProgress, signal) => {
+        seen.push(signal);
+        if (item === 2) throw new Error('普通失败');
+        return item;
+    });
+
+    assert.deepEqual(seen, [controller.signal, controller.signal]);
+    assert.deepEqual(Object.keys(out.errors[0]), ['idx', 'error']);
+    assert.deepEqual(events.at(-1), { type: 'done', total: 2, succeeded: 1, failed: 1 });
+});
+
+test('signal 不是 AbortSignal 时抛中文错误', async () => {
+    await assert.rejects(runBatch([], { signal: {} }, async () => {}), /runBatch: signal 须为 AbortSignal/);
+    await assert.rejects(runBatch([], { signal: 'abort' }, async () => {}), /signal 须为 AbortSignal/);
 });

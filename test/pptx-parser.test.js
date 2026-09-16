@@ -1,7 +1,7 @@
 /**
  * converters/parsers/pptx.js 单元测试
  * 覆盖：{ path } 契约、标题/正文抽取、内嵌图片抽取为 assets（含跨页去重、外链与失效引用告警）、
- *       备注、meta.title 优先级、kind
+ *       备注、meta.title 优先级、meta.author（dc:creator）、kind
  *
  * 测试用 pptx 由 jszip 现场构造，不引入二进制测试资源。
  */
@@ -154,9 +154,10 @@ function contentTypesXml() {
  * @param {Array} spec.slides 每页 { title?, subTitle?, bodies?, picRids?, rels?, notes?, notesFile? }
  *   notes 给定时写入 ppt/notesSlides/<notesFile 或 notesSlideN.xml> 并在本页 rels 中登记 notesSlide 关系
  * @param {string} [spec.coreTitle] docProps/core.xml 的 dc:title
+ * @param {string} [spec.coreCreator] docProps/core.xml 的 dc:creator（原样写入，实体由调用方转义）
  * @param {object} [spec.media] zip 内媒体路径 → Buffer，默认放一张 ppt/media/image1.png
  */
-async function makePptxFile({ slides, coreTitle, fileName = '产品发布.pptx', media } = {}) {
+async function makePptxFile({ slides, coreTitle, coreCreator, fileName = '产品发布.pptx', media } = {}) {
     const zip = new JSZip();
     zip.file('[Content_Types].xml', contentTypesXml());
     zip.file(
@@ -177,13 +178,15 @@ async function makePptxFile({ slides, coreTitle, fileName = '产品发布.pptx',
     const mediaFiles = media || { 'ppt/media/image1.png': PNG_8X8 };
     for (const [zipPath, buf] of Object.entries(mediaFiles)) zip.file(zipPath, buf);
 
-    if (coreTitle !== undefined) {
+    if (coreTitle !== undefined || coreCreator !== undefined) {
+        const title = coreTitle !== undefined ? `<dc:title>${coreTitle}</dc:title>` : '';
+        const creator = coreCreator !== undefined ? `<dc:creator>${coreCreator}</dc:creator>` : '';
         zip.file(
             'docProps/core.xml',
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
                 '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" ' +
                 'xmlns:dc="http://purl.org/dc/elements/1.1/">' +
-                `<dc:title>${coreTitle}</dc:title></cp:coreProperties>`,
+                `${title}${creator}</cp:coreProperties>`,
         );
     }
 
@@ -461,6 +464,37 @@ test('meta.title 优先取 docProps 的 dc:title，其次首页标题', async ()
     assert.equal(docB.meta.sourceType, 'pptx');
     assert.equal(docB.meta.sourceName, '产品发布.pptx');
     assert.equal(docB.meta.slideCount, 1);
+});
+
+test('meta.author 取 docProps/core.xml 的 dc:creator（实体还原、首尾空白裁剪）；缺失或空白时不写 author', async () => {
+    // Arrange
+    const withCreator = await makePptxFile({ ...minimalSpec(), coreCreator: ' 王五 &amp; 赵六 ' });
+    const blank = await makePptxFile({ ...minimalSpec(), coreTitle: '正式标题', coreCreator: '  ' });
+    const none = await makePptxFile(minimalSpec());
+
+    // Act
+    const docA = await parse({ path: withCreator.filePath });
+    const docB = await parse({ path: blank.filePath });
+    const docC = await parse({ path: none.filePath });
+
+    // Assert：core.xml 只有作者没有标题时，标题仍回退到首页标题
+    assert.equal(docA.meta.author, '王五 & 赵六');
+    assert.equal(docA.meta.title, '第一页标题');
+    assert.equal(docB.meta.title, '正式标题');
+    assert.equal('author' in docB.meta, false);
+    assert.deepEqual(Object.keys(docC.meta), ['title', 'sourceType', 'sourceName', 'slideCount']);
+});
+
+test('占位作者名不写入 meta：本项目 md → docx 渲染器写入的 MarkFlow 视为无作者', async () => {
+    // Arrange
+    const { filePath } = await makePptxFile({ ...minimalSpec(), coreCreator: 'MarkFlow' });
+
+    // Act
+    const doc = await parse({ path: filePath });
+
+    // Assert
+    assert.equal('author' in doc.meta, false);
+    assert.deepEqual(Object.keys(doc.meta), ['title', 'sourceType', 'sourceName', 'slideCount']);
 });
 
 test('无任何标题时 title 回退为去扩展名的文件名', async () => {

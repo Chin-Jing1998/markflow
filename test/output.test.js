@@ -1,7 +1,8 @@
 /**
  * converters/output.js 单元测试
  * 覆盖：writeFolder（files/assets/extras 落盘与 outputs 键、字符串与 Buffer 内容、穿越拒绝、参数校验）、
- *       writeBundle（含/不含 assets、覆盖写、路径穿越防护、参数校验）、writeSingle
+ *       writeBundle（含/不含 assets、覆盖写、路径穿越防护、参数校验）、writeSingle、
+ *       writeFolder 的 clean（只清 MarkFlow 产物、缺省不删、符号链接防护）
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -282,5 +283,119 @@ describe('writeFolder', () => {
         await assert.rejects(writeFolder({ ...base, name: 'a/b', files: { '{name}.html': 'x' } }), /产物名不得包含路径分隔符/);
         await assert.rejects(writeFolder({ name: 'x', files: { '{name}.html': 'x' } }), /缺少输出目录 outputDir/);
         assert.equal(fs.existsSync(path.join(root, '校验D')), false);
+    });
+});
+
+// ============================================================
+// writeFolder：clean（重跑前清理旧产物）
+// ============================================================
+
+describe('writeFolder：clean 只清理 MarkFlow 产物', () => {
+    const byCodePoint = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    const seed = (dir, rels) => {
+        for (const rel of rels) {
+            const file = path.join(dir, rel);
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(file, 'old');
+        }
+    };
+    // 目录下全部文件的 posix 相对路径（码点序）
+    const listTree = (dir) => fs.readdirSync(dir, { recursive: true, withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => path.relative(dir, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
+        .sort(byCodePoint);
+    const GENERATED = [
+        'images/image_99.jpg', 'images/sub/x.png',
+        '报告.md', '报告.json', '报告.html', '报告.xml', '报告.zip',
+        '报告_content_list.json', '报告_content_list_v2.json', '报告_model.json', '报告_layout.json', '报告_origin.pdf',
+        'claims.xml', 'description.xml', 'drawings.xml', 'abstract.xml', 'abstract-figure.xml', 'precheck.json',
+        'drawing-3.jpg', 'drawing-1-2.png', 'table-2.jpg', 'omath-1-1.jpg', 'omath-2-3-2.jpg', 'image_7.png',
+    ];
+    const USER = [
+        '旧笔记.txt', '报告_备注.txt', '报告 副本.md', 'notes/keep.md', 'images.bak/a.png',
+        'drawing.jpg', 'drawing-a.jpg', 'claims.xml.bak', 'Claims.txt',
+    ];
+
+    test('删除旧 images/、主产物、旁路 JSON、专利五书与预检、平铺图片；保留用户文件与产物目录外的一切', async () => {
+        // Arrange
+        const outDir = fs.mkdtempSync(path.join(root, 'clean-'));
+        const dir = path.join(outDir, '报告');
+        seed(dir, [...GENERATED, ...USER]);
+        seed(outDir, ['其他/images/image_1.png', '其他/其他.md', '根目录文件.txt', '报告.docx']);
+
+        // Act
+        const res = await writeFolder({
+            outputDir: outDir, name: '报告', files: { '{name}.md': '# 新\n', '{name}.json': '{}' }, assets: [ASSET], clean: true,
+        });
+
+        // Assert
+        assert.deepEqual(listTree(dir), [...USER, '报告.md', '报告.json', 'images/image_1.png'].sort(byCodePoint));
+        assert.equal(fs.readFileSync(res.outputs.md, 'utf8'), '# 新\n');
+        assert.deepEqual(res, { outputPath: dir, outputs: { md: path.join(dir, '报告.md'), json: path.join(dir, '报告.json'), imagesDir: path.join(dir, 'images') } });
+        assert.deepEqual(
+            listTree(outDir).filter((rel) => !rel.startsWith('报告/')),
+            ['其他/images/image_1.png', '其他/其他.md', '报告.docx', '根目录文件.txt'].sort(byCodePoint),
+        );
+    });
+
+    test('未传 clean 时不删除任何既有文件（回归守卫）', async () => {
+        const outDir = fs.mkdtempSync(path.join(root, 'noclean-'));
+        const dir = path.join(outDir, '报告');
+        seed(dir, ['images/image_99.jpg', '旧笔记.txt', '报告_origin.pdf']);
+
+        await writeFolder({ outputDir: outDir, name: '报告', files: { '{name}.md': '# 新\n' }, assets: [ASSET] });
+
+        assert.deepEqual(listTree(dir), ['images/image_1.png', 'images/image_99.jpg', '报告.md', '报告_origin.pdf', '旧笔记.txt'].sort(byCodePoint));
+    });
+
+    test('产物目录尚不存在时 clean 照常写入；校验失败时不做任何清理', async () => {
+        const outDir = fs.mkdtempSync(path.join(root, 'clean-new-'));
+        await writeFolder({ outputDir: outDir, name: '新产物', files: { '{name}.md': 'x' }, clean: true });
+        assert.deepEqual(listTree(outDir), ['新产物/新产物.md']);
+
+        seed(path.join(outDir, '旧产物'), ['images/image_1.png', '旧产物.md']);
+        await assert.rejects(
+            writeFolder({ outputDir: outDir, name: '旧产物', files: { '../x.md': 'x' }, clean: true }),
+            /产物名不得包含 "\.\."/,
+        );
+        assert.deepEqual(listTree(path.join(outDir, '旧产物')), ['images/image_1.png', '旧产物.md']);
+    });
+
+    test('产物目录经符号链接指向输出目录之外时拒绝清理，链接目标中的文件原样保留', async (t) => {
+        const outDir = fs.mkdtempSync(path.join(root, 'clean-link-'));
+        const outside = fs.mkdtempSync(path.join(root, 'outside-'));
+        seed(outside, ['images/image_1.png', '报告.md']);
+        try {
+            fs.symlinkSync(outside, path.join(outDir, '报告'), 'dir');
+        } catch (err) {
+            t.skip('本机无法创建符号链接');
+            return;
+        }
+
+        await assert.rejects(
+            writeFolder({ outputDir: outDir, name: '报告', files: { '{name}.md': 'x' }, clean: true }),
+            /清理中止/,
+        );
+        assert.deepEqual(listTree(outside), ['images/image_1.png', '报告.md']);
+        assert.equal(fs.readFileSync(path.join(outside, '报告.md'), 'utf8'), 'old');
+    });
+
+    test('产物目录内的 images 为符号链接时只移除链接本身，不删除链接目标', async (t) => {
+        const outDir = fs.mkdtempSync(path.join(root, 'clean-imglink-'));
+        const outside = fs.mkdtempSync(path.join(root, 'outside-img-'));
+        seed(outside, ['keep.png']);
+        fs.mkdirSync(path.join(outDir, '报告'));
+        try {
+            fs.symlinkSync(outside, path.join(outDir, '报告', 'images'), 'dir');
+        } catch (err) {
+            t.skip('本机无法创建符号链接');
+            return;
+        }
+
+        await writeFolder({ outputDir: outDir, name: '报告', files: { '{name}.md': 'x' }, assets: [ASSET], clean: true });
+
+        assert.deepEqual(listTree(outside), ['keep.png']);
+        assert.equal(fs.lstatSync(path.join(outDir, '报告', 'images')).isSymbolicLink(), false);
+        assert.deepEqual(fs.readdirSync(path.join(outDir, '报告', 'images')), ['image_1.png']);
     });
 });

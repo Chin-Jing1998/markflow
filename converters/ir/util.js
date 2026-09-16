@@ -2,7 +2,7 @@
  * IR 层公共工具（全仓唯一一份）
  *
  * 只收纳与具体格式无关的纯函数与目录工具：
- *   - 名称处理：sanitizeFolderName / stripExt
+ *   - 名称处理：sanitizeFolderName（含 Windows 保留设备名规避）/ stripExt / normalizeAuthor
  *   - 文本收集：collectText
  *   - 扩展名推断：getExtFromContentType / getExtFromUrl
  *   - HTML 清洗：stripHtml
@@ -22,6 +22,20 @@ const ILLEGAL_FILENAME_CHARS_RE = /[\\/:*?"<>|]/g;
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/g;
 // 首尾的空白、点与下划线（前导点会生成隐藏目录，尾随点与空白在 Windows 上非法）
 const EDGE_TRIM_RE = /^[\s._]+|[\s._]+$/g;
+// Windows 保留设备名（不分大小写；NUL.txt、NUL.tar.gz 等带扩展名的形式同样等价于 NUL）：CON、PRN、AUX、NUL、
+// COM1–COM9、LPT1–LPT9，以及 Windows 视同数字的上标 1、2、3（U+00B9、U+00B2、U+00B3，即 COM¹、LPT³ 等）。
+// 出处：Microsoft Learn「Naming Files, Paths, and Namespaces」
+const WINDOWS_RESERVED_NAME_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$/i;
+// 命中保留名时追加在主干之后的后缀
+const RESERVED_NAME_SUFFIX = '_';
+// 末尾的点与空白（Windows 不允许文件名以此结尾）
+const TRAILING_DOT_SPACE_RE = /[\s.]+$/;
+// 各方在没有真实作者时写入 docProps/core.xml 的占位名（小写形式，供不分大小写的精确匹配）：
+//   un-named  docx 库（node_modules/docx）生成文档时 creator 的缺省值
+//   unknown   exceljs 写出工作簿时 dc:creator 的缺省值（lib/doc/workbook.js）
+//   markflow  本项目 md → docx 渲染器写入的 creator（converters/renderers/docx.js）
+// 三者都不是真实作者，写进 front matter 只是噪音，故一律按无作者处理。
+const PLACEHOLDER_AUTHORS = new Set(['un-named', 'unknown', 'markflow']);
 
 const EXT_BY_CONTENT_TYPE = {
     'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/gif': '.gif',
@@ -33,7 +47,8 @@ const KNOWN_URL_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', 
 const DEFAULT_URL_IMAGE_EXT = '.jpg';
 
 // 把任意标题清洗为可安全落盘的文件夹名：非法字符替换为 "_"（保留分词边界，避免 "a/b" 与
-// "ab" 撞名），空白折叠为单个空格，去首尾空白与点，超长按码点截断，空结果回退到 fallback。
+// "ab" 撞名），空白折叠为单个空格，去首尾空白与点，超长按码点截断，空结果回退到 fallback；
+// 最后避开 Windows 保留设备名（与平台无关一律处理，保证产物可移植）。
 function sanitizeFolderName(name, fallback = '未命名文档') {
     const cleaned = String(name == null ? '' : name)
         .replace(CONTROL_CHARS_RE, '')
@@ -41,7 +56,27 @@ function sanitizeFolderName(name, fallback = '未命名文档') {
         .replace(/_+/g, '_')
         .replace(/\s+/g, ' ')
         .replace(EDGE_TRIM_RE, '');
-    return Array.from(cleaned).slice(0, MAX_FOLDER_NAME_LENGTH).join('').replace(EDGE_TRIM_RE, '') || fallback;
+    const base = Array.from(cleaned).slice(0, MAX_FOLDER_NAME_LENGTH).join('').replace(EDGE_TRIM_RE, '') || fallback;
+    return avoidWindowsReservedName(base);
+}
+
+// 第一个点之前的主干（去尾部空白后）命中保留名时，在主干之后追加 "_"：CON → CON_，con.txt → con_.txt；
+// 非保留名原样返回。追加后超长则按码点截断，并去掉末尾的点与空白
+function avoidWindowsReservedName(name) {
+    const dot = name.indexOf('.');
+    const stem = dot === -1 ? name : name.slice(0, dot);
+    if (!WINDOWS_RESERVED_NAME_RE.test(stem.trimEnd())) return name;
+    const fixed = `${stem}${RESERVED_NAME_SUFFIX}${dot === -1 ? '' : name.slice(dot)}`;
+    return Array.from(fixed).slice(0, MAX_FOLDER_NAME_LENGTH).join('').replace(TRAILING_DOT_SPACE_RE, '');
+}
+
+// 文档作者名归一，供 docx / pptx / xlsx 三个 parser 共用（网页来源的作者另由 parsers/url.js 提取，不走这里）：
+// 去首尾空白；整串不分大小写命中 PLACEHOLDER_AUTHORS 时返回空串，调用方据此不写 meta.author。
+// 只做整串精确匹配，「un-named 张三」「MarkFlow 团队」这类含占位词的真实姓名照旧返回。
+// 非字符串与空白串一律返回空串。
+function normalizeAuthor(raw) {
+    const text = typeof raw === 'string' ? raw.trim() : '';
+    return PLACEHOLDER_AUTHORS.has(text.toLowerCase()) ? '' : text;
 }
 
 // 去掉路径前缀与扩展名："/a/b/报告.docx" → "报告"
@@ -96,6 +131,6 @@ function stripHtml(value) {
 }
 
 module.exports = {
-    stripHtml, sanitizeFolderName, stripExt, collectText,
+    stripHtml, sanitizeFolderName, stripExt, normalizeAuthor, collectText,
     getExtFromContentType, getExtFromUrl, ensureDir,
 };

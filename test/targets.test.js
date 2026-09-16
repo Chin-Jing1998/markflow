@@ -1,7 +1,8 @@
 /**
  * converters/targets.js 单元测试
  * 覆盖：默认目标、显式目标校验、非法目标与非法输入类型、规则表五项（classes/layout/ext/hint）、
- *       html/xml 接受三类输入、listTargets 由规则派生、旧二进制格式不再受理、路径归一化、URL 识别
+ *       html/xml 接受三类输入、listTargets 由规则派生、旧二进制格式不再受理、路径归一化、URL 识别、
+ *       resolveUserPath（~ 展开、file:// 转换、Windows 写法、错误文案）与 classifyInput 受理 ~ / file://
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -171,4 +172,61 @@ test('空输入与非字符串输入抛「输入不能为空」', () => {
 test('不支持的扩展名抛错并列出受支持格式', () => {
     assert.throws(() => classifyInput('a.txt', '/tmp'), /不支持的输入格式：a\.txt（支持 .*\.md.*http\(s\) 网址）/);
     assert.throws(() => classifyInput('ftp://example.com/a', '/tmp'), /不支持的输入格式/);
+});
+
+// ============================================================
+// resolveUserPath 与 classifyInput 的本地路径写法（~、file://）
+// ============================================================
+
+const os = require('node:os');
+const url = require('node:url');
+const { resolveUserPath } = require('../converters/targets');
+
+test('resolveUserPath：~ 与 ~/ 展开为主目录，其余写法原样返回', () => {
+    assert.equal(resolveUserPath('~'), os.homedir());
+    assert.equal(resolveUserPath('~/'), os.homedir());
+    assert.equal(resolveUserPath('~/资料/a.docx'), path.join(os.homedir(), '资料', 'a.docx'));
+    for (const raw of ['docs/a.md', '/abs/a.md', '~other/a.md', 'a~/b.md', ' ~/a.md', 'https://example.com/a', '']) {
+        assert.equal(resolveUserPath(raw), raw, JSON.stringify(raw));
+    }
+    assert.equal(resolveUserPath(null), null);
+    assert.equal(resolveUserPath(42), 42);
+});
+
+test('resolveUserPath：~\\ 仅在 Windows 下展开；homedir 与 platform 可注入', () => {
+    const win = { homedir: 'C:\\Users\\me', platform: 'win32' };
+    assert.equal(resolveUserPath('~\\资料\\a.docx', win), 'C:\\Users\\me\\资料\\a.docx');
+    assert.equal(resolveUserPath('~/资料/a.docx', win), 'C:\\Users\\me\\资料\\a.docx');
+    assert.equal(resolveUserPath('~', win), 'C:\\Users\\me');
+    assert.equal(resolveUserPath('~\\资料', { homedir: '/home/me', platform: 'linux' }), '~\\资料');
+    assert.equal(resolveUserPath('~/资料', { homedir: '/home/me', platform: 'linux' }), '/home/me/资料');
+});
+
+test('resolveUserPath：file:// 地址转为本地路径（百分号解码、scheme 不分大小写、Windows 盘符）', () => {
+    assert.equal(resolveUserPath('file:///tmp/%E6%8A%A5%E5%91%8A%20v1.docx', { platform: 'darwin' }), '/tmp/报告 v1.docx');
+    assert.equal(resolveUserPath('FILE:///tmp/a.md', { platform: 'linux' }), '/tmp/a.md');
+    assert.equal(resolveUserPath('file://localhost/tmp/a.md', { platform: 'linux' }), '/tmp/a.md');
+    assert.equal(resolveUserPath('file:///C:/Users/me/a.docx', { platform: 'win32' }), 'C:\\Users\\me\\a.docx');
+});
+
+test('resolveUserPath：无法转换的 file:// 地址抛中文错误', () => {
+    assert.throws(
+        () => resolveUserPath('file://server/share/a.docx', { platform: 'darwin' }),
+        /无法识别的 file:\/\/ 地址：file:\/\/server\/share\/a\.docx/,
+    );
+    assert.throws(() => resolveUserPath('file:///tmp/a%2Fb.md', { platform: 'linux' }), /无法识别的 file:\/\/ 地址/);
+});
+
+test('classifyInput：~ 与 file:// 输入按本地文件归类为绝对路径', () => {
+    assert.deepEqual(classifyInput('~/资料/a.docx', '/other'), {
+        input: { path: path.join(os.homedir(), '资料', 'a.docx') },
+        type: 'docx',
+    });
+    const abs = path.resolve('/tmp/markflow-cwd/报告 1.pdf');
+    assert.deepEqual(classifyInput(`  ${url.pathToFileURL(abs).href}  `, '/other'), { input: { path: abs }, type: 'pdf' });
+});
+
+test('classifyInput：file:// 指向不支持的格式或无法转换时抛中文错误', () => {
+    assert.throws(() => classifyInput('file:///tmp/a.txt', '/tmp'), /不支持的输入格式：file:\/\/\/tmp\/a\.txt/);
+    assert.throws(() => classifyInput('file:///tmp/a%2Fb.md', '/tmp'), /无法识别的 file:\/\/ 地址/);
 });

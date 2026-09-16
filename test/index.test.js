@@ -2,7 +2,8 @@
  * converters/index.js 调度器单元测试
  * 覆盖：导出与懒加载、detectInputType、listTargets（规则派生）、convert 参数校验与非法选项、
  *       md → docx 与 md → html 真实端到端、三段式 API 独立调用、bundle/pdf/html/xml 经桩 parser/renderer
- *       的编排逻辑（字符串产物与 files 对象落盘、options 透传、extras 落盘与穿越拒绝、管线桩调用、渲染器缺失）
+ *       的编排逻辑（字符串产物与 files 对象落盘、options 透传、extras 落盘与穿越拒绝、管线桩调用、渲染器缺失）、
+ *       重跑策略 skipExisting / clean
  */
 const { test, describe, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -1234,5 +1235,219 @@ describe('bundle：MinerU 式结果包（桩 parser）', () => {
         for (const file of fs.readdirSync(dir).filter((name) => name.endsWith('.json'))) {
             assert.ok(!/[0-9a-f]{64}/.test(fs.readFileSync(path.join(dir, file), 'utf8')), `${file} 不应残留哈希图名`);
         }
+    });
+});
+
+// ============================================================
+// 重跑策略：skipExisting / clean（转换调用参数，不进 options）
+// ============================================================
+
+describe('convert：重跑策略 skipExisting / clean（桩 parser 与 renderer）', () => {
+    const { createNameRegistry: newRegistry } = require('../converters/naming');
+    let stubs = {};
+    let parseCalls = 0;
+
+    function stubLoader(rel) {
+        if (!Object.prototype.hasOwnProperty.call(stubs, rel)) return require(path.join(CONVERTERS_DIR, rel));
+        return stubs[rel];
+    }
+
+    before(() => _setModuleLoader(stubLoader));
+    after(() => _reset());
+    beforeEach(() => {
+        parseCalls = 0;
+        const parse = (sourceType, meta = {}) => async (input, ctx) => {
+            parseCalls += 1;
+            return createDocument({
+                ir: createRoot([createParagraph('正文')]),
+                meta: { sourceType, sourceName: ctx.sourceName, ...meta },
+                assets: [{ name: 'images/image_1.png', buffer: PNG, mime: 'image/png' }],
+            });
+        };
+        stubs = {
+            './parsers/docx': { parse: parse('docx') },
+            './parsers/md': { parse: parse('md') },
+            './parsers/url': { parse: parse('url', { title: '网页标题' }) },
+            './renderers/md': { render: async () => '# 正文\n' },
+            './renderers/json': { render: async () => '{}' },
+            './renderers/docx': { render: async () => Buffer.from('PK new') },
+            './renderers/xml': { render: async () => ({ files: { '{name}.xml': '<doc/>' } }) },
+        };
+    });
+
+    const byCodePoint = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    const listTree = (dir) => fs.readdirSync(dir, { recursive: true, withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => path.relative(dir, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
+        .sort(byCodePoint);
+    // 目录快照：相对路径 → 内容与修改时间，用于断言「不改动任何文件」
+    const snapshotTree = (dir) => Object.fromEntries(listTree(dir).map((rel) => {
+        const file = path.join(dir, rel);
+        return [rel, `${fs.readFileSync(file).toString('base64')}@${fs.statSync(file).mtimeMs}`];
+    }));
+    const seedInput = (name) => {
+        const file = path.join(fs.mkdtempSync(path.join(root, 'rerun-in-')), name);
+        fs.writeFileSync(file, 'PK');
+        return file;
+    };
+    const newOutDir = () => fs.mkdtempSync(path.join(root, 'rerun-out-'));
+
+    test('skipExisting：本地输入的主产物已存在时不解析、不改动任何文件，结果标 skipped: true', async () => {
+        // Arrange
+        const input = seedInput('报告.docx');
+        const outputDir = newOutDir();
+        const first = await convert({ input: { path: input }, target: 'bundle', outputDir });
+        assert.equal('skipped' in first, false, '缺省结果信封形状不变');
+        const before = snapshotTree(outputDir);
+        parseCalls = 0;
+
+        // Act
+        const res = await convert({ input: { path: input }, target: 'bundle', outputDir, skipExisting: true });
+
+        // Assert
+        assert.equal(parseCalls, 0);
+        const dir = path.join(outputDir, '报告');
+        assert.deepEqual(res, {
+            ok: true, skipped: true, target: 'bundle', name: '报告', title: null, sourceType: 'docx',
+            outputPath: dir, outputs: { md: path.join(dir, '报告.md') },
+            imagesCount: 0, warnings: [], options: res.options, extras: [], backends: { pdfParser: null, raster: null },
+        });
+        assert.equal(res.options.mineru.token, null);
+        assert.deepEqual(snapshotTree(outputDir), before);
+    });
+
+    test('skipExisting：主产物缺失时照常转换（产物目录已存在也一样）', async () => {
+        const input = seedInput('半成品.docx');
+        const outputDir = newOutDir();
+        fs.mkdirSync(path.join(outputDir, '半成品', 'images'), { recursive: true });
+
+        const res = await convert({ input: { path: input }, target: 'bundle', outputDir, skipExisting: true });
+
+        assert.equal(parseCalls, 1);
+        assert.equal('skipped' in res, false);
+        assert.ok(fs.existsSync(path.join(outputDir, '半成品', '半成品.md')));
+    });
+
+    test('skipExisting：单文件目标按 {name}.{ext} 判定；网页输入解析后按标题判定', async () => {
+        // Arrange
+        const outputDir = newOutDir();
+        const mdInput = seedInput('说明.md');
+        fs.writeFileSync(path.join(outputDir, '说明.docx'), 'OLD');
+        fs.mkdirSync(path.join(outputDir, '网页标题'));
+        fs.writeFileSync(path.join(outputDir, '网页标题', '网页标题.md'), 'OLD');
+
+        // Act
+        const single = await convert({ input: { path: mdInput }, target: 'docx', outputDir, skipExisting: true });
+        const callsAfterSingle = parseCalls;
+        const web = await convert({ input: { url: 'https://example.com/post' }, target: 'bundle', outputDir, skipExisting: true });
+
+        // Assert
+        assert.equal(callsAfterSingle, 0);
+        assert.equal(single.skipped, true);
+        assert.equal(single.outputPath, path.join(outputDir, '说明.docx'));
+        assert.deepEqual(single.outputs, { docx: path.join(outputDir, '说明.docx') });
+        assert.equal(fs.readFileSync(path.join(outputDir, '说明.docx'), 'utf8'), 'OLD');
+
+        assert.equal(parseCalls, 1, '网页产物名取决于标题，须先解析');
+        assert.equal(web.skipped, true);
+        assert.equal(web.title, '网页标题');
+        assert.equal(web.sourceType, 'url');
+        assert.deepEqual(fs.readdirSync(path.join(outputDir, '网页标题')), ['网页标题.md']);
+        assert.equal(fs.readFileSync(path.join(outputDir, '网页标题', '网页标题.md'), 'utf8'), 'OLD');
+    });
+
+    test('skipExisting：xml 目标的主产物随 profile 而定（generic 为 {name}.xml，patent 为 {name}.zip）', async () => {
+        const outputDir = newOutDir();
+        fs.mkdirSync(path.join(outputDir, 'sample'));
+        fs.writeFileSync(path.join(outputDir, 'sample', 'sample.zip'), 'OLD');
+
+        const patent = await convert({ input: { path: SAMPLE_MD }, target: 'xml', outputDir, options: { xml: { profile: 'patent' } }, skipExisting: true });
+        const generic = await convert({ input: { path: SAMPLE_MD }, target: 'xml', outputDir, skipExisting: true });
+
+        assert.equal(patent.skipped, true);
+        assert.deepEqual(patent.outputs, { zip: path.join(outputDir, 'sample', 'sample.zip') });
+        assert.equal('skipped' in generic, false);
+        assert.ok(fs.existsSync(path.join(outputDir, 'sample', 'sample.xml')));
+    });
+
+    test('skipExisting 与批内登记表：跳过的任务仍占名，后续同名任务的最终名与首轮一致', async () => {
+        // Arrange
+        const inputs = [seedInput('同名.docx'), seedInput('同名.docx')];
+        const outputDir = newOutDir();
+        const runAll = async (extra) => {
+            const nameRegistry = newRegistry();
+            const out = [];
+            for (const [order, input] of inputs.entries()) {
+                out.push(await convert({ input: { path: input }, target: 'bundle', outputDir, nameRegistry, order, ...extra }));
+            }
+            return out;
+        };
+        const first = await runAll({});
+        assert.deepEqual(first.map((res) => res.name), ['同名', '同名 (2)']);
+        fs.rmSync(path.join(outputDir, '同名 (2)'), { recursive: true });
+        parseCalls = 0;
+
+        // Act
+        const rerun = await runAll({ skipExisting: true });
+
+        // Assert
+        assert.deepEqual(rerun.map((res) => [res.name, res.skipped === true]), [['同名', true], ['同名 (2)', false]]);
+        assert.equal(parseCalls, 1);
+    });
+
+    test('clean：写入前删除该产物目录中旧的 MarkFlow 产物，保留用户文件；缺省不删除', async () => {
+        // Arrange
+        const input = seedInput('笔记.docx');
+        const outputDir = newOutDir();
+        const dir = path.join(outputDir, '笔记');
+        fs.mkdirSync(path.join(dir, 'images'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'images', 'image_99.jpg'), 'old');
+        fs.writeFileSync(path.join(dir, '旧笔记.txt'), 'mine');
+        fs.writeFileSync(path.join(dir, '笔记_origin.pdf'), 'old');
+
+        // Act & Assert：缺省重跑不清理（回归守卫）
+        await convert({ input: { path: input }, target: 'bundle', outputDir });
+        assert.ok(fs.existsSync(path.join(dir, 'images', 'image_99.jpg')));
+        assert.ok(fs.existsSync(path.join(dir, '笔记_origin.pdf')));
+
+        // Act & Assert：clean 只清 MarkFlow 产物
+        await convert({ input: { path: input }, target: 'bundle', outputDir, clean: true });
+        assert.deepEqual(listTree(dir), ['images/image_1.png', '旧笔记.txt', '笔记.json', '笔记.md', '笔记_content_list.json'].sort(byCodePoint));
+        assert.equal(fs.readFileSync(path.join(dir, '旧笔记.txt'), 'utf8'), 'mine');
+    });
+
+    test('clean 与 skipExisting 同时为真：已存在即跳过且不清理；主产物缺失时先清理再转换', async () => {
+        // Arrange
+        const input = seedInput('合并.docx');
+        const outputDir = newOutDir();
+        const dir = path.join(outputDir, '合并');
+        await convert({ input: { path: input }, target: 'bundle', outputDir });
+        fs.writeFileSync(path.join(dir, 'images', 'image_99.jpg'), 'old');
+
+        // Act & Assert：主产物存在 → 跳过，不清理
+        const skipped = await convert({ input: { path: input }, target: 'bundle', outputDir, clean: true, skipExisting: true });
+        assert.equal(skipped.skipped, true);
+        assert.ok(fs.existsSync(path.join(dir, 'images', 'image_99.jpg')));
+
+        // Act & Assert：主产物缺失 → 清理后转换
+        fs.rmSync(path.join(dir, '合并.md'));
+        const redone = await convert({ input: { path: input }, target: 'bundle', outputDir, clean: true, skipExisting: true });
+        assert.equal('skipped' in redone, false);
+        assert.equal(fs.existsSync(path.join(dir, 'images', 'image_99.jpg')), false);
+        assert.ok(fs.existsSync(path.join(dir, '合并.md')));
+    });
+
+    test('clean / skipExisting 须为布尔值，且不进入结果信封的 options', async () => {
+        const input = seedInput('严格.docx');
+        const outputDir = newOutDir();
+
+        await assert.rejects(convert({ input: { path: input }, target: 'bundle', outputDir, skipExisting: 'true' }), /skipExisting 须为布尔值/);
+        await assert.rejects(convert({ input: { path: input }, target: 'bundle', outputDir, clean: 1 }), /clean 须为布尔值/);
+        assert.equal(parseCalls, 0);
+
+        const res = await convert({ input: { path: input }, target: 'bundle', outputDir, clean: false, skipExisting: false });
+        assert.equal('clean' in res.options, false);
+        assert.equal('skipExisting' in res.options, false);
+        assert.equal('skipped' in res, false);
     });
 });

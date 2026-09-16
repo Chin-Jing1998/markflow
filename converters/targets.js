@@ -6,7 +6,9 @@
  * 为此本模块不依赖 index.js，保持为叶子模块。
  *
  * detectInputType(pathOrUrl)          → 输入类型，无法识别返回 null
- * classifyInput(raw, cwd)             → { input: { path } | { url }, type }；相对路径按 cwd 解析为绝对路径
+ * resolveUserPath(p, env?)            → 本地路径写法归一：前导 ~ 展开为主目录、file:// 地址转为本地路径，其余原样返回
+ * classifyInput(raw, cwd)             → { input: { path } | { url }, type }；本地输入先经 resolveUserPath，
+ *                                       相对路径再按 cwd 解析为绝对路径
  * resolveTarget(inputType, requested) → 目标格式；未指定时按输入类型取默认值，不合法时抛中文错误
  * assertTargetAllowed(target, type)   → 不合法即抛中文错误，供 convert 复用同一套判定与措辞
  * getTargetRule(target)               → TARGET_RULES 中的规则项（含 layout / ext），未知目标抛中文错误
@@ -21,7 +23,9 @@
  *
  * 本模块只做纯逻辑判断，不触碰文件系统：存在性由调用方（CLI 预检）或 convert 负责。
  */
+const os = require('os');
 const path = require('path');
+const { fileURLToPath } = require('url');
 
 // 扩展名 → 输入类型；旧二进制格式（.doc/.xls/.ppt）自 v3 起不再受理
 const EXT_TO_TYPE = Object.freeze({
@@ -55,6 +59,8 @@ const DEFAULT_TARGETS = Object.freeze(Object.fromEntries(
 ));
 
 const REMOTE_URL_RE = /^https?:\/\//i;
+// 本地文件地址；scheme 不分大小写（new URL 会将其归一为小写）
+const FILE_URL_RE = /^file:\/\//i;
 
 // 'docx'|'xlsx'|'pptx'|'pdf'|'md'|'url'|null
 function detectInputType(pathOrUrl) {
@@ -85,15 +91,42 @@ function resolveTarget(inputType, requested) {
     return requested;
 }
 
+/**
+ * 用户给出的本地路径写法归一，供各入口的本地输入、CLI 的 --out 与 MCP 的 outputDir 共用：
+ *   - '~' 与 '~/…' 展开为主目录；'~\…' 仅在 Windows 下展开（其它平台上反斜杠是合法的文件名字符）；
+ *   - 'file://…'（scheme 不分大小写）经 url.fileURLToPath 转为本地路径，百分号编码随之解码，Windows 下识别盘符与 UNC；
+ *   - 其余原样返回：不裁剪空白、不解析相对路径（由调用方 path.resolve）、'~user' 形式不展开，非字符串值原样返回。
+ * 第二参数只供测试注入：{ homedir = os.homedir(), platform = process.platform }。
+ * file:// 地址无法转换（主机名不是本机、路径含编码后的分隔符等）时抛中文错误「无法识别的 file:// 地址：…（原因）」。
+ */
+function resolveUserPath(p, { homedir, platform = process.platform } = {}) {
+    if (typeof p !== 'string') return p;
+    const windows = platform === 'win32';
+    if (FILE_URL_RE.test(p)) return fileUrlToLocalPath(p, windows);
+    const expandsHome = p === '~' || p.startsWith('~/') || (windows && p.startsWith('~\\'));
+    if (!expandsHome) return p;
+    const home = typeof homedir === 'string' && homedir ? homedir : os.homedir();
+    return (windows ? path.win32 : path.posix).join(home, p.slice(2));
+}
+
+function fileUrlToLocalPath(value, windows) {
+    try {
+        return fileURLToPath(value, { windows });
+    } catch (err) {
+        throw new Error(`无法识别的 file:// 地址：${value}（${err && err.message ? err.message : String(err)}）`);
+    }
+}
+
 function classifyInput(raw, cwd) {
     const value = typeof raw === 'string' ? raw.trim() : '';
     if (!value) throw new Error('输入不能为空');
-    const type = detectInputType(value);
+    if (REMOTE_URL_RE.test(value)) return { input: { url: value }, type: 'url' };
+    const local = resolveUserPath(value);
+    const type = detectInputType(local);
     if (!type) {
         throw new Error(`不支持的输入格式：${value}（支持 ${SUPPORTED_EXTENSIONS.join(' ')} 与 http(s) 网址）`);
     }
-    if (type === 'url') return { input: { url: value }, type };
-    return { input: { path: path.resolve(cwd || process.cwd(), value) }, type };
+    return { input: { path: path.resolve(cwd || process.cwd(), local) }, type };
 }
 
 /**
@@ -112,6 +145,6 @@ function listTargets({ pdfBackend = null } = {}) {
 }
 
 module.exports = {
-    detectInputType, classifyInput, resolveTarget, assertTargetAllowed, getTargetRule, listTargets,
+    detectInputType, resolveUserPath, classifyInput, resolveTarget, assertTargetAllowed, getTargetRule, listTargets,
     SUPPORTED_EXTENSIONS, INPUT_CLASS, INPUT_CLASSES, DEFAULT_TARGETS, TARGET_RULES, TARGETS, REMOTE_URL_RE,
 };

@@ -15,10 +15,21 @@
  *     转档 bundle 渲染与桌面端「编辑后保存 / 导出」共用，保证两处产出一致。content_list 的 img_path 直接取
  *     IR 图片节点的 url，调用方负责让 url 为产物内的真实相对路径；MinerU 来源改用其原件 content_list
  *     （附属文件 {name}_content_list.json，已补 display），图片路径按 sourcePath → url 改写
- *   writeDocument({ rendered, target, outputDir, name })
- *     → { outputPath, outputs, extras }
- *   convert({ input: { path? | url? }, target, outputDir, options?, onProgress?, allowPrivateNetwork?, nameRegistry?, order? }) 依次组合三者
+ *   writeDocument({ rendered, target, outputDir, name, clean? })
+ *     → { outputPath, outputs, extras }；clean 为 true 时 folder 布局先清理产物目录中的旧 MarkFlow 产物
+ *     （范围见 output.js），single 布局本就覆盖同一文件、不清理
+ *   convert({ input: { path? | url? }, target, outputDir, options?, onProgress?, allowPrivateNetwork?, nameRegistry?, order?, clean?, skipExisting? }) 依次组合三者
  *     → { ok, target, name, title, sourceType, outputPath, outputs, imagesCount, warnings, options, extras, backends }
+ *   clean 与 skipExisting 为写盘策略参数（非用户 options：不经 normalizeOptions、不回显到结果的 options；缺省 false，
+ *   非布尔值抛中文错误）：
+ *     skipExisting 为 true 且主产物已存在即跳过本次转换——主产物 folder 布局为 {outputDir}/{name}/{name}.{ext}、
+ *     single 布局为 {outputDir}/{name}.{ext}（xml 的 patent profile 不产出 {name}.xml，主产物为 {name}.zip）。
+ *     本地文件的产物名只取决于文件名，故先登记产物名再判定，命中即不解析、不改动任何文件、不发进度事件；网页的
+ *     产物名取决于标题，只能解析后再判定。跳过的结果与成功结果同形，另带 skipped: true，outputs 只列主产物，
+ *     title 在未解析时为 null，imagesCount 为 0。跳过的任务照常占用登记表中的名字，故批内后续同名任务的最终名
+ *     与首轮一致。
+ *     clean 为 true 时写入前清理该产物目录中的旧 MarkFlow 产物。两者同时为 true：已存在即跳过（不清理），
+ *     否则清理后照常转换。
  *   nameRegistry 与 order 为服务层内部参数（非用户 options）：批量转换时由 runConversion 传入同一张
  *   converters/naming.js 的登记表与本任务的批内序号，使同批内派生出同名产物的任务改名而不互相覆盖，
  *   且最终名只由序号决定（与解析快慢无关）；不传登记表即用派生名原样落盘，行为与引入登记表之前一致。
@@ -52,7 +63,7 @@
  */
 const path = require('path');
 const { sanitizeFolderName, stripExt, collectText } = require('./ir/util');
-const { statOrNull, toBuffer } = require('./util');
+const { statOrNull, toBuffer, isFile } = require('./util');
 const {
     detectInputType, assertTargetAllowed, getTargetRule, listTargets,
     SUPPORTED_EXTENSIONS, REMOTE_URL_RE,
@@ -85,21 +96,38 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 // ============================================================
 
 async function convert(params = {}) {
-    const { input, target, outputDir, onProgress, allowPrivateNetwork = false, options: rawOptions, nameRegistry, order } = params || {};
+    const {
+        input, target, outputDir, onProgress, allowPrivateNetwork = false, options: rawOptions, nameRegistry, order,
+        clean = false, skipExisting = false,
+    } = params || {};
+    assertBooleanParam(clean, 'clean');
+    assertBooleanParam(skipExisting, 'skipExisting');
     const source = await resolveSource(input);
     await assertOutputDir(outputDir);
     assertTargetAllowed(target, source.type);
     const options = normalizeOptions(rawOptions);
     const emit = createProgressEmitter(onProgress);
+    const skipCheck = skipExisting === true ? { outputDir, target, options, source } : null;
 
+    // skipExisting 下本地文件的产物名只取决于文件名：先登记再查主产物，命中即跳过解析（PDF 云端解析等开销一并省去）
+    let name = null;
+    if (skipCheck && source.type !== 'url') {
+        name = await claimOutputName({ nameRegistry, order, target, name: resolveOutputName(source, ''), source });
+        const skipped = await skipIfExisting({ ...skipCheck, name, title: null });
+        if (skipped) return skipped;
+    }
     const parsed = await parseResolved({ source, target, options, allowPrivateNetwork, emit });
-    // 名字登记在解析之后（网页标题要解析后才知道）、落盘之前；登记表按批内序号排队，
-    // 故此处可能短暂等待前序任务登记完毕，等待时间不超过前序任务的解析耗时
-    const name = await claimOutputName({ nameRegistry, order, target, name: parsed.name, source });
+    if (name === null) {
+        // 名字登记在解析之后（网页标题要解析后才知道）、落盘之前；登记表按批内序号排队，
+        // 故此处可能短暂等待前序任务登记完毕，等待时间不超过前序任务的解析耗时
+        name = await claimOutputName({ nameRegistry, order, target, name: parsed.name, source });
+        const skipped = skipCheck ? await skipIfExisting({ ...skipCheck, name, title: parsed.title, backends: parsed.backends }) : null;
+        if (skipped) return skipped;
+    }
     emit('rendering', PROGRESS.RENDERING);
     const rendered = await renderDocument(parsed.doc, target, options);
     emit('writing', PROGRESS.WRITING);
-    const written = await writeDocument({ rendered, target, outputDir, name });
+    const written = await writeDocument({ rendered, target, outputDir, name, clean: clean === true });
     emit('writing', PROGRESS.DONE);
 
     return {
@@ -123,6 +151,41 @@ async function claimOutputName({ nameRegistry, order, target, name, source }) {
     const claimed = await nameRegistry.claim({ name, source, order, layout, ext });
     if (typeof claimed !== 'string' || !claimed.trim()) throw new Error('产物名登记表返回了无效的产物名');
     return claimed;
+}
+
+// clean / skipExisting 是写盘策略参数，不经 normalizeOptions；省略与 null 视为 false，
+// 其余非布尔值直接报错，以免 'false' 一类字符串被当成真值
+function assertBooleanParam(value, key) {
+    if (value === undefined || value === null || typeof value === 'boolean') return;
+    throw new Error(`参数 ${key} 须为布尔值（true/false），实际：${String(value)}`);
+}
+
+// 主产物：folder 布局为 {outputDir}/{name}/{name}.{ext}，single 布局为 {outputDir}/{name}.{ext}；ext 取自规则表，
+// 唯 xml 的 patent profile 不产出 {name}.xml，以五书与图片的同一平铺集合 {name}.zip 为主产物。
+// outputsKey 与落盘路径一致：single 布局取目标名（见 writeDocument），folder 布局取扩展名（见 output.js）
+function mainProductOf({ outputDir, target, name, options }) {
+    const { layout, ext: ruleExt } = getTargetRule(target);
+    const ext = target === 'xml' && options.xml.profile === 'patent' ? 'zip' : ruleExt;
+    const baseDir = path.resolve(outputDir);
+    if (layout === 'single') {
+        const file = path.join(baseDir, `${name}.${ext}`);
+        return { file, outputPath: file, outputsKey: target };
+    }
+    const dir = path.join(baseDir, name);
+    return { file: path.join(dir, `${name}.${ext}`), outputPath: dir, outputsKey: ext };
+}
+
+// skipExisting：主产物已存在即返回跳过结果（与成功结果同形，另带 skipped: true；未渲染，故 outputs 只列主产物、
+// imagesCount 为 0、warnings 与 extras 为空），否则返回 null 表示照常转换
+async function skipIfExisting({ outputDir, target, options, source, name, title, backends }) {
+    const main = mainProductOf({ outputDir, target, name, options });
+    if (!(await isFile(main.file))) return null;
+    return {
+        ok: true, skipped: true, target, name, title, sourceType: source.type,
+        outputPath: main.outputPath, outputs: { [main.outputsKey]: main.file },
+        imagesCount: 0, warnings: [], options: redactOptions(options), extras: [],
+        backends: backends || { pdfParser: null, raster: null },
+    };
 }
 
 // ============================================================
@@ -370,11 +433,12 @@ function defaultImageMode(target, options) {
 // writeDocument
 // ============================================================
 
-async function writeDocument({ rendered, target, outputDir, name } = {}) {
+async function writeDocument({ rendered, target, outputDir, name, clean = false } = {}) {
     const rule = getTargetRule(target);
     await assertOutputDir(outputDir);
     if (!rendered || !isPlainObject(rendered.files)) throw new Error('writeDocument 需要 renderDocument 的结果');
 
+    // single 布局本就覆盖写同一个文件，没有旧产物残留，clean 只作用于 folder 布局的产物目录
     if (rule.layout === 'single') {
         const entries = Object.entries(rendered.files);
         if (entries.length !== 1) throw new Error(`目标 ${target} 为单文件布局，只能写出一个文件（实际 ${entries.length} 个）`);
@@ -387,7 +451,7 @@ async function writeDocument({ rendered, target, outputDir, name } = {}) {
     }
 
     const extras = asArray(rendered.extras);
-    const written = await output.writeFolder({ outputDir, name, files: rendered.files, assets: asArray(rendered.assets), extras });
+    const written = await output.writeFolder({ outputDir, name, files: rendered.files, assets: asArray(rendered.assets), extras, clean: clean === true });
     // 附属文件名中的 {name} 已由 writeFolder 替换，这里返回实际落盘的相对路径
     return { outputPath: written.outputPath, outputs: written.outputs, extras: extras.map((item) => String(item.name).split(NAME_TOKEN).join(name)) };
 }
