@@ -26,14 +26,8 @@ afterEach(() => {
 // 辅助
 // ============================================================
 
-function getElectronPath() {
-    try {
-        const mod = require('electron');
-        return typeof mod === 'string' && fs.existsSync(mod) ? mod : null;
-    } catch (err) {
-        return null;
-    }
-}
+// 与生产代码同一份解析：刻意不 require('electron')，否则二进制缺失时会当场下载并往 stdout 打印
+const { getElectronPath } = require('../converters/chromium/spawn');
 
 function isSpawnBlocked(err) {
     if (!err) return false;

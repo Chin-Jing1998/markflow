@@ -13,11 +13,14 @@
  *   - spawn 可注入以便测试。
  * assertExitOk(result, label) → 超时抛「<label>超时」，退出码非 0 抛含退出码与 stderr 摘要（首行、绝对路径脱敏为
  *   <path>）的中文错误，完整 stderr 走 console.error 供排障；正常返回 undefined。
- * getElectronPath() → 普通 Node 进程里 require('electron') 得到的是 electron 可执行文件的路径字符串，
- *   存在时返回该路径，未安装或文件不存在返回 null（不抛错）。
+ * getElectronPath() → electron 可执行文件的绝对路径，未安装或文件不存在返回 null（不抛错）。
+ *   刻意不走 require('electron')：该模块在二进制缺失时会当场下载（往 stdout 打印「Downloading Electron
+ *   binary...」并以 stdio:'inherit' 拉起 install.js），既污染 CLI 的 --json 单行输出，也让一次能力探测
+ *   变成几十 MB 的下载。改为自行读 electron 包内的 path.txt 并核对文件确实存在，缺任一项即视同未安装。
  */
 const { spawn: nodeSpawn } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 const tmp = require('../tmp');
 
 const DEFAULT_TIMEOUT_MS = 60000;
@@ -38,9 +41,16 @@ const STDERR_NOISE_PATTERNS = Object.freeze([
 const attempt = (fn) => { try { return fn(); } catch (err) { return null; } };
 
 function getElectronPath() {
-    const mod = attempt(() => require('electron'));
-    if (typeof mod !== 'string' || !mod) return null;
-    return attempt(() => fs.existsSync(mod)) ? mod : null;
+    // 包目录经 require.resolve 定位（不加载 index.js，故不触发下载）；在 Electron 内运行时没有这个包，返回 null，
+    // 与此前 require('electron') 拿到 API 对象时的结果一致——那种场景本就该走进程内后端
+    const dir = attempt(() => path.dirname(require.resolve('electron/package.json')));
+    if (!dir) return null;
+    const relative = attempt(() => fs.readFileSync(path.join(dir, 'path.txt'), 'utf-8').trim());
+    if (!relative) return null;
+    // 与 electron/index.js 同样尊重 ELECTRON_OVERRIDE_DIST_PATH（自建或共享 dist 目录时用）
+    const override = process.env.ELECTRON_OVERRIDE_DIST_PATH;
+    const full = override ? path.join(override, relative) : path.join(dir, 'dist', relative);
+    return attempt(() => fs.existsSync(full)) ? full : null;
 }
 
 /** 以 base 为底复制一份环境变量并剔除会改变 Electron 身份或注入 Node 开关的键 */
