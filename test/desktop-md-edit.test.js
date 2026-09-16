@@ -82,7 +82,11 @@ test('writeFileAtomic：内容写入、不留 .mftmp 临时文件、保留原 mo
         const written = await mdEdit.writeFileAtomic(file, '新内容\n');
         assert.equal(written, file);
         assert.equal(fs.readFileSync(file, 'utf8'), '新内容\n');
-        assert.equal(fs.statSync(file).mode & 0o777, 0o640, 'mode 须与原文件一致');
+        // Windows 无 POSIX 权限位，该断言只在类 Unix 上有意义：chmod(0o640) 在 win32 上不落地，
+        // stat 读回的恒是 0o666，「保留原 mode」无从验证。内容与临时文件的断言照常执行。
+        if (process.platform !== 'win32') {
+            assert.equal(fs.statSync(file).mode & 0o777, 0o640, 'mode 须与原文件一致');
+        }
         assert.deepEqual(leftovers(dir), []);
         const created = await mdEdit.writeFileAtomic(path.join(dir, 'new.md'), 'x');
         assert.equal(fs.readFileSync(created, 'utf8'), 'x', '文件不存在时新建');

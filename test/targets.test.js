@@ -227,6 +227,13 @@ test('classifyInput：~ 与 file:// 输入按本地文件归类为绝对路径',
 });
 
 test('classifyInput：file:// 指向不支持的格式或无法转换时抛中文错误', () => {
-    assert.throws(() => classifyInput('file:///tmp/a.txt', '/tmp'), /不支持的输入格式：file:\/\/\/tmp\/a\.txt/);
+    // file:///tmp/a.txt 只在类 Unix 上是合法的本地文件 URL；Windows 要求带盘符，
+    // fileURLToPath 会先以「File URL path must be absolute」抛错，落不到「格式不受支持」这一分支。
+    // 故按本机语义构造 URL（与上一用例同法），三平台断言的都是同一条分支。
+    const txtUrl = url.pathToFileURL(path.resolve('/tmp/a.txt')).href;
+    assert.throws(() => classifyInput(txtUrl, '/tmp'), (err) => {
+        assert.ok(err.message.startsWith(`不支持的输入格式：${txtUrl}`), err.message);
+        return true;
+    });
     assert.throws(() => classifyInput('file:///tmp/a%2Fb.md', '/tmp'), /无法识别的 file:\/\/ 地址/);
 });

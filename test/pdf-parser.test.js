@@ -157,6 +157,34 @@ test('onProgress 回调抛错不影响解析', async () => {
     assert.equal(doc.kind, 'document');
 });
 
+test('交叉引用表损坏的 PDF 照常解析，且 pdfjs 的告警不写进 stdout', async () => {
+    // Arrange：把 LF 换成 CRLF，复刻 Windows 上 git core.autocrlf=true 检出 sample.pdf 的效果——
+    // 字节偏移整体后移，xref 里的对象偏移全部失效，pdfjs 会走 indexObjects() 重建并发告警。
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-pdf-crlf-'));
+    const broken = path.join(dir, 'crlf.pdf');
+    const source = fs.readFileSync(SAMPLE_PDF).toString('latin1');
+    fs.writeFileSync(broken, Buffer.from(source.replace(/\n/g, '\r\n'), 'latin1'));
+
+    // Act：整段解析期间接管 console.log（pdfjs 的 warn 正是经它写 stdout）
+    const written = [];
+    const original = console.log;
+    console.log = (...args) => written.push(args.join(' '));
+    let doc;
+    try {
+        doc = await parse({ path: broken }, LOCAL_CTX);
+    } finally {
+        console.log = original;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    // Assert：stdout 一个字节都不该有——CLI 的 --json 与 MCP 的 stdio 均以此为契约
+    assert.deepEqual(written, [], `pdfjs 不得向 stdout 写入：${JSON.stringify(written)}`);
+    assert.equal(doc.kind, 'document');
+    assert.equal(doc.meta.pdfParser, 'pdfjs');
+    const text = collect(doc.ir, (node) => node.type === 'paragraph').map(plainText).join('\n');
+    assert.match(text, /MarkFlow sample document/, '重建交叉引用后仍应取到正文');
+});
+
 test('源码不再引用已不存在的 legacy/build/pdf.js', () => {
     // Arrange
     const source = fs.readFileSync(parserPath, 'utf8');

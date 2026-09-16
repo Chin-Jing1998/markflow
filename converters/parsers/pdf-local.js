@@ -54,6 +54,11 @@ async function parse(input, ctx = {}) {
         data: new Uint8Array(buffer),
         disableFontFace: true,
         useSystemFonts: true,
+        // pdfjs 的 warn() 走 console.log，即写进程 stdout（见 pdf.mjs 的 warn 实现）。
+        // 交叉引用表损坏一类的文档会触发「Warning: Indexing all PDF objects」，
+        // 与 CLI `--json`「stdout 恰好一行 JSON」、MCP stdio「stdout 只承载协议帧」的契约冲突，
+        // 故降到 ERRORS 级：解析失败仍以异常上抛，不会被吞掉。
+        verbosity: pdfjs.VerbosityLevel.ERRORS,
     });
     try {
         return await buildDocument(await loadingTask.promise, { sourceName, ctx });

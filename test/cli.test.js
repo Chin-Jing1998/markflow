@@ -559,7 +559,11 @@ test('config set/get/unset：文件权限 0600，只报是否已配置与来源�
     assert.equal(set.stdout.includes(TOKEN_SAMPLE), false, '令牌不得出现在 stdout');
     assert.equal(set.stderr.includes(TOKEN_SAMPLE), false, '令牌不得出现在 stderr');
     assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).mineruToken, TOKEN_SAMPLE);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    // Windows 无 POSIX 权限位，该断言只在类 Unix 上有意义：NTFS 的访问控制走 ACL，
+    // Node 在 win32 上对 mode 只反映只读位，chmod(0o600) 不产生实际效果。本用例其余断言照常执行。
+    if (process.platform !== 'win32') {
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    }
 
     // Act & Assert：人类模式只报状态与来源
     const got = await runCli(['config', 'get'], { env });
@@ -1074,6 +1078,15 @@ test('--clean：重转前清理旧产物，用户放入的其它文件保留', a
 });
 
 test('SIGINT 中止批次：进行中的任务跑完，未开始的记为已取消，退出码 2', async (t) => {
+    // Windows 没有 POSIX 信号：child.kill('SIGINT') 不会把 SIGINT 投递给子进程，
+    // libuv 对 SIGTERM/SIGINT/SIGKILL 一律退化为 TerminateProcess，进程内注册的
+    // SIGINT 处理器永无机会执行，因此「已中止，正在等待进行中的任务结束」不会出现。
+    // 用户在控制台按 Ctrl+C 走的是控制台控制事件，CLI 的中止逻辑在 Windows 上仍然可用，
+    // 故这是测试手段的平台语义差异，不是产品缺陷；该平台无从模拟，整条跳过。
+    if (process.platform === 'win32') {
+        t.skip('Windows 不投递 SIGINT，见注释');
+        return;
+    }
     // Arrange：本机 HTTP 服务延时应答，确保首项仍在进行时 SIGINT 已经送达
     const server = await startArticleServer({ pages: { '/slow': { html: buildArticlePage(), delayMs: 400 } } });
     t.after(() => server.close());

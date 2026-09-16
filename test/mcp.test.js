@@ -783,7 +783,9 @@ test('returnContent 正文超过 20 万字符时截断并置 contentTruncated', 
 // ============================================================
 
 test('outputDir 支持 ~ 写法，paths 支持目录并把展开情况写入信封', async (t) => {
-    // Arrange：另起一个 HOME 指向临时目录的服务进程，使 ~ 可预期地展开
+    // Arrange：另起一个主目录指向临时目录的服务进程，使 ~ 可预期地展开。
+    // os.homedir() 在类 Unix 上读 HOME，在 Windows 上读 USERPROFILE，两者都要覆盖，
+    // 否则 win32 下 ~ 仍展开为运行器的真实主目录（C:\Users\runneradmin）。
     const home = fs.mkdtempSync(path.join(tmpDir, 'mcp-home-'));
     const outputDir = path.join(home, 'out');
     fs.mkdirSync(outputDir);
@@ -793,7 +795,7 @@ test('outputDir 支持 ~ 写法，paths 支持目录并把展开情况写入信�
     fs.writeFileSync(path.join(inDir, 'notes.txt'), '不受支持的文件');
     const homeClient = new Client({ name: 'markflow-home-test', version: '1.0.0' });
     await homeClient.connect(new StdioClientTransport({
-        command: process.execPath, args: [SERVER], cwd: ROOT, env: { ...process.env, HOME: home },
+        command: process.execPath, args: [SERVER], cwd: ROOT, env: { ...process.env, HOME: home, USERPROFILE: home },
     }));
     t.after(() => homeClient.close());
 

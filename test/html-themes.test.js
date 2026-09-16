@@ -38,6 +38,14 @@ ul.contains-task-list { list-style: none; padding-left: 1.2em; }
 .task-list-item input[type="checkbox"] { margin-right: 0.4em; vertical-align: middle; }
 `;
 
+/**
+ * 行尾归一：Windows 上 git 默认 core.autocrlf=true，检出的 .css 会变成 CRLF；
+ * 而 V2_PAGE_CSS 写在 .js 模板字面量里，ECMAScript 规定模板字面量的 CRLF 一律归一为 LF，
+ * 两侧行尾表示法因此在 Windows 上必然不同。行尾属版本控制的检出形态，不是样式内容的一部分，
+ * 故比较前统一为 LF——断言的实质（前缀逐字相同、其后只追加公式样式）不受影响。
+ */
+const toLf = (text) => text.replace(/\r\n/g, '\n');
+
 // 只取 :root 变量块，避免主题 CSS 里的同名片段干扰断言
 function rootBlock(css) {
     const matched = /^:root\{([^}]*)\}/.exec(css);
@@ -92,10 +100,10 @@ test('fontFamily 为 null 时取主题默认字体栈：academic 显式含宋体
 
 test('print 主题以 v2 的 PAGE_CSS 为前缀（前缀逐字相同），其后只追加公式样式', () => {
     // Arrange
-    const printCss = fs.readFileSync(path.join(THEMES_DIR, 'print.css'), 'utf8');
+    const printCss = toLf(fs.readFileSync(path.join(THEMES_DIR, 'print.css'), 'utf8'));
 
     // Act
-    const css = buildStyles(DEFAULT_OPTIONS.html, { theme: 'print' });
+    const css = toLf(buildStyles(DEFAULT_OPTIONS.html, { theme: 'print' }));
 
     // Assert：前缀逐字相同
     assert.equal(printCss.slice(0, V2_PAGE_CSS.length), V2_PAGE_CSS, 'print.css 须以 PAGE_CSS 原文为前缀');

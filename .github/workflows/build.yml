@@ -38,6 +38,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
 
+      # Electron 的 SUID 沙箱要求 chrome-sandbox 属主为 root 且置 setuid 位（4755）。
+      # npm ci 解包后该文件属主是 runner、权限 0755，渲染进程会以
+      # [FATAL:setuid_sandbox_host.cc] 退出，错误经栅格工作进程的 stderr 混入 CLI 输出，
+      # 使「--json 模式 stderr 仍为空」一类用例失败。此处按 Electron 官方要求补齐权限。
+      - name: 配置 Electron 沙箱权限（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+
       - name: 运行测试（Linux，经 xvfb）
         if: runner.os == 'Linux'
         run: xvfb-run -a npm test

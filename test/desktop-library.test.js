@@ -22,6 +22,16 @@ after(() => fs.rmSync(root, { recursive: true, force: true }));
 // 夹具
 // ============================================================
 
+/**
+ * 夹具里的绝对路径一律以 POSIX 写法书写，再经本函数转成本机形态。
+ * 生产代码按本机语义归一路径（library.js 的 path.resolve / path.normalize、
+ * library-migrate.js 的 path.resolve），Windows 上会补当前盘符并换成反斜杠：
+ * path.resolve('/data/out/甲') → 'D:\\data\\out\\甲'。
+ * 夹具与期望统一走这一层，类 Unix 上是恒等变换，Windows 上与生产侧同形，
+ * 断言比的始终是路径结构本身，而不是某个平台的分隔符写法。
+ */
+const absPath = (p) => path.resolve(p);
+
 let seq = 0;
 const workDir = (label) => {
     const dir = path.join(root, `${label}-${(seq += 1)}`);
@@ -60,18 +70,23 @@ const recordOf = (overrides = {}) => ({
     ...overrides,
 });
 
+// 本地文件输入夹具的源目录与产物目录（本机形态，见 absPath 注释）
+const DEMO_INPUT_DIR = absPath('/Users/demo/输入');
+const DEMO_INPUT_FILE = path.join(DEMO_INPUT_DIR, '季度报告.docx');
+const DEMO_PRODUCT_DIR = path.join(absPath('/Users/demo/输出'), '季度报告');
+
 // converters/service.js describeResult 的形状（本地文件输入）
 const fileResult = (overrides = {}) => ({
-    input: '/Users/demo/输入/季度报告.docx',
+    input: DEMO_INPUT_FILE,
     target: 'bundle',
     name: '季度报告',
     title: '季度报告 Q3',
     sourceType: 'docx',
-    outputPath: '/Users/demo/输出/季度报告',
+    outputPath: DEMO_PRODUCT_DIR,
     outputs: {
-        md: '/Users/demo/输出/季度报告/季度报告.md',
-        json: '/Users/demo/输出/季度报告/季度报告.json',
-        imagesDir: '/Users/demo/输出/季度报告/images',
+        md: path.join(DEMO_PRODUCT_DIR, '季度报告.md'),
+        json: path.join(DEMO_PRODUCT_DIR, '季度报告.json'),
+        imagesDir: path.join(DEMO_PRODUCT_DIR, 'images'),
     },
     imagesCount: 3,
     warnings: ['表格已降级为图片'],
@@ -256,17 +271,19 @@ describe('增删改查', () => {
 
     test('paths 汇总 outputPath、outputs 与 extras 并去重，越界 extras 被丢弃', async () => {
         const { lib } = makeLibrary('paths');
+        // extras 是相对 outputPath 的路径，由生产侧 path.resolve 拼成绝对路径，故基准目录取本机形态
+        const out = absPath('/data/out/甲');
         await lib.add(recordOf({
-            outputPath: '/data/out/甲',
-            outputs: { md: '/data/out/甲/甲.md', imagesDir: '/data/out/甲/images', dup: '/data/out/甲/甲.md' },
+            outputPath: out,
+            outputs: { md: path.join(out, '甲.md'), imagesDir: path.join(out, 'images'), dup: path.join(out, '甲.md') },
             extras: ['mineru/full.md', '../越界.md'],
         }));
 
         assert.deepEqual(await lib.paths('r1'), [
-            '/data/out/甲',
-            '/data/out/甲/甲.md',
-            '/data/out/甲/images',
-            '/data/out/甲/mineru/full.md',
+            out,
+            path.join(out, '甲.md'),
+            path.join(out, 'images'),
+            path.join(out, 'mineru', 'full.md'),
         ]);
         assert.deepEqual(await lib.paths('不存在'), []);
     });
@@ -407,13 +424,13 @@ describe('转换结果入库', () => {
         assert.equal(record.id, 'r1');
         assert.equal(record.createdAt, new Date(clock.now()).toISOString());
         assert.deepEqual(record.source, {
-            kind: 'file', value: '/Users/demo/输入/季度报告.docx', type: 'docx',
-            dir: '/Users/demo/输入', name: '季度报告.docx',
+            kind: 'file', value: DEMO_INPUT_FILE, type: 'docx',
+            dir: DEMO_INPUT_DIR, name: '季度报告.docx',
         });
         assert.equal(record.target, 'bundle');
         assert.equal(record.title, '季度报告 Q3');
-        assert.equal(record.outputPath, '/Users/demo/输出/季度报告');
-        assert.equal(record.outputs.md, '/Users/demo/输出/季度报告/季度报告.md');
+        assert.equal(record.outputPath, DEMO_PRODUCT_DIR);
+        assert.equal(record.outputs.md, path.join(DEMO_PRODUCT_DIR, '季度报告.md'));
         assert.equal(record.imagesCount, 3);
         assert.deepEqual(record.warnings, ['表格已降级为图片']);
         assert.deepEqual(record.options, { imageFormat: 'jpg', mineru: { token: null } });
@@ -469,9 +486,10 @@ describe('转换结果入库', () => {
     test('managedOutputDir 按 createdAt 月份归档，默认取当前时钟', () => {
         const { lib } = makeLibrary('managed-dir', { start: '2026-11-30T23:00:00.000Z' });
 
-        assert.equal(lib.managedOutputDir({ root: '/Users/demo/Documents/MarkFlow Library' }),
-            path.join('/Users/demo/Documents/MarkFlow Library', '2026-11'));
-        assert.equal(lib.managedOutputDir({ root: '/lib', date: '2026-02-01T00:00:00.000Z' }), path.join('/lib', '2026-02'));
+        const libRoot = absPath('/Users/demo/Documents/MarkFlow Library');
+        const shortRoot = absPath('/lib');
+        assert.equal(lib.managedOutputDir({ root: libRoot }), path.join(libRoot, '2026-11'));
+        assert.equal(lib.managedOutputDir({ root: shortRoot, date: '2026-02-01T00:00:00.000Z' }), path.join(shortRoot, '2026-02'));
         assert.throws(() => lib.managedOutputDir({}), /需要托管根目录 root/);
     });
 });
@@ -512,22 +530,22 @@ describe('写队列', () => {
 // ============================================================
 
 describe('planMigration', () => {
-    const LIB_ROOT = '/Users/demo/Documents/MarkFlow Library';
+    const LIB_ROOT = absPath('/Users/demo/Documents/MarkFlow Library');
 
     test('跳过已托管、已在 root 内与缺 outputPath 的记录', () => {
         const plan = planMigration({
             root: LIB_ROOT,
             records: [
-                { id: 'a', createdAt: '2026-03-01T00:00:00.000Z', outputPath: '/data/out/甲', managed: false },
-                { id: 'b', createdAt: '2026-03-01T00:00:00.000Z', outputPath: '/data/out/乙', managed: true },
+                { id: 'a', createdAt: '2026-03-01T00:00:00.000Z', outputPath: absPath('/data/out/甲'), managed: false },
+                { id: 'b', createdAt: '2026-03-01T00:00:00.000Z', outputPath: absPath('/data/out/乙'), managed: true },
                 { id: 'c', createdAt: '2026-03-01T00:00:00.000Z', outputPath: path.join(LIB_ROOT, '2026-03', '丙') },
                 { id: 'd', createdAt: '2026-03-01T00:00:00.000Z', outputPath: '' },
-                { id: 'e', createdAt: '不是时间', outputPath: '/data/out/戊' },
+                { id: 'e', createdAt: '不是时间', outputPath: absPath('/data/out/戊') },
             ],
         });
 
         assert.deepEqual(plan.moves, [
-            { id: 'a', from: '/data/out/甲', to: path.join(LIB_ROOT, '2026-03', '甲'), conflict: false },
+            { id: 'a', from: absPath('/data/out/甲'), to: path.join(LIB_ROOT, '2026-03', '甲'), conflict: false },
         ]);
         assert.deepEqual(plan.skipped, [
             { id: 'b', reason: '记录已处于托管模式' },
@@ -542,11 +560,11 @@ describe('planMigration', () => {
         const plan = planMigration({
             root: LIB_ROOT,
             records: [
-                { ...base, id: 'a', outputPath: '/in/一/报告' },
-                { ...base, id: 'b', outputPath: '/in/二/报告' },
-                { ...base, id: 'c', outputPath: '/in/三/报告' },
-                { ...base, id: 'd', outputPath: '/in/一/说明.docx' },
-                { ...base, id: 'e', outputPath: '/in/二/说明.docx' },
+                { ...base, id: 'a', outputPath: absPath('/in/一/报告') },
+                { ...base, id: 'b', outputPath: absPath('/in/二/报告') },
+                { ...base, id: 'c', outputPath: absPath('/in/三/报告') },
+                { ...base, id: 'd', outputPath: absPath('/in/一/说明.docx') },
+                { ...base, id: 'e', outputPath: absPath('/in/二/说明.docx') },
             ],
         });
 
@@ -563,7 +581,7 @@ describe('planMigration', () => {
         const plan = planMigration({
             root: LIB_ROOT,
             monthOf: () => '2030-12',
-            records: [{ id: 'a', createdAt: '2026-03-01T00:00:00.000Z', outputPath: '/in/甲' }],
+            records: [{ id: 'a', createdAt: '2026-03-01T00:00:00.000Z', outputPath: absPath('/in/甲') }],
         });
 
         assert.equal(plan.moves[0].to, path.join(LIB_ROOT, '2030-12', '甲'));
