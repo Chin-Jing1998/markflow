@@ -86,7 +86,8 @@
         "en_US"
       ],
       "language": "2052",
-      "shortcutName": "MarkFlow"
+      "shortcutName": "MarkFlow",
+      "artifactName": "${productName}-Setup-${version}.${ext}"
     }
   },
   "keywords": [
