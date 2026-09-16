@@ -83,10 +83,11 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # --publish never 关掉 electron-builder 自带的发布器。它在有 GH_TOKEN 且当前为 tag 时会自行
+      # 上传一次，与下面的「上传至 Release」步骤构成两条发布路径：产物名含空格时两者的净化规则
+      # 不同（一个转连字符、一个转点号），同一个安装包会变成两份资产。发布统一交给下面那一步。
       - name: 构建 macOS 安装包
-        run: npm run build:mac
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run build:mac -- --publish never
 
       - name: 上传至 Release
         uses: softprops/action-gh-release@v2
@@ -117,10 +118,11 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # --publish never 关掉 electron-builder 自带的发布器。它在有 GH_TOKEN 且当前为 tag 时会自行
+      # 上传一次，与下面的「上传至 Release」步骤构成两条发布路径：产物名含空格时两者的净化规则
+      # 不同（一个转连字符、一个转点号），同一个安装包会变成两份资产。发布统一交给下面那一步。
       - name: 构建 Windows 安装包
-        run: npm run build:win
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run build:win -- --publish never
 
       - name: 上传至 Release
         uses: softprops/action-gh-release@v2
