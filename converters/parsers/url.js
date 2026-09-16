@@ -4,13 +4,17 @@
  * 流程：fetch-guard 抓页（SSRF 守卫 + 限长限时）→ cheerio 载入 → 标题提取
  *       → 正文提取（web/extract 的三级链路：站点选择器 → Readability → 旧兜底）
  *       → 噪声清洗（web/noise）→ 图片逐张经 fetch-guard 下载进 assets（失败记 warning
- *       并保留原 URL）→ 内联样式预处理 → turndown('url') → 文本规范化（web/normalize）
- *       → remark-parse + remark-gfm
+ *       并保留原 URL），同时记下显示尺寸（web/image-display → data-mf-display）
+ *       → 内联样式预处理（样式 → 语义标签、段首缩进 → INDENT 标记、合并相邻 <strong>）
+ *       → turndown('url') → collapseBreakMarkers（BR 标记折叠）→ 文本规范化（web/normalize）
+ *       → remark-parse + remark-gfm → liftInlineHtml → restoreMarkers → markCaptions
  *
  * 契约：
  *   - async parse({ url } | string, ctx) → MarkFlowDocument{ ir, assets, warnings, meta }
  *   - 不写盘、不打印；ctx.allowPrivateNetwork 透传给 fetch-guard（仅测试使用）
- *   - 成功下载的图片按文档顺序编号为 images/image_N.ext（N 从 1 起），与 assets 一一对应
+ *   - 成功下载的图片按文档顺序编号为 images/image_N.ext（N 从 1 起），与 assets 一一对应；
+ *     取得到显示尺寸的图片节点带 data.display（见 converters/ir/schema.js）
+ *   - 段首缩进进 paragraph.data.indent，图注进 paragraph.data.role；<br> 单个为硬换行、连续两个为分段
  *   - ctx.skipImages 为 true 时一张图都不下载：图片地址就地绝对化，清单挂在 data.images 上，
  *     assets 保持为空（供 MCP 的 extract_article 只读提取使用）
  *   - meta 除 title/sourceType/sourceName/sourceUrl/finalUrl 外，另含 extraction（实际命中的
@@ -21,12 +25,19 @@ const cheerio = require('cheerio');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
+const { MARKERS, indentMarker, stripMarkers, restoreMarkers } = require('../ir/markers');
+const { liftInlineHtml } = require('../ir/inline-html');
+const { markCaptions } = require('../ir/captions');
 const { fetchText, fetchBinary } = require('../net/fetch-guard');
 const { getExtFromContentType, getExtFromUrl } = require('../ir/util');
 const { extractContent, matchesHost } = require('../web/extract');
-const { cleanNoise } = require('../web/noise');
+const { cleanNoise, isAttached } = require('../web/noise');
 const { normalizeMarkdown } = require('../web/normalize');
 const { extractMetadata, countWords } = require('../web/metadata');
+const { displaySizeOf, formatDisplayAttr } = require('../web/image-display');
+const {
+    indentFromStyleChain, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS,
+} = require('../web/indent');
 const { notify, errText, hostnameOf } = require('../util');
 
 const DEFAULT_TITLE = '未命名文章';
@@ -47,6 +58,17 @@ const MIME_BY_EXT = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
     '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp',
 };
+// 段首缩进识别：遇到首个可见字符即停；「可见」不含 ASCII 空白、不换行空格与全角类空格
+const INDENT_SPACE_ONLY_RE = new RegExp(`^[${INDENT_SPACE_CLASS}]*$`);
+// JS 的 \s 含不换行空格与全角空格，据此判定「有可见文字」
+const VISIBLE_TEXT_RE = /[^\s]/;
+// 空 span 里须保留的空白：U+00A0 不换行空格、U+3000 全角空格（码点声明，源码不出现不可见字面量）
+const KEPT_SPACE_RE = new RegExp(`[${String.fromCharCode(0x00a0)}${String.fromCharCode(0x3000)}]`);
+// BR 标记折叠：一段连续的 BR（可夹空白与换行），不吞下一行行首的缩进
+const BREAK_RUN_RE = new RegExp(`[ \\t]*${MARKERS.BR}(?:[ \\t\\n]*${MARKERS.BR})*[ \\t]*\\n*`, 'g');
+const HEADING_LINE_RE = /^#{1,6}\s/;
+const LONE_IMG_LINE_RE = /^<img\b[^<>\n]*>[ \t]*$/;
+const FENCE_RE = /^\s{0,3}(```|~~~)/;
 
 /** @param {{ url: string }|string} input @param {{ sourceName?, allowPrivateNetwork?, skipImages?, onProgress? }} ctx */
 async function parse(input, ctx = {}) {
@@ -69,10 +91,11 @@ async function parse(input, ctx = {}) {
     const { html: processedHtml, images } = skipImages
         ? listImages(contentHtml, pageUrl)
         : { html: await collectImages(contentHtml, pageUrl, { allowPrivateNetwork, assets, warnings }), images: [] };
-    const markdown = normalizeMarkdown(buildMarkdown(preprocessHtml(processedHtml), title));
+    const markdown = normalizeMarkdown(isolateImageLines(collapseBreakMarkers(buildMarkdown(preprocessHtml(processedHtml), title))));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
-    const ir = unified().use(remarkParse).use(remarkGfm).parse(markdown);
+    const parsed = unified().use(remarkParse).use(remarkGfm).parse(markdown);
+    const ir = markCaptions(restoreMarkers(liftInlineHtml(parsed, { source: 'web' })));
     notify(ctx, 'parsing', PROGRESS_IR);
 
     return createDocument({
@@ -88,7 +111,7 @@ async function parse(input, ctx = {}) {
             finalUrl: pageUrl,
             fetchedAt,
             extraction: extracted.extraction,
-            wordCount: countWords(markdown),
+            wordCount: countWords(stripMarkers(markdown)),
         },
         assets,
         warnings,
@@ -161,9 +184,11 @@ function toDisplayUrl(raw, pageUrl) {
 /**
  * 图片收集：遍历正文中的 <img>，远程图片经 fetch-guard 下载，data URL 直接解码；
  * 成功者替换 src 为 images/image_N.ext 并推入 assets，失败者记 warning 并保留原 URL。
+ * 显示尺寸在改写 src 之前取得并写入 data-mf-display（下载成败都写）。
  */
 async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warnings }) {
     const $ = cheerio.load(html, null, false);
+    const host = hostnameOf(pageUrl);
     const candidates = [];
 
     $('img').each((_, el) => {
@@ -180,6 +205,7 @@ async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warni
 
     candidates.forEach((candidate, index) => {
         const result = results[index];
+        markDisplay(candidate.$img, host);
         // 懒加载属性已取值，清掉以免渲染端再度覆盖 src
         for (const attr of IMAGE_SRC_ATTRS) {
             if (attr !== 'src') candidate.$img.removeAttr(attr);
@@ -195,6 +221,12 @@ async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warni
     });
 
     return $.html();
+}
+
+function markDisplay($img, host) {
+    const display = displaySizeOf($img, host);
+    if (display) $img.attr('data-mf-display', formatDisplayAttr(display));
+    $img.removeAttr('data-mf-width');
 }
 
 function pickImageSource($img) {
@@ -265,7 +297,7 @@ async function mapWithConcurrency(items, limit, worker) {
     return results;
 }
 
-// ---------- HTML 预处理（源自 旧版 url.js:339-382）：内联样式 → 语义标签 ----------
+// ---------- HTML 预处理（源自 旧版 url.js:339-382）：内联样式 → 语义标签、段首缩进 → 标记 ----------
 
 const STYLE_TO_TAG_RULES = [
     { selector: 'span, b', re: BOLD_STYLE_RE, tag: 'strong' },
@@ -286,11 +318,88 @@ function preprocessHtml(html) {
         const dataSrc = $(el).attr('data-src');
         if (dataSrc && !$(el).attr('src')) $(el).attr('src', dataSrc);
     });
-    // 移除既无文本又无图片的空 span
-    $('span').each((_, el) => {
-        if (!$(el).text().trim() && !$(el).find('img').length) $(el).remove();
-    });
+    markIndents($);
+    mergeAdjacentStrong($);
+    tidyEmptySpans($);
     return $.html();
+}
+
+/**
+ * 叶子块的段首缩进 → INDENT 标记：有效 text-indent（继承自祖先亦算）与段首连续的不换行空格 / 全角空格
+ * 两者之和，原空白随之删除（留着的话 normalize 会把 NBSP 变成普通空格、remark 再当作缩进代码块或吞掉）
+ */
+function markIndents($) {
+    $(LEAF_BLOCK_SELECTOR).each((_, el) => {
+        if (!isAttached(el)) return;
+        const $el = $(el);
+        if ($el.find(NESTED_BLOCK_SELECTOR).length > 0) return;
+        if (!VISIBLE_TEXT_RE.test($el.text())) return;
+        const count = indentFromStyleChain(styleChainOf(el)) + takeLeadingSpaces(el);
+        if (count > 0) $el.prepend(indentMarker(count));
+    });
+}
+
+function styleChainOf(el) {
+    const styles = [];
+    for (let node = el; node && node.type === 'tag'; node = node.parent) styles.push((node.attribs && node.attribs.style) || '');
+    return styles;
+}
+
+// 删除段首的缩进空白并返回折算的字数；不构成缩进（不足两个可见空格）时不动文本、返回 0
+function takeLeadingSpaces(el) {
+    const texts = [];
+    collectLeadingTexts(el, texts);
+    const run = leadingIndentRun(texts.map((node) => node.data || '').join(''));
+    if (!run) return 0;
+    let remaining = run.length;
+    for (const node of texts) {
+        if (remaining <= 0) break;
+        const data = node.data || '';
+        const take = Math.min(remaining, data.length);
+        node.data = data.slice(take);
+        remaining -= take;
+    }
+    return run.count;
+}
+
+// 按文档序收集段首的文本节点，遇到首个含可见字符的文本、图片或换行即停
+function collectLeadingTexts(node, out) {
+    for (const child of node.children || []) {
+        if (child.type === 'text') {
+            out.push(child);
+            if (!INDENT_SPACE_ONLY_RE.test(child.data || '')) return true;
+            continue;
+        }
+        if (child.type === 'tag') {
+            if (child.name === 'img' || child.name === 'br') return true;
+            if (collectLeadingTexts(child, out)) return true;
+        }
+    }
+    return false;
+}
+
+// 微信把一句加粗拆成多个相邻 <strong>，直接相邻的并为一个，避免产出空的粗体边界
+function mergeAdjacentStrong($) {
+    $('strong').each((_, el) => {
+        if (!isAttached(el)) return;
+        for (let next = el.next; next && next.type === 'tag' && next.name === 'strong'; next = el.next) {
+            $(el).append($(next).contents());
+            $(next).remove();
+        }
+    });
+}
+
+// 空 span：含 <br> 的拆包保留换行；只含不换行空格或全角空格的保留；其余删除
+function tidyEmptySpans($) {
+    $('span').each((_, el) => {
+        if (!isAttached(el)) return;
+        const $el = $(el);
+        if ($el.find('img').length > 0) return;
+        const text = $el.text();
+        if (VISIBLE_TEXT_RE.test(text) || KEPT_SPACE_RE.test(text)) return;
+        if ($el.find('br').length > 0) $el.replaceWith($el.contents());
+        else $el.remove();
+    });
 }
 
 function buildMarkdown(html, title) {
@@ -301,6 +410,39 @@ function buildMarkdown(html, title) {
     return markdown.startsWith('# ') ? markdown : `# ${title}\n\n${markdown}`;
 }
 
+/**
+ * BR 标记折叠：连续两个及以上 → 分段（\n\n）；行首、行尾的 → 删除；单个 → 反斜杠硬换行（\ + 换行，
+ * 不依赖行尾两空格，normalize 去行尾空白也不受影响）；标题行内的单个 BR 换成空格（标题不能跨行）
+ */
+function collapseBreakMarkers(markdown) {
+    return String(markdown).replace(BREAK_RUN_RE, (run, offset, whole) => {
+        const count = run.split(MARKERS.BR).length - 1;
+        const newlines = run.replace(/[^\n]/g, '');
+        const lineStart = offset === 0 || whole[offset - 1] === '\n';
+        const lineEnd = newlines.length > 0 || offset + run.length >= whole.length;
+        if (lineStart || lineEnd) return newlines;
+        if (count >= 2) return '\n\n';
+        const lineHead = whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset);
+        return HEADING_LINE_RE.test(lineHead) ? ' ' : '\\\n';
+    });
+}
 
+/**
+ * 独占一行的 <img> 前后补空行：CommonMark 的 HTML 块会一直延续到空行，紧跟的正文行会被吞进
+ * html 节点而无法提升为图片（围栏代码块内不动）
+ */
+function isolateImageLines(markdown) {
+    const lines = String(markdown).split('\n');
+    const out = [];
+    let inFence = false;
+    lines.forEach((line, index) => {
+        if (FENCE_RE.test(line)) inFence = !inFence;
+        const lone = !inFence && LONE_IMG_LINE_RE.test(line);
+        if (lone && out.length > 0 && out[out.length - 1].trim() !== '') out.push('');
+        out.push(line);
+        if (lone && index + 1 < lines.length && lines[index + 1].trim() !== '') out.push('');
+    });
+    return out.join('\n');
+}
 
-module.exports = { parse };
+module.exports = { parse, collapseBreakMarkers };

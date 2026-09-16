@@ -2,9 +2,24 @@
  * MarkFlow 内部中间表示（IR）schema
  *
  * 主体复用 mdast（unified 生态的 Markdown AST），渲染时直接喂给 remark/rehype。
- * 为非线性内容（PPTX 幻灯片、XLSX 工作表）引入两个自定义扩展节点：
+ * 为非线性与非文本内容引入三个自定义扩展节点：
  *   - slideBreak    幻灯片分隔（MD/HTML → H2(title) + ---；DOCX/PDF → 分页 + 标题）
  *   - sheetSection  工作表段标记（MD/HTML → H1(name)；DOCX/PDF → 标题 + 表格内容）
+ *   - math          公式（docx 的 OMML 等）：{ type: 'math', data: { omml, mathml, text, display } }
+ *                   display=true 表示独立成段的公式，须放在块级位置；false 表示行内公式，须放在段落内。
+ *                   不支持公式的渲染器先经 degradeMath 把它降为线性化文本。
+ * 另有一个行内扩展节点 underline（下划线）：{ type: 'underline', children }，由 ir/inline-html 从 <u> 提升而来。
+ * downgradeCustomNodes 按普通容器原样递归保留它；md / html / docx / xml 各渲染器均有专门处理
+ * （<u>、u 元素、下划线 run、u 标记），新增渲染器须同样认识它。
+ *
+ * 节点 data 上的版面约定（解析器写入，渲染器读取）：
+ *   image.data.display   = { width, height?, unit: 'px' | '%', source }   显示尺寸，与原文档 / 原网页一致；
+ *                          source 为 'web' | 'docx' | 'pptx' | 'mineru' | 'html'（Markdown 输入的 <img>）。
+ *                          与栅格化用的像素尺寸 data.{width, height, dpi}（raster/rasterize-nodes 写入）分开存放
+ *   image.data.floating  = true   docx 浮动图（wp:anchor）；ir/captions 据此把它从文字中取出
+ *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
+ *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入
+ *   paragraph.data.role   = 'caption' | 'image_footnote'   图注 / 图片脚注；与图片靠「紧随其后」对应，不存图片名
  *
  * 顶层包装结构（MarkFlowDocument）：
  * {
@@ -14,6 +29,8 @@
  *   data: <格式特有数据快照，无则 null>,
  *   meta: { title?, sourceType, sourceName?, baseDir? },
  *   assets:   [{ name: 'images/image_1.png', buffer, mime }],
+ *   extras:   [{ name: '{name}_layout.json', buffer }],   // sidecar 附属文件：落盘时按 name（posix 相对路径）写入产物目录，
+ *                                                        // 其中的 {name} 占位符替换为产物名（见 converters/output.js）
  *   warnings: [string],
  * }
  *
@@ -23,7 +40,7 @@
 
 const SCHEMA_VERSION = 1;
 
-function createDocument({ kind = 'document', ir, data = null, meta = {}, assets = [], warnings = [] } = {}) {
+function createDocument({ kind = 'document', ir, data = null, meta = {}, assets = [], extras = [], warnings = [] } = {}) {
     return {
         schemaVersion: SCHEMA_VERSION,
         kind,
@@ -31,6 +48,7 @@ function createDocument({ kind = 'document', ir, data = null, meta = {}, assets 
         data,
         meta: { ...(meta || {}) },
         assets: Array.isArray(assets) ? assets : [],
+        extras: Array.isArray(extras) ? extras : [],
         warnings: Array.isArray(warnings) ? warnings : [],
     };
 }
@@ -53,6 +71,20 @@ const createTableCell = (children) => ({ type: 'tableCell', children: normalizeC
 // 自定义扩展节点
 const createSlideBreak = ({ title = '', index = 0, notes = '' } = {}) => ({ type: 'slideBreak', data: { title, index, notes } });
 const createSheetSection = ({ name = '', index = 0 } = {}) => ({ type: 'sheetSection', data: { name, index } });
+
+/**
+ * 公式节点：omml 为源 XML 片段，mathml 为转换结果，text 为线性化文本（降级用），三者均可缺省；
+ * display 标记块级公式。字符串以外的 omml/mathml 归一为 null。
+ */
+const createMath = ({ omml = null, mathml = null, text = '', display = false } = {}) => ({
+    type: 'math',
+    data: {
+        omml: typeof omml === 'string' && omml ? omml : null,
+        mathml: typeof mathml === 'string' && mathml ? mathml : null,
+        text: String(text == null ? '' : text),
+        display: Boolean(display),
+    },
+});
 
 // 容错：把字符串自动包装成 text 节点
 function normalizeChildren(children) {
@@ -80,6 +112,33 @@ function downgradeSection(data, depth, title) {
     return result;
 }
 
+/**
+ * 公式的线性化文本：优先取 data.text；没有时从 MathML 去标签后取纯文本作兜底；都没有返回空串。
+ */
+function mathToText(node) {
+    const data = node && node.data && typeof node.data === 'object' ? node.data : {};
+    const text = typeof data.text === 'string' ? data.text.trim() : '';
+    if (text) return text;
+    const mathml = typeof data.mathml === 'string' ? data.mathml : '';
+    return mathml.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 公式降级：把 math 节点替换为线性化文本——行内公式变 text 节点，块级公式（display=true）
+ * 变只含一个 text 节点的 paragraph。不修改入参，返回新树；供不支持公式的渲染器在喂给
+ * remark/rehype 前调用，与 downgradeCustomNodes 相互独立、可任意组合。
+ */
+function degradeMath(node) {
+    if (!node || typeof node !== 'object') return node;
+    if (Array.isArray(node)) return node.map(degradeMath);
+    if (node.type === 'math') {
+        const text = createText(mathToText(node));
+        return node.data && node.data.display ? createParagraph([text]) : text;
+    }
+    if (Array.isArray(node.children)) return { ...node, children: node.children.map(degradeMath) };
+    return node;
+}
+
 module.exports = {
     SCHEMA_VERSION,
     createDocument,
@@ -87,7 +146,7 @@ module.exports = {
     createRoot, createHeading, createParagraph, createText, createBlockquote,
     createThematicBreak, createTable, createTableRow, createTableCell,
     // 扩展节点
-    createSlideBreak, createSheetSection,
+    createSlideBreak, createSheetSection, createMath,
     // 工具
-    normalizeChildren, downgradeCustomNodes,
+    normalizeChildren, downgradeCustomNodes, mathToText, degradeMath,
 };

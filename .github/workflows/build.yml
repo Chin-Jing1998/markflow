@@ -1,13 +1,23 @@
-name: 测试
+name: 测试与发布
 
 on:
   push:
     branches: ['**']
+    tags:
+      - 'v*'
   pull_request:
+
+permissions:
+  contents: write
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: 测试（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -21,5 +31,101 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      - name: 运行测试
+      # 真实 Electron 用例在无法启动时自动跳过；装上 xvfb 提供虚拟显示，使其在 Linux 上真正执行
+      - name: 安装 xvfb（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      # npm ci 之后 node_modules/electron/dist 仍为空（postinstall 未落地二进制），
+      # 于是测试跑到一半才惰性下载：下载提示写进 stdout 破坏 --json 契约，Windows 上还会
+      # 让并行的用例崩溃。此处在跑测试前一次性装好，使下载时机确定、真实 Electron 用例真正执行。
+      - name: 安装 Electron 二进制
+        run: node node_modules/electron/install.js
+
+      # Electron 的 SUID 沙箱要求 chrome-sandbox 属主为 root 且置 setuid 位（4755）。
+      # 解包后该文件属主是 runner、权限 0755，渲染进程会以 [FATAL:setuid_sandbox_host.cc]
+      # 退出，错误经栅格工作进程的 stderr 混入 CLI 输出，使「--json 模式 stderr 仍为空」
+      # 一类用例失败。此处按 Electron 官方要求补齐权限；须在上一步装好二进制之后执行。
+      - name: 配置 Electron 沙箱权限（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+
+      - name: 运行测试（Linux，经 xvfb）
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm test
+
+      - name: 运行测试（macOS / Windows）
+        if: runner.os != 'Linux'
         run: npm test
+
+  build-mac:
+    name: 打包 macOS
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: macos-latest
+    env:
+      # 本期不做代码签名与公证：关掉 electron-builder 的钥匙串证书自动探测，避免在无证书的运行器上失败
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建 macOS 安装包
+        run: npm run build:mac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传至 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.dmg
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-win:
+    name: 打包 Windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建 Windows 安装包
+        run: npm run build:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传至 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

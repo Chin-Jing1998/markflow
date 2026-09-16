@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd">
+<?xml-stylesheet type="text/xsl" href="/dtdandxsl/showxml.xsl"?>
+<cn-application-body lang="zh" country="CN">
+  <cn-drawings>
+    <cn-drawing-p>
+      <p id="l0001" num="XXXX" Italic="0">图1</p>
+    </cn-drawing-p>
+    <figure id="f0001" num="1">
+      <img id="i0001" he="90" wi="120" file="drawing-1.jpg" img-format="jpg" img-content="drawing" inline="no" orientation="portrait"/>
+    </figure>
+    <pb pnum="1"/>
+    <cn-drawing-p>
+      <p id="l0002" num="XXXX" Italic="0">图2</p>
+    </cn-drawing-p>
+    <figure id="f0002" num="2" figure-labels="装置结构示意图">
+      <img id="i0002" he="72" wi="150" file="drawing-2.jpg" img-format="jpg" img-content="drawing" inline="no" orientation="landscape"/>
+    </figure>
+    <pb pnum="2"/>
+  </cn-drawings>
+</cn-application-body>

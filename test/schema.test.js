@@ -1,6 +1,7 @@
 /**
  * converters/ir/schema.js 单元测试
- * 覆盖：createDocument 默认值与透传、节点工厂、零引用工厂已删除、downgradeCustomNodes
+ * 覆盖：createDocument 默认值与透传（含 extras）、节点工厂、零引用工厂已删除、downgradeCustomNodes、
+ *       math 节点工厂与 mathToText / degradeMath 降级
  */
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
@@ -24,8 +25,9 @@ describe('createDocument', () => {
         assert.equal(doc.data, null);
         assert.deepEqual(doc.meta, {});
         assert.deepEqual(doc.assets, []);
+        assert.deepEqual(doc.extras, []);
         assert.deepEqual(doc.warnings, []);
-        assert.deepEqual(Object.keys(doc), ['schemaVersion', 'kind', 'ir', 'data', 'meta', 'assets', 'warnings']);
+        assert.deepEqual(Object.keys(doc), ['schemaVersion', 'kind', 'ir', 'data', 'meta', 'assets', 'extras', 'warnings']);
     });
 
     test('透传各字段，meta 为浅拷贝', () => {
@@ -33,6 +35,7 @@ describe('createDocument', () => {
         const meta = { title: 'T', sourceType: 'md', sourceName: 'a.md', baseDir: '/tmp' };
         const ir = { type: 'root', children: [{ type: 'paragraph', children: [] }] };
         const assets = [{ name: 'images/image_1.png', buffer: Buffer.alloc(1), mime: 'image/png' }];
+        const extras = [{ name: 'mineru/full.md', buffer: Buffer.alloc(1) }];
 
         // Act
         const doc = schema.createDocument({
@@ -41,6 +44,7 @@ describe('createDocument', () => {
             data: { sheets: 1 },
             meta,
             assets,
+            extras,
             warnings: ['提示'],
         });
 
@@ -51,12 +55,14 @@ describe('createDocument', () => {
         assert.deepEqual(doc.meta, meta);
         assert.notEqual(doc.meta, meta);
         assert.equal(doc.assets, assets);
+        assert.equal(doc.extras, extras);
         assert.deepEqual(doc.warnings, ['提示']);
     });
 
-    test('非数组的 assets/warnings 与空 meta 归一化', () => {
-        const doc = schema.createDocument({ assets: 'x', warnings: null, meta: null });
+    test('非数组的 assets/extras/warnings 与空 meta 归一化', () => {
+        const doc = schema.createDocument({ assets: 'x', extras: {}, warnings: null, meta: null });
         assert.deepEqual(doc.assets, []);
+        assert.deepEqual(doc.extras, []);
         assert.deepEqual(doc.warnings, []);
         assert.deepEqual(doc.meta, {});
     });
@@ -158,5 +164,56 @@ describe('downgradeCustomNodes', () => {
         assert.equal(JSON.stringify(ir), snapshot);
         assert.equal(out.children[0].children[0].type, 'heading');
         assert.equal(schema.downgradeCustomNodes(null), null);
+    });
+});
+
+// ============================================================
+// math 节点：createMath / mathToText / degradeMath
+// ============================================================
+
+describe('math 节点', () => {
+    test('createMath 默认值与归一：非字符串的 omml/mathml 归 null，display 转布尔', () => {
+        assert.deepEqual(schema.createMath(), { type: 'math', data: { omml: null, mathml: null, text: '', display: false } });
+        assert.deepEqual(
+            schema.createMath({ omml: '<m:oMath/>', mathml: '<math><mi>x</mi></math>', text: 'x', display: 1 }),
+            { type: 'math', data: { omml: '<m:oMath/>', mathml: '<math><mi>x</mi></math>', text: 'x', display: true } },
+        );
+        assert.deepEqual(schema.createMath({ omml: 42, mathml: '', text: null }).data, { omml: null, mathml: null, text: '', display: false });
+    });
+
+    test('mathToText 优先取 text，其次从 MathML 去标签取文本，都没有返回空串', () => {
+        assert.equal(schema.mathToText(schema.createMath({ text: ' a + b ', mathml: '<math><mi>z</mi></math>' })), 'a + b');
+        assert.equal(schema.mathToText(schema.createMath({ mathml: '<math>\n <mi>x</mi>\n <mo>=</mo>\n <mn>1</mn>\n</math>' })), 'x = 1');
+        assert.equal(schema.mathToText(schema.createMath()), '');
+        assert.equal(schema.mathToText(null), '');
+    });
+
+    test('degradeMath：行内公式降为 text，块级公式降为 paragraph，递归处理且不修改入参', () => {
+        // Arrange
+        const ir = schema.createRoot([
+            schema.createMath({ text: 'E = mc^2', display: true }),
+            schema.createParagraph(['前 ', schema.createMath({ text: 'x_1' }), ' 后']),
+            schema.createBlockquote([schema.createMath({ mathml: '<math><mi>y</mi></math>', display: true })]),
+            schema.createSlideBreak({ title: '页', index: 0 }),
+        ]);
+        const snapshot = JSON.stringify(ir);
+
+        // Act
+        const out = schema.degradeMath(ir);
+
+        // Assert
+        assert.equal(JSON.stringify(ir), snapshot);
+        assert.deepEqual(out.children[0], { type: 'paragraph', children: [{ type: 'text', value: 'E = mc^2' }] });
+        assert.deepEqual(out.children[1].children.map((n) => n.value), ['前 ', 'x_1', ' 后']);
+        assert.deepEqual(out.children[2].children[0], { type: 'paragraph', children: [{ type: 'text', value: 'y' }] });
+        assert.equal(out.children[3].type, 'slideBreak', '其它扩展节点原样保留');
+        assert.equal(schema.degradeMath(null), null);
+    });
+
+    test('downgradeCustomNodes 不触碰 math 节点，两者可任意组合', () => {
+        const ir = schema.createRoot([schema.createSheetSection({ name: 'S', index: 0 }), schema.createMath({ text: 'k', display: true })]);
+        const out = schema.degradeMath(schema.downgradeCustomNodes(ir));
+        assert.deepEqual(out.children.map((n) => n.type), ['heading', 'paragraph']);
+        assert.equal(schema.downgradeCustomNodes(ir).children[1].type, 'math');
     });
 });

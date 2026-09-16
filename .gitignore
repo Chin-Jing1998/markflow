@@ -18,3 +18,12 @@ Thumbs.db
 # 环境变量
 .env
 .env.local
+
+# 打包产物
+dist/
+
+# 其它 agent 的工作目录
+.codex/
+
+# 官方参考资料（国知局 Word 转 XML 编辑器解包件与手册，仅本机留存，不入库）
+.reference/

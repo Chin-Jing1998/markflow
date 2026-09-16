@@ -6,6 +6,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createTurndownService } = require('../converters/ir/turndown');
+const { MARKERS } = require('../converters/ir/markers');
 
 // 表格规则在 word 与 url 两个 profile 上都挂着，两者行为应一致
 const PROFILES_WITH_TABLE = ['word', 'url'];
@@ -66,4 +67,49 @@ test('单元格内的换行折叠为空格，竖线被转义', () => {
     // Assert
     assert.equal(lines[0], '| 甲 乙 | a\\|b |');
     assert.equal(lines[1], '| --- | --- |');
+});
+
+// ============================================================
+// url profile 的保真约定（与 ir/markers、ir/inline-html 配套）
+// ============================================================
+
+test('url profile：section 按块级分段（微信正文不再塌成一段），<br> 输出 BR 标记', () => {
+    // Act
+    const markdown = toMarkdown('<section><span>甲</span></section><section><section><span>乙<br>丙</span></section></section>', 'url');
+
+    // Assert
+    assert.equal(markdown, `甲\n\n乙${MARKERS.BR}丙`);
+});
+
+test('url profile：粗体、斜体、删除线输出 HTML 标签而非星号；含空行的块级粗体逐块包裹', () => {
+    // Act
+    const inline = toMarkdown('<p>依据<strong>《词典》</strong>的<em>斜</em><del>删</del><span style="font-weight:bold">样式粗</span></p>', 'url');
+    const block = toMarkdown('<section style="font-weight: bold"><p>甲</p><p>乙</p></section>', 'url');
+
+    // Assert
+    assert.equal(inline, '依据<strong>《词典》</strong>的<em>斜</em><del>删</del><strong>样式粗</strong>');
+    assert.equal(block, '<strong>甲</strong>\n\n<strong>乙</strong>');
+});
+
+test('url profile：图片后的小字 section 与 figcaption 输出 CAPTION 标记开头的独立段落', () => {
+    // Act
+    const wechat = toMarkdown('<section><img src="a.png"></section><section style="font-size: 12px;text-align: center"><span>图｜说明</span></section>', 'url');
+    const figure = toMarkdown('<figure><img src="b.png"><figcaption>图 1 甲</figcaption></figure>', 'url');
+    const notCaption = toMarkdown('<section><span>无图</span></section><section style="font-size: 12px"><span>小字但前面没有图</span></section>', 'url');
+
+    // Assert
+    assert.equal(wechat, `![](a.png)\n\n${MARKERS.CAPTION}图｜说明`);
+    assert.equal(figure, `![](b.png)\n\n${MARKERS.CAPTION}图 1 甲`);
+    assert.ok(!notCaption.includes(MARKERS.CAPTION), notCaption);
+});
+
+test('url profile：带 data-mf-display 的 img 输出 <img src alt width>（属性值转义、百分比、宽高）', () => {
+    assert.equal(toMarkdown('<img src="images/a.png" alt="甲&quot;乙" data-mf-display="677">', 'url'), '<img src="images/a.png" alt="甲&quot;乙" width="677">');
+    assert.equal(toMarkdown('<img src="a.png" data-mf-display="320x160">', 'url'), '<img src="a.png" width="320" height="160">');
+    assert.equal(toMarkdown('<img src="a.png" data-mf-display="50%">', 'url'), '<img src="a.png" width="50%">');
+    assert.equal(toMarkdown('<img src="a.png" data-mf-display="bad">', 'url'), '');
+});
+
+test('word profile 保留 <u>（mammoth 经 styleMap 产出），交 ir/inline-html 提升', () => {
+    assert.equal(toMarkdown('<p>前<u>下划线</u>后</p>', 'word'), '前<u>下划线</u>后');
 });

@@ -1,0 +1,40 @@
+/* academic：衬线正文（宋体优先），首行缩进、编号感强，适合论文与呈报稿 */
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--mf-font);
+  font-size: var(--mf-size);
+  line-height: var(--mf-lh);
+  max-width: var(--mf-width);
+  margin: 0 auto;
+  padding: 3rem 1.5rem 5rem;
+  background: #fdfdfb;
+  color: #1a1a1a;
+  text-align: justify;
+  overflow-wrap: break-word;
+}
+h1, h2, h3, h4, h5, h6 { line-height: 1.35; font-weight: 700; text-align: left; margin: calc(var(--mf-space) * 2.4) 0 var(--mf-space); }
+h1 { font-size: 1.9em; text-align: center; margin: 0 0 calc(var(--mf-space) * 2); }
+h2 { font-size: 1.4em; }
+h3 { font-size: 1.2em; }
+h4, h5, h6 { font-size: 1.05em; }
+p { margin: var(--mf-space) 0; text-indent: 2em; }
+blockquote p, li p, td p, th p { text-indent: 0; }
+ul, ol { margin: var(--mf-space) 0; padding-left: 2em; text-align: left; }
+li { margin: calc(var(--mf-space) * 0.35) 0; }
+img { max-width: 100%; height: auto; display: block; margin: calc(var(--mf-space) * 1.5) auto; }
+table { border-collapse: collapse; width: 100%; margin: calc(var(--mf-space) * 1.5) 0; font-size: 0.95em; }
+th, td { border-top: 1px solid #1a1a1a; border-bottom: 1px solid #1a1a1a; padding: 0.45em 0.7em; text-align: left; vertical-align: top; }
+th { border-bottom-width: 2px; font-weight: 700; }
+code, pre { font-family: var(--mf-mono); }
+code { background: #f0efe9; padding: 0.12em 0.35em; border-radius: 3px; font-size: 0.9em; }
+pre { background: #f0efe9; padding: 0.9em 1.1em; border: 1px solid #e0dfd6; overflow-x: auto; white-space: pre-wrap; word-break: break-all; text-indent: 0; text-align: left; }
+pre code { background: none; padding: 0; }
+blockquote { border-left: 3px solid #b8b6ab; margin: calc(var(--mf-space) * 1.5) 2em; padding: 0.2em 1em; color: #4a4a4a; }
+hr { border: none; border-top: 1px solid #b8b6ab; margin: calc(var(--mf-space) * 3) 0; }
+a { color: #1a3fa8; text-decoration: none; }
+a:hover { text-decoration: underline; }
+ul.contains-task-list { list-style: none; padding-left: 1.2em; }
+.task-list-item input[type="checkbox"] { margin-right: 0.4em; vertical-align: middle; }
+.mf-math { font-style: italic; }
+.mf-math-display { display: block; text-align: center; text-indent: 0; margin: calc(var(--mf-space) * 1.5) 0; }
+math { font-size: 1.05em; }

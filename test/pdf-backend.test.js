@@ -26,14 +26,8 @@ afterEach(() => {
 // 辅助
 // ============================================================
 
-function getElectronPath() {
-    try {
-        const mod = require('electron');
-        return typeof mod === 'string' && fs.existsSync(mod) ? mod : null;
-    } catch (err) {
-        return null;
-    }
-}
+// 与生产代码同一份解析：刻意不 require('electron')，否则二进制缺失时会当场下载并往 stdout 打印
+const { getElectronPath } = require('../converters/chromium/spawn');
 
 function isSpawnBlocked(err) {
     if (!err) return false;
@@ -264,4 +258,40 @@ test('backend 清理超过 1 天的 markflow-pdf-* 残留目录，保留新目�
         fs.rmSync(stale, { recursive: true, force: true });
         fs.rmSync(fresh, { recursive: true, force: true });
     }
+});
+
+test('进程内后端优先：注册后 detect 返回注册名、renderPdf 直接调用 render 并透传 print，注销后回退', async () => {
+    // Arrange：其余两级都不可用，只剩进程内后端
+    backend._setDeps({ electronPath: null, soffice: unavailableSoffice() });
+    const calls = [];
+    backend.registerInProcess({
+        name: 'in-process',
+        render: async ({ html, print }) => {
+            calls.push({ html, print });
+            return MOCK_PDF;
+        },
+    });
+
+    // Act
+    const detected = await backend.detect();
+    const pdf = await backend.renderPdf({ html: '<p>进程内</p>', print: { pageSize: 'Letter', landscape: true } });
+
+    // Assert
+    assert.deepEqual(detected, { name: 'in-process', available: true, hint: '' });
+    assert.deepEqual(pdf, MOCK_PDF);
+    assert.deepEqual(calls, [{ html: '<p>进程内</p>', print: { pageSize: 'Letter', landscape: true } }]);
+
+    // 返回非 PDF 时同样经 ensurePdf 拦截
+    backend.registerInProcess({ name: 'bad', render: async () => Buffer.from('not-pdf') });
+    await assert.rejects(() => backend.renderPdf({ html: '<p>x</p>' }), /PDF 后端 bad 返回的内容不是合法 PDF/);
+
+    // 注销后回退到（此处不可用的）常规探测
+    backend.unregisterInProcess();
+    const after = await backend.detect();
+    assert.equal(after.name, null);
+    assert.equal(after.available, false);
+
+    // 参数校验
+    assert.throws(() => backend.registerInProcess({ name: '  ', render: async () => MOCK_PDF }), /name/);
+    assert.throws(() => backend.registerInProcess({ name: 'x' }), /render/);
 });

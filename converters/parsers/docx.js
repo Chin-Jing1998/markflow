@@ -1,30 +1,71 @@
 /**
  * DOCX → IR
  *
- * 流程：mammoth（docx → HTML，图片经 convertImage 截获为 Buffer）
+ * 流程：读入 buffer → inspectOoxml（OOXML 预检信息）→ extractMath（OMML 换成哨兵 run）
+ *       → prepareLayout（首行缩进、制表符、题注换成标记 run，图片 alt 前写序号并记下显示尺寸）
+ *       → mammoth（docx → HTML，图片经 convertImage 截获为 Buffer，下划线经 styleMap 'u => u' 保留）
  *       → turndown('word')（HTML → Markdown）→ remark-parse + remark-gfm（Markdown → mdast）
+ *       → restoreMath（哨兵换回 math 节点）→ liftInlineHtml（<u> 等 → 节点）→ applyDisplay（显示尺寸写回图片）
+ *       → restoreMarkers（标记 → data.indent / data.role / \t）→ markCaptions（大图拆段、图注定角色）
  *
  * 契约：
- *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, assets, warnings, meta }
- *   - 不写盘、不打印：mammoth 警告与图片读取失败一律推入 warnings
- *   - 图片按出现顺序编号为 images/image_N.ext（N 从 1 起），IR 中 image 节点 url 与 assets 一一对应
- *   - 标题取首个 <h1> 文本，否则取去扩展名的文件名
+ *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, data, assets, warnings, meta }
+ *   - 不写盘、不打印：mammoth 警告、图片读取失败、预检与公式抽取异常一律推入 warnings
+ *   - 图片按出现顺序编号为 images/image_N.ext（N 从 1 起），IR 中 image 节点 url 与 assets 一一对应；
+ *     取得到 wp:extent / VML 尺寸的图片带 data.display（px），浮动图另带 data.floating
+ *   - 标题取首个有文字的 Title 样式段（不带编号的在正文中仍为普通段落，带编号的与同一编号定义下的普通段同为列表项），
+ *     其次首个 <h1> 文本，否则取去扩展名的文件名
+ *   - data.ooxml 为 OOXML 预检信息（采集失败时为 null），meta.sourcePath 为源文件绝对路径
+ *   - meta.author 取 docProps/core.xml 的 dc:creator，经 ir/util.normalizeAuthor 归一（去首尾空白、滤掉占位名）；
+ *     为空、缺失或是占位名时不设该键，front matter 随之不写 author 行
+ *   - 公式一律进 IR 的 math 节点；options.math='text' 的降级由渲染器负责，解析层不降级
+ *   - 段落文本本身不带全角缩进（由 md 渲染器按 data.indent 插入），专利 XML 等下游不受影响
  */
 const path = require('path');
+const fsp = require('fs/promises');
 const mammoth = require('mammoth');
+const JSZip = require('jszip');
+const cheerio = require('cheerio');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
 const { createTurndownService } = require('../ir/turndown');
-const { stripExt, getExtFromContentType } = require('../ir/util');
+const { liftInlineHtml } = require('../ir/inline-html');
+const { MARKERS, restoreMarkers, stripMarkers } = require('../ir/markers');
+const { markCaptions } = require('../ir/captions');
+const { stripExt, getExtFromContentType, normalizeAuthor } = require('../ir/util');
 const { notify, errText } = require('../util');
+const { inspectOoxml } = require('./docx-ooxml');
+const { extractMath, restoreMath } = require('./docx-math');
+const { prepareLayout, parseImageMarker } = require('./docx-layout');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
+// 作者等核心属性所在的 OOXML 部件
+const CORE_PROPS_PATH = 'docProps/core.xml';
+// mammoth 默认丢弃下划线；映射为 <u> 后由 turndown 的 word profile 保留、ir/inline-html 提升为 underline。
+// mammoth 默认样式表不认 Title（封面题名常用此样式而非标题 1），标成带类名的普通段落供 extractTitle 采信；
+// turndown 不理会类名，正文输出不变。style-name 按样式名匹配（不分大小写），与样式 ID（中文版 Word 为 a4 等）无关
+const TITLE_CLASS = 'mf-title';
+// 带编号的 Title 段按默认列表映射的同一路径输出为列表项：自定义映射排在默认映射之前、先匹配者生效，须先于普通 Title 映射截住。
+// 层级 1–5 与 mammoth 默认样式表（lib/options-reader.js）一致，超出者与普通编号段一样不成列表，仍走普通 Title 映射。
+// 类名放在 li 内的 span 上而非 li 本身：li 带属性后与其后下级编号段路径中的 li 属性不同，mammoth 不再合并，
+// 下级列表会另起一个空列表项、打乱后续编号；span 由 turndown 按内容输出，md 中不留痕迹
+const LIST_LEVELS = Object.freeze([1, 2, 3, 4, 5]);
+const titleListItemPath = (listTag, level) => `${'ul|ol > li > '.repeat(level - 1)}${listTag} > li:fresh > span.${TITLE_CLASS}`;
+const TITLE_LIST_MAP = LIST_LEVELS.flatMap((level) => [
+    `p[style-name='Title']:ordered-list(${level}) => ${titleListItemPath('ol', level)}`,
+    `p[style-name='Title']:unordered-list(${level}) => ${titleListItemPath('ul', level)}`,
+]);
+const STYLE_MAP = Object.freeze(['u => u', ...TITLE_LIST_MAP, `p[style-name='Title'] => p.${TITLE_CLASS}:fresh`]);
 // 残留在 HTML 里的 base64 内嵌图片（正常情况下 convertImage 已截获全部图片，此处兜底）
 const INLINE_BASE64_IMG_RE = /<img\b[^>]*?\bsrc="data:image\/([a-z0-9.+-]+);base64,([^"]*)"[^>]*>/gi;
 // 游离在标签之外的 base64 图片文本
 const STRAY_BASE64_RE = /data:image\/[^;]+;base64,[A-Za-z0-9+/=]{50,}/g;
 const H1_RE = /<h1[^>]*>([\s\S]*?)<\/h1>/i;
+// Title 样式段的文字：不带编号的在 <p class> 内，带编号的在列表项的 <span class> 内（见 STYLE_MAP）
+const TITLE_P_RE = new RegExp(`<(p|span) class="${TITLE_CLASS}">([\\s\\S]*?)</\\1>`, 'g');
+// 标题文字里连续的 TAB 标记（如「第一章<Tab>总则」）换成一个空格，避免与相邻文字粘连；其余标记仍整段删除
+const TITLE_TAB_RE = new RegExp(`${MARKERS.TAB}+`, 'g');
 // 进度百分比：parser 只报 parsing 阶段，三个节点单调递增且不超过 55（其后由调度器接管）
 const PROGRESS_READ = 20;
 const PROGRESS_ASSETS = 40;
@@ -42,25 +83,81 @@ async function parse(input, ctx = {}) {
     const warnings = [];
 
     notify(ctx, 'parsing', PROGRESS_READ);
-    const rawHtml = await convertWithMammoth(source, assets, warnings);
+    const original = source.buffer || await fsp.readFile(source.path);
+    const ooxml = await inspectSafely(original, warnings);
+    const { buffer, formulas } = await extractSafely(original, warnings);
+    const layout = await layoutSafely(buffer, warnings);
+
+    const displayByAsset = new Map();
+    const rawHtml = await convertWithMammoth({ buffer: layout.buffer }, { assets, warnings, displays: layout.displays, displayByAsset });
     const html = collectInlineBase64Images(rawHtml, assets, warnings);
     notify(ctx, 'parsing', PROGRESS_ASSETS);
 
-    const title = extractTitle(html) || stripExt(sourceName);
+    const title = titleText(html) || stripExt(sourceName);
     const markdown = cleanupMarkdown(createTurndownService('word').turndown(html));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
-    const ir = unified().use(remarkParse).use(remarkGfm).parse(markdown);
+    const parsed = unified().use(remarkParse).use(remarkGfm).parse(markdown);
+    const restored = restoreMath(parsed, formulas);
+    warnings.push(...restored.warnings);
+    const lifted = applyDisplay(liftInlineHtml(restored.ir, { source: 'docx' }), displayByAsset);
+    const ir = markCaptions(restoreMarkers(lifted));
     notify(ctx, 'parsing', PROGRESS_IR);
 
+    const author = await readCoreCreator(original);
     return createDocument({
         kind: 'document',
         ir,
-        data: null,
-        meta: { title, sourceType: 'docx', sourceName },
+        data: ooxml ? { ooxml } : null,
+        // 作者为空时不设该键：meta 与 front matter 均与引入作者之前逐字节一致
+        meta: { title, ...(author ? { author } : {}), sourceType: 'docx', sourceName, sourcePath: source.path || null },
         assets,
         warnings,
     });
+}
+
+// docProps/core.xml 的 dc:creator（XML 实体经 cheerio 还原，再经 normalizeAuthor 去空白并滤掉占位名）。
+// 作者是可选元数据：core.xml 缺失、字段为空、是占位名或读取失败一律按无作者处理，不记 warning
+// （包体本身损坏时 mammoth 自会报错）
+async function readCoreCreator(buffer) {
+    try {
+        const zip = await JSZip.loadAsync(buffer);
+        const core = zip.file(CORE_PROPS_PATH);
+        if (!core) return '';
+        return normalizeAuthor(cheerio.load(await core.async('text'), { xmlMode: true })('dc\\:creator').first().text());
+    } catch (err) {
+        return '';
+    }
+}
+
+// 预检信息采集失败不阻断解析，只记 warning
+async function inspectSafely(buffer, warnings) {
+    try {
+        return await inspectOoxml(buffer);
+    } catch (err) {
+        warnings.push(`OOXML 预检信息采集失败，已跳过（${errText(err)}）`);
+        return null;
+    }
+}
+
+// 公式抽取失败时按无公式继续，交由 mammoth 决定后续成败
+async function extractSafely(buffer, warnings) {
+    try {
+        return await extractMath(buffer);
+    } catch (err) {
+        warnings.push(`公式抽取失败，已按无公式处理（${errText(err)}）`);
+        return { buffer, formulas: [] };
+    }
+}
+
+// 版面预处理失败时按原样交给 mammoth：缩进、制表符与图片尺寸缺失，但正文不受影响
+async function layoutSafely(buffer, warnings) {
+    try {
+        return await prepareLayout(buffer);
+    } catch (err) {
+        warnings.push(`版面信息（缩进、制表符、题注、图片尺寸）读取失败，已按原样转换（${errText(err)}）`);
+        return { buffer, displays: new Map() };
+    }
 }
 
 function resolveSource(input) {
@@ -71,21 +168,29 @@ function resolveSource(input) {
 
 // ---------- mammoth 转换 ----------
 
-async function convertWithMammoth(source, assets, warnings) {
+/**
+ * 图片 alt 里的序号标记（docx-layout 写入）在此取出并还原原 alt，据此把显示尺寸登记到资产名上
+ */
+async function convertWithMammoth(source, { assets, warnings, displays, displayByAsset }) {
     const options = {
+        styleMap: [...STYLE_MAP],
         convertImage: mammoth.images.imgElement(async (image) => {
+            const { index, alt } = parseImageMarker(image.altText);
             let buffer;
             try {
                 buffer = await image.readAsBuffer();
             } catch (err) {
                 warnings.push(`图片读取失败，已跳过（${errText(err)}）`);
-                return { src: '' };
+                return { src: '', alt };
             }
             if (!buffer || buffer.length === 0) {
                 warnings.push('遇到空图片，已跳过');
-                return { src: '' };
+                return { src: '', alt };
             }
-            return { src: pushAsset(assets, buffer, image.contentType) };
+            const name = pushAsset(assets, buffer, image.contentType);
+            const display = index === null ? null : displays.get(index);
+            if (display && display.width >= 1) displayByAsset.set(name, display);
+            return { src: name, alt };
         }),
     };
 
@@ -109,6 +214,27 @@ function normalizeMime(contentType) {
     return mime === 'image/jpg' ? 'image/jpeg' : mime;
 }
 
+// ---------- IR 后处理 ----------
+
+// 资产名 → 显示尺寸，写回 image 节点的 data.display（px）；浮动图另记 data.floating。不改动入参
+function applyDisplay(node, displayByAsset) {
+    if (!node || typeof node !== 'object' || displayByAsset.size === 0) return node;
+    if (node.type === 'image') {
+        const size = displayByAsset.get(node.url);
+        if (!size) return node;
+        const display = { width: size.width };
+        if (size.height >= 1) display.height = size.height;
+        display.unit = 'px';
+        display.source = 'docx';
+        const data = { ...(node.data || {}), display };
+        if (size.floating) data.floating = true;
+        return { ...node, data };
+    }
+    if (!Array.isArray(node.children)) return node;
+    const children = node.children.map((child) => applyDisplay(child, displayByAsset));
+    return children.some((child, i) => child !== node.children[i]) ? { ...node, children } : node;
+}
+
 // ---------- HTML 后处理 ----------
 
 // 把残留的 base64 内嵌图片收进 assets，并清掉游离的 base64 文本
@@ -126,10 +252,24 @@ function collectInlineBase64Images(html, assets, warnings) {
         .replace(STRAY_BASE64_RE, '');
 }
 
+// 标题最终文本：TAB 标记（连续多个算一处）换成一个空格，其余标记删除，折叠空白后掐头去尾
+function titleText(html) {
+    const withSpaces = extractTitle(html).replace(TITLE_TAB_RE, ' ');
+    return stripMarkers(withSpaces).replace(/\s+/g, ' ').trim();
+}
+
+// Title 样式段中首个有文字的优先（只含版面标记的不算），其次首个 <h1>
 function extractTitle(html) {
+    for (const matched of html.matchAll(TITLE_P_RE)) {
+        const text = htmlText(matched[2]);
+        if (stripMarkers(text).trim()) return text;
+    }
     const matched = H1_RE.exec(html);
-    if (!matched) return '';
-    const text = matched[1].replace(/<[^>]+>/g, '')
+    return matched ? htmlText(matched[1]) : '';
+}
+
+function htmlText(inner) {
+    const text = inner.replace(/<[^>]+>/g, '')
         .replace(/&(?:amp|lt|gt|quot|#39|nbsp);/g, (entity) => HTML_ENTITIES[entity] || entity);
     return text.replace(/\s+/g, ' ').trim();
 }
@@ -143,7 +283,5 @@ function cleanupMarkdown(markdown) {
         .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
-
-
 
 module.exports = { parse };

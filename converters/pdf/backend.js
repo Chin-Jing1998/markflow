@@ -1,30 +1,34 @@
 /**
- * PDF 出图后端（两级回退）：把 HTML（必要时改用 DOCX）渲染为 PDF Buffer，
- * 按运行环境依次尝试 BACKENDS 候选表：
+ * PDF 出图后端（三级回退）：把 HTML（必要时改用 DOCX）渲染为 PDF Buffer，
+ * 按运行环境依次尝试候选表：
+ *   ⓪ 进程内后端     —— 桌面端主进程经 registerInProcess({ name, render }) 注册（自身即 Electron，
+ *                        隐藏窗口 printToPDF），注册后 detect / renderPdf 一律优先取用，name 原样返回；
  *   ① electron-worker —— 项目内装有 electron 二进制，spawn 独立 Electron 无界面运行
  *                        converters/pdf/electron-worker.js 打印（串行排队，超时 60s）；
  *   ② soffice         —— 本机装有 LibreOffice，先由 getDocxBuffer 生成 DOCX，再 soffice 转 PDF；
- *   ③ 二者皆无        —— 抛中文错误并附安装/使用提示。
- * 探测结果缓存：成功永久缓存，失败缓存 60s 后可重探；detect({ force:true }) 强制重探。
+ *   ③ 三者皆无        —— 抛中文错误并附安装/使用提示。
+ * 子进程的 env 清洗、超时 SIGKILL 与 stderr 摘要统一由 converters/chromium/spawn.js 提供。
+ * 探测结果缓存：成功永久缓存，失败缓存 60s 后可重探；detect({ force:true }) 强制重探；
+ * 注册 / 注销进程内后端即清空缓存。
  * 模块加载时异步清理 os.tmpdir() 下修改时间超过 1 天的 markflow-pdf-* 残留目录
  * （上次异常退出遗留的工作目录，正常路径已在 finally 中清理）。
- * 依赖可经 _setDeps 注入以便测试，_reset 恢复真实实现并清空缓存。
+ * 依赖可经 _setDeps 注入以便测试，_reset 恢复真实实现并清空缓存与进程内注册。
  */
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const tmp = require('../tmp');
-const { spawn } = require('child_process');
+const { spawnElectron, assertExitOk, getElectronPath } = require('../chromium/spawn');
 
 const WORKER_TIMEOUT_MS = 60000;
+const WORKER_LABEL = 'Electron PDF 工作进程';
 const DETECT_FAILURE_TTL_MS = 60000;
 const TEMP_PREFIX = 'markflow-pdf-';
-const STDERR_KEEP_LIMIT = 4096;
-const STDERR_EXCERPT_LIMIT = 500;
 const PDF_MAGIC = '%PDF';
 const WORKER_SCRIPT = path.join(__dirname, 'electron-worker.js');
 
 let overrides = {};
+let inProcess = null;
 let detectCache = null;
 let detectFailedAt = 0;
 let workerQueue = Promise.resolve();
@@ -36,19 +40,13 @@ const attempt = (fn) => { try { return fn(); } catch (err) { return null; } };
 // ---- 依赖装载（可被 _setDeps 覆盖）与探测 ----
 
 const getSoffice = () => ('soffice' in overrides ? overrides.soffice : attempt(() => require('../soffice')));
-const getSpawn = () => (typeof overrides.spawn === 'function' ? overrides.spawn : spawn);
 const getWorkerScript = () => overrides.workerScript || WORKER_SCRIPT;
 const getWorkerTimeoutMs = () => (Number(overrides.workerTimeoutMs) > 0 ? Number(overrides.workerTimeoutMs) : WORKER_TIMEOUT_MS);
 
-/** 普通 Node 进程里 require('electron') 得到的是 electron 可执行文件的路径字符串 */
-function getElectronPath() {
-    if ('electronPath' in overrides) return overrides.electronPath;
-    const mod = attempt(() => require('electron'));
-    return typeof mod === 'string' && mod ? mod : null;
-}
-
+/** electron 二进制路径：测试可经 _setDeps({ electronPath }) 注入；文件不存在视同未安装 */
 function findElectronBinary() {
-    const electronPath = getElectronPath();
+    if (!('electronPath' in overrides)) return getElectronPath();
+    const electronPath = overrides.electronPath;
     if (typeof electronPath !== 'string' || !electronPath) return null;
     return attempt(() => (fs.existsSync(electronPath) ? electronPath : null));
 }
@@ -59,14 +57,27 @@ async function isSofficeAvailable() {
     try { return !!(await soffice.isAvailable()); } catch (err) { return false; }
 }
 
-/** 后端候选表：check 为真的首个候选胜出，其 run(html, { getDocxBuffer }) 负责出图 */
+/** 后端候选表：check 为真的首个候选胜出，其 run(html, { getDocxBuffer, print }) 负责出图 */
 const BACKENDS = [
-    { name: 'electron-worker', check: () => !!findElectronBinary(), run: (html) => renderViaWorker(html, findElectronBinary()) },
+    {
+        name: 'electron-worker',
+        check: () => !!findElectronBinary(),
+        run: (html, opts) => renderViaWorker(html, findElectronBinary(), opts.print),
+    },
     { name: 'soffice', check: () => isSofficeAvailable(), run: (html, opts) => renderViaSoffice(opts.getDocxBuffer) },
 ];
 
+/** 进程内后端排在候选表最前；未注册时为 null */
+function inProcessCandidate() {
+    if (!inProcess) return null;
+    const { name, render } = inProcess;
+    return { name, check: () => true, run: (html, opts) => render({ html, print: opts.print }) };
+}
+
 async function pickBackend() {
-    for (const backend of BACKENDS) if (await backend.check()) return backend;
+    for (const backend of [inProcessCandidate(), ...BACKENDS]) {
+        if (backend && await backend.check()) return backend;
+    }
     return null;
 }
 
@@ -82,7 +93,8 @@ function buildHint() {
 
 /**
  * 探测可用后端（结果缓存）
- * @returns {Promise<{ name: 'electron-worker'|'soffice'|null, available: boolean, hint: string }>}
+ * @returns {Promise<{ name: string|null, available: boolean, hint: string }>}
+ *   name 为进程内后端的注册名、'electron-worker' 或 'soffice'；皆不可用时为 null
  */
 async function detect({ force = false } = {}) {
     if (!force && detectCache && (detectCache.available || Date.now() - detectFailedAt < DETECT_FAILURE_TTL_MS)) {
@@ -94,13 +106,41 @@ async function detect({ force = false } = {}) {
     return detectCache;
 }
 
+/**
+ * 注册进程内后端（桌面端主进程启动时调用）：render({ html, print }) → Promise<Buffer>，返回值须为合法 PDF。
+ * 重复注册以最后一次为准；注册即清空探测缓存。
+ */
+function registerInProcess({ name, render } = {}) {
+    if (typeof name !== 'string' || !name.trim()) throw new Error('registerInProcess 需要非空的后端名 name');
+    if (typeof render !== 'function') throw new Error('registerInProcess 需要 render({ html, print }) 函数');
+    inProcess = { name: name.trim(), render };
+    clearDetectCache();
+}
 
-/** @param {{ html: string, getDocxBuffer?: () => Promise<Buffer> }} params @returns {Promise<Buffer>} */
-async function renderPdf({ html, getDocxBuffer } = {}) {
+function unregisterInProcess() {
+    inProcess = null;
+    clearDetectCache();
+}
+
+function clearDetectCache() {
+    detectCache = null;
+    detectFailedAt = 0;
+}
+
+/**
+ * @param {{
+ *   html: string,
+ *   getDocxBuffer?: () => Promise<Buffer>,
+ *   print?: { pageSize?: 'A4'|'Letter', landscape?: boolean, margins?: { top, bottom, left, right } },
+ * }} params
+ * print 为打印参数（页边距单位英寸），省略时工作进程沿用其内置默认；soffice 后端不支持该参数。
+ * @returns {Promise<Buffer>}
+ */
+async function renderPdf({ html, getDocxBuffer, print } = {}) {
     if (typeof html !== 'string') throw new Error('renderPdf 需要 html 字符串');
     const hit = await pickBackend();
     if (!hit) throw new Error(`PDF 输出不可用：未找到可用的渲染后端。${buildHint()}`);
-    return ensurePdf(await hit.run(html, { getDocxBuffer }), hit.name);
+    return ensurePdf(await hit.run(html, { getDocxBuffer, print }), hit.name);
 }
 
 /** 不足 4 字节时截取结果必然短于 %PDF，同样判为非法 */
@@ -115,75 +155,33 @@ function ensurePdf(output, backendName) {
 // ---- ① 独立 Electron 工作进程 ----
 
 /** 串行排队：Electron 实例开销大，同一时刻只跑一个工作进程 */
-function renderViaWorker(html, electronPath) {
-    const task = () => runWorker(html, electronPath);
+function renderViaWorker(html, electronPath, print) {
+    const task = () => runWorker(html, electronPath, print);
     const run = workerQueue.then(task, task);
     workerQueue = run.then(noop, noop);
     return run;
 }
 
-async function runWorker(html, electronPath) {
+/** 打印参数以 JSON 落在工作目录内，路径作为第五个位置参数传给工作进程；省略时参数表与 v2 完全一致 */
+async function runWorker(html, electronPath, print) {
     const tmpDir = await tmp.makeTempDir(`${TEMP_PREFIX}worker-`);
     const inPath = path.join(tmpDir, 'index.html');
     const outPath = path.join(tmpDir, 'output.pdf');
     try {
         await fsp.writeFile(inPath, html, 'utf8');
-        await spawnWorker(electronPath, [getWorkerScript(), inPath, outPath, path.join(tmpDir, 'profile')]);
+        const args = [getWorkerScript(), inPath, outPath, path.join(tmpDir, 'profile')];
+        if (print && typeof print === 'object') {
+            const printPath = path.join(tmpDir, 'print.json');
+            await fsp.writeFile(printPath, JSON.stringify(print), 'utf8');
+            args.push(printPath);
+        }
+        const result = await spawnElectron(electronPath, args, { timeoutMs: getWorkerTimeoutMs(), spawn: overrides.spawn });
+        assertExitOk(result, WORKER_LABEL);
         return await fsp.readFile(outPath);
     } finally {
         await tmp.removeTempDir(tmpDir);
     }
 }
-
-function spawnWorker(electronPath, args) {
-    return new Promise((resolve, reject) => {
-        // 继承 ELECTRON_RUN_AS_NODE 会让子进程退化为纯 Node，必须剔除
-        const env = { ...process.env };
-        delete env.ELECTRON_RUN_AS_NODE;
-        let child;
-        try {
-            child = getSpawn()(electronPath, args, { env, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
-        } catch (err) {
-            reject(wrapSpawnError(err));
-            return;
-        }
-
-        let stderr = '';
-        let settled = false;
-        const timeoutMs = getWorkerTimeoutMs();
-        const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); };
-        const timer = setTimeout(() => {
-            attempt(() => child.kill('SIGKILL')); // 进程可能已退出
-            finish(reject, new Error(`Electron PDF 工作进程超时（${Math.round(timeoutMs / 1000)}s），已强制结束`));
-        }, timeoutMs);
-
-        if (child.stderr) {
-            child.stderr.on('data', (chunk) => { if (stderr.length < STDERR_KEEP_LIMIT) stderr += String(chunk); });
-        }
-        child.on('error', (err) => finish(reject, wrapSpawnError(err)));
-        child.on('exit', (code, signal) => {
-            if (code === 0) return finish(resolve);
-            const signalText = signal ? `, signal=${signal}` : '';
-            // 完整 stderr（含调用栈与绝对路径）只进日志，用户可见文案取脱敏后的首行
-            if (stderr) console.error('Electron PDF 工作进程 stderr：', stderr);
-            const detail = excerpt(stderr) || '无 stderr 输出';
-            return finish(reject, new Error(`Electron PDF 工作进程退出异常（code=${code}${signalText}）：${detail}`));
-        });
-    });
-}
-
-function wrapSpawnError(err) {
-    const wrapped = new Error(`无法启动 Electron PDF 工作进程：${err && err.message ? err.message : err}`);
-    wrapped.code = 'ELECTRON_SPAWN_FAILED';
-    wrapped.cause = err;
-    return wrapped;
-}
-
-/**
- * 用户可见的 stderr 摘要：只取首行并把绝对路径替换为 <path>。
- * 首行之后通常是调用栈，既无助于用户排障，又会把项目目录结构暴露到界面与日志导出中。
- */
-const excerpt = (text) => tmp.excerpt(text, { limit: STDERR_EXCERPT_LIMIT, firstLineOnly: true, redactPaths: true });
 
 // ---- ② LibreOffice：DOCX → PDF ----
 
@@ -212,19 +210,18 @@ cleanupStaleTempDirs().catch(noop);
 /** 覆盖依赖：{ electronPath, soffice, spawn, workerScript, workerTimeoutMs }；传入后清空探测缓存 */
 function _setDeps(next = {}) {
     overrides = { ...overrides, ...next };
-    detectCache = null;
-    detectFailedAt = 0;
+    clearDetectCache();
 }
 
-/** 恢复真实依赖并清空缓存与队列 */
+/** 恢复真实依赖并清空缓存、队列与进程内注册 */
 function _reset() {
     overrides = {};
-    detectCache = null;
-    detectFailedAt = 0;
+    inProcess = null;
+    clearDetectCache();
     workerQueue = Promise.resolve();
 }
 
 module.exports = {
-    detect, renderPdf,
+    detect, renderPdf, registerInProcess, unregisterInProcess,
     _setDeps, _reset, _cleanupStaleTempDirs: cleanupStaleTempDirs,
 };

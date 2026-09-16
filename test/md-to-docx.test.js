@@ -1,7 +1,8 @@
 /**
  * converters/renderers/docx.js 单元测试
  * 覆盖：GFM 表格/删除线/任务列表、超链接、图片内嵌与降级、引用块、代码块、HTML 去标签、
- *       未知节点降级、CJK 默认字体、图片宽度缩放、空文档
+ *       未知节点降级、CJK 默认字体、图片宽度缩放、空文档、
+ *       options.docx 的纸张/页边距/字号/中西文字体透传、math 节点降级为线性化文本
  * IR 直接由 unified + remark-parse + remark-gfm 从内联 Markdown 构造，不依赖 parsers/md.js。
  */
 const { test } = require('node:test');
@@ -11,6 +12,8 @@ const JSZip = require('jszip');
 
 const { loadUnified } = require('../converters/ir/unified-loader');
 const docxRenderer = require('../converters/renderers/docx');
+const { normalizeOptions } = require('../converters/options');
+const { createMath } = require('../converters/ir/schema');
 
 // ============================================================
 // 测试夹具：手工生成合法 PNG（避免引入二进制测试资源）
@@ -292,4 +295,95 @@ test('slideBreak/sheetSection 自定义节点降级后可渲染，空文档亦�
     assert.ok(documentXml.includes('第二页'));
     assert.ok(documentXml.includes('Heading2'));
     assert.equal(empty.subarray(0, 2).toString('latin1'), 'PK');
+});
+
+test('options.docx 透传：纸张与页边距落到 sectPr，字号与中西文字体落到默认样式', async () => {
+    // Arrange
+    const ir = await parseMarkdown('正文\n');
+    const options = normalizeOptions({
+        docx: {
+            pageSize: 'Letter',
+            fontSize: 14,
+            fontFamily: { ascii: 'Times New Roman', eastAsia: '宋体' },
+            margins: { top: 0.5, bottom: 0.5, left: 1.25, right: 1.25 },
+        },
+    });
+
+    // Act
+    const { documentXml, stylesXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir), options));
+
+    // Assert：Letter = 12240×15840 twip，0.5in = 720 twip，1.25in = 1800 twip
+    assert.match(documentXml, /<w:pgSz w:w="12240" w:h="15840"/);
+    assert.match(documentXml, /<w:pgMar[^>]*w:top="720"[^>]*w:right="1800"[^>]*w:bottom="720"[^>]*w:left="1800"/);
+    // 14pt = 28 半磅
+    assert.match(stylesXml, /<w:sz w:val="28"\/>/);
+    assert.ok(stylesXml.includes('w:ascii="Times New Roman"') && stylesXml.includes('w:eastAsia="宋体"'), stylesXml.slice(0, 400));
+});
+
+test('省略 options 时纸张为 A4、字号 11pt，与 v2 默认一致', async () => {
+    // Arrange
+    const ir = await parseMarkdown('正文\n');
+
+    // Act
+    const { documentXml, stylesXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert：A4 = 11906×16838 twip，11pt = 22 半磅
+    assert.match(documentXml, /<w:pgSz w:w="11906" w:h="16838"/);
+    assert.match(stylesXml, /<w:sz w:val="22"\/>/);
+    assert.ok(stylesXml.includes('w:ascii="Calibri"') && stylesXml.includes('w:eastAsia="微软雅黑"'));
+});
+
+test('math 节点降级为线性化文本：行内并入段落，块级独立成段', async () => {
+    // Arrange：行内公式带 MathML，块级公式只有 text
+    const ir = {
+        type: 'root',
+        children: [
+            { type: 'paragraph', children: [{ type: 'text', value: '式 ' }, createMath({ mathml: '<math><mi>x</mi></math>', text: 'x^2' })] },
+            createMath({ text: 'E=mc^2', display: true }),
+        ],
+    };
+
+    // Act
+    const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert
+    assert.ok(documentXml.includes('x^2') && documentXml.includes('E=mc^2'), documentXml);
+    assert.ok(!documentXml.includes('<m:oMath') && !documentXml.includes('&lt;math'), '不得残留公式标记');
+    assert.equal((documentXml.match(/<w:p>/g) || []).length >= 2, true, '块级公式应独立成段');
+});
+
+test('带 data.safeTable 的 html 节点按文本处理（已知限制：不重建表格结构）', async () => {
+    // Arrange
+    const ir = {
+        type: 'root',
+        children: [{
+            type: 'html',
+            value: '<table><tr><td>甲</td><td>乙</td></tr></table>',
+            data: { safeTable: true },
+        }],
+    };
+
+    // Act
+    const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert
+    assert.ok(documentXml.includes('甲') && documentXml.includes('乙'));
+    assert.ok(!documentXml.includes('&lt;table'), '不应残留 HTML 标签');
+});
+
+test('underline 输出下划线 run；带 display 的图片按显示宽度内嵌（缺高度时按像素宽高比补）；\\t 输出为 w:tab', async () => {
+    // Arrange：IR 经 ir/inline-html 提升（与 md 解析器同一链路）
+    const { liftInlineHtml } = require('../converters/ir/inline-html');
+    const ir = liftInlineHtml(await parseMarkdown('<img src="images/pic.png" width="300">\n\n前<u>下划线</u>后\n\n图 1\t图 2\n'));
+    const [image] = collect(ir, (n) => n.type === 'image');
+    attachAsset(image, { buffer: makePng(100, 50), width: 100, height: 50 });
+
+    // Act
+    const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert
+    assert.ok(documentXml.includes(`cx="${300 * EMU_PER_PX}"`), '宽度取显示宽度 300px');
+    assert.ok(documentXml.includes(`cy="${150 * EMU_PER_PX}"`), '高度按像素宽高比补为 150px');
+    assert.match(documentXml, /<w:u w:val="single"\/>/);
+    assert.ok(documentXml.includes('<w:tab/>'), '制表符应为 w:tab');
 });

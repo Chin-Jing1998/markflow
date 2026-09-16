@@ -1,6 +1,7 @@
 /**
  * converters/ir/util.js 单元测试
- * 覆盖：sanitizeFolderName、stripExt、collectText、扩展名推断、ensureDir
+ * 覆盖：sanitizeFolderName（含 Windows 保留名）、normalizeAuthor（占位作者名过滤）、stripExt、
+ *       collectText、扩展名推断、ensureDir
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -52,6 +53,79 @@ describe('sanitizeFolderName', () => {
     test('去除控制字符与首尾点号', () => {
         const withNul = '.hidden' + String.fromCharCode(0) + 'name.';
         assert.equal(util.sanitizeFolderName(withNul), 'hiddenname');
+    });
+});
+
+describe('sanitizeFolderName：Windows 保留名', () => {
+    // 上标数字以码点生成：Windows 把 ¹²³ 视同数字，COM¹、LPT³ 等同样是设备名
+    const SUP = { 1: String.fromCharCode(0xb9), 2: String.fromCharCode(0xb2), 3: String.fromCharCode(0xb3) };
+
+    test('CON、PRN、AUX、NUL、COM1–COM9、LPT1–LPT9 不分大小写，追加下划线', () => {
+        const cases = [
+            ['CON', 'CON_'], ['con', 'con_'], ['Prn', 'Prn_'], ['aux', 'aux_'], ['NUL', 'NUL_'],
+            ['COM1', 'COM1_'], ['com9', 'com9_'], ['LPT1', 'LPT1_'], ['Lpt9', 'Lpt9_'],
+        ];
+        for (const [raw, expected] of cases) assert.equal(util.sanitizeFolderName(raw), expected, raw);
+    });
+
+    test('带扩展名的形式：下划线追加在第一个点之前的主干之后', () => {
+        assert.equal(util.sanitizeFolderName('con.txt'), 'con_.txt');
+        assert.equal(util.sanitizeFolderName('NUL.tar.gz'), 'NUL_.tar.gz');
+        assert.equal(util.sanitizeFolderName('CON .txt'), 'CON _.txt');
+    });
+
+    test('Windows 视同数字的上标 ¹²³ 同样构成保留名', () => {
+        assert.equal(util.sanitizeFolderName(`COM${SUP[1]}`), `COM${SUP[1]}_`);
+        assert.equal(util.sanitizeFolderName(`lpt${SUP[3]}.md`), `lpt${SUP[3]}_.md`);
+        assert.equal(util.sanitizeFolderName(`com${SUP[2]}`), `com${SUP[2]}_`);
+    });
+
+    test('去掉末尾的点与空格后再判定', () => {
+        assert.equal(util.sanitizeFolderName('CON. '), 'CON_');
+        assert.equal(util.sanitizeFolderName('  nul ..'), 'nul_');
+    });
+
+    test('非保留名原样不变', () => {
+        for (const name of ['COM0', 'COM10', 'LPT', 'CONSOLE', 'con-1', 'console.log', 'aux1', 'PRN1', '报告 CON']) {
+            assert.equal(util.sanitizeFolderName(name), name, name);
+        }
+    });
+
+    test('回退名为保留名时同样处理；结果不超过 100 个码点', () => {
+        assert.equal(util.sanitizeFolderName('', 'CON'), 'CON_');
+        const long = util.sanitizeFolderName(`CON.${'x'.repeat(200)}`);
+        assert.equal(Array.from(long).length, 100);
+        assert.ok(long.startsWith('CON_.'));
+    });
+});
+
+// ============================================================
+// normalizeAuthor
+// ============================================================
+
+describe('normalizeAuthor', () => {
+    test('第三方库与本项目写入的占位作者名视为无作者（不分大小写、含首尾空白）', () => {
+        // docx 库缺省 Un-named、exceljs 缺省 Unknown、本项目 md → docx 渲染器写入 MarkFlow
+        for (const raw of ['Un-named', 'un-named', 'UN-NAMED', '  Un-named  ', 'Unknown', 'unknown', 'MarkFlow', 'markflow']) {
+            assert.equal(util.normalizeAuthor(raw), '', JSON.stringify(raw));
+        }
+    });
+
+    test('真实作者照旧返回，只去首尾空白', () => {
+        assert.equal(util.normalizeAuthor(' 张三 '), '张三');
+        assert.equal(util.normalizeAuthor('李四 & 王五'), '李四 & 王五');
+        assert.equal(util.normalizeAuthor('咕咕'), '咕咕');
+    });
+
+    test('只做整串精确匹配：含占位词的真实姓名不受影响', () => {
+        assert.equal(util.normalizeAuthor('un-named 张三'), 'un-named 张三');
+        assert.equal(util.normalizeAuthor('MarkFlow 团队'), 'MarkFlow 团队');
+        assert.equal(util.normalizeAuthor('Unknown Rivers'), 'Unknown Rivers');
+        assert.equal(util.normalizeAuthor('Un-named2'), 'Un-named2');
+    });
+
+    test('空值、纯空白与非字符串返回空串', () => {
+        for (const raw of ['', '   ', null, undefined, 42, {}]) assert.equal(util.normalizeAuthor(raw), '', JSON.stringify(raw));
     });
 });
 

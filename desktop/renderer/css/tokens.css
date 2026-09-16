@@ -1,0 +1,207 @@
+/* ============================================================
+   MarkFlow 桌面端 · 设计令牌（自 v1 css/styles.css 恢复）
+   设计语言：macOS Tahoe / iOS 26 风格 —— 材质、连续圆角、动态强调色、弹簧动效
+   主题：单份 token，浅 / 深两套取值经 light-dark() 由 color-scheme 决定；
+         页面跟随 prefers-color-scheme，用户固定主题时由主进程同步 nativeTheme.themeSource
+   ============================================================ */
+
+:root {
+    color-scheme: light dark;
+
+    /* Dynamic Tint（默认 Apple Blue，改 --tint-h 即可整体换色） */
+    --tint-h: 252; --tint-c: 0.18; --tint-l: 63%;
+    --accent: oklch(var(--tint-l) var(--tint-c) var(--tint-h));
+    --accent-hover: oklch(calc(var(--tint-l) + 4%) var(--tint-c) var(--tint-h));
+    --accent-bg: color-mix(in oklch, var(--accent) 12%, transparent);
+    --accent-ring: color-mix(in oklch, var(--accent) 35%, transparent);
+
+    /* Surface（浅 / 深） */
+    --bg: light-dark(oklch(98% 0.003 250), oklch(18% 0.004 260));
+    --bg-translucent: light-dark(oklch(98% 0.003 250 / 0.55), oklch(18% 0.004 260 / 0.55));
+    --surface-1: light-dark(color-mix(in oklch, white 72%, transparent), color-mix(in oklch, white 8%, transparent));
+    --surface-2: light-dark(color-mix(in oklch, white 84%, transparent), color-mix(in oklch, white 14%, transparent));
+    --surface-3: light-dark(color-mix(in oklch, white 94%, transparent), color-mix(in oklch, white 22%, transparent));
+    /* select 原生下拉弹层会直接沿用 background-color 计算值，若用带透明度的 surface-* 会连同弹层一起透出下方页面内容形成重影；
+       这里按相同配方改与不透明的 --bg 混合，视觉效果与叠在 --bg 上的 surface-2/3 一致，但本身是纯色，弹层不再透光 */
+    --surface-2-solid: light-dark(color-mix(in oklch, white 84%, var(--bg)), color-mix(in oklch, white 14%, var(--bg)));
+    --surface-3-solid: light-dark(color-mix(in oklch, white 94%, var(--bg)), color-mix(in oklch, white 22%, var(--bg)));
+    --surface-stroke: light-dark(color-mix(in oklch, white 60%, transparent), color-mix(in oklch, white 14%, transparent));
+    --highlight-top: light-dark(rgba(255,255,255,.6), rgba(255,255,255,.10));
+    --surface-highlight: linear-gradient(180deg, var(--highlight-top), rgba(255,255,255,0) 55%);
+    --sidebar-bg: light-dark(rgba(255,255,255,0.28), rgba(255,255,255,0.03));
+
+    /* 文档底色：视图帧（iframe）装载前的底色，与帧内文档的浅 / 深纸面一致，深色下不闪白；
+       --doc-paper 用于固定白纸的帧（对比预览产物栏、html 原样渲染），见 dom.js createViewFrame 的 appearance */
+    --doc-surface: light-dark(#ffffff, #1c1c1e);
+    --doc-paper: #ffffff;
+
+    /* Label / Separator */
+    --label-primary: light-dark(oklch(20% 0.01 260), oklch(96% 0.005 260));
+    --label-secondary: light-dark(oklch(48% 0.01 260), oklch(70% 0.01 260));
+    --label-tertiary: light-dark(oklch(65% 0.01 260), oklch(52% 0.01 260));
+    --label-on-accent: oklch(99% 0.01 var(--tint-h));
+    --separator: light-dark(color-mix(in oklch, black 8%, transparent), color-mix(in oklch, white 12%, transparent));
+    --separator-opaque: light-dark(color-mix(in oklch, black 12%, transparent), color-mix(in oklch, white 18%, transparent));
+
+    /* System Colors */
+    --system-red: oklch(64% 0.22 27);
+    --system-green: oklch(72% 0.18 145);
+    --system-orange: oklch(75% 0.16 60);
+
+    /* 编辑区查找高亮（Markdown 编辑页镜像层，垫在原文字下方）：全部命中取浅黄，当前命中取 Apple 系统黄；
+       深色下降低不透明度，原文的浅色字叠在当前命中上仍有约 4.7:1 的对比度 */
+    --find-match-bg: light-dark(color-mix(in srgb, #ffcc00 30%, transparent), color-mix(in srgb, #ffd60a 20%, transparent));
+    --find-current-bg: light-dark(#ffcc00, color-mix(in srgb, #ffd60a 45%, transparent));
+
+    /* Continuous Corner（伪 squircle）；--r-xs 供行内小件：链接按钮、树节点与筛选行、清单行 */
+    --r-xs: 6px; --r-sm: 10px; --r-md: 14px; --r-lg: 20px; --r-xl: 28px; --r-pill: 999px;
+
+    /* 多层阴影（颜色分量按主题取值） */
+    --shadow-inset-1: light-dark(rgba(255,255,255,.5), rgba(255,255,255,.08));
+    --shadow-inset-2: light-dark(rgba(255,255,255,.7), rgba(255,255,255,.12));
+    --shadow-ring-1: light-dark(rgba(0,0,0,.04), rgba(0,0,0,.4));
+    --shadow-ring-2: light-dark(rgba(0,0,0,.06), rgba(0,0,0,.5));
+    --shadow-near-1: light-dark(rgba(0,0,0,.05), rgba(0,0,0,.4));
+    --shadow-near-2: light-dark(rgba(0,0,0,.06), rgba(0,0,0,.5));
+    --shadow-far-1: light-dark(rgba(0,0,0,.06), rgba(0,0,0,.45));
+    --shadow-far-2: light-dark(rgba(0,0,0,.10), rgba(0,0,0,.6));
+    --shadow-1: 0 0.5px 0 0 var(--shadow-inset-2) inset, 0 0 0 1px var(--shadow-ring-1), 0 1px 2px var(--shadow-near-1), 0 8px 24px var(--shadow-far-1);
+    --shadow-2: 0 0.5px 0 0 var(--shadow-inset-2) inset, 0 0 0 1px var(--shadow-ring-2), 0 2px 6px var(--shadow-near-2), 0 24px 60px var(--shadow-far-2);
+    --glow-accent: 0 0 0 4px var(--accent-ring), 0 6px 24px color-mix(in oklch, var(--accent) 35%, transparent);
+
+    /* Motion · Spring tokens */
+    --ease-spring: cubic-bezier(0.30, 0.70, 0.40, 1.00);
+    --ease-standard: cubic-bezier(0.40, 0.00, 0.20, 1.00);
+    --dur-fast: 150ms; --dur-base: 250ms; --dur-slow: 400ms;
+    /* 通用过渡只走颜色类属性：悬停不再位移或缩放，尺寸与位置变化即时生效 */
+    --transition:
+        color var(--dur-base) var(--ease-spring),
+        background-color var(--dur-base) var(--ease-spring),
+        border-color var(--dur-base) var(--ease-spring),
+        box-shadow var(--dur-base) var(--ease-spring),
+        opacity var(--dur-base) var(--ease-spring);
+
+    /* Type · 系统字体优先，不加载远程字体 */
+    --font: -apple-system, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", Menlo, monospace;
+    /* 字号阶梯（Apple HIG macOS 文本样式）：界面文字只取这 7 级；图标字形按所在文字样式取号（与 SF Symbols 同理） */
+    --font-title-2: 17px;
+    --font-title-3: 15px;
+    --font-headline: 13px;
+    --font-headline-weight: 600;
+    --font-body: 13px;
+    --font-callout: 12px;
+    --font-subheadline: 11px;
+    --font-footnote: 10px;
+
+    /* 控件尺寸（macOS 26：small 24 / regular 28 / large 36；large 用胶囊，small 与 regular 为圆角矩形） */
+    --control-height-sm: 24px;
+    --control-height: 28px;
+    --control-height-lg: 36px;
+    --icon-btn-size-sm: 24px;
+    --icon-btn-size: 28px;
+    --disabled-opacity: 0.4;
+
+    /* 分段控件与页签共用配方（.segmented / .pane-tabs）：填色轨道 + 抬起的选中滑块，滑块圆角与轨道同心 */
+    --seg-track: light-dark(color-mix(in oklch, black 6%, transparent), color-mix(in oklch, white 9%, transparent));
+    --seg-track-stroke: transparent;
+    --seg-thumb: light-dark(#ffffff, color-mix(in oklch, white 20%, transparent));
+    --seg-thumb-shadow: 0 0 0 0.5px var(--shadow-ring-2), 0 1px 2px var(--shadow-far-2);
+    --seg-pad: 2px;
+    --seg-radius: var(--r-sm);
+    --seg-item-radius: calc(var(--seg-radius) - var(--seg-pad));
+    --seg-label: var(--label-secondary);
+    --seg-label-active: var(--label-primary);
+
+    /* 键盘焦点环（:focus-visible）：强调色半透明外环，沿控件圆角，对应 macOS 键盘焦点指示 */
+    --focus-ring-color: color-mix(in oklch, var(--accent) 55%, transparent);
+    --focus-ring-width: 3px;
+    --focus-ring-offset: 1px;
+    --focus-ring: 0 0 0 var(--focus-ring-width) var(--focus-ring-color);
+
+    /* 弹层材质（排序菜单、仓库菜单、右键菜单、仓库条目菜单共用；取值即文件库排序菜单与仓库菜单的既定配方） */
+    --popover-bg: color-mix(in oklch, var(--surface-3) 92%, var(--bg) 8%);
+    --popover-stroke: var(--separator-opaque);
+    --popover-radius: var(--r-md);
+    --popover-pad: 6px;
+    --popover-shadow: var(--shadow-2);
+    --popover-filter: blur(20px) saturate(150%);
+    --popover-item-radius: var(--r-sm);
+    --popover-item-hover: color-mix(in oklch, var(--label-primary) 10%, transparent);
+
+    /* Space · 4pt grid */
+    --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px;
+    --s-5: 20px; --s-6: 24px; --s-8: 32px; --s-10: 40px;
+
+    /* 标题栏让位：Windows titleBarOverlay 提供 env()，macOS hiddenInset 取回退值 */
+    --titlebar-height: env(titlebar-area-height, 52px);
+    --statusbar-height: 28px;
+    --sidebar-width: 56px;
+}
+
+/* ===== Reset ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+body {
+    background: transparent;          /* 让 Electron vibrancy 透出；无 vibrancy 平台由窗口 backgroundColor 兜底 */
+    color: var(--label-primary);
+    font-family: var(--font);
+    font-size: var(--font-body);
+    line-height: 1.5;
+    overflow: hidden;
+    font-feature-settings: "ss01", "cv01", "cv02";
+    user-select: none;
+}
+input, textarea, select, button { font-family: inherit; }
+input, textarea { user-select: text; }
+a { color: var(--accent); }
+.icon { width: 1em; height: 1em; flex-shrink: 0; vertical-align: -0.15em; }
+button .icon { font-size: var(--font-title-3); }
+
+/* ===== Scrollbar (overlay style) ===== */
+::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+    background: color-mix(in oklch, var(--label-primary) 20%, transparent);
+    border-radius: var(--r-pill);
+    background-clip: padding-box;
+    border: 3px solid transparent;
+}
+::-webkit-scrollbar-thumb:hover { background: color-mix(in oklch, var(--label-primary) 35%, transparent); background-clip: padding-box; border: 3px solid transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ===== 降级处理 ===== */
+/* 降低透明度：弹层与分段滑块改用实色，去掉背景模糊 */
+@media (prefers-reduced-transparency: reduce) {
+    :root {
+        --popover-bg: var(--surface-3-solid);
+        --popover-filter: none;
+        --seg-thumb: light-dark(#ffffff, color-mix(in oklch, white 20%, var(--bg)));
+    }
+    body { background: var(--bg) !important; }
+    .sidebar { background: var(--bg) !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+/* 增强对比度：分隔线与描边加深，焦点环改实色并加大间隙，分段轨道加描边，弹层改实色 */
+@media (prefers-contrast: more) {
+    :root {
+        --separator: light-dark(rgba(0, 0, 0, 0.4), rgba(255, 255, 255, 0.4));
+        --separator-opaque: light-dark(rgba(0, 0, 0, 0.55), rgba(255, 255, 255, 0.55));
+        --label-secondary: var(--label-primary);
+        --focus-ring-color: var(--accent);
+        --focus-ring-offset: 2px;
+        --seg-track-stroke: var(--separator-opaque);
+        --seg-thumb-shadow: 0 0 0 1px var(--separator-opaque);
+        --popover-bg: var(--surface-3-solid);
+        --popover-filter: none;
+    }
+}

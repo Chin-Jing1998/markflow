@@ -24,6 +24,9 @@ const FIELD_ORDER = Object.freeze([
     ['source', 'source'],
     ['finalUrl', 'finalUrl'],
     ['sourceType', 'sourceType'],
+    // PDF 输入专有：实际生效的解析后端与 MinerU 模型，便于事后判断产物质量来源
+    ['pdfParser', 'pdfParser'],
+    ['mineruModel', 'mineruModel'],
     ['siteName', 'siteName'],
     ['excerpt', 'excerpt'],
     ['lang', 'lang'],

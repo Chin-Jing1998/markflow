@@ -1,7 +1,7 @@
 /**
  * converters/parsers/xlsx.js 单元测试
  * 覆盖：{ path } 契约、多 sheet → sheetSection + table、单元格取值规则（公式/日期/富文本）、
- *       kind/meta/data 快照、assets 为空
+ *       kind/meta/data 快照、assets 为空、meta.author（dc:creator）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -166,4 +166,40 @@ test('源文件不存在时抛出 ENOENT', async () => {
 
     // Act & Assert
     await assert.rejects(() => parse({ path: missing }), (err) => err.code === 'ENOENT');
+});
+
+test('meta.author 取 docProps/core.xml 的 dc:creator；无作者时 meta 不含 author', async () => {
+    // Arrange：exceljs 写出时总会填 dc:creator（缺省 Unknown），无作者的样本改写 core.xml 得到
+    const JSZip = require('jszip');
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-xlsx-author-')));
+    const withAuthor = path.join(dir, '有作者.xlsx');
+    const wb = new ExcelJS.Workbook();
+    wb.creator = ' 周八 ';
+    wb.addWorksheet('表').addRow(['甲']);
+    await wb.xlsx.writeFile(withAuthor);
+    const noAuthor = path.join(dir, '无作者.xlsx');
+    const zip = await JSZip.loadAsync(fs.readFileSync(withAuthor));
+    const core = await zip.file('docProps/core.xml').async('text');
+    zip.file('docProps/core.xml', core.replace(/<dc:creator>[^<]*<\/dc:creator>/, '<dc:creator></dc:creator>'));
+    fs.writeFileSync(noAuthor, await zip.generateAsync({ type: 'nodebuffer' }));
+
+    // Act
+    const docA = await parse({ path: withAuthor });
+    const docB = await parse({ path: noAuthor });
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    // Assert
+    assert.equal(docA.meta.author, '周八');
+    assert.deepEqual(Object.keys(docB.meta), ['title', 'sourceType', 'sourceName', 'sheetCount']);
+});
+
+test('占位作者名不写入 meta：exceljs 写出时缺省的 Unknown 视为无作者', async () => {
+    // Arrange：makeWorkbookFile 不设 creator，exceljs 写入缺省值 Unknown
+    const { filePath } = await makeWorkbookFile();
+
+    // Act
+    const doc = await parse({ path: filePath });
+
+    // Assert
+    assert.deepEqual(Object.keys(doc.meta), ['title', 'sourceType', 'sourceName', 'sheetCount']);
 });

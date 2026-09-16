@@ -1,0 +1,17 @@
+# 二进制文件一律不做行尾转换。
+# Windows 的 core.autocrlf=true 在检出时会把被判为文本的文件里的 LF 换成 CRLF：
+# test/fixtures/sample.pdf 前 8000 字节无 NUL 且含 33 个 LF，正好被 Git 判为文本，
+# 检出后字节偏移整体后移、交叉引用表全部失效，PDF 相关用例在 Windows 上实际是在
+# 校验一份与其它平台不同的损坏文档。图标与图片同理。
+*.pdf   binary
+*.docx  binary
+*.xlsx  binary
+*.pptx  binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.icns  binary
+*.ico   binary
+*.zip   binary

@@ -16,6 +16,11 @@
 const { parseHTML } = require('linkedom');
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
 const { hostnameOf } = require('../util');
+const { indentMarker } = require('../ir/markers');
+const { indentFromStyleChain, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR } = require('./indent');
+
+// Readability 预标注用：img 的 style 宽度（px 或 %）
+const STYLE_WIDTH_RE = /(?:^|;)\s*width\s*:\s*(\d{1,5}(?:\.\d+)?)\s*(px|%)/i;
 
 // 站点专属选择器：url 含 match 时按 selectors 顺序取第一个非空结果
 const SITE_SELECTORS = Object.freeze([
@@ -88,6 +93,7 @@ function extractByReadability(html) {
         return null;
     }
     if (!document || !isReaderable(document)) return null;
+    annotateLayout(document);
 
     let article;
     try {
@@ -99,6 +105,35 @@ function extractByReadability(html) {
     const textLength = String(article.textContent || '').trim().length;
     if (textLength < MIN_READABILITY_TEXT_LENGTH) return null;
     return { html: article.content, extraction: 'readability', article };
+}
+
+/**
+ * Readability 的 _cleanStyles 会删掉 style（text-indent 与图片宽度随之丢失），但保留 data-* 属性与文本，
+ * 故在它运行前先把两者预标注下来：叶子块的有效 text-indent → 段首 INDENT 标记文本（ir/markers），
+ * img 的 style 宽度 → data-mf-width（web/image-display 读取）。标注失败不影响正文提取。
+ */
+function annotateLayout(document) {
+    try {
+        for (const img of Array.from(document.querySelectorAll('img'))) {
+            const matched = STYLE_WIDTH_RE.exec(img.getAttribute('style') || '');
+            if (matched && !img.getAttribute('data-mf-width')) img.setAttribute('data-mf-width', `${matched[1]}${matched[2].toLowerCase()}`);
+        }
+        for (const el of Array.from(document.querySelectorAll(LEAF_BLOCK_SELECTOR))) {
+            if (el.querySelector(NESTED_BLOCK_SELECTOR)) continue;
+            if (!/[^\s]/.test(el.textContent || '')) continue;
+            const count = indentFromStyleChain(styleChainOf(el));
+            if (count > 0) el.insertBefore(document.createTextNode(indentMarker(count)), el.firstChild);
+        }
+    } catch (err) {
+        /* 预标注只为保真，DOM 能力不足时按未标注继续 */
+    }
+}
+
+// 自身到祖先（由近及远）的 style 串，供 text-indent 的继承查找
+function styleChainOf(el) {
+    const styles = [];
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) styles.push(node.getAttribute('style') || '');
+    return styles;
 }
 
 // isProbablyReaderable 内部依赖 matches/className 等 DOM 能力，异常时按不可读处理

@@ -378,7 +378,10 @@ test('data URL 落盘到 mkdtemp 私有目录，权限 0600，且同内容复用
     assert.notEqual(dir, path.join(os.tmpdir(), 'markflow-md-assets'));
 
     // Assert：文件权限仅属主可读写
-    assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+    // Windows 无 POSIX 权限位，该断言只在类 Unix 上有意义（NTFS 走 ACL，mode 只反映只读位）
+    if (process.platform !== 'win32') {
+        assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+    }
 
     // Assert：同内容复用同一路径，内容与源一致
     assert.equal(second.img.data.asset.absPath, target);

@@ -5,6 +5,7 @@
  * 与 converters/ir/util.js 的分工：那边只放 IR 与名称相关的纯函数，这边放进程侧工具。
  */
 const fsp = require('fs').promises;
+const path = require('path');
 
 // 取错误的可读文本；非 Error 值一律 String 化
 const errText = (err) => (err && err.message ? err.message : String(err));
@@ -48,4 +49,25 @@ function notify(ctx, phase, pct) {
     }
 }
 
-module.exports = { errText, hostnameOf, toBuffer, statOrNull, isFile, isDirectory, notify };
+// ============================================================
+// 目录边界判定（md 图片、产物落盘、桌面端资源协议共用）
+// ============================================================
+
+// 词法判定：absPath 位于 baseDir 之内（含 baseDir 自身）
+function isWithinDir(baseDir, absPath) {
+    const rel = path.relative(path.resolve(baseDir), absPath);
+    if (rel === '') return true;
+    return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+// realpath 判定：解开符号链接后仍在 baseDir 之内；任一端 realpath 失败即视为越界
+async function isRealWithinDir(baseDir, absPath) {
+    try {
+        const [realBase, realTarget] = await Promise.all([fsp.realpath(baseDir), fsp.realpath(absPath)]);
+        return isWithinDir(realBase, realTarget);
+    } catch (err) {
+        return false;
+    }
+}
+
+module.exports = { errText, hostnameOf, toBuffer, statOrNull, isFile, isDirectory, notify, isWithinDir, isRealWithinDir };

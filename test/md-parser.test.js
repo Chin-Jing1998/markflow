@@ -178,7 +178,7 @@ test('无 H1 时 title 回退为去扩展名的文件名', async () => {
     assert.equal(doc.meta.title, '知识库笔记');
 });
 
-test('本地相对路径图片被解析为可内嵌 asset，远程图片记 warning 且保持原样', async () => {
+test('本地相对路径图片进 assets 且 url 改写为资源名，远程图片记 warning 且保持原样', async () => {
     // Arrange
     const { dir, lfPath } = makeFixture();
 
@@ -189,16 +189,19 @@ test('本地相对路径图片被解析为可内嵌 asset，远程图片记 warn
     // Assert
     assert.equal(images.length, 2);
 
-    const local = images.find((n) => n.url === 'images/pic.png');
-    assert.ok(local.data && local.data.asset, '本地图片应挂上 asset');
+    const local = images.find((n) => n.data && n.data.asset);
+    assert.equal(local.url, 'images/image_1.png', '本地图片的 url 应改写为资源名');
+    assert.equal(local.data.assetName, 'images/image_1.png');
     assert.ok(Buffer.isBuffer(local.data.asset.buffer));
     assert.equal(local.data.asset.width, 8);
     assert.equal(local.data.asset.height, 8);
     assert.equal(local.data.asset.mime, 'image/png');
     assert.equal(local.data.asset.absPath, path.join(dir, 'images', 'pic.png'));
 
+    // 未取到 buffer 的远程图片不登记，url 与 data 均保持原样
     const remote = images.find((n) => n.url === 'https://example.com/a.png');
     assert.equal(remote.data && remote.data.asset, undefined);
+    assert.equal(remote.data && remote.data.assetName, undefined);
 
     assert.equal(doc.assets.length, 1);
     assert.equal(doc.assets[0].name, 'images/image_1.png');
@@ -240,32 +243,48 @@ const GIF_1X1 = Buffer.concat([
     Buffer.from([0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00]),
 ]);
 
-test('assets 只收可内嵌类型并统一编号，同一 url 只登记一次', async () => {
-    // Arrange：png 与 gif 可内嵌，svg 不可内嵌；png 被引用两次
+// 8×8 无损 WebP（cwebp 生成），用于验证 svg/webp 一类非内嵌格式同样进 assets
+const WEBP_8X8 = Buffer.from('UklGRiQAAABXRUJQVlA4TBcAAAAvB8ABEA8Q8x/zHwyBbPLlb51ERP9DBgA=', 'base64');
+
+test('凡取到 buffer 的图片都进 assets（含 svg/webp）并统一编号，同一 url 只登记一次', async () => {
+    // Arrange：png 被引用两次，另有 gif、svg、webp 各一
     const { dir } = makeFixture();
     fs.writeFileSync(path.join(dir, 'images', 'anim.gif'), GIF_1X1);
     fs.writeFileSync(
         path.join(dir, 'images', 'logo.svg'),
         '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"></svg>',
     );
+    fs.writeFileSync(path.join(dir, 'images', 'shot.webp'), WEBP_8X8);
     const md = [
         '![一](images/pic.png)', '',
         '![二](images/pic.png)', '',
         '![三](images/anim.gif)', '',
         '![四](images/logo.svg)', '',
+        '![五](images/shot.webp)', '',
     ].join('\n');
 
     // Act
     const doc = await parse({ text: md }, { baseDir: dir });
+    const images = collect(doc.ir, (n) => n.type === 'image');
 
     // Assert
     assert.deepEqual(
         doc.assets.map((a) => [a.name, a.mime]),
-        [['images/image_1.png', 'image/png'], ['images/image_2.gif', 'image/gif']],
+        [
+            ['images/image_1.png', 'image/png'],
+            ['images/image_2.gif', 'image/gif'],
+            ['images/image_3.svg', 'image/svg+xml'],
+            ['images/image_4.webp', 'image/webp'],
+        ],
     );
-    // svg 不进 assets，但节点上仍挂着 asset，HTML 渲染照常可用
-    const svg = collect(doc.ir, (n) => n.type === 'image').find((n) => n.url === 'images/logo.svg');
-    assert.ok(svg.data && svg.data.asset, 'svg 仍应挂上 data.asset');
+    // 每个节点的 url 与 data.assetName 一致；重复引用的 png 复用同一资源
+    assert.deepEqual(images.map((n) => n.url), [
+        'images/image_1.png', 'images/image_1.png', 'images/image_2.gif',
+        'images/image_3.svg', 'images/image_4.webp',
+    ]);
+    assert.deepEqual(images.map((n) => n.data.assetName), images.map((n) => n.url));
+    // data.asset 原样保留，docx/pdf 渲染器仍按它取 buffer
+    const svg = images.find((n) => n.url === 'images/image_3.svg');
     assert.equal(svg.data.asset.mime, 'image/svg+xml');
 });
 
@@ -281,5 +300,40 @@ test('资源名不沿用 Markdown 中的原始地址，子目录与中文文件�
 
     // Assert
     assert.deepEqual(doc.assets.map((a) => a.name), ['images/image_1.png']);
-    assert.equal(collect(doc.ir, (n) => n.type === 'image')[0].url, 'assets/插图/示意图.png');
+    assert.equal(collect(doc.ir, (n) => n.type === 'image')[0].url, 'images/image_1.png');
+});
+
+test('<img width> 进 assets 并统一编号，保留 data.asset.absPath 与 data.display；<u> 成 underline；越界与脚本协议不收', async () => {
+    // Arrange
+    const { dir } = makeFixture();
+    const md = [
+        '<img src="images/pic.png" width="300" alt="示意">', '',
+        '行内<img src="images/pic.png" width="50%">与<u>下划线</u>', '',
+        '<img src="../outside.png" width="100">', '',
+        '<img src="javascript:alert(1)">', '',
+    ].join('\n');
+
+    // Act
+    const doc = await parse({ text: md }, { baseDir: dir });
+    const images = collect(doc.ir, (n) => n.type === 'image');
+
+    // Assert：两处引用同一文件，只登记一份资源
+    assert.deepEqual(doc.assets.map((a) => a.name), ['images/image_1.png']);
+    assert.equal(images.length, 3);
+    const [block, inline, outside] = images;
+    assert.equal(block.url, 'images/image_1.png');
+    assert.equal(block.alt, '示意');
+    assert.equal(block.data.asset.absPath, path.join(dir, 'images', 'pic.png'));
+    assert.deepEqual(block.data.display, { width: 300, unit: 'px', source: 'html' });
+    assert.equal(inline.url, 'images/image_1.png');
+    assert.deepEqual(inline.data.display, { width: 50, unit: '%', source: 'html' });
+
+    // Assert：越出 baseDir 的 <img> 与 Markdown 图片一样被拒，不登记
+    assert.equal(outside.url, '../outside.png');
+    assert.equal(outside.data.asset, undefined);
+    assert.ok(doc.warnings.some((w) => w.includes('超出文档目录')), JSON.stringify(doc.warnings));
+
+    // Assert：<u> 提升为 underline；脚本协议的 <img> 不提升，留作 html 由渲染器剥离
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'underline').map(plainText), ['下划线']);
+    assert.ok(collect(doc.ir, (n) => n.type === 'html').some((n) => n.value.includes('javascript:')));
 });
