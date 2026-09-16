@@ -1,8 +1,7 @@
 /**
- * <mf-settings-page>：设置页，抽屉式布局。
- * 左侧 .settings-nav 为分类栏（role="tablist"），右侧 .settings-panel 承载 7 张分区卡片，一次只显示一张；
- * 切换分类只改卡片的 hidden，未选中分区的节点一律保留在 DOM 中（原因见 selectSection 的注释）。
- * 页脚的「保存设置」与设置文件路径不随分类变化，任何分类下都可见。
+ * <mf-settings-page>：设置页，单列长滚动，7 张分区卡片自上而下依次排列。
+ * 卡片带 data-section 供 CSS 定位——外观的分段控件与「转换默认项」的三列网格各有专门排版，
+ * 用该钩子而非「第几个子卡片」，卡片增删或换序时排版不会错位。
  * 外观主题即时生效（mf:theme:set）；输出目录、默认目标、转换默认项、文件库模式经「保存设置」一次提交（mf:settings:set）；
  * MinerU 令牌单独保存 / 清除 / 测试连接（只显示「已配置 / 未配置」与测试结果，不回显令牌）；
  * 「关于」一节写明三端使用方法，并经 mf:update:check 取 GitHub 最新 release 与当前版本比对
@@ -37,21 +36,6 @@ const ISSUES_URL = 'https://github.com/Chin-Jing1998/markflow/issues';
 /** 更新检测四态 → .mineru-result 的显示档位（ok 绿 / error 红 / info 灰） */
 const UPDATE_KINDS = Object.freeze({ latest: 'ok', 'update-available': 'info', unknown: 'info', failed: 'error' });
 
-/**
- * 抽屉式设置页的 7 个分区：分类栏的每一项与同 key 的 <section class="card" data-section="…"> 一一对应。
- * data-section 同时是 app.css 的定位钩子（分段控件三等分、「转换默认项」三列网格都按它取），
- * 故 key 不可随意改名；顺序即分类栏与面板中的排列顺序。
- */
-const SECTIONS = Object.freeze([
-    { key: 'appearance', label: '外观', icon: 'sun' },
-    { key: 'output', label: '输出', icon: 'folder' },
-    { key: 'defaults', label: '转换默认项', icon: 'convert' },
-    { key: 'mineru', label: 'MinerU 令牌', icon: 'key' },
-    { key: 'library', label: '文件库', icon: 'library' },
-    { key: 'capabilities', label: '运行能力', icon: 'monitor' },
-    { key: 'about', label: '关于', icon: 'info' },
-]);
-const DEFAULT_SECTION = SECTIONS[0].key;
 
 /**
  * 「关于」中的联系方式，逐条照录。
@@ -109,15 +93,8 @@ const usageBlock = ({ title, items }) => `<details class="about-block">
     <ul class="capabilities">${items.map(([name, text]) => `<li><span><strong>${escapeHtml(name)}</strong>：${escapeHtml(text)}</span></li>`).join('')}</ul>
 </details>`;
 
-/** 分类栏的一项：roving tabindex，只有当前项可 Tab 进入，其余靠 ↑／↓ 与 Home／End 到达 */
-const navItem = ({ key, label, icon: iconName }, index) => `<button class="settings-nav-item" type="button" role="tab"
-    id="settings-tab-${key}" aria-controls="settings-panel-${key}"
-    aria-selected="${index === 0 ? 'true' : 'false'}" tabindex="${index === 0 ? '0' : '-1'}"
-    data-section-tab="${key}">${icon(iconName)}<span>${escapeHtml(label)}</span></button>`;
-
-/** 分区卡片：非当前分区只置 hidden 不拆节点，理由见 MfSettingsPage.selectSection 的注释 */
-const sectionCard = (key, inner) => `<section class="card" data-section="${key}" role="tabpanel"
-    id="settings-panel-${key}" aria-labelledby="settings-tab-${key}"${key === DEFAULT_SECTION ? '' : ' hidden'}>${inner}</section>`;
+/** 分区卡片：data-section 供 CSS 定位，见文件头注释 */
+const sectionCard = (key, inner) => `<section class="card" data-section="${key}">${inner}</section>`;
 
 const contactBlock = () => `<div class="about-block">
     <h3>联系与反馈</h3>
@@ -135,10 +112,6 @@ class MfSettingsPage extends HTMLElement {
         this.innerHTML = `
             <header class="page-header"><h1>设置</h1></header>
             <div class="page-body settings-body">
-                <div class="settings-nav" role="tablist" aria-label="设置分类" aria-orientation="vertical">
-                    ${SECTIONS.map(navItem).join('')}
-                </div>
-                <div class="settings-panel">
                 ${sectionCard('appearance', `
                     <h2>外观</h2>
                     <div class="segmented" role="group" aria-label="外观主题">
@@ -197,14 +170,12 @@ class MfSettingsPage extends HTMLElement {
                     <p class="hint">检测更新会向 GitHub（api.github.com）发送一次请求，取最新发布版本号与当前版本比对，不上传任何本机信息。应用启动时自动检测一次，结果缓存 24 小时；点击「检测更新」则立即重新检测。网络不通时只在此处提示检测失败，不影响其它功能。</p>
                     ${USAGE_SECTIONS.map(usageBlock).join('')}
                     ${contactBlock()}`)}
-                </div>
             </div>
             <footer class="page-footer">
                 <div class="footer-summary" data-role="paths"></div>
                 <div class="footer-actions"><button class="btn btn-primary" type="button" data-action="save">${icon('check')}保存设置</button></div>
             </footer>`;
         this.addEventListener('click', (event) => this.onClick(event));
-        this.addEventListener('keydown', (event) => this.onNavKeydown(event));
         this.addEventListener('input', (event) => {
             if (event.target instanceof Element && event.target.matches('[data-field]') && event.target.dataset.field !== 'token') this.dirty = true;
         });
@@ -216,41 +187,6 @@ class MfSettingsPage extends HTMLElement {
 
     disconnectedCallback() {
         if (this.unsubscribe) this.unsubscribe();
-    }
-
-    /**
-     * 切换分类：只改卡片的 hidden，绝不移除或重建卡片节点。
-     * 原因：collectPatch() 以 this.querySelector('[data-field=…]') 一次性读取输出目录、三类默认目标、
-     * 转换默认项与文件库四组值，而这些字段分散在「输出」「转换默认项」「文件库」三个分区中，
-     * 依赖全部 [data-field] 始终留在 DOM 里可被查询。若切换时销毁未选中分区的节点，
-     * 用户切到「关于」再点「保存设置」，这些 querySelector 就会取到 null 或空值，
-     * 把输出目录与转换默认项一并清空后写回设置文件。故本方法只做显隐，不做增删。
-     */
-    selectSection(key, { focus = false } = {}) {
-        for (const tab of this.querySelectorAll('[data-section-tab]')) {
-            const active = tab.dataset.sectionTab === key;
-            tab.setAttribute('aria-selected', active ? 'true' : 'false');
-            tab.tabIndex = active ? 0 : -1;          // roving tabindex：只有当前项在 Tab 序列里
-            if (active && focus) tab.focus();
-        }
-        for (const card of this.querySelectorAll('[data-section]')) card.hidden = card.dataset.section !== key;
-        const panel = this.querySelector('.settings-panel');
-        if (panel) panel.scrollTop = 0;
-    }
-
-    /** 分类栏内的键盘操作：↑／↓ 在分类间循环移动并即时切换，Home／End 跳首末 */
-    onNavKeydown(event) {
-        const tab = event.target instanceof Element ? event.target.closest('[data-section-tab]') : null;
-        if (!tab) return;
-        const step = { ArrowUp: -1, ArrowDown: 1 }[event.key];
-        const current = SECTIONS.findIndex((section) => section.key === tab.dataset.sectionTab);
-        let next = -1;
-        if (step !== undefined && current >= 0) next = (current + step + SECTIONS.length) % SECTIONS.length;
-        else if (event.key === 'Home') next = 0;
-        else if (event.key === 'End') next = SECTIONS.length - 1;
-        if (next < 0) return;
-        event.preventDefault();
-        this.selectSection(SECTIONS[next].key, { focus: true });
     }
 
     refresh() {
@@ -388,11 +324,6 @@ class MfSettingsPage extends HTMLElement {
     }
 
     async onClick(event) {
-        const navTab = event.target instanceof Element ? event.target.closest('[data-section-tab]') : null;
-        if (navTab) {
-            this.selectSection(navTab.dataset.sectionTab);
-            return;
-        }
         const themeButton = event.target instanceof Element ? event.target.closest('.segment[data-theme]') : null;
         if (themeButton) {
             try {

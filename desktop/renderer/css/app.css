@@ -567,64 +567,35 @@ mf-progress .progress-text { font: 500 var(--font-subheadline) var(--font-mono);
 .library-context-menu button:focus-visible, .library-repository-manager-item-menu button:focus-visible { outline: none; background: var(--popover-item-hover); }
 
 /* ===== 设置页 ===== */
-/* 抽屉式布局：左列为分类栏、右列为内容面板，一次只显示一张分区卡片。
-   这里关掉 .page-body 的 overflow-y，改由 .settings-panel 自行纵向滚动，分类栏才不会随内容滚走。
-   未选中的卡片留在 DOM 中并置 hidden；tokens.css 的 [hidden] 带 !important，压得过 .card 的 display: flex。 */
+/* 单列长滚动：卡片自上而下排列，滚动由 .page-body 承担。
+   排版钩子用 data-section 而非「第几个子卡片」，卡片增删或换序时不会错位。 */
 .settings-body {
-    display: grid;
-    grid-template-columns: 176px minmax(0, 1fr);
-    gap: var(--s-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-3);
     width: 100%;
     max-width: none;
     padding-left: var(--s-4);
     padding-right: var(--s-4);
-    overflow: hidden;
 }
-.settings-nav { display: flex; flex-direction: column; gap: 2px; align-self: start; min-width: 0; }
-.settings-nav-item {
-    display: flex; align-items: center; gap: var(--s-2);
-    width: 100%;
-    padding: 7px 10px;
-    border: 0;
-    border-radius: var(--popover-item-radius);
-    background: none;
-    color: var(--label-secondary);
-    font-size: var(--font-callout); font-weight: 500;
-    text-align: left; white-space: nowrap;
-    cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
-}
-.settings-nav-item .icon { font-size: var(--font-body); }
-.settings-nav-item:hover { background: var(--popover-item-hover); color: var(--label-primary); }
-.settings-nav-item[aria-selected="true"] { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
-.settings-panel { display: flex; flex-direction: column; gap: var(--s-3); min-width: 0; min-height: 0; overflow-y: auto; }
-/* 卡片限宽：面板在宽窗下可达千余像素，而卡内多为「左标签 — 右取值」的两端对齐行，
-   不限宽时两者会被拉开到相隔上千像素、难以对读。窗口最小宽度 960 时面板约 600px，该上限不生效 */
-.settings-panel > .card { flex: none; max-width: 820px; }
-/* 分段控件三等分与「转换默认项」三列网格原先按「.settings-body 的第几个子卡片」定位；
-   卡片改挂到 .settings-panel 且逐个显隐后位置不再稳定，一律改用 data-section 钩子定位 */
-.settings-panel > .card[data-section="appearance"] .segmented {
+.settings-body > .card[data-section="appearance"] .segmented {
     align-self: stretch;
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     width: 100%;
 }
-.settings-panel > .card[data-section="appearance"] .segment { justify-content: center; min-width: 0; }
-.settings-panel > .card[data-section="defaults"] {
+.settings-body > .card[data-section="appearance"] .segment { justify-content: center; min-width: 0; }
+.settings-body > .card[data-section="defaults"] {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     align-items: start;
 }
-.settings-panel > .card[data-section="defaults"] > h2 { grid-column: 1 / -1; }
-.settings-panel > .card[data-section="defaults"] > [data-role="defaults"] { display: contents; }
-.settings-panel > .card[data-section="defaults"] [data-field="jpegPpi"] { width: 100%; }
+.settings-body > .card[data-section="defaults"] > h2 { grid-column: 1 / -1; }
+.settings-body > .card[data-section="defaults"] > [data-role="defaults"] { display: contents; }
+.settings-body > .card[data-section="defaults"] [data-field="jpegPpi"] { width: 100%; }
 @media (max-width: 760px) {
-    /* 窄窗：分类栏改为内容区顶部的一条横向可滚动条，主内容仍按 minmax(0, 1fr) 收缩，不横向溢出 */
-    .settings-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-    .settings-nav { flex-direction: row; gap: var(--s-1); overflow-x: auto; padding-bottom: var(--s-1); }
-    .settings-nav-item { flex: 0 0 auto; width: auto; }
-    .settings-panel > .card[data-section="appearance"] .segmented { grid-template-columns: 1fr; }
-    .settings-panel > .card[data-section="defaults"] { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .settings-body > .card[data-section="appearance"] .segmented { grid-template-columns: 1fr; }
+    .settings-body > .card[data-section="defaults"] { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 }
 /* 设置页「关于」：可折叠的使用方法区块 */
 .about-block { border-top: 1px solid var(--separator); padding-top: var(--s-2); }
