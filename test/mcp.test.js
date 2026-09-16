@@ -35,12 +35,15 @@ const SAMPLE_PDF = path.join(ROOT, 'test', 'fixtures', 'sample.pdf');
 const PKG_VERSION = require('../package.json').version;
 
 let client;
+let clientTransport;
 let tmpDir;
 
 before(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-mcp-'));
     client = new Client({ name: 'markflow-test', version: '1.0.0' });
-    await client.connect(new StdioClientTransport({ command: process.execPath, args: [SERVER], cwd: ROOT }));
+    // 传输层对象留作引用：进度用例要在 SDK 派发之前抓取原始帧，理由见该用例注释
+    clientTransport = new StdioClientTransport({ command: process.execPath, args: [SERVER], cwd: ROOT });
+    await client.connect(clientTransport);
 });
 
 after(async () => {
@@ -879,30 +882,59 @@ test('请求取消后不再领取新任务：已开始的照常写出，服务�
 // 进度通知、annotations 与 instructions
 // ============================================================
 
+/**
+ * 进度通知在传输层取证，而不是只看 SDK 的 onprogress 回调：
+ * StdioClientTransport 的 processReadBuffer 会把同一个读块里的帧按序同步交给 onmessage，而 SDK 的
+ * Protocol 对两类帧处理时序不同——通知走 _onnotification，派发被推迟到一个微任务（protocol.js:284）；
+ * 响应走 _onresponse，在同一同步段里就删掉了 _progressHandlers（protocol.js:488）。于是末尾若干条通知
+ * 一旦与响应落进同一个读块，等它们的微任务跑起来时 progress 处理器已被删除，_onprogress 会以
+ * “unknown token” 丢弃它们。服务端的写入顺序本身是对的（通知先于响应写进同一条 stdout 管道，实测
+ * 180 轮无一例外），丢帧纯属客户端派发时序，负载越高越容易命中——CI 上那次 last.progress 停在 190
+ * 即此因。故在 onmessage 上取证：该回调与响应帧的处理同处一个同步段，响应到达时先于它的帧必已记全，
+ * 断言因此不依赖任何时序。
+ */
 test('带 progressToken 调用时推送严格递增的中文进度通知，末条为全部完成', async () => {
     // Arrange
     const outputDir = makeOutDir('progress-');
+    const frames = [];
     const events = [];
+    const deliver = clientTransport.onmessage;
+    clientTransport.onmessage = (message, extra) => {
+        if (message && message.method === 'notifications/progress') frames.push(message.params);
+        deliver(message, extra);
+    };
 
     // Act：SDK 客户端给出 onprogress 时自动在 _meta 中带上 progressToken
-    const result = await client.callTool(
-        { name: 'convert_document', arguments: { paths: [SAMPLE_MD, SAMPLE_PDF], outputDir, pdfBackend: 'local' } },
-        undefined,
-        { onprogress: (progress) => events.push(progress) },
-    );
+    let result;
+    try {
+        result = await client.callTool(
+            { name: 'convert_document', arguments: { paths: [SAMPLE_MD, SAMPLE_PDF], outputDir, pdfBackend: 'local' } },
+            undefined,
+            { onprogress: (progress) => events.push(progress) },
+        );
+    } finally {
+        clientTransport.onmessage = deliver;
+    }
 
     // Assert
     assert.notEqual(result.isError, true, JSON.stringify(result.content));
     assert.equal(result.structuredContent.ok, true);
-    assert.ok(events.length >= 2, `应收到多条进度，实际 ${events.length}`);
-    events.forEach((event, i) => {
-        assert.equal(event.total, 200);
-        assert.match(event.message, /[一-龥]/);
-        if (i > 0) assert.ok(event.progress > events[i - 1].progress, `进度须严格递增：${JSON.stringify(events)}`);
+    assert.ok(frames.length >= 2, `应收到多条进度，实际 ${frames.length}`);
+    const token = frames[0].progressToken;
+    frames.forEach((frame, i) => {
+        assert.equal(frame.progressToken, token, '同一次调用的进度帧须带同一个 token');
+        assert.equal(frame.total, 200);
+        assert.match(frame.message, /[一-龥]/);
+        if (i > 0) assert.ok(frame.progress > frames[i - 1].progress, `进度须严格递增：${JSON.stringify(frames)}`);
     });
-    const last = events[events.length - 1];
+    const last = frames[frames.length - 1];
     assert.equal(last.progress, 200);
     assert.match(last.message, /完成/);
+    // SDK 交付给调用方的那部分只可能少掉末尾若干条，故必为线上序列的前缀
+    assert.deepEqual(
+        events.map((event) => event.progress),
+        frames.slice(0, events.length).map((frame) => frame.progress),
+    );
 });
 
 test('工具 annotations 与服务 instructions', async () => {

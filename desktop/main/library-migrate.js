@@ -39,6 +39,9 @@ const EXDEV = 'EXDEV';
 
 const DEFAULT_FS = Object.freeze({
     rename: (from, to) => fsp.rename(from, to),
+    // 必须用异步 fsp.cp（Node 22 下为纯 JS 实现）。不要改成 fs.cpSync：它落到原生绑定
+    // fsBinding.cpSyncCheckPaths，在 Windows 上会以 0xC0000409 直接终止进程且无栈可查，
+    // 目录名含非 ASCII 字符时尤其容易命中（见 nodejs/node#54476、#59408）。
     copy: (from, to) => fsp.cp(from, to, { recursive: true }),
     rm: (target) => fsp.rm(target, { recursive: true, force: true }),
     mkdir: (dir) => fsp.mkdir(dir, { recursive: true }),

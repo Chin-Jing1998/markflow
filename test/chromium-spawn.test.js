@@ -228,5 +228,7 @@ test('真实 electron：--version 输出版本号到 stdout 并以 0 退出', { 
     }
     assert.equal(result.timedOut, false);
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /^v\d+\.\d+\.\d+/);
+    // Windows 上 Electron 会在版本号前先打一个空行（实测 stdout 为 '\nv44.3.0\n'），这是 Electron 自身
+    // 的输出习惯而非本项目的行为，故去掉首尾空白后再校验版本号形态；退出码与版本号形态照旧严格校验
+    assert.match(result.stdout.trim(), /^v\d+\.\d+\.\d+/, `stdout=${JSON.stringify(result.stdout)}`);
 });

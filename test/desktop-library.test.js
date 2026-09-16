@@ -590,6 +590,24 @@ describe('planMigration', () => {
 });
 
 describe('runMigration', () => {
+    /**
+     * 夹具自带的递归拷贝，刻意不用 fs.cpSync。
+     * Node 22 的 cpSync 落到原生绑定 fsBinding.cpSyncCheckPaths，该实现在 Windows 上会以
+     * 0xC0000409（STATUS_STACK_BUFFER_OVERRUN，退出码 3221226505）直接终止进程，且不抛任何 JS 异常、
+     * 无栈可查；目录名含非 ASCII 字符（本夹具的「季度报告」）时尤其容易命中。上游至今未修，
+     * 见 nodejs/node#54476 与 #59408。生产代码走的是异步 fsp.cp（JS 实现），不经过该原生路径。
+     * 此处只是 EXDEV 回退分支的桩实现，换成 copyFileSync 逐项拷贝后语义完全相同。
+     */
+    const copyTree = (from, to) => {
+        fs.mkdirSync(to, { recursive: true });
+        for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+            const src = path.join(from, entry.name);
+            const dest = path.join(to, entry.name);
+            if (entry.isDirectory()) copyTree(src, dest);
+            else fs.copyFileSync(src, dest);
+        }
+    };
+
     // 造一个真实产物目录并入库，返回 { lib, record, libRoot }
     async function seedMigration(label) {
         const { lib, clock } = makeLibrary(label, { start: '2026-04-09T02:00:00.000Z' });
@@ -643,7 +661,7 @@ describe('runMigration', () => {
             library: lib,
             fs: {
                 rename: async () => { calls.push('rename'); throw exdev; },
-                copy: async (from, to) => { calls.push(`copy:${path.basename(to)}`); fs.cpSync(from, to, { recursive: true }); },
+                copy: async (from, to) => { calls.push(`copy:${path.basename(to)}`); copyTree(from, to); },
                 rm: async (target) => { calls.push('rm'); fs.rmSync(target, { recursive: true, force: true }); },
             },
         });
