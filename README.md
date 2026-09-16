@@ -4,7 +4,7 @@
 
 文档转换工具：把办公文档、PDF 与网页转成 Markdown 知识库包，把 Markdown 转成 Word 或 PDF，并把以上全部输入转成 HTML 或 XML（含国家知识产权局专利五书 XML）。同一套转换内核由三个入口共用——桌面应用、命令行与 MCP 服务。
 
-形态沿革：v1.0.0 为 Electron 桌面应用；v2.0.0 移除界面，改为纯命令行与 MCP；v3.0.0 重新提供桌面应用，与命令行、MCP 共用 `converters/` 内核，三端能力同步。相较 v2.0.0 的主要变化：
+形态沿革：v1.0.0 为 Electron 桌面应用；v2.0.0 移除界面，改为纯命令行与 MCP；v3.0.0 重新提供桌面应用，与命令行、MCP 共用 `converters/` 内核。三端共用同一套转换内核与选项定义（`converters/options.js`），转换结果的结构也一致；但三端的交互面并不等同：桌面端格式面板的 33 项转换选项在命令行（36 个旗标）与 MCP（15 个选项入参，含嵌套段）中均有对应，页边距三端都未开放，且命令行会预检输入文件是否存在、MCP 不预检（缺失项记入 `errors`）。相较 v2.0.0 的主要变化：
 
 - 新增 `html` 与 `xml` 两个转换目标，`xml` 含 `generic` 与 `patent` 两套方言。
 - PDF 输入改以 MinerU 云端解析为主，可拿到图片、版面、表格与公式；无令牌时回退本地文本层解析并告警。
@@ -82,6 +82,7 @@ Windows 上 SmartScreen 会拦截未签名安装包，点「更多信息」后�
 
 ```bash
 markflow convert <输入...> [--to bundle|docx|pdf|html|xml] [--out <目录>] [--json] [--concurrency <n>] [转换选项...]
+markflow extract <网址> [--json] [--max-chars <n>]
 markflow formats [--json]
 markflow config get [--json] | config set <项> <值> | config unset <项>
 markflow mcp
@@ -93,20 +94,26 @@ markflow mcp
 |---|---|
 | `--to <目标>` | `bundle` \| `docx` \| `pdf` \| `html` \| `xml`；省略时按输入类型取默认目标 |
 | `--out <目录>` | 输出目录，必须已存在；省略时取环境变量 `MARKFLOW_OUTPUT_DIR`，再回退到当前目录 |
-| `--json` | 标准输出只有一行 JSON 结果，进度与错误一律走标准错误 |
-| `--concurrency <n>` | `convert` 的并发数，默认 2 |
+| `--json` | 标准输出只有一行 JSON 结果；**不输出进度**，告警随结果进 JSON，参数错误与运行异常走标准错误 |
+| `--concurrency <n>` | `convert` 的并发数，默认 2；取值非法时在标准错误给出告警并按默认值继续，不中断转换 |
+| `--max-chars <n>` | `extract` 返回 Markdown 的字符上限，默认 50000，超出即截断并提示 |
+| `--no-<开关>` | 关闭任一布尔开关，如 `--no-mineru-formula`；同一开关以最后一次出现为准 |
 | `-h, --help` | 显示帮助 |
 | `-v, --version` | 显示版本号 |
 
-退出码：0 为全部成功，1 为参数错误或运行异常，2 为存在失败项。
+人类模式（不加 `--json`）下标准输出只有产物路径，进度、告警与汇总走标准错误：每项完成后逐条打印该项告警（`  告警：…`），汇总行在有告警时追加告警条数。参数解析的报错一律为中文。
+
+退出码：0 为全部成功，1 为参数错误或运行异常，2 为存在失败项（`extract` 为提取失败）。
 
 ### convert 的转换选项
 
-取值范围与默认值的唯一定义处为 `converters/options.js`，下表与 `markflow convert --help` 同源。
+取值范围与默认值的唯一定义处为 `converters/options.js`，下表与 `markflow --help` 同源。布尔开关写旗标即开启，写 `--no-<旗标>` 即关闭（如 `--no-mineru-formula`）。
+
+选项按本批目标校验：某段只服务于本批之外的目标时，越界取值跳过写入并保留该段默认值，不让整批失败。例如 `--to docx --font-size 9` 中 9 超出 html 段的 10–32 但落在 docx 段的 8–36 内，于是只写入 docx 段（html 段保留 16）；`--to html --font-size 34` 则照常报错。
 
 | 选项 | 取值 | 默认 | 说明 |
 |---|---|---|---|
-| `--theme <主题>` | `apple` \| `apple-dark` \| `github` \| `academic` \| `reader` \| `print` | `apple` | HTML 主题；同时作用于 `html` 与 `pdf` 目标 |
+| `--theme <主题>` | `apple` \| `apple-dark` \| `github` \| `academic` \| `reader` \| `print` | html `apple`、pdf `print` | 同时作用于 `html` 与 `pdf` 目标，两者缺省值不同 |
 | `--xml-profile <profile>` | `generic` \| `patent` | `generic` | XML 方言：`generic` 通用文档结构，`patent` 国知局专利五书 |
 | `--patent-parts <部分列表>` | `claims` \| `description` \| `drawings` \| `abstract` \| `abstract-figure`，逗号分隔 | `auto` | `patent` profile 下输出的五书子集；`auto` 按识别结果输出 |
 | `--pdf-backend <后端>` | `auto` \| `mineru` \| `local` | `auto` | PDF 解析后端：`auto` 有令牌走云端否则本地，`mineru` 强制云端，`local` 强制本地 |
@@ -116,12 +123,31 @@ markflow mcp
 | `--math <方式>` | `image` \| `text` | `image` | docx 公式：`image` 栅格为图片，`text` 降级为线性化文本 |
 | `--mineru-model <模型>` | `pipeline` \| `vlm` | `pipeline` | MinerU 解析模型 |
 | `--mineru-ocr` | 布尔开关 | `false` | 强制 OCR |
+| `--mineru-formula` | 布尔开关 | `true` | 识别公式；关闭写 `--no-mineru-formula` |
+| `--mineru-table` | 布尔开关 | `true` | 识别表格；关闭写 `--no-mineru-table` |
 | `--mineru-lang <语言>` | 1–32 位字母、数字、`_`、`-` | `ch` | 文档语言代码 |
+| `--mineru-timeout <秒>` | 整数 30–3600 | `600` | MinerU 云端解析超时 |
 | `--page-ranges <范围>` | 形如 `1-5,8` | 无 | MinerU 解析的页码范围 |
 | `--font <字体栈>` | CSS `font-family` 值 | 无 | 正文字体栈；省略时取主题默认栈 |
-| `--font-size <n>` | 10–32 | `16` | 正文字号（px）；`docx` 目标按 pt 取同一取值，范围 8–36 |
+| `--font-size <n>` | html 10–32，docx 8–36 | html `16`、docx `11` | 正文字号：`html` 与 `pdf` 目标按 px，`docx` 目标按 pt |
+| `--docx-font-size <n>` | 8–36 | `11` | `docx` 正文字号（pt）；与 `--font-size` 同给时以本项为准 |
+| `--font-ascii <字体>` | 字体名 | `Calibri` | `docx` 西文字体 |
+| `--font-east-asia <字体>` | 字体名 | `微软雅黑` | `docx` 中文字体 |
 | `--line-height <n>` | 1–3 | `1.7` | 行高倍数 |
+| `--content-width <n>` | 整数 480–1600 | `760` | HTML 正文栏宽（px） |
+| `--spacing <档位>` | `compact` \| `normal` \| `loose` | `normal` | 段落间距档位 |
+| `--inline-images` | 布尔开关 | `false` | HTML 图片以 data URI 内联，不再引用 `images/` |
+| `--page-size <纸张>` | `A4` \| `Letter` | `A4` | `pdf` 与 `docx` 目标的纸张 |
+| `--landscape` | 布尔开关 | `false` | `pdf` 横向 |
+| `--xml-indent <n>` | 整数 0–8 | `2` | XML 缩进空格数 |
 | `--numbering-start <n>` | 整数 1–9999 | `1` | 说明书段号起始值 |
+| `--numbering-width <n>` | 整数 1–6 | `4` | 说明书段号补零位数 |
+| `--patent-image-dpi <n>` | 整数 72–600 | `300` | `patent` profile 的图片密度（DPI） |
+| `--section-detection <方式>` | `auto` \| `headings` | `auto` | `patent` 分节识别：`auto` 标题或加粗短段，`headings` 仅标题 |
+| `--rasterize-tables` | 布尔开关 | `true` | `patent` 表格栅格为图片；关闭写 `--no-rasterize-tables` |
+| `--rasterize-formulas` | 布尔开关 | `true` | `patent` 公式栅格为图片；关闭写 `--no-rasterize-formulas` |
+| `--raster-scale <倍数>` | 1–4 | `2` | 栅格化缩放倍数（`patent` profile 下忽略） |
+| `--raster-max-width <n>` | 整数 200–10000 | `1600` | 图片最大宽度（px，`patent` profile 下忽略） |
 | `--validate` | 布尔开关 | `false` | 仅 `xml` 目标生效：渲染后用官方 DTD 校验，结果写入 warnings 与 `precheck.json` |
 
 使用示例：
@@ -142,6 +168,16 @@ markflow convert https://example.com/a https://example.com/b --out ~/Documents/�
 # 专利底稿转五书 XML 并做 DTD 校验
 markflow convert 专利底稿.docx --to xml --xml-profile patent --validate --out ~/Desktop
 ```
+
+### extract：网页正文只读提取
+
+```bash
+markflow extract https://example.com/a                      # Markdown 正文写标准输出
+markflow extract https://example.com/a --json               # 一行 JSON：正文与元数据
+markflow extract https://example.com/a --max-chars 200000   # 调大正文上限
+```
+
+抓取一个 `http`/`https` 网页，只返回提取后的 Markdown 正文与元数据：不落盘、不下载图片（图片只列原始地址）。人类模式下正文走标准输出，标题、提取方式、字数与图片数走标准错误；`--json` 时标准输出为一行 JSON，字段与 MCP 的 `extract_article` 完全一致：`url`、`finalUrl`、`title`、`wordCount`、`extraction`、`markdown`、`truncated`、`images`，以及取得到时才出现的 `author`、`publishedAt`、`siteName`、`excerpt`、`lang`。正文超过 `--max-chars`（默认 5 万字符）即截断并把 `truncated` 置为 `true`，`wordCount` 仍按全文统计。抓取失败以退出码 2 结束，说明写标准错误。
 
 ### 配置
 
@@ -170,6 +206,7 @@ markflow config unset mineru-token         # 从配置文件移除；其它来�
       "outputs": {
         "md": "/Users/you/Documents/知识库/季度报告/季度报告.md",
         "json": "/Users/you/Documents/知识库/季度报告/季度报告.json",
+        "contentList": "/Users/you/Documents/知识库/季度报告/季度报告_content_list.json",
         "imagesDir": "/Users/you/Documents/知识库/季度报告/images"
       },
       "imagesCount": 7,
@@ -183,42 +220,52 @@ markflow config unset mineru-token         # 从配置文件移除；其它来�
 }
 ```
 
-字段说明：`options` 为本次生效的完整选项（`mineru.token` 一律置 `null`）；`extras` 为已落盘附属文件在产物目录内的相对路径（MinerU 产物即在此列）；`backends` 记录实际生效的 PDF 解析后端与栅格化后端；`--validate` 时信封另有 `validate: true`。
+字段说明：`options` 为本次生效的完整选项（`mineru.token` 一律置 `null`）；`extras` 为已落盘附属文件在产物目录内的相对路径（MinerU 产物即在此列）；`backends` 记录实际生效的 PDF 解析后端与栅格化后端；`--validate` 时信封另有 `validate: true`。告警不单列字段，逐项写在各结果的 `warnings` 中；`--json` 模式不输出进度。
+
+`outputs` 的键由产物文件名派生（规则的唯一定义处为 `converters/output.js`）：主产物 `{名称}.<扩展名>` 取扩展名（`md`、`json`、`html`、`xml`、`docx`、`pdf`、`zip`）；以 `{名称}_` 开头的旁路文件取其后主干的 camelCase，非 `.json` 的再接扩展名；其余文件取去扩展名的文件名转 camelCase（`claims.xml` → `claims`、`abstract-figure.xml` → `abstractFigure`）；写入了 `images/` 则另有 `imagesDir`。因此 `bundle` 目标恒有 `md`、`json`、`contentList`，有图片时有 `imagesDir`；PDF 走 MinerU 时另有 `contentListV2`、`model`、`layout`、`originPdf`。
 
 ## MCP 服务
 
-以标准输入输出提供三个工具，供 Claude Code、Codex 等 agent 直接调用。
+以标准输入输出提供三个工具，供 Claude Code、Codex 等 agent 直接调用。工具描述、枚举与取值范围由 `converters/options.js` 的描述树生成，与 `markflow --help` 同源；入参校验的拒绝文案为中文。
 
-| 工具 | 用途 |
-|---|---|
-| `convert_document` | 转换本地文件或网页，返回结构与命令行 `--json` 一致 |
-| `extract_article` | 抓取网页只返回正文 Markdown 与元数据，不落盘、不下载图片 |
-| `list_formats` | 返回输入与目标的对应矩阵、可选主题与 XML profile，以及本机 PDF 后端、栅格化后端与 MinerU 令牌状态 |
+| 工具 | 用途 | annotations |
+|---|---|---|
+| `convert_document` | 转换本地文件或网页，返回结构与命令行 `--json` 一致 | `destructiveHint`、`openWorldHint` |
+| `extract_article` | 抓取网页只返回正文 Markdown 与元数据，不落盘、不下载图片 | `readOnlyHint` |
+| `list_formats` | 返回输入与目标的对应矩阵、受理扩展名、可选主题与 XML profile，以及本机 PDF 后端、栅格化后端、DTD 校验器、LibreOffice 与 MinerU 令牌状态 | `readOnlyHint` |
+
+`initialize` 回包的 `instructions` 写明三件事：`outputDir` 必须已存在（服务端不创建目录）、PDF 缺省可能走按量计费的 MinerU 云端（传 `pdfBackend:"local"` 可留在本机）、只读网页用 `extract_article`。
 
 `convert_document` 入参：
 
 | 入参 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `paths` | `string[]` | 与 `urls` 至少一项 | 本地文件绝对路径列表 |
+| `paths` | `string[]` | 与 `urls` 至少一项 | 本地文件路径列表；建议绝对路径 |
 | `urls` | `string[]` | 与 `paths` 至少一项 | 网页 URL 列表 |
-| `outputDir` | `string` | 是 | 已存在的输出目录绝对路径 |
+| `outputDir` | `string` | 是 | 已存在的输出目录；服务端不创建目录 |
 | `target` | `bundle` \| `docx` \| `pdf` \| `html` \| `xml` | 否 | 省略时按输入类型取默认目标 |
-| `returnContent` | `boolean` | 否 | 为真时附带生成的 Markdown 正文，上限 20 万字符 |
-| `theme` | 六款主题之一 | 否 | `html` 与 `pdf` 目标的主题 |
+| `returnContent` | `boolean` | 否 | 为真时在 `bundle` 目标的结果项 `content` 中附带 Markdown 正文，上限 20 万字符，超出截断并置 `contentTruncated`；其它目标不返回正文，只在该项 `warnings` 中说明 |
+| `theme` | 六款主题之一 | 否 | `html` 与 `pdf` 目标的主题（html 默认 `apple`，pdf 默认 `print`） |
 | `xmlProfile` | `generic` \| `patent` | 否 | XML 方言 |
 | `patentParts` | 五书名数组 | 否 | `patent` profile 下输出的五书子集 |
 | `pdfBackend` | `auto` \| `mineru` \| `local` | 否 | PDF 解析后端 |
 | `imageFormat` | `jpg` \| `keep` | 否 | 图片归一格式 |
-| `jpegQuality` | `integer` | 否 | JPEG 压缩质量，60–100 |
+| `jpegQuality` | `integer` | 否 | JPEG 压缩质量，60–100，默认 90 |
 | `jpegPpi` | `integer` | 否 | JPEG 分辨率，72–600 PPI，默认 330 |
 | `math` | `image` \| `text` | 否 | docx 公式处理方式 |
 | `validate` | `boolean` | 否 | `xml` 目标的校验开关 |
-| `mineru` | `{ model, ocr, language, pageRanges }` | 否 | MinerU 解析参数；令牌不接受经此传入 |
-| `html` | `{ fontFamily, fontSize, lineHeight, contentWidth, spacing, inlineImages }` | 否 | HTML 目标参数：字体栈、字号（px）、行高、栏宽（px）、段距档位与图片内联 |
+| `mineru` | `{ model, ocr, formula, table, language, pageRanges, timeoutSec }` | 否 | MinerU 解析参数；令牌只取自本机环境变量、`~/.markflow/config.json` 或 `~/.mineru/config.yaml`，不接受经此传入 |
+| `html` | `{ fontFamily, fontSize, lineHeight, contentWidth, spacing, inlineImages }` | 否 | HTML 目标参数：字体栈、字号（px）、行高、栏宽（px）、段距档位与图片内联；`pdf` 目标同样以本段排版，只有主题另取 `pdf.theme` |
+| `pdf` | `{ pageSize, landscape }` | 否 | PDF 目标参数：纸张与横向 |
 | `docx` | `{ pageSize, fontSize, fontAscii, fontEastAsia }` | 否 | DOCX 目标参数：纸张、正文字号（pt）与中西文字体 |
-| `xml` | `{ indent, numberingStart, numberingWidth }` | 否 | XML 目标参数：缩进空格数与说明书段号的起始值、补零位数 |
+| `xml` | `{ indent, numberingStart, numberingWidth, imageDpi, sectionDetection, rasterizeTables, rasterizeFormulas }` | 否 | XML 目标参数：缩进与说明书段号；后四项仅 `patent` profile 生效 |
+| `raster` | `{ scale, maxWidth }` | 否 | 栅格化参数（`patent` profile 下忽略） |
 
-`extract_article` 入参为 `url`（必填）与 `maxChars`（可选，默认 5 万字符，超出截断并以 `truncated` 标记）；返回 `url`、`finalUrl`、`title`、`wordCount`、`extraction`、`markdown`、`truncated`、`images`，以及取得时才出现的 `author`、`publishedAt`、`siteName`、`excerpt`、`lang`。`list_formats` 无入参。
+返回结构与命令行 `--json` 相同，另有三处只出现在 MCP 的字段：`validate` 为真时信封带 `validate: true`；传入本工具不认得的键时信封带 `ignoredArguments`（形如 `["font", "html.colour"]`，段内未知字段记为 `段.字段`），这些键被忽略而非静默丢弃，转换照常进行；`returnContent` 为真时结果项带 `content` 与 `contentTruncated`。调用时在 `_meta` 中带上 `progressToken` 即可收到 `notifications/progress`，进度单调递增，`message` 为中文阶段名。
+
+与命令行的两点差异：其一，命令行在转换前预检每个输入文件是否存在，任一缺失即以退出码 1 结束且不启动转换；MCP 不预检，缺失项记入 `errors`，`isError` 仍为 `false`，同批其余项照常转换。其二，命令行的相对路径按当前工作目录解析，MCP 的 `paths`、`urls` 与 `outputDir` 按 MCP 服务进程的工作目录解析，故建议一律传绝对路径。
+
+`extract_article` 入参为 `url`（必填）与 `maxChars`（可选，默认 5 万字符，超出截断并以 `truncated` 标记）；返回 `url`、`finalUrl`、`title`、`wordCount`、`extraction`、`markdown`、`truncated`、`images`，以及取得时才出现的 `author`、`publishedAt`、`siteName`、`excerpt`、`lang`。与命令行的 `markflow extract` 共用同一实现，字段与截断语义完全一致。`list_formats` 无入参。
 
 **Claude Code**：仓库根已有 `.mcp.json`，在本目录启动会话即自动识别。其他目录执行：
 
@@ -238,7 +285,7 @@ args = ["/绝对路径/mcp/server.js"]
 
 ### bundle：Markdown 知识库包
 
-产物为 `{名称}/` 目录，含 `{名称}.md`、`{名称}.json` 与 `images/`。Markdown 带 YAML front matter，字段顺序固定，缺失字段整条省略：标题、作者、发布时间、原文链接、最终地址、来源类型、PDF 解析后端、MinerU 模型、站点名、摘要、语言、字数、提取方式、抓取与转换时间。Obsidian、basic-memory 等工具可直接索引并回溯出处。
+产物为 `{名称}/` 目录，含 `{名称}.md`、`{名称}.json`、`{名称}_content_list.json` 与 `images/`（结果 `outputs` 中对应 `md`、`json`、`contentList`、`imagesDir`）。Markdown 带 YAML front matter，字段顺序固定，缺失字段整条省略：标题、作者、发布时间、原文链接、最终地址、来源类型、PDF 解析后端、MinerU 模型、站点名、摘要、语言、字数、提取方式、抓取与转换时间。Obsidian、basic-memory 等工具可直接索引并回溯出处。
 
 JSON 产物结构为 `{ schemaVersion, kind, ir, data, meta }`，其中 `ir` 为 mdast 语法树，`kind` 取 `document`、`workbook` 或 `presentation`。
 
@@ -376,7 +423,7 @@ test/                      测试与固定样本
 ## 开发与测试
 
 ```bash
-npm test        # node:test，953 项（2026-09-16 实测）
+npm test        # node:test，1047 项（2026-09-16 实测）
 npm run cli     # 等同 node bin/markflow.js
 npm run mcp     # 等同 node mcp/server.js
 npm start       # 等同 electron .，启动桌面应用
