@@ -36,8 +36,14 @@ const LIBRARY_ROOT_DIRNAME = 'MarkFlow Library';
 /** 渲染进程可申请的权限：只放行剪贴板写入（复制路径），其余一律拒绝 */
 const PERMISSIONS_ALLOWED = Object.freeze(new Set(['clipboard-sanitized-write']));
 
-/** 普通 Node 进程里 require('electron') 得到的是可执行文件路径字符串（或抛错），此时返回 null */
+/**
+ * 仅在 Electron 进程内返回 electron 模块，普通 Node 进程返回 null。
+ * 先查 process.versions.electron：只有 Electron 进程才有该字段。普通 Node 里不能贸然
+ * require('electron')——那是 npm 包的路径解析逻辑，二进制缺失时会当场下载（往 stdout
+ * 打印并以 stdio:'inherit' 拉起 install.js），测试与命令行都不该有这种副作用。
+ */
 function loadElectron() {
+    if (!process.versions || !process.versions.electron) return null;
     try {
         const mod = require('electron');
         return mod && typeof mod === 'object' && mod.app ? mod : null;
