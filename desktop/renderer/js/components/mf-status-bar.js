@@ -3,42 +3,36 @@
  * 默认仅显示应用名称；路由到文件库页或阅读页时换显该页的搜索 / 仅显示收藏 / 折叠侧栏三个按钮（参考 Obsidian 顶栏图标行，
  * 位置贴近红绿灯；侧栏折叠时只留折叠按钮）。该页有打开的文件时（store.libraryDoc / store.readerDoc 非 null）另显文档功能：
  *   左区：三个按钮之后接「后退 / 前进」（⌘[ / ⌘]；焦点在输入框或编辑区时不拦截）；
- *   中区：文件名、Markdown 保存状态与所在文件夹（小字），过长时省略；
- *   右区：视图分段控件、内联查找框（⌘F；Enter 或 ⌘G 下一个、⇧Enter 或 ⇧⌘G 上一个、Esc 关闭）、阅读辅助（大纲、查找、A−、A+）、
- *         当前文件操作（收藏、在访达中显示、用默认应用打开）与「⋯」菜单（复制路径；文件库另有重新转换，阅读页另有关闭文件）。
- *         窗口变窄时先收起文件操作、再收起阅读辅助，均改入「⋯」，视图分段控件保留到最后。
+ *   右区：阅读辅助（大纲、查找、A−、A+）、当前文件操作（收藏、在访达中显示、用默认应用打开）
+ *         与「⋯」菜单（复制路径；文件库另有重新转换，阅读页另有关闭文件）。本栏自身放不下时先收起文件操作、再收起阅读辅助，均改入「⋯」。
+ * 文件名、视图分段控件与内联查找框不在本栏，而在各页主内容区顶部的 <mf-doc-bar>（只占主内容区宽度，不横跨图标栏与文件树）。
  * 本组件与 <mf-library-page>/<mf-reader-page> 互不直接引用：状态只从 store 读，操作经 window 上的 mf-doc-command 事件
- * { route, command, value } 下发；需要回包的命令（outline、find）由页面同步写入 event.detail.result。
- * 查找命令的 value 为 { query, backwards, reset, restore }，回包 { total, current, pending? }；计数文案统一由 findCountLabel 给出，
- * 编辑页另经编辑器冒泡到 window 的 mf-md-find 事件边改边更新。查找框开着时换视图或换文件，自动按当前查询串重查：
- * 编辑页只重现高亮与计数、不动选区与滚动；帧内视图同按 Enter，帧未装载完（pending）时限次重发。
+ * { route, command, value } 下发；需要回包的命令（outline）由页面同步写入 event.detail.result。
+ * 查找的全部状态与逻辑都在 <mf-doc-bar> 内，本栏只管三处入口：「查找」按钮与 ⌘F / Esc 翻转 store 的 libraryFindOpen / readerFindOpen
+ * 开关字段（与「搜索」「仅显示收藏」同一套做法），⌘G / ⇧⌘G 经 mf-doc-command 下发 find-step 命令（「跳到下一处」是动作、不是状态）。
  * ⌘+ / ⌘- 不在此绑定，留给应用菜单的整窗缩放。
  */
 import { store } from '../store.js';
 import { icon } from '../icons.js';
 import { platform } from '../api.js';
 import { escapeHtml, escapeAttr } from '../dom.js';
-import { DOC_ZOOM, findCountLabel } from '../doc-tools.mjs';
+import { DOC_ZOOM } from '../doc-tools.mjs';
 
 // 两个路由各自的状态字段名；库与阅读页各自独立，互不影响。
 const ROUTE_FIELDS = Object.freeze({
-    library: { collapsed: 'librarySidebarCollapsed', favorites: 'libraryFavoritesOnly', search: 'librarySearchOpen', doc: 'libraryDoc' },
-    reader: { collapsed: 'readerSidebarCollapsed', favorites: 'readerFavoritesOnly', search: 'readerSearchOpen', doc: 'readerDoc' },
+    library: { collapsed: 'librarySidebarCollapsed', favorites: 'libraryFavoritesOnly', search: 'librarySearchOpen', find: 'libraryFindOpen', doc: 'libraryDoc' },
+    reader: { collapsed: 'readerSidebarCollapsed', favorites: 'readerFavoritesOnly', search: 'readerSearchOpen', find: 'readerFindOpen', doc: 'readerDoc' },
 });
 const IS_MAC = platform === 'darwin';
 const MOD = IS_MAC ? '⌘' : 'Ctrl+';
-const FIND_NEXT_KEYS = IS_MAC ? '⌘G' : 'Ctrl+G';
-const FIND_PREV_KEYS = IS_MAC ? '⇧⌘G' : 'Ctrl+Shift+G';
 const REVEAL_LABEL = IS_MAC ? '在访达中显示' : (platform === 'win32' ? '在资源管理器中显示' : '在文件管理器中显示');
 // 右区可收进「⋯」的分组，按收起先后排列：先收文件操作，再收阅读辅助
 const COLLAPSIBLE_GROUPS = Object.freeze(['file', 'aids']);
-const MIN_TITLE_WIDTH = 140;
+// 判定本栏是否放不下的容差：scrollWidth 与 clientWidth 取整后可能差 1px，超过它才算真溢出
+const OVERFLOW_SLACK = 1;
 const POPOVER_MARGIN = 8;
 const TEXT_ENTRY = 'input, textarea, select, [contenteditable=""], [contenteditable="true"]';
 const MENU_SEPARATOR = '<div class="status-bar-menu-separator" role="separator"></div>';
-// 查找目标还没装载完（帧内视图的帧未装载完，回包 pending）时的重发间隔与次数上限：每 50 ms 一次、最多 200 次（约 10 s），届时仍未装载完则计数留空
-const FIND_RETRY_MS = 50;
-const FIND_RETRY_LIMIT = 200;
 
 const docButton = (action, iconName, label, extra = '') => `<button class="icon-btn icon-btn-sm" type="button" data-action="${action}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}"${extra}>${icon(iconName)}</button>`;
 const menuItem = (command, label, disabled = false) => `<button type="button" role="menuitem" data-menu-command="${command}"${disabled ? ' disabled' : ''}>${escapeHtml(label)}</button>`;
@@ -60,9 +54,6 @@ class MfStatusBar extends HTMLElement {
         this.dataset.ready = '1';
         this.doc = null;
         this.docKey = '';
-        this.findOpen = false;
-        // 查找目标未装载完时的重发计时器；新的查找、换视图或换文件、关闭查找时作废
-        this.findRetryTimer = null;
         // 当前展开的弹层（'' | 'menu' | 'outline'）。字段不可取名 popover：HTMLElement 上同名属性属 Popover API，赋值会把本元素变成弹层
         this.activePopover = '';
         this.activePopoverAnchor = null;
@@ -80,16 +71,7 @@ class MfStatusBar extends HTMLElement {
                     ${docButton('doc-forward', 'chevronRight', `前进（${MOD}]）`)}
                 </span>
             </div>
-            <div class="status-bar-doc-title" data-role="doc-title" hidden></div>
             <div class="status-bar-doc-tools" data-role="doc-tools" hidden>
-                <span class="pane-tabs status-bar-doc-views" data-role="doc-views" role="tablist" aria-label="文件视图" hidden></span>
-                <div class="status-bar-find" data-role="find" role="search" hidden>
-                    <input class="input input-slim status-bar-find-input" type="search" data-role="find-input" placeholder="在文档中查找" aria-label="在文档中查找" spellcheck="false">
-                    <span class="status-bar-find-count" data-role="find-count" aria-live="polite"></span>
-                    ${docButton('find-prev', 'chevronUp', `上一个（⇧Enter 或 ${FIND_PREV_KEYS}）`)}
-                    ${docButton('find-next', 'chevronDown', `下一个（Enter 或 ${FIND_NEXT_KEYS}）`)}
-                    ${docButton('find-close', 'x', '关闭查找（Esc）')}
-                </div>
                 <div class="status-bar-doc-group" data-group="aids">
                     ${docButton('doc-outline', 'outline', '大纲', ' data-role="outline-btn" aria-haspopup="menu" aria-expanded="false"')}
                     ${docButton('doc-find', 'findInPage', `在文档中查找（${MOD}F）`, ' data-role="find-btn" aria-pressed="false"')}
@@ -105,10 +87,6 @@ class MfStatusBar extends HTMLElement {
                 <div class="status-bar-popover status-bar-menu" data-role="doc-menu" role="menu" aria-label="更多操作" hidden></div>
                 <div class="status-bar-popover status-bar-outline" data-role="doc-outline" role="menu" aria-label="大纲" hidden></div>
             </div>`;
-        const input = this.querySelector('[data-role="find-input"]');
-        input.addEventListener('input', (event) => { if (!event.isComposing) this.runFind({ reset: true }); });
-        input.addEventListener('compositionend', () => this.runFind({ reset: true }));
-        input.addEventListener('keydown', (event) => this.onFindKey(event));
         this.addEventListener('click', (event) => this.onClick(event));
         this.onDocumentKey = (event) => this.onShortcut(event);
         this.onDocumentPointer = (event) => {
@@ -117,12 +95,9 @@ class MfStatusBar extends HTMLElement {
         };
         // 点进帧内时父页收不到 pointerdown，但窗口会失焦：借此收起弹层
         this.onWindowBlur = () => this.closePopover();
-        // 编辑页实时计数：编辑器重建查找高亮或换当前命中后派发 mf-md-find，冒泡到 window
-        this.onEditorFindEvent = (event) => this.onEditorFind(event.detail);
         document.addEventListener('keydown', this.onDocumentKey);
         document.addEventListener('pointerdown', this.onDocumentPointer, true);
         window.addEventListener('blur', this.onWindowBlur);
-        window.addEventListener('mf-md-find', this.onEditorFindEvent);
         if (typeof ResizeObserver === 'function') {
             this.resizeObserver = new ResizeObserver(() => this.layoutDocTools());
             this.resizeObserver.observe(this);
@@ -136,8 +111,6 @@ class MfStatusBar extends HTMLElement {
         document.removeEventListener('keydown', this.onDocumentKey);
         document.removeEventListener('pointerdown', this.onDocumentPointer, true);
         window.removeEventListener('blur', this.onWindowBlur);
-        window.removeEventListener('mf-md-find', this.onEditorFindEvent);
-        this.stopFindRetry();
         if (this.resizeObserver) this.resizeObserver.disconnect();
     }
 
@@ -150,14 +123,16 @@ class MfStatusBar extends HTMLElement {
         return detail.result;
     }
 
+    /** 查找框的开关状态存于 store，由各页主内容区的 <mf-doc-bar> 跟随该字段开合；本栏只翻转字段，不持有查找状态 */
+    setFind(open) {
+        const state = store.get();
+        const fields = ROUTE_FIELDS[state.route];
+        if (fields && Boolean(state[fields.find]) !== open) store.set({ [fields.find]: open });
+    }
+
     onClick(event) {
         const target = event.target instanceof Element ? event.target : null;
         if (!target) return;
-        const view = target.closest('[data-doc-view]');
-        if (view) {
-            this.command('view', view.dataset.docView);
-            return;
-        }
         const outlineEntry = target.closest('[data-outline-index]');
         if (outlineEntry) {
             this.closePopover();
@@ -183,23 +158,20 @@ class MfStatusBar extends HTMLElement {
             case 'doc-back': this.command('back'); break;
             case 'doc-forward': this.command('forward'); break;
             case 'doc-outline': this.toggleOutline(button); break;
-            case 'doc-find': if (this.findOpen) this.closeFind(); else this.openFind(); break;
+            case 'doc-find': this.setFind(!state[fields.find]); break;
             case 'doc-zoom-out': this.command('zoom', -1); break;
             case 'doc-zoom-in': this.command('zoom', 1); break;
             case 'doc-favorite': this.command('favorite'); break;
             case 'doc-reveal': this.command('reveal'); break;
             case 'doc-open': this.command('open'); break;
             case 'doc-more': this.toggleMenu(button); break;
-            case 'find-prev': this.runFind({ backwards: true }); break;
-            case 'find-next': this.runFind({}); break;
-            case 'find-close': this.closeFind(); break;
             default: break;
         }
     }
 
     runMenuCommand(name) {
         if (name === 'outline') this.toggleOutline(this.querySelector('[data-role="more-btn"]'));
-        else if (name === 'find') this.openFind();
+        else if (name === 'find') this.setFind(true);
         else if (name === 'zoom-out' || name === 'zoom-in') this.command('zoom', name === 'zoom-in' ? 1 : -1);
         else this.command(name);
     }
@@ -209,7 +181,7 @@ class MfStatusBar extends HTMLElement {
         this.querySelector('.status-bar-brand').hidden = Boolean(fields);
         const tools = this.querySelector('[data-role="library-tools"]');
         tools.hidden = !fields;
-        this.syncDoc(fields ? state[fields.doc] || null : null, state.route);
+        this.syncDoc(fields ? state[fields.doc] || null : null, state.route, Boolean(fields && state[fields.find]));
         if (!fields) return;
         // 侧栏折叠后搜索与「仅显示收藏」都作用不到已隐藏的文件树，一并隐藏；折叠按钮始终留在原位（贴近红绿灯），单独可见。
         const collapsed = state[fields.collapsed];
@@ -224,64 +196,30 @@ class MfStatusBar extends HTMLElement {
         collapseButton.innerHTML = icon(collapsed ? 'panelLeftOpen' : 'panelLeftClose');
     }
 
-    /**
-     * 文档三区：无打开文件时全部隐藏（顶部栏保持原样）；换文件或换视图时收起弹层、清空查找计数并作废尚在等待的重发。
-     * 查找框仍开着且新视图可查找时按当前查询串自动重查（refind）；不可查找时静默收起查找框。
-     */
-    syncDoc(doc, route) {
+    /** 文档两区（左区后退 / 前进、右区工具）：无打开文件时隐藏，顶部栏保持原样；换文件或换视图时收起弹层 */
+    syncDoc(doc, route, findOpen) {
         const hasDoc = Boolean(doc);
         this.classList.toggle('has-doc', hasDoc);
-        for (const role of ['doc-nav', 'doc-title', 'doc-tools']) this.querySelector(`[data-role="${role}"]`).hidden = !hasDoc;
+        for (const role of ['doc-nav', 'doc-tools']) this.querySelector(`[data-role="${role}"]`).hidden = !hasDoc;
         const key = hasDoc ? `${route}|${doc.sessionId}|${doc.activeView}` : '';
-        const switched = key !== this.docKey;
-        if (switched) {
+        if (key !== this.docKey) {
             this.docKey = key;
             this.closePopover();
-            this.setFindCount('');
-            this.stopFindRetry();
         }
         this.doc = doc;
-        if (!hasDoc || !doc.canFind) this.closeFind({ silent: true });
-        else if (switched && this.findOpen) this.refind();
         if (!hasDoc) return;
-        this.renderTitle(doc);
-        this.renderViews(doc);
-        this.renderButtons(doc);
+        this.renderButtons(doc, findOpen);
         if (this.activePopover === 'menu') this.renderMenu(doc);
         this.layoutDocTools();
     }
 
-    renderTitle(doc) {
-        const save = doc.saveState && doc.saveState.label
-            ? `<span class="md-editor-status status-bar-doc-save" data-state="${escapeAttr(doc.saveState.state)}" title="${escapeAttr(doc.saveState.message || doc.saveState.label)}">${escapeHtml(doc.saveState.label)}</span>`
-            : '';
-        const folder = doc.folderName ? `<span class="status-bar-doc-folder" title="${escapeAttr(doc.folder)}">${escapeHtml(doc.folderName)}</span>` : '';
-        const html = `<span class="status-bar-doc-name" title="${escapeAttr(doc.path || doc.title)}">${escapeHtml(doc.title)}</span>${save}${folder}`;
-        if (html === this.titleHtml) return;
-        this.titleHtml = html;
-        this.querySelector('[data-role="doc-title"]').innerHTML = html;
-    }
-
-    /** 视图分段控件复用 .pane-tabs / .pane-tab 配方；只有一个视图（json、html、pdf、无结构视图的 xml）时不显示 */
-    renderViews(doc) {
-        const views = Array.isArray(doc.views) ? doc.views : [];
-        const html = views.length > 1
-            ? views.map(([key, label]) => `<button class="pane-tab${key === doc.activeView ? ' is-active' : ''}" type="button" role="tab" data-doc-view="${escapeAttr(key)}" aria-selected="${key === doc.activeView}">${escapeHtml(label)}</button>`).join('')
-            : '';
-        const host = this.querySelector('[data-role="doc-views"]');
-        host.hidden = !html;
-        if (html === this.viewsHtml) return;
-        this.viewsHtml = html;
-        host.innerHTML = html;
-    }
-
-    renderButtons(doc) {
+    renderButtons(doc, findOpen) {
         const zoom = Number(doc.zoom) || DOC_ZOOM.fallback;
         const byRole = (role) => this.querySelector(`[data-role="${role}"]`);
         setButton(this.querySelector('[data-action="doc-back"]'), { enabled: Boolean(doc.canBack) });
         setButton(this.querySelector('[data-action="doc-forward"]'), { enabled: Boolean(doc.canForward) });
         setButton(byRole('outline-btn'), { enabled: Boolean(doc.hasOutline), label: doc.hasOutline ? '大纲' : (doc.outlineHint || '当前视图没有可列出的标题') });
-        setButton(byRole('find-btn'), { enabled: Boolean(doc.canFind), label: doc.canFind ? `在文档中查找（${MOD}F）` : '当前视图不支持文档内查找', pressed: this.findOpen });
+        setButton(byRole('find-btn'), { enabled: Boolean(doc.canFind), label: doc.canFind ? `在文档中查找（${MOD}F）` : '当前视图不支持文档内查找', pressed: Boolean(findOpen) });
         const zoomHint = '当前视图不支持调整字号';
         setButton(byRole('zoom-out'), { enabled: Boolean(doc.canZoom) && zoom > DOC_ZOOM.min, label: doc.canZoom ? `缩小字号（当前 ${zoom}%）` : zoomHint });
         setButton(byRole('zoom-in'), { enabled: Boolean(doc.canZoom) && zoom < DOC_ZOOM.max, label: doc.canZoom ? `放大字号（当前 ${zoom}%）` : zoomHint });
@@ -360,15 +298,20 @@ class MfStatusBar extends HTMLElement {
         this.activePopoverAnchor = null;
     }
 
-    /** 窗口变窄时按 COLLAPSIBLE_GROUPS 的顺序把分组收进「⋯」，直到中区文件名留出 MIN_TITLE_WIDTH；视图分段控件不收 */
+    /**
+     * 窄窗口降级：按 COLLAPSIBLE_GROUPS 的顺序把右区分组收进「⋯」，直到本栏自身放得下。
+     * 依据：文件名、视图分段与查找框已移到各页主内容区的 <mf-doc-bar>，收起本栏的分组不再能为文件名腾出空间，
+     * 原先「中区文件名窄于某阈值即收起」的启发式随之失效，改为各栏对自己的宽度负责——本栏按自身剩余宽度判断，
+     * 文档状态栏的窄宽度降级（文件名可收缩并省略、页签与查找框保持自然宽度）由该组件自理。
+     * 溢出判定取本栏的 scrollWidth 与 clientWidth 之差：右区为 flex: none、不可收缩，放不下即溢出。
+     */
     layoutDocTools() {
         const tools = this.querySelector('[data-role="doc-tools"]');
-        const title = this.querySelector('[data-role="doc-title"]');
         if (!tools || tools.hidden || !this.clientWidth) return;
         const groups = COLLAPSIBLE_GROUPS.map((key) => tools.querySelector(`[data-group="${key}"]`));
         for (const group of groups) group.hidden = false;
         const collapsed = [];
-        for (let index = 0; index < groups.length && title.clientWidth < MIN_TITLE_WIDTH; index += 1) {
+        for (let index = 0; index < groups.length && this.scrollWidth > this.clientWidth + OVERFLOW_SLACK; index += 1) {
             groups[index].hidden = true;
             collapsed.push(COLLAPSIBLE_GROUPS[index]);
         }
@@ -377,107 +320,22 @@ class MfStatusBar extends HTMLElement {
         this.closePopover();
     }
 
-    // ---------- 查找 ----------
-
-    openFind() {
-        if (!this.doc || !this.doc.canFind) return;
-        this.closePopover();
-        this.findOpen = true;
-        this.querySelector('[data-role="find"]').hidden = false;
-        this.querySelector('[data-role="find-btn"]').setAttribute('aria-pressed', 'true');
-        this.layoutDocTools();
-        const input = this.querySelector('[data-role="find-input"]');
-        input.focus();
-        input.select();
-        if (input.value) this.runFind({ reset: true });
-    }
-
-    /** silent：换到不支持查找的视图或文件关闭时只收起查找框，不再通知页面 */
-    closeFind({ silent = false } = {}) {
-        if (!this.findOpen) return;
-        this.stopFindRetry();
-        this.findOpen = false;
-        this.querySelector('[data-role="find"]').hidden = true;
-        this.querySelector('[data-role="find-btn"]').setAttribute('aria-pressed', 'false');
-        this.setFindCount('');
-        if (!silent) this.command('find-close');
-        this.layoutDocTools();
-    }
-
     /**
-     * 下发查找并按回包显示计数。restore 为换视图或换文件后的自动重查：编辑页不动选区与滚动，帧内视图同 reset。
-     * 回包 pending（帧还没装载完）时计数留空，每 FIND_RETRY_MS 重发一次、最多 FIND_RETRY_LIMIT 次；
-     * 每次下发都先作废尚在等待的重发，快速连续的查找或切换只有最后一次生效。
+     * ⌘F 查找、⌘G / ⇧⌘G 下一处 / 上一处、⌘[ / ⌘] 后退前进、Esc 收起弹层或查找框；焦点在帧内时按键经 doc-view.prepareDocFrame 转发到这里。
+     * 快捷键统一在本栏绑定：本栏全窗只有一份，两页的 <mf-doc-bar> 却同时存在，绑在那里会触发两次。
+     * 查找相关的按键只翻转 store 的开关字段或下发 find-step，实际动作由当前路由的 <mf-doc-bar> 执行。
      */
-    runFind({ backwards = false, reset = false, restore = false } = {}, attempt = 0) {
-        this.stopFindRetry();
-        if (!this.findOpen) return;
-        const query = this.querySelector('[data-role="find-input"]').value;
-        // 查询串清空时同样下发：编辑页据此撤掉高亮，帧内视图对空串不做处理
-        const result = this.command('find', { query, backwards, reset, restore });
-        if (query && result && result.pending && attempt < FIND_RETRY_LIMIT) {
-            this.findRetryTimer = setTimeout(() => this.runFind({ backwards, reset, restore }, attempt + 1), FIND_RETRY_MS);
-        }
-        this.showFindCount(query, result);
-    }
-
-    /** 换视图或换文件后的重查：延到本轮同步渲染之后下发（页面已挂好新视图、store 通知已走完）；查询串为空时不重查 */
-    refind() {
-        this.stopFindRetry();
-        if (!this.querySelector('[data-role="find-input"]').value) return;
-        this.findRetryTimer = setTimeout(() => this.runFind({ reset: true, restore: true }), 0);
-    }
-
-    stopFindRetry() {
-        clearTimeout(this.findRetryTimer);
-        this.findRetryTimer = null;
-    }
-
-    /**
-     * 编辑页实时计数（mf-md-find）：只认查找框开着、当前路由的文档可查找、事件出自当前文档（同会话）的编辑器、
-     * 且查询串与查找框一致的那次，对比预览等其他编辑器或已失效的查找不改写计数。事件的 current 为 0 起下标（无为 -1）。
-     */
-    onEditorFind(detail) {
-        if (!detail || !this.findOpen || !this.doc || !this.doc.canFind) return;
-        if (String(detail.sessionId || '') !== String(this.doc.sessionId || '')) return;
-        const query = this.querySelector('[data-role="find-input"]').value;
-        if (!query || detail.query !== query) return;
-        this.showFindCount(query, { total: detail.total, current: Number(detail.current) + 1 });
-    }
-
-    showFindCount(query, result) {
-        const { text, empty } = findCountLabel(query, result);
-        this.setFindCount(text, empty);
-    }
-
-    setFindCount(text, empty = false) {
-        const count = this.querySelector('[data-role="find-count"]');
-        count.textContent = text;
-        count.toggleAttribute('data-empty', empty);
-    }
-
-    onFindKey(event) {
-        if (event.isComposing) return;
-        if (event.key === 'Enter') {
-            event.preventDefault();
-            this.runFind({ backwards: event.shiftKey });
-        } else if (event.key === 'Escape') {
-            event.preventDefault();
-            event.stopPropagation();
-            this.closeFind();
-        }
-    }
-
-    /** ⌘F 查找、⌘G / ⇧⌘G 下一处 / 上一处、⌘[ / ⌘] 后退前进、Esc 收起弹层或查找框；焦点在帧内时按键经 doc-view.prepareDocFrame 转发到这里 */
     onShortcut(event) {
         if (event.defaultPrevented || event.isComposing || !this.doc) return;
+        const fields = ROUTE_FIELDS[store.get().route];
+        if (!fields) return;
         if (event.key === 'Escape' && !event.metaKey && !event.ctrlKey) {
             if (this.activePopover) {
                 event.preventDefault();
                 this.closePopover();
-            } else if (this.findOpen) {
+            } else if (store.get()[fields.find]) {
                 event.preventDefault();
-                this.closeFind();
+                this.setFind(false);
             }
             return;
         }
@@ -486,15 +344,15 @@ class MfStatusBar extends HTMLElement {
         if (String(event.key || '').toLowerCase() === 'f' && !event.shiftKey) {
             if (!this.doc.canFind) return;
             event.preventDefault();
-            this.openFind();
+            this.closePopover();
+            this.setFind(true);
             return;
         }
-        // ⌘G / ⇧⌘G：查找框已开时为下一处 / 上一处（焦点在查找框、编辑区或帧内均可）；未开时与 ⌘F 相同，打开查找框
+        // ⌘G / ⇧⌘G：查找框已开时为下一处 / 上一处（焦点在查找框、编辑区或帧内均可）；未开时与 ⌘F 相同，打开查找框。两种情形都由 find-step 在文档状态栏内分辨
         if (String(event.key || '').toLowerCase() === 'g') {
             if (!this.doc.canFind) return;
             event.preventDefault();
-            if (this.findOpen) this.runFind({ backwards: event.shiftKey });
-            else this.openFind();
+            this.command('find-step', { backwards: event.shiftKey });
             return;
         }
         const back = event.key === '[' || event.code === 'BracketLeft';

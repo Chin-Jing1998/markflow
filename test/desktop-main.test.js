@@ -159,7 +159,7 @@ test('渲染层：页面与模块文件齐备，脚本以 ES 模块加载', () =
     }
     const components = fs.readdirSync(path.join(rendererDir, 'js', 'components')).sort();
     assert.deepEqual(components, [
-        'mf-compare-view.js', 'mf-convert-page.js', 'mf-dropzone.js', 'mf-facets.js', 'mf-format-panel.js',
+        'mf-compare-view.js', 'mf-convert-page.js', 'mf-doc-bar.js', 'mf-dropzone.js', 'mf-facets.js', 'mf-format-panel.js',
         'mf-library-page.js', 'mf-md-editor.js', 'mf-product-pane.js', 'mf-progress.js', 'mf-reader-page.js', 'mf-settings-page.js',
         'mf-sidebar.js', 'mf-source-pane.js', 'mf-status-bar.js', 'mf-task-list.js', 'mf-toast.js', 'mf-url-input.js',
     ]);
@@ -209,8 +209,8 @@ test('视图帧外观：adaptive 注入深色覆盖样式，paper 与缺省不�
     assert.match(dom.textDocument('a'), /body > pre \{[^}]*background: none/);
 });
 
-test('页签：三处 .pane-tab（顶部栏视图分段、对比预览两栏）均带 role="tab" 与 aria-selected，is-active 写在 class 引号内', () => {
-    for (const name of ['mf-status-bar.js', 'mf-product-pane.js', 'mf-source-pane.js']) {
+test('页签：三处 .pane-tab（文档状态栏视图分段、对比预览两栏）均带 role="tab" 与 aria-selected，is-active 写在 class 引号内', () => {
+    for (const name of ['mf-doc-bar.js', 'mf-product-pane.js', 'mf-source-pane.js']) {
         const buttons = readComponent(name).match(/<button class="pane-tab[^>]*>/g) || [];
         assert.ok(buttons.length > 0, `${name} 应渲染 .pane-tab`);
         for (const button of buttons) {
@@ -219,7 +219,7 @@ test('页签：三处 .pane-tab（顶部栏视图分段、对比预览两栏）�
             assert.match(button, /aria-selected="\$\{[^}]+\}"/, `${name}：aria-selected`);
         }
     }
-    // 文件库页与阅读页的视图页签已移到顶部栏，页面自身不再渲染 .pane-tab
+    // 文件库页与阅读页的视图页签已移到文档状态栏 <mf-doc-bar>，页面自身不再渲染 .pane-tab
     for (const name of ['mf-library-page.js', 'mf-reader-page.js']) assert.ok(!readComponent(name).includes('class="pane-tab'), `${name} 不再渲染视图页签`);
 });
 

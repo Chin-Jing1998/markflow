@@ -70,29 +70,19 @@ body {
 .status-bar-library-tools { display: flex; align-items: center; gap: 4px; margin-left: var(--sidebar-width); margin-right: auto; -webkit-app-region: no-drag; }
 .status-bar-library-tools .icon-btn-sm { width: 24px; height: 24px; font-size: 14px; }
 /* 顶部栏文档功能（文件库页 / 阅读页有打开文件时显示，无打开文件时不占位）：左区三按钮后接后退 / 前进；
-   中区文件名 + 保存状态 + 所在文件夹（标题区空白仍可拖动窗口，文字本身 no-drag 以便悬停看全路径）；
-   右区视图分段、查找框、阅读辅助、文件操作与「⋯」。选择器带 .status-bar 前缀，压过后文的 .input / .icon-btn / .pane-tabs 通用规则 */
+   右区阅读辅助、文件操作与「⋯」。文件名、视图分段与查找框不在顶部栏，见后文 .doc-bar。
+   选择器带 .status-bar 前缀，压过后文的 .icon-btn 通用规则 */
 .status-bar-sep { flex: none; width: 1px; height: 14px; margin: 0 3px; background: var(--separator-opaque); }
 .status-bar-doc-nav { display: inline-flex; align-items: center; gap: 2px; }
-.status-bar-doc-title { display: flex; flex: 1 1 auto; align-items: baseline; justify-content: center; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
-.status-bar-doc-name { min-width: 0; overflow: hidden; color: var(--label-primary); font-size: var(--font-callout); font-weight: 600; text-overflow: ellipsis; -webkit-app-region: no-drag; }
-.status-bar .status-bar-doc-save { padding: 0; -webkit-app-region: no-drag; }
-.status-bar-doc-folder { flex: 0 1 auto; min-width: 0; max-width: 40%; overflow: hidden; color: var(--label-tertiary); font-size: var(--font-subheadline); text-overflow: ellipsis; -webkit-app-region: no-drag; }
 .status-bar-doc-tools { display: flex; flex: none; align-items: center; gap: 4px; -webkit-app-region: no-drag; }
 .status-bar-doc-tools .icon-btn-sm { width: 24px; height: 24px; font-size: 14px; }
 .status-bar-doc-group { display: inline-flex; align-items: center; gap: 2px; padding-left: 4px; border-left: 1px solid var(--separator); }
-.status-bar .status-bar-doc-views { flex: none; margin-left: 0; }
-.status-bar .status-bar-doc-views .pane-tab { white-space: nowrap; }
 .status-bar-doc-tools .status-bar-zoom-btn { width: auto; min-width: 24px; padding: 0 3px; font: 600 var(--font-callout) / 1 var(--font); }
 .status-bar .icon-btn[aria-disabled="true"] { opacity: var(--disabled-opacity); cursor: default; }
 .status-bar .icon-btn[aria-disabled="true"]:hover { background: transparent; border-color: transparent; color: var(--label-secondary); }
 /* 「收藏当前文件」已收藏时为橙色实心星、无底色，与左区「仅显示收藏」按下时的强调色底区分 */
 .status-bar .status-bar-doc-star[aria-pressed="true"], .status-bar .status-bar-doc-star[aria-pressed="true"]:hover { background: transparent; border-color: transparent; color: var(--system-orange); }
 .status-bar .status-bar-doc-star[aria-pressed="true"] .icon { fill: currentColor; }
-.status-bar-find { display: inline-flex; align-items: center; gap: 2px; }
-.status-bar .status-bar-find-input { width: 168px; height: 22px; padding: 0 8px; font-size: var(--font-callout); }
-.status-bar-find-count { min-width: 40px; color: var(--label-tertiary); font: 500 var(--font-subheadline) var(--font-mono); text-align: center; white-space: nowrap; }
-.status-bar-find-count[data-empty] { color: var(--system-red); font-family: var(--font); }
 .status-bar-popover { position: absolute; top: calc(100% + 4px); z-index: 30; min-width: 184px; max-width: min(360px, calc(100vw - 16px)); padding: var(--popover-pad); border: 1px solid var(--popover-stroke); border-radius: var(--popover-radius); background: var(--popover-bg); box-shadow: var(--popover-shadow); backdrop-filter: var(--popover-filter); -webkit-backdrop-filter: var(--popover-filter); -webkit-app-region: no-drag; }
 .status-bar-outline { width: 300px; max-height: min(60vh, 480px); overflow-y: auto; }
 .status-bar-popover-title { padding: 4px 8px 6px; color: var(--label-primary); font-size: var(--font-callout); font-weight: 600; }
@@ -107,6 +97,40 @@ body {
 .status-bar-outline-item[data-level="4"] { padding-left: 46px; }
 .status-bar-outline-item[data-level="5"] { padding-left: 58px; }
 .status-bar-outline-item[data-level="6"] { padding-left: 70px; }
+/* 文档状态栏 <mf-doc-bar>：文件库页与阅读页主内容区顶部的一条，只占主内容区宽度（左缘与页面文件树的右缘齐），
+   不横跨左侧图标栏与文件树；无打开文件时整条 hidden、不占高度，内容区自然上移。
+   窄宽度下本栏自适应、不把控件收进菜单：先收文件名（收到 0 并省略），再收查找框的输入框，视图分段与各按钮始终保持自然宽度。
+   min-height 取「小控件高度 + 上下内边距」，高度不随视图分段与查找框的显隐变化。
+   窗口上沿的拖动条（.window-drag-bar，高 --titlebar-height）会盖住阅读页的这一条，故整条声明 no-drag，保证页签可点、查找框可输入。
+   选择器带 .doc-bar 前缀，压过后文的 .input / .icon-btn / .pane-tabs 通用规则 */
+.doc-bar {
+    display: flex; flex: none; align-items: center; gap: 7px;
+    min-width: 0; min-height: calc(var(--control-height-sm) + 10px);
+    padding: 5px var(--s-4);
+    border-bottom: 1px solid var(--separator);
+    color: var(--label-secondary);
+    font-size: 11px;
+    -webkit-app-region: no-drag;
+}
+/* flex-shrink 取 1000：收缩量按「收缩系数 × 基准宽度」分摊，文件名与查找框的基准都由内容定、比例不可控，
+   给文件名一个远大的系数，宽度不够时先把它收到 0（并省略），收完才轮到查找框 */
+.doc-bar-title { display: flex; flex: 1 1000 auto; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
+.doc-bar-name { min-width: 0; overflow: hidden; color: var(--label-primary); font-size: var(--font-callout); font-weight: 600; text-overflow: ellipsis; }
+.doc-bar .doc-bar-save { padding: 0; }
+.doc-bar-folder { flex: 0 1 auto; min-width: 0; max-width: 40%; overflow: hidden; color: var(--label-tertiary); font-size: var(--font-subheadline); text-overflow: ellipsis; }
+.doc-bar .doc-bar-views { flex: none; margin-left: 0; }
+.doc-bar .doc-bar-views .pane-tab { white-space: nowrap; }
+/* 窄宽度下的收缩次序：先收文件名（见上），再收查找框，且只收其中的输入框。
+   查找框的下限写成 min-width 而不靠 flex 项默认的 min-content：嵌套 flex 的 min-content 由浏览器按内在尺寸算，
+   实测收不到输入框的 min-width，会在 147px 处停住并把「关闭」按钮挤出可见区。
+   208px = 输入框下限 88 + 计数 40 + 上一个 / 下一个 / 关闭三个 24px 按钮 + 四处 2px 间距；
+   计数与三个按钮取 flex: none，任何宽度下都不被压窄 */
+.doc-bar-find { display: inline-flex; flex: 0 1 auto; align-items: center; gap: 2px; min-width: 208px; }
+.doc-bar .doc-bar-find-input { flex: 0 1 168px; width: auto; min-width: 88px; height: 22px; padding: 0 8px; font-size: var(--font-callout); }
+.doc-bar-find .icon-btn-sm { flex: none; }
+.doc-bar-find-count { flex: none; min-width: 40px; color: var(--label-tertiary); font: 500 var(--font-subheadline) var(--font-mono); text-align: center; white-space: nowrap; }
+.doc-bar-find-count[data-empty] { color: var(--system-red); font-family: var(--font); }
+.doc-bar .icon-btn-sm { width: 24px; height: 24px; font-size: 14px; }
 .page-header {
     display: flex; align-items: center; justify-content: space-between; gap: var(--s-3);
     min-height: var(--titlebar-height);
@@ -471,8 +495,6 @@ mf-progress .progress-text { font: 500 var(--font-subheadline) var(--font-mono);
 .library-file-tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .library-file-tab-close { flex: 0 0 var(--icon-btn-size-sm); width: var(--icon-btn-size-sm); height: var(--icon-btn-size-sm); margin-right: 3px; color: var(--label-tertiary); }
 .library-file-tab-close:hover { color: var(--label-primary); background: var(--surface-3); }
-.library-new-tab { flex: 0 0 var(--icon-btn-size); width: var(--icon-btn-size); height: var(--icon-btn-size); margin: 1px 0 1px 2px; color: var(--label-secondary); }
-.library-new-tab:hover { color: var(--label-primary); background: var(--surface-2); }
 .library-reader-workspace { position: relative; display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--surface-2); border: 1px solid var(--separator); border-radius: 0; }
 .library-reader-frame { flex: 1; min-width: 0; min-height: 0; background: var(--bg); }
 .library-reader-busy { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: var(--s-2); color: var(--label-secondary); font-size: var(--font-callout); background: var(--bg-translucent); backdrop-filter: saturate(180%) blur(20px); }

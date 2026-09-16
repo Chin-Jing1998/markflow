@@ -21,6 +21,7 @@ import {
 } from '../doc-view.js';
 import { readOpenHistory, rememberOpenFile, toggleFavoriteOpenFile } from '../reader-history.js';
 import { notify } from './mf-toast.js';
+import './mf-doc-bar.js';
 import './mf-md-editor.js';
 
 const SIDEBAR_WIDTH = Object.freeze({ min: 220, max: 320, default: 220 });
@@ -101,6 +102,8 @@ class MfReaderPage extends HTMLElement {
                 </aside>
                 <div class="sidebar-resize-handle" data-role="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="调整阅读页侧栏宽度" aria-valuemin="${SIDEBAR_WIDTH.min}" aria-valuemax="${SIDEBAR_WIDTH.max}" aria-valuenow="${SIDEBAR_WIDTH.default}" tabindex="0"></div>
                 <section class="reader-main">
+                    <!-- 文档状态栏（文件名 + 保存状态 + 所在文件夹、视图分段、查找框）：本页无标签条，放在主内容区最上方 -->
+                    <mf-doc-bar class="doc-bar" data-route="reader" hidden></mf-doc-bar>
                     <section class="compare-empty" data-role="empty">
                         <div class="dropzone-icon">${icon('reader')}</div>
                         <h3>直接打开阅读</h3>

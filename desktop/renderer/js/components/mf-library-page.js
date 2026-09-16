@@ -18,6 +18,7 @@ import {
     readDocZoom, writeDocZoom, prepareDocFrame, bindEditorPreviewFrames, applyDocZoom, findInView, endFindInView, gotoOutlineItem,
 } from '../doc-view.js';
 import { notify } from './mf-toast.js';
+import './mf-doc-bar.js';
 import './mf-md-editor.js';
 
 // 排序菜单：字段 + 方向的六种组合，参考 Obsidian 文件浏览器排序菜单的排布与措辞。
@@ -230,13 +231,11 @@ class MfLibraryPage extends HTMLElement {
                 <section class="library-main">
                     <div class="migration-panel" hidden></div>
                     <div class="library-open-tabs" data-role="open-tabs" role="tablist" aria-label="已打开文件" hidden></div>
+                    <!-- 文档状态栏（文件名 + 保存状态 + 所在文件夹、视图分段、查找框）：放在标签条之下、阅读区之上，
+                         标签条选的是「哪个文档」，本栏描述「当前这个文档」，由外到内自上而下排，本栏也贴着它所描述的内容 -->
+                    <mf-doc-bar class="doc-bar" data-route="library" hidden></mf-doc-bar>
+                    <!-- 未打开文件时本页主区域留白：「选择文件…」入口只在阅读页提供，本页从左侧目录树打开文件 -->
                     <section class="library-reader-workspace" data-role="reader-workspace">
-                        <section class="compare-empty" data-role="reader-empty">
-                            <div class="dropzone-icon">${icon('reader')}</div>
-                            <h3>直接打开阅读</h3>
-                            <p>从左侧文件库目录选择文件，文件将在此处打开；支持 Markdown、HTML、XML、JSON 与 PDF。</p>
-                            <div class="dropzone-actions"><button class="btn btn-primary" type="button" data-action="pick-reader">${icon('file')}选择文件…</button></div>
-                        </section>
                         <div class="library-reader-frame" data-role="reader-frame"></div>
                         <div class="md-editor-host" data-role="editor-host" hidden></div>
                         <div class="library-reader-busy" data-role="reader-busy" hidden><span class="spinner">${icon('spinner')}</span><span>正在打开…</span></div>
@@ -865,7 +864,7 @@ class MfLibraryPage extends HTMLElement {
                 <button class="icon-btn icon-btn-sm library-file-tab-close" type="button" data-action="close-library-tab" data-tab-id="${escapeAttr(tab.id)}" title="关闭标签" aria-label="关闭 ${escapeAttr(tab.label || tab.name || '文件')}标签">${icon('x')}</button>
             </div>`).join('');
         tabs.hidden = this.state.openTabs.length === 0;
-        tabs.innerHTML = `<div class="library-file-tabs">${fileTabs}<button class="icon-btn icon-btn-sm library-new-tab" type="button" data-action="pick-reader" title="打开新文件" aria-label="打开新文件">${icon('plus')}</button></div>`;
+        tabs.innerHTML = `<div class="library-file-tabs">${fileTabs}</div>`;
     }
 
     /**
@@ -1041,15 +1040,13 @@ class MfLibraryPage extends HTMLElement {
 
     renderWorkspace() {
         const workspace = this.querySelector('[data-role="reader-workspace"]');
-        const empty = this.querySelector('[data-role="reader-empty"]');
         const busy = this.querySelector('[data-role="reader-busy"]');
         const error = this.querySelector('[data-role="reader-error"]');
-        if (!workspace || !empty || !busy || !error) return;
+        if (!workspace || !busy || !error) return;
         const active = this.state.openTabs.find((tab) => tab.id === this.state.activeTabId) || null;
         const hasActive = Boolean(active);
         this.renderLibraryStatus(active);
         workspace.hidden = false;
-        empty.hidden = hasActive || this.state.libraryReaderBusy || Boolean(this.state.libraryReaderError);
         busy.hidden = !this.state.libraryReaderBusy;
         error.hidden = !this.state.libraryReaderError || this.state.libraryReaderBusy;
         error.textContent = this.state.libraryReaderError || '';
@@ -1183,16 +1180,6 @@ class MfLibraryPage extends HTMLElement {
             this.libraryOpening.delete(path);
             this.state.libraryReaderBusy = false;
             this.renderWorkspace();
-        }
-    }
-
-    async pickLibraryFile() {
-        try {
-            const picked = await api.pickFiles({ purpose: 'read' });
-            if (picked.canceled || picked.paths.length === 0) return;
-            await this.openLibraryFile(picked.paths[0]);
-        } catch (err) {
-            notify(err.message, 'error', 6000);
         }
     }
 
@@ -1404,7 +1391,6 @@ class MfLibraryPage extends HTMLElement {
                 case 'close-repository-manager':
                     this.closeRepositoryManager();
                     break;
-                case 'pick-reader': await this.pickLibraryFile(); break;
                 case 'toggle-expand-all': {
                     const tree = this.querySelector('[data-role="library-tree"]');
                     const nodes = tree ? [...tree.querySelectorAll('details.library-tree-node')] : [];
