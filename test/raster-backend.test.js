@@ -7,7 +7,6 @@
 const { test, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
 
@@ -42,8 +41,23 @@ function isSpawnBlocked(err) {
     return err.code === 'ELECTRON_SPAWN_FAILED' || /sandbox|seatbelt|EPERM|EACCES/i.test(String(err.message));
 }
 
-function countRasterTempDirs() {
-    return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX)).length;
+/**
+ * 记录被测调用自己建出的栅格工作目录。
+ * 不数 os.tmpdir() 下的同前缀目录总数：该命名空间由全仓共享（converters/raster/backend.js 的
+ * markflow-raster-、desktop/main/chromium-jobs.js 的 markflow-raster-app-，以及各后端模块加载时
+ * 的残留回收器），npm test 又以每文件一进程并发跑 58 个套件，前后两次计数会被无关进程的
+ * 建/删动作改写，与本用例是否清理无关。改为在调用期间挂 mkdtemp 探针，直接拿到本次调用的目录路径。
+ * @returns {{ created: string[], restore: () => void }} created 为本次调用建出的工作目录绝对路径
+ */
+function spyRasterTempDirs() {
+    const created = [];
+    const realMkdtemp = fs.promises.mkdtemp;
+    fs.promises.mkdtemp = async (prefix, ...rest) => {
+        const dir = await realMkdtemp.call(fs.promises, prefix, ...rest);
+        if (path.basename(dir).startsWith(TEMP_PREFIX)) created.push(dir);
+        return dir;
+    };
+    return { created, restore: () => { fs.promises.mkdtemp = realMkdtemp; } };
 }
 
 function fakeChild() {
@@ -227,7 +241,7 @@ test('真实 electron 出图：PNG 像素 = CSS 像素 × 3.125 且内容为黑�
         return;
     }
     // Arrange
-    const before = countRasterTempDirs();
+    const spy = spyRasterTempDirs();
     const table = createTable(null, [
         createTableRow([createTableCell('项目'), createTableCell('数值')]),
         createTableRow([createTableCell('宽度'), createTableCell('12.5')]),
@@ -243,6 +257,8 @@ test('真实 electron 出图：PNG 像素 = CSS 像素 × 3.125 且内容为黑�
             return;
         }
         throw err;
+    } finally {
+        spy.restore();
     }
 
     // Assert
@@ -260,5 +276,6 @@ test('真实 electron 出图：PNG 像素 = CSS 像素 × 3.125 且内容为黑�
     assert.ok(Buffer.isBuffer(tablePng), tablePng instanceof Error ? tablePng.message : '表格应返回 Buffer');
     const tableSize = pngSize(tablePng);
     assert.ok(tableSize.width > 100 && tableSize.height > 30, JSON.stringify(tableSize));
-    assert.equal(countRasterTempDirs(), before, '工作目录应被清理');
+    assert.equal(spy.created.length, 1, '本次 rasterize 应建且只建一个栅格工作目录');
+    assert.equal(fs.existsSync(spy.created[0]), false, '工作目录应被清理');
 });
