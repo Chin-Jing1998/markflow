@@ -25,6 +25,7 @@
  *     defaultTargets: { office, markup, url },
  *     defaults: { theme?, imageFormat?, jpegQuality?, jpegPpi?, math?, pdfBackend?, mineruModel?, xmlProfile? }（扁平转换选项，交 service.buildOptions），
  *     library: { mode: 'index'|'managed', root, repositories?, activeRepository? },
+ *     checkUpdateOnStartup: boolean（启动时是否自动检测更新，默认 true，用户可在设置页改），
  *     update?: { checkedAt, status, message, latestVersion, url }（更新检测缓存，仅主进程写） }
  * secrets.json：{ mineruToken: <base64 密文> }。令牌永不进入 settings.json、日志与 IPC 回包。
  *
@@ -104,6 +105,8 @@ const SettingsSchema = z.object({
     defaultTargets: DefaultTargetsSchema,
     defaults: DefaultsSchema,
     library: LibrarySchema,
+    // 旧设置文件没有该字段：load 里与默认值深合并后取 true，不会因缺字段把整份设置判为不合法
+    checkUpdateOnStartup: z.boolean(),
     // 缓存损坏按缺失处理，不牵连其余设置项
     update: UpdateCacheSchema.optional().catch(undefined),
 }).strict();
@@ -114,6 +117,7 @@ const SettingsPatchSchema = z.object({
     defaultTargets: DefaultTargetsSchema.partial().optional(),
     defaults: DefaultsPatchSchema.optional(),
     library: LibrarySchema.partial().optional(),
+    checkUpdateOnStartup: z.boolean().optional(),
 }).strict();
 
 /** zod 报错 → 单行中文 */
@@ -136,6 +140,7 @@ function buildDefaultSettings({ outputDir, libraryRoot } = {}) {
         },
         defaults: {},
         library: { mode: 'index', root: path.resolve(libraryRoot) },
+        checkUpdateOnStartup: true,
     };
 }
 
@@ -252,6 +257,7 @@ function createSettingsStore({ dir, safeStorage, defaults } = {}) {
         const next = clone(current);
         if (patch.theme !== undefined) next.theme = patch.theme;
         if (patch.outputDir !== undefined) next.outputDir = path.resolve(patch.outputDir);
+        if (patch.checkUpdateOnStartup !== undefined) next.checkUpdateOnStartup = patch.checkUpdateOnStartup;
         if (patch.defaultTargets) next.defaultTargets = { ...next.defaultTargets, ...patch.defaultTargets };
         if (patch.library) {
             next.library = { ...next.library, ...patch.library };

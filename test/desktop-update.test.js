@@ -5,7 +5,8 @@
  *       五种失败情形（超时、非 200、响应体超长、JSON 非法、字段类型不对）均按「检测失败」处理且不抛出；
  *       回包中的下载链接须落在本仓库前缀内，否则回退 releases 页面；
  *       24 小时缓存：命中即不发请求，force 无视缓存，过期后重新检测；缓存写入失败不影响返回值；
- *       settings.json 的 update 段：写入后可读回，损坏时按缺失处理且不牵连其余设置项。
+ *       settings.json 的 update 段：写入后可读回，损坏时按缺失处理且不牵连其余设置项；
+ *       启动开关 checkUpdateOnStartup：关掉后启动判定为假，既不调用检测器也不发请求。
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -18,6 +19,7 @@ const {
 } = require('../desktop/main/update-check');
 const { createSettingsStore, SETTINGS_FILENAME } = require('../desktop/main/settings');
 const { createIpcHandlers, validatePayload, CHANNELS, UPDATE_NOT_READY } = require('../desktop/main/ipc');
+const { shouldCheckUpdateOnStartup } = require('../desktop/main/index')._internal;
 const realService = require('../converters/service');
 const scan = require('../desktop/main/scan');
 
@@ -341,6 +343,52 @@ test('mf:update:check：转发 force 给检测器，模块未就绪时给中文�
 });
 
 // ============================================================
+// 启动时自动检测的开关（settings.checkUpdateOnStartup）
+// ============================================================
+
+test('shouldCheckUpdateOnStartup：只有设置里显式为 false 才关闭', () => {
+    assert.equal(shouldCheckUpdateOnStartup({ checkUpdateOnStartup: false }), false);
+    assert.equal(shouldCheckUpdateOnStartup({ checkUpdateOnStartup: true }), true);
+    assert.equal(shouldCheckUpdateOnStartup({}), true, '旧设置文件缺该字段按开启处理');
+    assert.equal(shouldCheckUpdateOnStartup(undefined), true);
+});
+
+/**
+ * 启动路径的等价复现：index.js 的 scheduleStartupUpdateCheck 内 run() 只有两行——
+ * 判定为假直接返回，否则调 updateChecker.check({ force: false })。
+ * 该函数定义在 bootstrap 内、依赖 Electron 的 app / BrowserWindow，普通 Node 里驱动不起来
+ * （require 入口在非 Electron 进程中刻意不执行 bootstrap），故这里用同一个导出的判定函数
+ * 加真实检测器复现那两行，覆盖等价于「开关为假时启动不触发检测」。
+ */
+test('启动开关：关掉后不调用检测器、不发请求、不写缓存；打开则照常检测', async () => {
+    const { store } = makeStore();
+    let fetched = 0;
+    const checker = createUpdateChecker({
+        settings: store,
+        currentVersion: '3.0.0',
+        fetchImpl: async () => { fetched += 1; return response(200, releaseBody('v3.0.0', RELEASES_PAGE_URL)); },
+    });
+    let checks = 0;
+    const startupRun = async () => {
+        if (!shouldCheckUpdateOnStartup(store.get())) return;
+        checks += 1;
+        await checker.check({ force: false });
+    };
+
+    await store.set({ checkUpdateOnStartup: false });
+    await startupRun();
+    assert.equal(checks, 0, '开关关闭：不调用 check');
+    assert.equal(fetched, 0, '开关关闭：一个请求都不发');
+    assert.equal(store.getUpdateCache(), null, '开关关闭：不写检测缓存');
+
+    await store.set({ checkUpdateOnStartup: true });
+    await startupRun();
+    assert.equal(checks, 1);
+    assert.equal(fetched, 1);
+    assert.equal(store.getUpdateCache().status, 'latest');
+});
+
+// ============================================================
 // settings.json 的 update 段
 // ============================================================
 
@@ -372,4 +420,56 @@ test('设置存储：update 段写入后可读回，渲染层的 patch 无法写
     assert.equal(settings.theme, 'dark', '损坏的缓存不牵连其余设置项');
     assert.deepEqual(reloaded.warnings(), []);
     assert.equal(reloaded.getUpdateCache(), null);
+});
+
+test('并发的非强制检测合并为一次请求：缓存过期时启动路径与设置页不会各打一次 GitHub', async () => {
+    // Arrange：缓存留空（等同过期），fetch 计数并人为拉长，制造真实的并发窗口
+    const { store } = makeStore();
+    let calls = 0;
+    const fetchImpl = async () => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return response(200, releaseBody('v3.1.0', RELEASES_PAGE_URL));
+    };
+    const checker = createUpdateChecker({ settings: store, currentVersion: '3.0.0', fetchImpl });
+
+    // Act：主进程与渲染层同时触发
+    const [a, b] = await Promise.all([checker.check({ force: false }), checker.check({ force: false })]);
+
+    // Assert
+    assert.equal(calls, 1, `并发的非强制检测应只请求一次，实际 ${calls} 次`);
+    assert.equal(a.status, 'update-available');
+    assert.deepEqual(a, b, '两个调用方拿到同一个结果');
+
+    // 在途 promise 落定后须释放：缓存此时已写入，再检测直接回缓存、仍不增加请求
+    assert.equal((await checker.check({ force: false })).cached, true);
+    assert.equal(calls, 1);
+
+    // 强制检测不并入合并，用户点按钮就应重新请求
+    await checker.check({ force: true });
+    assert.equal(calls, 2);
+});
+
+test('在途检测失败后不卡死：下一次检测仍会重新请求', async () => {
+    // Arrange：第一次抛错，其后正常
+    const { store } = makeStore();
+    let calls = 0;
+    const fetchImpl = async () => {
+        calls += 1;
+        if (calls === 1) throw Object.assign(new Error('boom'), { name: 'TypeError' });
+        return response(200, releaseBody('v3.1.0', RELEASES_PAGE_URL));
+    };
+    const checker = createUpdateChecker({ settings: store, currentVersion: '3.0.0', fetchImpl });
+
+    // Act
+    const first = await checker.check({ force: false });
+
+    // Assert：网络异常被 fetchLatestRelease 兜住，记为检测失败而非抛出
+    assert.equal(first.status, 'failed');
+    assert.equal(calls, 1);
+
+    // 失败结果也会写缓存，故这里用 force 绕开缓存，验证在途 promise 已释放
+    const second = await checker.check({ force: true });
+    assert.equal(second.status, 'update-available');
+    assert.equal(calls, 2);
 });

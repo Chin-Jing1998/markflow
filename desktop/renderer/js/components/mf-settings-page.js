@@ -2,10 +2,12 @@
  * <mf-settings-page>：设置页，单列长滚动，7 张分区卡片自上而下依次排列。
  * 卡片带 data-section 供 CSS 定位——外观的分段控件与「转换默认项」的三列网格各有专门排版，
  * 用该钩子而非「第几个子卡片」，卡片增删或换序时排版不会错位。
- * 外观主题即时生效（mf:theme:set）；输出目录、默认目标、转换默认项、文件库模式经「保存设置」一次提交（mf:settings:set）；
+ * 外观主题即时生效（mf:theme:set）；输出目录、默认目标、转换默认项、文件库模式、启动时是否自动检查更新
+ * 经「保存设置」一次提交（mf:settings:set）；
  * MinerU 令牌单独保存 / 清除 / 测试连接（只显示「已配置 / 未配置」与测试结果，不回显令牌）；
  * 「关于」一节写明三端使用方法，并经 mf:update:check 取 GitHub 最新 release 与当前版本比对
- * （请求一律由主进程发起，渲染层既不发网络请求也不指定地址；挂载时读缓存，点按钮才强制重新检测）。
+ * （请求一律由主进程发起，渲染层既不发网络请求也不指定地址；开关开启时拿到设置后读一次缓存，点按钮才强制重新检测，
+ *   开关关闭时连这一次都不读——页面元素随应用启动即创建，无条件读会在缓存过期时把启动联网放回来）。
  */
 import { store } from '../store.js';
 import { api } from '../api.js';
@@ -109,6 +111,7 @@ class MfSettingsPage extends HTMLElement {
         this.dataset.ready = '1';
         this.lastSettings = null;
         this.updateUrl = null;
+        this.updateLoaded = false;
         this.innerHTML = `
             <header class="page-header"><h1>设置</h1></header>
             <div class="page-body settings-body">
@@ -167,7 +170,8 @@ class MfSettingsPage extends HTMLElement {
                         <button class="link-btn" type="button" data-action="open-release" hidden>${icon('open')}前往下载</button>
                     </div>
                     <p class="mineru-result" data-role="update-result" hidden></p>
-                    <p class="hint">检测更新会向 GitHub（api.github.com）发送一次请求，取最新发布版本号与当前版本比对，不上传任何本机信息。应用启动时自动检测一次，结果缓存 24 小时；点击「检测更新」则立即重新检测。网络不通时只在此处提示检测失败，不影响其它功能。</p>
+                    <label class="field field-check"><input type="checkbox" data-field="checkUpdateOnStartup"><span>启动时自动检查更新</span></label>
+                    <p class="hint">检测更新会向 GitHub（api.github.com）发送一次请求，取最新发布版本号与当前版本比对，不上传任何本机信息。勾选「启动时自动检查更新」时，应用启动后自动检测一次，结果缓存 24 小时，其间重复启动直接读缓存；取消勾选后应用不会主动联网，只有点击「检测更新」才发起请求，且每次点击都立即重新检测。网络不通时只在此处提示检测失败，不影响其它功能。</p>
                     ${USAGE_SECTIONS.map(usageBlock).join('')}
                     ${contactBlock()}`)}
             </div>
@@ -181,8 +185,7 @@ class MfSettingsPage extends HTMLElement {
         });
         this.unsubscribe = store.subscribe((state) => this.fill(state));
         this.fill(store.get());
-        // 不强制：启动时主进程已自动检测过，24 小时内直接回缓存，不会重复请求 GitHub
-        this.loadUpdate({ force: false });
+        // 首次读取更新状态改由 fill() 在拿到设置后触发，见 maybeLoadUpdateOnce
     }
 
     disconnectedCallback() {
@@ -205,9 +208,11 @@ class MfSettingsPage extends HTMLElement {
         tokenStatus.textContent = described.mineruTokenConfigured ? '已配置' : '未配置';
         tokenStatus.dataset.state = described.mineruTokenConfigured ? 'on' : 'off';
         this.querySelector('[data-role="paths"]').textContent = `设置文件：${described.paths.settingsPath}`;
+        this.maybeLoadUpdateOnce(described.settings);
         if (described.settings === this.lastSettings || this.dirty) return;
         this.lastSettings = described.settings;
         const settings = described.settings;
+        this.querySelector('[data-field="checkUpdateOnStartup"]').checked = settings.checkUpdateOnStartup !== false;
         this.querySelector('[data-field="outputDir"]').value = settings.outputDir;
         this.querySelector('[data-field="libraryMode"]').value = settings.library.mode;
         this.querySelector('[data-field="libraryRoot"]').value = settings.library.root;
@@ -273,6 +278,19 @@ class MfSettingsPage extends HTMLElement {
     }
 
     /**
+     * 拿到设置后只读一次更新状态，且只在开关开启时读。
+     * 页面元素在应用启动时即全部创建（见 app.js 的 mountPages），此处若无条件调用，
+     * 缓存过期时主进程仍会发起请求——那样关掉开关也挡不住启动联网。
+     */
+    maybeLoadUpdateOnce(settings) {
+        if (this.updateLoaded) return;
+        this.updateLoaded = true;
+        if (settings.checkUpdateOnStartup === false) return;
+        // 不强制：启动时主进程已自动检测过，24 小时内直接回缓存，不会重复请求 GitHub
+        this.loadUpdate({ force: false });
+    }
+
+    /**
      * 更新检测：force 为假时读主进程的 24 小时缓存（挂载即调，不额外请求 GitHub）；
      * force 为真时立即重新检测。自动检测失败保持静默，手动检测把失败原因显示在原处。
      */
@@ -316,6 +334,7 @@ class MfSettingsPage extends HTMLElement {
         const ppi = value('[data-field="jpegPpi"]').trim();
         defaults.jpegPpi = ppi === '' ? null : Number(ppi);
         return {
+            checkUpdateOnStartup: this.querySelector('[data-field="checkUpdateOnStartup"]').checked,
             outputDir: value('[data-field="outputDir"]').trim(),
             defaultTargets: Object.fromEntries(Object.keys(CLASS_LABELS).map((cls) => [cls, value(`[data-field="target-${cls}"]`)])),
             defaults,

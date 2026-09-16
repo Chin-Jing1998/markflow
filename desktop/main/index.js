@@ -68,6 +68,13 @@ function loadLibraryModules(log = () => undefined) {
     }
 }
 
+/**
+ * 启动时是否自动检测更新：只有设置里显式为 false 才关闭。
+ * 旧设置文件没有该字段时，settings.load() 与默认值合并后读出的就是 true（见 settings.js 的 buildDefaultSettings），
+ * 这里再兜一层，缺字段或取值异常一律按开启处理。
+ */
+const shouldCheckUpdateOnStartup = (settings) => !(settings && settings.checkUpdateOnStartup === false);
+
 function defaultDirs(app) {
     let documents;
     try {
@@ -159,10 +166,12 @@ function bootstrap(electron) {
      * 启动时自动检测一次更新：等窗口内容加载完再异步触发，不占用启动路径；
      * 失败静默（只记 stderr，不弹窗），结果写入设置文件，设置页打开时读缓存显示。
      * 24 小时内重复启动不会重复请求 GitHub——有效期判定在 update-check.js 内。
+     * 设置里关掉「启动时自动检查更新」则直接返回，一个请求都不发；判定读当次的设置值而非启动时的快照。
      */
     function scheduleStartupUpdateCheck(win) {
         if (!win) return;
         const run = () => {
+            if (!shouldCheckUpdateOnStartup(settings.get())) return;
             updateChecker.check({ force: false }).catch((err) => log(`[desktop] 自动检测更新失败：${errText(err)}`));
         };
         if (win.webContents.isLoading()) win.webContents.once('did-finish-load', run);
@@ -295,7 +304,7 @@ function bootstrap(electron) {
 
 module.exports = {
     _internal: {
-        loadElectron, shouldBootstrap, loadLibraryModules, defaultDirs, bootstrap,
+        loadElectron, shouldBootstrap, loadLibraryModules, defaultDirs, bootstrap, shouldCheckUpdateOnStartup,
         RENDERER_DIR, PRELOAD_PATH, ICON_PNG, APP_URL, PERMISSIONS_ALLOWED, LIBRARY_DIRNAME,
     },
 };

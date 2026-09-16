@@ -2,7 +2,8 @@
  * desktop/main/settings.js 单元测试（纯逻辑，safeStorage 以桩替代）
  * 覆盖：默认值、settings.json 原子写与读回、非法 patch 拒绝、defaults 的 null 删除语义、
  *       secrets.json 与 settings.json 分离、令牌不出现在 settings.json / describe() 回包、
- *       解密失败返回 null、safeStorage 不可用时拒绝保存、损坏文件回退默认并告警、secrets 文件权限。
+ *       解密失败返回 null、safeStorage 不可用时拒绝保存、损坏文件回退默认并告警、secrets 文件权限、
+ *       checkUpdateOnStartup（缺字段按 true 补齐、可经 patch 关闭并持久化、非布尔值拒绝）。
  */
 const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -194,6 +195,59 @@ test('旧文件缺少新字段时以默认值补齐', () => {
     assert.equal(settings.outputDir, path.join(dir, 'x'));
     assert.deepEqual(settings.library, { mode: 'index', root: path.join(dir, 'lib') });
     assert.deepEqual(store.warnings(), []);
+});
+
+/** 旧设置文件：写满除 checkUpdateOnStartup 外的全部字段，用于验证升级路径 */
+const legacySettings = (dir) => ({
+    version: 1,
+    theme: 'dark',
+    outputDir: path.join(dir, 'x'),
+    defaultTargets: { office: 'html', markup: 'pdf', url: 'html' },
+    defaults: { imageFormat: 'keep' },
+    library: { mode: 'managed', root: path.join(dir, 'vault') },
+});
+
+function writeLegacy(dir) {
+    fs.mkdirSync(dir, { recursive: true });
+    const legacy = legacySettings(dir);
+    fs.writeFileSync(path.join(dir, SETTINGS_FILENAME), JSON.stringify(legacy));
+    return legacy;
+}
+
+test('checkUpdateOnStartup：旧设置文件缺该字段时读出为 true，其余设置项照旧', () => {
+    const dir = workDir();
+    const legacy = writeLegacy(dir);
+    const store = makeStore(dir);
+    const settings = store.load();
+    assert.equal(settings.checkUpdateOnStartup, true, '缺字段按开启处理');
+    assert.deepEqual(store.warnings(), [], '缺字段不算不合法，整份设置不退回默认');
+    assert.equal(settings.theme, legacy.theme);
+    assert.equal(settings.outputDir, legacy.outputDir);
+    assert.deepEqual(settings.defaultTargets, legacy.defaultTargets);
+    assert.deepEqual(settings.defaults, legacy.defaults);
+    assert.deepEqual(settings.library, legacy.library);
+});
+
+test('checkUpdateOnStartup：经 patch 关闭后落盘并可读回，非布尔值拒绝', async () => {
+    const dir = workDir();
+    const legacy = writeLegacy(dir);
+    const store = makeStore(dir);
+    store.load();
+
+    const next = await store.set({ checkUpdateOnStartup: false });
+    assert.equal(next.checkUpdateOnStartup, false);
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, SETTINGS_FILENAME), 'utf8'));
+    assert.equal(onDisk.checkUpdateOnStartup, false, '写入 settings.json');
+    assert.equal(onDisk.outputDir, legacy.outputDir, '其余字段未被破坏');
+    assert.deepEqual(onDisk.defaultTargets, legacy.defaultTargets);
+    assert.deepEqual(onDisk.library, legacy.library);
+
+    const reloaded = makeStore(dir).load();
+    assert.equal(reloaded.checkUpdateOnStartup, false, '重新加载仍为关闭');
+    assert.equal(reloaded.theme, legacy.theme);
+
+    assert.equal((await store.set({ checkUpdateOnStartup: true })).checkUpdateOnStartup, true, '可再打开');
+    await assert.rejects(store.set({ checkUpdateOnStartup: 'yes' }), /设置项不合法/);
 });
 
 test('createSettingsStore 参数校验', () => {

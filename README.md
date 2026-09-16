@@ -423,7 +423,7 @@ test/                      测试与固定样本
 ## 开发与测试
 
 ```bash
-npm test        # node:test，1063 项（2026-09-16 实测）
+npm test        # node:test，1069 项（2026-09-16 实测）
 npm run cli     # 等同 node bin/markflow.js
 npm run mcp     # 等同 node mcp/server.js
 npm start       # 等同 electron .，启动桌面应用

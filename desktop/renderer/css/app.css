@@ -593,10 +593,6 @@ mf-progress .progress-text { font: 500 var(--font-subheadline) var(--font-mono);
 .settings-body > .card[data-section="defaults"] > h2 { grid-column: 1 / -1; }
 .settings-body > .card[data-section="defaults"] > [data-role="defaults"] { display: contents; }
 .settings-body > .card[data-section="defaults"] [data-field="jpegPpi"] { width: 100%; }
-@media (max-width: 760px) {
-    .settings-body > .card[data-section="appearance"] .segmented { grid-template-columns: 1fr; }
-    .settings-body > .card[data-section="defaults"] { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-}
 /* 设置页「关于」：可折叠的使用方法区块 */
 .about-block { border-top: 1px solid var(--separator); padding-top: var(--s-2); }
 .about-block > summary {
