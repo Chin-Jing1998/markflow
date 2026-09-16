@@ -2,8 +2,10 @@
  * mcp/server.js 集成测试
  *
  * 以官方 SDK 的 stdio 客户端连接真实服务进程，覆盖：
- *   工具清单与入参 schema（含转换选项、2020-12 方言、无 $ref）、list_formats 能力矩阵、
- *   convert_document 的成功/选项透传/入参错误/运行期失败、returnContent、
+ *   工具清单与入参 schema（含转换选项、2020-12 方言、无 $ref、描述与取值范围、中文校验文案）、
+ *   工具 annotations 与服务 instructions、list_formats 能力矩阵（含 DTD 校验器、LibreOffice 与受理扩展名）、
+ *   convert_document 的成功/选项透传/入参错误/运行期失败、validate 标记、ignoredArguments、
+ *   缺失输入不预检、returnContent（contentTruncated、非 bundle 告警、紧凑 JSON）、进度通知、
  *   extract_article 的只读提取（结构、截断语义、零落盘）。
  * 客户端在 listTools() 后会用 outputSchema 校验 structuredContent，因此这些用例同时验证了
  * 服务端返回结构与声明的 schema 一致。临时产物一律写入 os.tmpdir()。
@@ -22,6 +24,8 @@ const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 
 const { OPTION_ENUMS } = require('../converters/options');
+// 正文页固件只用于长正文用例；本文件下方另有自带的 /article 页与段落常量
+const { startArticleServer, buildArticlePage } = require('./fixtures/article-server');
 
 const ROOT = path.resolve(__dirname, '..');
 const SERVER = path.join(ROOT, 'mcp', 'server.js');
@@ -103,8 +107,9 @@ test('convert_document 的 inputSchema 暴露全部转换选项，只有 outputD
 
     // Assert：入参键清单
     assert.deepEqual(Object.keys(properties).sort(), [
-        'docx', 'html', 'imageFormat', 'jpegPpi', 'jpegQuality', 'math', 'mineru', 'outputDir', 'paths',
-        'patentParts', 'pdfBackend', 'returnContent', 'target', 'theme', 'urls', 'validate', 'xml', 'xmlProfile',
+        'clean', 'docx', 'html', 'imageFormat', 'jpegPpi', 'jpegQuality', 'math', 'mineru', 'outputDir', 'paths',
+        'patentParts', 'pdf', 'pdfBackend', 'raster', 'returnContent', 'skipExisting', 'target', 'theme', 'urls',
+        'validate', 'xml', 'xmlProfile',
     ].sort());
     assert.equal(properties.validate.type, 'boolean');
     assert.deepEqual(tool.inputSchema.required, ['outputDir']);
@@ -117,11 +122,18 @@ test('convert_document 的 inputSchema 暴露全部转换选项，只有 outputD
     assert.deepEqual(properties.pdfBackend.enum, [...OPTION_ENUMS.pdfBackends]);
     assert.deepEqual(properties.imageFormat.enum, [...OPTION_ENUMS.imageFormats]);
     assert.deepEqual(properties.math.enum, [...OPTION_ENUMS.mathModes]);
-    assert.deepEqual(Object.keys(properties.mineru.properties), ['model', 'ocr', 'language', 'pageRanges']);
+    assert.deepEqual(Object.keys(properties.mineru.properties),
+        ['model', 'ocr', 'formula', 'table', 'language', 'pageRanges', 'timeoutSec']);
     assert.deepEqual(Object.keys(properties.html.properties),
         ['fontFamily', 'fontSize', 'lineHeight', 'contentWidth', 'spacing', 'inlineImages']);
+    assert.deepEqual(Object.keys(properties.pdf.properties), ['pageSize', 'landscape']);
     assert.deepEqual(Object.keys(properties.docx.properties), ['pageSize', 'fontSize', 'fontAscii', 'fontEastAsia']);
-    assert.deepEqual(Object.keys(properties.xml.properties), ['indent', 'numberingStart', 'numberingWidth']);
+    assert.deepEqual(Object.keys(properties.xml.properties), [
+        'indent', 'numberingStart', 'numberingWidth', 'imageDpi', 'sectionDetection', 'rasterizeTables', 'rasterizeFormulas',
+    ]);
+    assert.deepEqual(Object.keys(properties.raster.properties), ['scale', 'maxWidth']);
+    assert.deepEqual(properties.pdf.properties.pageSize.enum, [...OPTION_ENUMS.pageSizes]);
+    assert.deepEqual(properties.xml.properties.sectionDetection.enum, [...OPTION_ENUMS.sectionDetection]);
     assert.deepEqual(properties.mineru.required, undefined, '嵌套段各字段均为可选');
     assert.equal(JSON.stringify(tool.inputSchema).includes('$ref'), false, 'inputSchema 不得出现 $ref');
     assert.equal(properties.mineru.properties.token, undefined, '令牌不经 MCP 传入');
@@ -142,7 +154,13 @@ test('list_formats 返回能力矩阵，office 目标含 bundle', async () => {
     assert.deepEqual(targets.url, ['bundle', 'html', 'xml']);
     assert.ok(targets.markup.includes('docx'));
     assert.ok(targets.markup.includes('html'));
-    assert.deepEqual(Object.keys(capabilities).sort(), ['mineru', 'pdfBackend', 'raster', 'themes', 'xmlProfiles']);
+    assert.deepEqual(Object.keys(capabilities).sort(),
+        ['libreoffice', 'mineru', 'pdfBackend', 'raster', 'themes', 'validator', 'xmlProfiles']);
+    for (const key of ['validator', 'libreoffice']) {
+        assert.deepEqual(Object.keys(capabilities[key]).sort(), ['available', 'hint', 'name'], `${key} 的键`);
+        assert.equal(capabilities[key].available, capabilities[key].name !== null);
+    }
+    assert.deepEqual(result.structuredContent.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']);
     assert.equal('sofficeAvailable' in capabilities, false);
     assert.equal(typeof capabilities.pdfBackend.available, 'boolean');
     assert.equal(typeof capabilities.pdfBackend.hint, 'string');
@@ -310,6 +328,10 @@ test('returnContent 为 true 时附带生成的 Markdown 正文', async () => {
     assert.equal(typeof item.content, 'string');
     assert.ok(item.content.length > 0);
     assert.equal(item.content, fs.readFileSync(item.outputs.md, 'utf8'));
+    assert.equal(item.contentTruncated, false);
+    // text 仍含正文以兼容只读 text 的客户端，但改为紧凑 JSON（无缩进换行）
+    assert.equal(result.content[0].text.includes('\n'), false, 'text 应为紧凑 JSON');
+    assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
 });
 
 test('paths 与 urls 可同时提供，按顺序批量转换', async () => {
@@ -561,6 +583,342 @@ test('extract_article 抓取失败时返回 isError 与中文说明', async () =
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /[一-龥]/);
     assert.equal(result.structuredContent, undefined);
+});
+
+// ============================================================
+// 入参描述、取值范围与中文校验文案
+// ============================================================
+
+test('convert_document 的入参描述由 options.js 描述树生成，顶层数值字段带取值范围', async () => {
+    // Act
+    const { tools } = await client.listTools();
+    const { properties } = tools.find((item) => item.name === 'convert_document').inputSchema;
+
+    // Assert
+    assert.match(properties.target.description, /content_list/);
+    assert.match(properties.target.description, /contentListV2/);
+    assert.match(properties.theme.description, /html 默认 apple，pdf 默认 print/);
+    assert.match(properties.mineru.description, /~\/\.mineru\/config\.yaml/);
+    assert.match(properties.paths.description, /工作目录/);
+    assert.match(properties.paths.description, /errors/);
+    assert.match(properties.returnContent.description, /contentTruncated/);
+    assert.equal(properties.jpegQuality.type, 'integer');
+    assert.equal(properties.jpegQuality.minimum, 60);
+    assert.equal(properties.jpegQuality.maximum, 100);
+    assert.match(properties.jpegQuality.description, /范围 60–100；默认 90/);
+    assert.equal(properties.jpegPpi.minimum, 72);
+    assert.equal(properties.jpegPpi.maximum, 600);
+    assert.match(properties.html.properties.fontSize.description, /范围 10–32；默认 16/);
+    assert.match(properties.docx.properties.fontSize.description, /范围 8–36；默认 11/);
+});
+
+test('schema 层拒绝的入参返回 isError 与中文说明：必填、类型、网址、整数与范围', async () => {
+    // Arrange
+    const cases = [
+        [{ paths: [SAMPLE_MD] }, /outputDir 为必填项/],
+        [{ paths: [SAMPLE_MD], outputDir: 42 }, /outputDir 须为字符串/],
+        [{ urls: ['not-a-url'], outputDir: tmpDir }, /urls 的每一项须为合法网址/],
+        [{ paths: [SAMPLE_MD], outputDir: tmpDir, jpegQuality: 'abc' }, /jpegQuality 须为数字/],
+        [{ paths: [SAMPLE_MD], outputDir: tmpDir, jpegPpi: 100.5 }, /jpegPpi 须为整数/],
+        [{ paths: [SAMPLE_MD], outputDir: tmpDir, jpegQuality: 120 }, /jpegQuality 须为 60–100 之间的整数/],
+        [{ paths: [SAMPLE_MD], outputDir: tmpDir, html: 'apple' }, /html 须为对象/],
+        [{ paths: [SAMPLE_MD], outputDir: tmpDir, xml: { indent: 'x' } }, /xml\.indent 须为数字/],
+    ];
+
+    for (const [args, expected] of cases) {
+        // Act
+        const result = await client.callTool({ name: 'convert_document', arguments: args });
+
+        // Assert
+        assert.equal(result.isError, true, JSON.stringify(args));
+        assert.match(result.content[0].text, expected);
+        assert.equal(result.structuredContent, undefined);
+    }
+    const extract = await client.callTool({ name: 'extract_article', arguments: {} });
+    assert.equal(extract.isError, true);
+    assert.match(extract.content[0].text, /url 为必填项/);
+});
+
+// ============================================================
+// convert_document：结果信封的新增字段
+// ============================================================
+
+test('validate 为真时结果信封标记 validate: true，省略时无此字段', async () => {
+    // Arrange
+    const outputDir = makeOutDir('validate-');
+
+    // Act
+    const marked = await client.callTool({
+        name: 'convert_document', arguments: { paths: [SAMPLE_MD], target: 'xml', outputDir, validate: true },
+    });
+    const plain = await client.callTool({ name: 'convert_document', arguments: { paths: [SAMPLE_MD], target: 'xml', outputDir } });
+
+    // Assert
+    assert.notEqual(marked.isError, true, JSON.stringify(marked.content));
+    assert.equal(marked.structuredContent.validate, true);
+    assert.equal(marked.structuredContent.results[0].options.xml.validate, true);
+    assert.equal(plain.structuredContent.validate, undefined);
+    const { tools } = await client.listTools();
+    assert.equal(tools.find((item) => item.name === 'convert_document').outputSchema.properties.validate.type, 'boolean');
+});
+
+test('未知入参不再静默丢弃：顶层与嵌套段的未知键记入 ignoredArguments，其余照常转换', async () => {
+    // Arrange
+    const outputDir = makeOutDir('ignored-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: { paths: [SAMPLE_MD], target: 'html', outputDir, fontSize: 20, font: 'Georgia', html: { colour: 'red', fontSize: 18 } },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const payload = result.structuredContent;
+    assert.equal(payload.ok, true);
+    assert.deepEqual(payload.ignoredArguments, ['font', 'fontSize', 'html.colour']);
+    assert.equal(payload.results[0].options.html.fontSize, 18, '已知字段照常生效');
+    assert.equal(payload.results[0].options.html.fontFamily, null, '未知键 font 不生效');
+    const { tools } = await client.listTools();
+    const tool = tools.find((item) => item.name === 'convert_document');
+    assert.notEqual(tool.inputSchema.additionalProperties, false, 'inputSchema 不再声明拒收未知键');
+    assert.deepEqual(tool.outputSchema.properties.ignoredArguments.items, { type: 'string' });
+});
+
+test('输入文件不预检：缺失项记入 errors 且 isError 为 false，其余项照常转换', async () => {
+    // Arrange
+    const outputDir = makeOutDir('missing-');
+    const missing = path.join(tmpDir, '不存在.md');
+
+    // Act
+    const result = await client.callTool({ name: 'convert_document', arguments: { paths: [SAMPLE_MD, missing], outputDir } });
+
+    // Assert
+    assert.notEqual(result.isError, true);
+    const payload = result.structuredContent;
+    assert.equal(payload.ok, false);
+    assert.equal(payload.results.length, 1);
+    assert.deepEqual(payload.errors.map((item) => item.input), [missing]);
+    assert.match(payload.errors[0].error, /输入文件不存在/);
+    assert.equal(payload.ignoredArguments, undefined, '无未知入参时不写 ignoredArguments');
+});
+
+test('convert_document 的新增嵌套字段（pdf、mineru、xml 的 patent 别名、raster）进入结果 options', async () => {
+    // Arrange
+    const outputDir = makeOutDir('new-fields-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: {
+            paths: [SAMPLE_MD], target: 'html', outputDir,
+            pdf: { pageSize: 'Letter', landscape: true },
+            mineru: { formula: false, table: false, timeoutSec: 120 },
+            xml: { imageDpi: 200, sectionDetection: 'headings', rasterizeTables: false, rasterizeFormulas: false },
+            raster: { scale: 3, maxWidth: 1200 },
+        },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const { options } = result.structuredContent.results[0];
+    assert.equal(options.pdf.pageSize, 'Letter');
+    assert.equal(options.pdf.landscape, true);
+    assert.equal(options.mineru.formula, false);
+    assert.equal(options.mineru.table, false);
+    assert.equal(options.mineru.timeoutSec, 120);
+    assert.deepEqual(options.xml.patent, {
+        parts: 'auto', rasterizeTables: false, rasterizeFormulas: false, imageDpi: 200, sectionDetection: 'headings',
+    });
+    assert.deepEqual(options.raster, { scale: 3, maxWidth: 1200 });
+});
+
+// ============================================================
+// convert_document：returnContent
+// ============================================================
+
+test('returnContent 对非 bundle 目标不返回正文，并在该项 warnings 中说明', async () => {
+    // Arrange
+    const outputDir = makeOutDir('content-html-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document', arguments: { paths: [SAMPLE_MD], target: 'html', outputDir, returnContent: true },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const [item] = result.structuredContent.results;
+    assert.equal(item.content, undefined);
+    assert.equal(item.contentTruncated, undefined);
+    assert.ok(item.warnings.includes('returnContent 仅对 bundle 目标返回正文'), JSON.stringify(item.warnings));
+});
+
+test('returnContent 正文超过 20 万字符时截断并置 contentTruncated', async (t) => {
+    // Arrange：约 23 万字符的长正文页，另起放行本机地址的服务进程
+    const paragraphs = Array.from({ length: 2000 }, (_, i) => `第 ${i + 1} 段。${ARTICLE_PARAGRAPHS[i % ARTICLE_PARAGRAPHS.length]}`);
+    const server = await startArticleServer({ pages: { '/long': buildArticlePage({ title: '超长正文', paragraphs }) } });
+    const workDir = fs.mkdtempSync(path.join(tmpDir, 'long-'));
+    const outputDir = makeOutDir('long-out-');
+    const extractClient = await startExtractClient(workDir);
+    t.after(async () => { await extractClient.close(); await server.close(); });
+
+    // Act
+    const result = await extractClient.callTool({
+        name: 'convert_document', arguments: { urls: [`${server.base}/long`], outputDir, returnContent: true },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const [item] = result.structuredContent.results;
+    const markdown = fs.readFileSync(item.outputs.md, 'utf8');
+    assert.ok(markdown.length > 200000, `产物正文应超过 20 万字符，实际 ${markdown.length}`);
+    assert.equal(item.contentTruncated, true);
+    assert.equal(item.content.length, 200000);
+    assert.ok(markdown.startsWith(item.content));
+});
+
+// ============================================================
+// 目录输入、路径写法、重跑策略与取消
+// ============================================================
+
+test('outputDir 支持 ~ 写法，paths 支持目录并把展开情况写入信封', async (t) => {
+    // Arrange：另起一个 HOME 指向临时目录的服务进程，使 ~ 可预期地展开
+    const home = fs.mkdtempSync(path.join(tmpDir, 'mcp-home-'));
+    const outputDir = path.join(home, 'out');
+    fs.mkdirSync(outputDir);
+    const inDir = fs.mkdtempSync(path.join(tmpDir, 'mcp-dir-'));
+    fs.copyFileSync(SAMPLE_MD, path.join(inDir, 'a.md'));
+    fs.copyFileSync(SAMPLE_MD, path.join(inDir, 'b.md'));
+    fs.writeFileSync(path.join(inDir, 'notes.txt'), '不受支持的文件');
+    const homeClient = new Client({ name: 'markflow-home-test', version: '1.0.0' });
+    await homeClient.connect(new StdioClientTransport({
+        command: process.execPath, args: [SERVER], cwd: ROOT, env: { ...process.env, HOME: home },
+    }));
+    t.after(() => homeClient.close());
+
+    // Act
+    const result = await homeClient.callTool({
+        name: 'convert_document', arguments: { paths: [inDir], target: 'html', outputDir: '~/out' },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const payload = result.structuredContent;
+    assert.equal(payload.ok, true, JSON.stringify(payload.errors));
+    assert.equal(payload.outputDir, outputDir, '~ 应展开为主目录下的绝对路径');
+    assert.deepEqual(payload.results.map((item) => item.name).sort(), ['a', 'b']);
+    assert.deepEqual(payload.inputExpansion.directories, [{ path: inDir, count: 2 }]);
+    assert.deepEqual(payload.inputExpansion.skipped, [path.join(inDir, 'notes.txt')]);
+    assert.equal(payload.inputExpansion.truncated, false);
+});
+
+test('未给目录时信封不带 inputExpansion；skipExisting 命中时结果项带 skipped 且不重写产物', async () => {
+    // Arrange
+    const outputDir = makeOutDir('skip-');
+
+    // Act
+    const first = await client.callTool({ name: 'convert_document', arguments: { paths: [SAMPLE_MD], target: 'docx', outputDir } });
+    assert.notEqual(first.isError, true, JSON.stringify(first.content));
+    const produced = first.structuredContent.results[0].outputPath;
+    const mtimeBefore = fs.statSync(produced).mtimeMs;
+    const second = await client.callTool({
+        name: 'convert_document', arguments: { paths: [SAMPLE_MD], target: 'docx', outputDir, skipExisting: true },
+    });
+    assert.notEqual(second.isError, true, JSON.stringify(second.content));
+    // 跳过项未解析文档，title 为 null，outputSchema 须放行
+    assert.equal(second.structuredContent.results[0].title, null);
+    const badClean = await client.callTool({
+        name: 'convert_document', arguments: { paths: [SAMPLE_MD], target: 'docx', outputDir, clean: 'yes' },
+    });
+
+    // Assert
+    assert.equal(first.structuredContent.inputExpansion, undefined, '未给目录时不写 inputExpansion');
+    assert.equal(first.structuredContent.results[0].skipped, undefined);
+    assert.equal(second.structuredContent.results[0].skipped, true);
+    assert.equal(fs.statSync(produced).mtimeMs, mtimeBefore, '跳过时不得重写产物');
+    assert.equal(badClean.isError, true);
+    assert.match(badClean.content[0].text, /clean 须为布尔值/);
+});
+
+test('请求取消后不再领取新任务：已开始的照常写出，服务继续可用', async (t) => {
+    // Arrange：延时应答的本机页面，取消时首批任务必然仍在进行
+    const server = await startArticleServer({ pages: { '/slow': { html: buildArticlePage(), delayMs: 400 } } });
+    const workDir = fs.mkdtempSync(path.join(tmpDir, 'cancel-'));
+    const outputDir = makeOutDir('cancel-out-');
+    const cancelClient = await startExtractClient(workDir);
+    t.after(async () => { await cancelClient.close(); await server.close(); });
+    const urls = Array.from({ length: 6 }, () => `${server.base}/slow`);
+    const controller = new AbortController();
+
+    // Act：首个请求到达即取消
+    const call = cancelClient.callTool(
+        { name: 'convert_document', arguments: { urls, outputDir } }, undefined, { signal: controller.signal },
+    );
+    await new Promise((resolve) => {
+        const timer = setInterval(() => {
+            if (server.requests.length >= 1) { clearInterval(timer); resolve(); }
+        }, 10);
+    });
+    controller.abort();
+    await assert.rejects(call, '取消后客户端侧的调用应被拒绝');
+    // MCP 协议规定取消后不再回响应，故以磁盘产物与服务可用性验证服务端行为
+    await new Promise((resolve) => { setTimeout(resolve, 900); });
+
+    // Assert
+    assert.ok(fs.readdirSync(outputDir).length < urls.length,
+        `未领取的任务不应产出：${JSON.stringify(fs.readdirSync(outputDir))}`);
+    assert.ok(server.requests.length < urls.length, '中止后不应再抓取新页面');
+    const after = await cancelClient.callTool({ name: 'list_formats' });
+    assert.notEqual(after.isError, true, '取消后服务仍应继续可用');
+});
+
+// ============================================================
+// 进度通知、annotations 与 instructions
+// ============================================================
+
+test('带 progressToken 调用时推送严格递增的中文进度通知，末条为全部完成', async () => {
+    // Arrange
+    const outputDir = makeOutDir('progress-');
+    const events = [];
+
+    // Act：SDK 客户端给出 onprogress 时自动在 _meta 中带上 progressToken
+    const result = await client.callTool(
+        { name: 'convert_document', arguments: { paths: [SAMPLE_MD, SAMPLE_PDF], outputDir, pdfBackend: 'local' } },
+        undefined,
+        { onprogress: (progress) => events.push(progress) },
+    );
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    assert.equal(result.structuredContent.ok, true);
+    assert.ok(events.length >= 2, `应收到多条进度，实际 ${events.length}`);
+    events.forEach((event, i) => {
+        assert.equal(event.total, 200);
+        assert.match(event.message, /[一-龥]/);
+        if (i > 0) assert.ok(event.progress > events[i - 1].progress, `进度须严格递增：${JSON.stringify(events)}`);
+    });
+    const last = events[events.length - 1];
+    assert.equal(last.progress, 200);
+    assert.match(last.message, /完成/);
+});
+
+test('工具 annotations 与服务 instructions', async () => {
+    // Act
+    const { tools } = await client.listTools();
+    const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+    const instructions = client.getInstructions();
+
+    // Assert
+    assert.deepEqual(byName.convert_document.annotations, { destructiveHint: true, openWorldHint: true });
+    assert.equal(byName.extract_article.annotations.readOnlyHint, true);
+    assert.equal(byName.list_formats.annotations.readOnlyHint, true);
+    assert.equal(typeof instructions, 'string');
+    assert.match(instructions, /outputDir/);
+    assert.match(instructions, /已存在/);
+    assert.match(instructions, /计费/);
+    assert.match(instructions, /pdfBackend:"local"/);
+    assert.match(instructions, /extract_article/);
 });
 
 // ============================================================

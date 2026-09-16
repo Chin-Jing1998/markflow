@@ -1,7 +1,9 @@
 /**
  * converters/service.js 单元测试
  * 覆盖：buildOptions 的扁平参数映射与类型转换、嵌套段深合并与 xml 扁平别名、未知键忽略、非法值中文错误、
- *       probeCapabilities 的形状（含 raster 后端探测结果与 mineru 状态，不含令牌）、runConversion 结果信封的新字段
+ *       按本批目标校验（targets）、docx 专属扁平键与 xml 段的 patent 别名；describeOptionHint 的取值说明；
+ *       probeCapabilities 的形状（含 raster、DTD 校验器与 LibreOffice 的探测结果与 mineru 状态，不含令牌）、
+ *       describeFormats 的受理扩展名、runConversion 结果信封的新字段
  */
 const { test, describe, afterEach, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -18,7 +20,10 @@ const TMP_ROOT = path.join(__dirname, 'tmp');
 fs.mkdirSync(TMP_ROOT, { recursive: true });
 const root = fs.mkdtempSync(path.join(TMP_ROOT, 'service-'));
 after(() => fs.rmSync(root, { recursive: true, force: true }));
-afterEach(() => config._reset());
+afterEach(() => {
+    config._reset();
+    service._resetProbeCache();
+});
 
 // 隔离的家目录（无 ~/.mineru/config.yaml）与环境变量
 function isolateConfig(env = {}) {
@@ -117,6 +122,99 @@ describe('buildOptions', () => {
         assert.throws(() => service.buildOptions({ html: 'apple' }), /参数 html 须为对象/);
         assert.throws(() => service.buildOptions({ html: { colour: 'red' } }), /未知选项：html\.colour/);
     });
+
+    test('省略 targets 即全部段照常校验（保持旧行为）', () => {
+        assert.throws(() => service.buildOptions({ fontSize: 9 }), /选项 html\.fontSize 须为 10–32 之间的数字/);
+        assert.throws(() => service.buildOptions({ fontSize: 9 }, {}), /选项 html\.fontSize/);
+    });
+
+    test('按本批目标校验：不属于本批目标的段取值越界时跳过写入、保留默认值', () => {
+        // Act & Assert：docx 批次，html 段不属于本批，9 越界即跳过；docx 段照常写入
+        const docxOnly = service.buildOptions({ fontSize: 9 }, { targets: ['docx'] });
+        assert.equal(docxOnly.docx.fontSize, 9);
+        assert.equal(docxOnly.html.fontSize, 16);
+
+        // Act & Assert：html 批次，html 段属于本批，越界照常报错
+        assert.throws(() => service.buildOptions({ fontSize: 34 }, { targets: ['html'] }), /选项 html\.fontSize 须为 10–32 之间的数字/);
+
+        // Act & Assert：混合批次两段分别校验，任一段越界即报错，两段都合法才一并写入
+        assert.throws(() => service.buildOptions({ fontSize: 9 }, { targets: ['html', 'docx'] }), /选项 html\.fontSize/);
+        assert.throws(() => service.buildOptions({ fontSize: 34 }, { targets: new Set(['docx', 'html']) }), /选项 html\.fontSize/);
+        const mixed = service.buildOptions({ fontSize: 20 }, { targets: ['html', 'docx'] });
+        assert.equal(mixed.html.fontSize, 20);
+        assert.equal(mixed.docx.fontSize, 20);
+    });
+
+    test('pdf 目标以 html 段排版，html 段同属 pdf 目标；与目标无关的段照常校验', () => {
+        assert.throws(() => service.buildOptions({ fontSize: 9 }, { targets: ['pdf'] }), /选项 html\.fontSize/);
+        const bundle = service.buildOptions({ fontSize: 9, lineHeight: 5, theme: 'solarized' }, { targets: ['bundle'] });
+        assert.equal(bundle.html.fontSize, 16);
+        assert.equal(bundle.docx.fontSize, 9, 'docx 段虽不在本批，但 9 对该段合法，照常写入');
+        assert.equal(bundle.html.lineHeight, 1.7);
+        assert.equal(bundle.pdf.theme, 'print');
+        // 顶层键与 mineru、raster 段不绑定目标：越界照常报错
+        assert.throws(() => service.buildOptions({ jpegQuality: 120 }, { targets: ['bundle'] }), /选项 jpegQuality/);
+        assert.throws(() => service.buildOptions({ mineruTimeout: 5 }, { targets: ['docx'] }), /选项 mineru\.timeoutSec/);
+        assert.throws(() => service.buildOptions({ rasterScale: 9 }, { targets: ['docx'] }), /选项 raster\.scale/);
+        // 类型转换失败与目标无关，照常报错
+        assert.throws(() => service.buildOptions({ lineHeight: 'abc' }, { targets: ['docx'] }), /参数 lineHeight 须为数字/);
+        assert.throws(() => service.buildOptions({}, { targets: 'docx' }), /targets 须为目标名数组/);
+    });
+
+    test('docxFontSize / fontAscii / fontEastAsia 只作用于 docx 段，docxFontSize 优先于 fontSize', () => {
+        // Act
+        const opts = service.buildOptions({ fontSize: '18', docxFontSize: '12', fontAscii: 'Georgia', fontEastAsia: '宋体' });
+
+        // Assert
+        assert.equal(opts.html.fontSize, 18);
+        assert.equal(opts.docx.fontSize, 12);
+        assert.deepEqual(opts.docx.fontFamily, { ascii: 'Georgia', eastAsia: '宋体' });
+    });
+
+    test('xml 段内 imageDpi / sectionDetection / rasterizeTables / rasterizeFormulas 展开到 xml.patent', () => {
+        // Act
+        const opts = service.buildOptions({
+            xml: { imageDpi: 200, sectionDetection: 'headings', rasterizeTables: false, rasterizeFormulas: false },
+            pdf: { pageSize: 'Letter', landscape: true },
+            raster: { scale: 3, maxWidth: 1200 },
+        });
+
+        // Assert
+        assert.deepEqual(opts.xml.patent, {
+            parts: 'auto', rasterizeTables: false, rasterizeFormulas: false, imageDpi: 200, sectionDetection: 'headings',
+        });
+        assert.equal(opts.pdf.pageSize, 'Letter');
+        assert.equal(opts.pdf.landscape, true);
+        assert.deepEqual(opts.raster, { scale: 3, maxWidth: 1200 });
+    });
+});
+
+// ============================================================
+// describeOptionHint（CLI 帮助与 MCP 入参描述同源的取值说明）
+// ============================================================
+
+describe('describeOptionHint', () => {
+    test('单路径：枚举列可选值、数字列范围，附默认值；默认为 null 的可空项不列', () => {
+        assert.equal(service.describeOptionHint(['jpegQuality']), '（范围 60–100；默认 90）');
+        assert.equal(service.describeOptionHint(['xml.profile']), '（可选 generic | patent；默认 generic）');
+        assert.equal(service.describeOptionHint(['mineru.formula']), '（默认 true）');
+        assert.equal(service.describeOptionHint(['html.fontFamily']), '');
+    });
+
+    test('多路径：取值相同则合并，默认值不同逐段列出；取值不同则逐段列范围与默认', () => {
+        assert.equal(
+            service.describeOptionHint(['html.theme', 'pdf.theme']),
+            '（可选 apple | apple-dark | github | academic | reader | print；html 默认 apple，pdf 默认 print）',
+        );
+        assert.equal(service.describeOptionHint(['html.fontSize', 'docx.fontSize']), '（html 范围 10–32，默认 16；docx 范围 8–36，默认 11）');
+        assert.equal(service.describeOptionHint(['pdf.pageSize', 'docx.pageSize']), '（可选 A4 | Letter；默认 A4）');
+    });
+
+    test('describeOptionSpec 取描述树叶子；未知路径抛中文错误', () => {
+        assert.equal(service.describeOptionSpec('xml.patent.imageDpi').max, 600);
+        assert.equal(service.describeOptionSpec('html.nope'), null);
+        assert.throws(() => service.describeOptionHint(['html.nope']), /未知选项路径：html\.nope/);
+    });
 });
 
 // ============================================================
@@ -132,7 +230,17 @@ describe('probeCapabilities', () => {
         const caps = await service.probeCapabilities();
 
         // Assert
-        assert.deepEqual(Object.keys(caps).sort(), ['mineru', 'pdfBackend', 'raster', 'themes', 'xmlProfiles']);
+        assert.deepEqual(Object.keys(caps).sort(), ['libreoffice', 'mineru', 'pdfBackend', 'raster', 'themes', 'validator', 'xmlProfiles']);
+        // DTD 校验器与 LibreOffice 同 raster 一样报 { name, available, hint }，可用性与名称一致
+        for (const key of ['validator', 'libreoffice']) {
+            assert.deepEqual(Object.keys(caps[key]).sort(), ['available', 'hint', 'name'], `${key} 的键`);
+            assert.equal(caps[key].available, caps[key].name !== null, `${key} 可用性与名称一致`);
+            assert.equal(typeof caps[key].hint, 'string');
+        }
+        if (fs.existsSync(path.join(ROOT, 'node_modules', 'libxml2-wasm'))) {
+            assert.deepEqual(caps.validator, { name: 'libxml2-wasm', available: true, hint: '' });
+        }
+        if (!caps.libreoffice.available) assert.match(caps.libreoffice.hint, /非必需/);
         assert.equal(typeof caps.pdfBackend.available, 'boolean');
         assert.equal(typeof caps.pdfBackend.hint, 'string');
         assert.deepEqual(Object.keys(caps.raster).sort(), ['available', 'hint', 'name']);
@@ -155,12 +263,49 @@ describe('probeCapabilities', () => {
         assert.equal('sofficeAvailable' in caps, false);
     });
 
+    test('DTD 校验器探测在进程内缓存，可注入实现与复位', async () => {
+        // Arrange
+        isolateConfig({});
+        let calls = 0;
+        service._setValidatorProbe(async () => {
+            calls += 1;
+            return { name: 'stub-validator', available: true, hint: '' };
+        });
+
+        // Act
+        const first = await service.probeCapabilities();
+        const second = await service.probeCapabilities();
+
+        // Assert
+        assert.equal(calls, 1, '重复调用只探测一次');
+        assert.equal(first.validator.name, 'stub-validator');
+        assert.equal(second.validator.name, 'stub-validator');
+        service._resetProbeCache();
+        const third = await service.probeCapabilities();
+        assert.notEqual(third.validator.name, 'stub-validator', '复位后回到真实探测');
+    });
+
     test('令牌来自环境变量时只报来源，绝不透出令牌', async () => {
         isolateConfig({ MINERU_TOKEN: 'secret-xyz-123' });
         const caps = await service.probeCapabilities();
         assert.deepEqual(caps.mineru, { configured: true, source: 'env:MINERU_TOKEN' });
         assert.equal(JSON.stringify(caps).includes('secret-xyz-123'), false);
         assert.equal(JSON.stringify(await service.describeFormats()).includes('secret-xyz-123'), false);
+    });
+
+    test('describeFormats 另报受理扩展名清单，既有字段不变', async () => {
+        // Arrange
+        isolateConfig({});
+
+        // Act
+        const formats = await service.describeFormats();
+
+        // Assert
+        assert.deepEqual(Object.keys(formats), ['targets', 'capabilities', 'extensions', 'version']);
+        assert.deepEqual(formats.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']);
+        assert.equal(typeof formats.targets.capabilities.pdfBackend, 'object', 'targets.capabilities.pdfBackend 与 capabilities.pdfBackend 并存');
+        assert.equal(typeof formats.capabilities.validator.available, 'boolean');
+        assert.equal(typeof formats.capabilities.libreoffice.available, 'boolean');
     });
 });
 
@@ -293,6 +438,57 @@ describe('runConversion 的产物名登记', () => {
         assert.deepEqual(payload.results.map((item) => item.target), ['docx', 'bundle']);
         assert.deepEqual(payload.results.map((item) => item.name), ['sample', 'sample']);
         assert.deepEqual(fs.readdirSync(outputDir).sort(), ['sample', 'sample.docx']);
+    });
+
+    test('signal 中止后未领取的任务记为已取消：errors 带 cancelled 标记', async () => {
+        // Arrange：并发 1，首项完成即中止；worker 领下一项前会查中止标记，故后两项必然未开始
+        const inDir = fs.mkdtempSync(path.join(root, 'cancel-in-'));
+        const inputs = ['a.md', 'b.md', 'c.md'].map((name) => {
+            const file = path.join(inDir, name);
+            fs.writeFileSync(file, `# ${name}\n\n正文\n`);
+            return file;
+        });
+        const outputDir = fs.mkdtempSync(path.join(root, 'cancel-out-'));
+        const tasks = service.planTasks(inputs, 'docx', ROOT);
+        const controller = new AbortController();
+
+        // Act
+        const payload = await service.runConversion({
+            tasks, outputDir, concurrency: 1, signal: controller.signal,
+            onEvent: (event) => { if (event.type === 'item') controller.abort(); },
+        });
+
+        // Assert
+        assert.equal(payload.ok, false);
+        assert.deepEqual(payload.results.map((item) => item.input), [inputs[0]]);
+        assert.deepEqual(payload.errors.map((item) => item.input), [inputs[1], inputs[2]]);
+        payload.errors.forEach((item) => {
+            assert.equal(item.cancelled, true, '取消项须带 cancelled 标记');
+            assert.equal(item.error, '已取消');
+        });
+        assert.equal(payload.results[0].skipped, undefined, '未启用 skipExisting 时结果不带 skipped');
+    });
+
+    test('skipExisting 与 clean 透传给 convert：命中跳过时结果带 skipped 且不重写产物', async () => {
+        // Arrange
+        const inDir = fs.mkdtempSync(path.join(root, 'skip-in-'));
+        const input = path.join(inDir, 'keep.md');
+        fs.writeFileSync(input, '# 标题\n\n正文\n');
+        const outputDir = fs.mkdtempSync(path.join(root, 'skip-out-'));
+        const tasks = service.planTasks([input], 'docx', ROOT);
+
+        // Act
+        const first = await service.runConversion({ tasks, outputDir });
+        const produced = first.results[0].outputPath;
+        const mtimeBefore = fs.statSync(produced).mtimeMs;
+        const second = await service.runConversion({ tasks, outputDir, skipExisting: true });
+        const badClean = await service.runConversion({ tasks, outputDir, clean: 'yes' });
+
+        // Assert
+        assert.equal(first.results[0].skipped, undefined);
+        assert.equal(second.results[0].skipped, true);
+        assert.equal(fs.statSync(produced).mtimeMs, mtimeBefore, '跳过时不得重写产物');
+        assert.match(badClean.errors[0].error, /参数 clean 须为布尔值/, 'clean 原样透传给 convert');
     });
 
     test('登记表不跨批次：同一输入再转一次仍写回同一产物（幂等）', async () => {

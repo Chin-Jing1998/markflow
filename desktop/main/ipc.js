@@ -365,14 +365,14 @@ function createIpcHandlers(deps = {}) {
         const flat = { ...current.defaults, ...options };
         const token = settings.getMineruToken();
         if (token) flat.mineruToken = token;
-        const normalized = service.buildOptions(flat);
-
         const tasks = items.map((item, index) => {
             const raw = item.path || item.url;
             const type = detectInputType(raw);
             const [task] = service.planTasks([raw], pickTarget(type, item.target, current.defaultTargets), process.cwd());
             return { ...task, taskId: item.id || `task-${index + 1}`, type, name: item.path ? path.basename(item.path) : hostnameOf(raw) || raw };
         });
+        // 扁平选项按本批目标校验：只作用于其它目标的段，取值越界时跳过写入而不是让整批失败
+        const normalized = service.buildOptions(flat, { targets: tasks.map((task) => task.target) });
 
         runSeq += 1;
         const runId = `run-${Date.now().toString(36)}-${runSeq}`;

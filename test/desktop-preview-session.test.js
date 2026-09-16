@@ -211,6 +211,22 @@ test('render 复用缓存：非重解析项只重渲染，不再解析', async (
     assert.equal(h.core.calls.render.filter((item) => item.target === 'html').length, 2);
 });
 
+test('预览选项按本次目标校验：xml 目标下 9 号字不因 html 段越界被拒', async () => {
+    // Arrange
+    const h = makeHarness();
+    const opened = await openDocx(h);
+
+    // Act：9 落在 docx 段的 8–36 内、却在 html 段的 10–32 外；本次目标为 xml，两段都不属于本批
+    const rendered = await h.preview.render({ sessionId: opened.sessionId, target: 'xml', options: { theme: 'github', fontSize: 9 } });
+
+    // Assert
+    assert.equal(rendered.target, 'xml');
+    const last = h.core.calls.render.at(-1);
+    assert.equal(last.target, 'xml');
+    assert.equal(last.options.html.fontSize, 16, 'html 段不属于本次目标，越界取值跳过并保留默认值');
+    assert.equal(last.options.docx.fontSize, 9, '9 对 docx 段合法，照常写入');
+});
+
 test('render 命中重解析项时重新解析并重建来源栏', async () => {
     const h = makeHarness();
     const opened = await openDocx(h);

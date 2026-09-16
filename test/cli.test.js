@@ -2,10 +2,14 @@
  * bin/markflow.js 命令行集成测试
  *
  * 以子进程方式调用真实 CLI，断言 stdout/stderr 分流与退出码。
- * 覆盖：help/version、formats、convert 的默认目标与显式目标、转换选项透传与非法取值、--validate 标记、
+ * 覆盖：help/version、formats（含 DTD 校验器、LibreOffice 与受理扩展名）、convert 的默认目标与显式目标、
+ *       转换选项透传与非法取值、按本批目标校验选项、--validate 标记、人类模式的告警输出、
+ *       参数解析（中文报错、--no-<开关>、布尔开关误带取值、--concurrency 非法值告警）、
+ *       extract 子命令（本机 HTTP 服务、stdout 为正文、零落盘）、
  *       config 子命令（set/get/unset 与文件权限）、参数错误（1）、失败项（2）、
  *       输出目录解析（--out / MARKFLOW_OUTPUT_DIR）、人类模式与 --json 模式的输出分流。
- * 临时产物与隔离的配置目录一律写入 os.tmpdir()。
+ * 临时产物与隔离的配置目录一律写入 os.tmpdir()。extract 的成功路径以 --require 预加载
+ * allow-private-network.js，为子进程内的 SSRF 守卫放行 127.0.0.1（守卫本体不变）。
  */
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -14,11 +18,16 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const { startArticleServer, buildArticlePage, ARTICLE_TITLE, ARTICLE_PARAGRAPHS } = require('./fixtures/article-server');
+
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'markflow.js');
+const PRELOAD = path.join(ROOT, 'test', 'fixtures', 'allow-private-network.js');
 const SAMPLE_MD = path.join(ROOT, 'test', 'fixtures', 'sample.md');
 const SAMPLE_PDF = path.join(ROOT, 'test', 'fixtures', 'sample.pdf');
 const PKG_VERSION = require('../package.json').version;
+// parseArgs 的英文原文：CLI 已按错误码中文化，任何一句都不应再出现在 stderr 中
+const ENGLISH_PARSE_ERROR_RE = /Unknown option|argument missing|does not take an argument|ambiguous|Unexpected argument/;
 
 let tmpDir;
 
@@ -30,10 +39,10 @@ after(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-// 运行 CLI 并收集 stdout/stderr 与退出码
+// 运行 CLI 并收集 stdout/stderr 与退出码；options.nodeArgs 放在脚本路径之前（如 --require 预加载）
 function runCli(args, options = {}) {
     return new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [CLI, ...args], {
+        const child = spawn(process.execPath, [...(options.nodeArgs || []), CLI, ...args], {
             cwd: options.cwd || ROOT,
             env: { ...process.env, ...(options.env || {}) },
         });
@@ -80,11 +89,21 @@ test('--help 的选项段由 options.js 的描述树生成，列出全部转换�
     assert.equal(code, 0);
     const flags = ['--theme', '--xml-profile', '--patent-parts', '--pdf-backend', '--image-format',
         '--jpeg-quality', '--jpeg-ppi', '--math', '--mineru-model', '--mineru-ocr', '--mineru-lang', '--page-ranges',
-        '--font', '--font-size', '--line-height', '--numbering-start', '--validate'];
+        '--font', '--font-size', '--line-height', '--numbering-start', '--validate',
+        '--content-width', '--spacing', '--inline-images', '--page-size', '--landscape', '--docx-font-size',
+        '--font-ascii', '--font-east-asia', '--xml-indent', '--numbering-width', '--mineru-formula', '--mineru-table',
+        '--mineru-timeout', '--patent-image-dpi', '--section-detection', '--rasterize-tables', '--rasterize-formulas',
+        '--raster-scale', '--raster-max-width'];
     flags.forEach((flag) => assert.ok(stdout.includes(flag), `--help 应列出 ${flag}`));
-    assert.match(stdout, /可选 apple \| apple-dark \| github \| academic \| reader \| print；默认 apple/);
+    // 多路径旗标：取值相同则合并、默认值不同逐段列出（pdf 主题缺省为 print 而非 apple）；取值不同则逐段列出
+    assert.match(stdout, /可选 apple \| apple-dark \| github \| academic \| reader \| print；html 默认 apple，pdf 默认 print/);
+    assert.match(stdout, /--font-size <n>.*html 范围 10–32，默认 16；docx 范围 8–36，默认 11/);
     assert.match(stdout, /范围 60–100；默认 90/);
     assert.match(stdout, /范围 72–600；默认 330/);
+    assert.match(stdout, /--no-<开关>/);
+    assert.match(stdout, /--json .*不输出进度/);
+    assert.match(stdout, /extract <网址>/);
+    assert.match(stdout, /--max-chars <n>/);
     assert.match(stdout, /config {2,}读写/);
     assert.match(stdout, /mineru-token/);
 });
@@ -108,10 +127,11 @@ test('未知子命令以 1 退出并在 stderr 给出中文提示', async () => 
     assert.match(stderr, /未知子命令：unknown-cmd/);
 });
 
-test('未知选项以 1 退出并在 stderr 给出参数错误', async () => {
+test('未知选项以 1 退出并在 stderr 给出中文的参数错误', async () => {
     const { code, stderr } = await runCli(['convert', '--nope']);
     assert.equal(code, 1);
-    assert.match(stderr, /参数错误：/);
+    assert.match(stderr, /参数错误：未知选项 --nope/);
+    assert.doesNotMatch(stderr, ENGLISH_PARSE_ERROR_RE);
 });
 
 // ============================================================
@@ -143,6 +163,13 @@ test('formats --json 输出单行 JSON，含 targets 与 capabilities', async ()
         if (process.env[name]) assert.equal(stdout.includes(process.env[name]), false, `${name} 的取值不得出现在输出中`);
     }
     assert.equal(payload.version, PKG_VERSION);
+    // DTD 校验器与 LibreOffice 的状态、受理扩展名清单；targets.capabilities.pdfBackend 为兼容保留
+    for (const key of ['validator', 'libreoffice']) {
+        assert.deepEqual(Object.keys(capabilities[key]).sort(), ['available', 'hint', 'name'], `${key} 的键`);
+        assert.equal(capabilities[key].available, capabilities[key].name !== null);
+    }
+    assert.deepEqual(payload.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']);
+    assert.ok('pdfBackend' in payload.targets.capabilities);
 });
 
 test('formats 人类模式输出可读文本到 stdout', async () => {
@@ -156,7 +183,10 @@ test('formats 人类模式输出可读文本到 stdout', async () => {
     assert.match(stdout, /XML profile/);
     assert.match(stdout, /apple、apple-dark、github、academic、reader、print/);
     assert.match(stdout, /generic、patent/);
-    assert.doesNotMatch(stdout, /LibreOffice/);
+    assert.match(stdout, /DTD 校验器 +→ /);
+    assert.match(stdout, /受理扩展名 +→ \.docx \.xlsx \.pptx \.pdf \.md \.markdown/);
+    // LibreOffice 非必需：可用时报名称，不可用时写明仅作兜底
+    assert.match(stdout, /LibreOffice +→ (soffice|不可用（非必需)/);
 });
 
 // ============================================================
@@ -244,6 +274,8 @@ test('人类模式：产物路径走 stdout，进度与汇总走 stderr', async 
     assert.match(stderr, /开始：.*sample\.md → docx/);
     assert.match(stderr, /完成：.*sample\.docx/);
     assert.match(stderr, /汇总：成功 1 项，失败 0 项/);
+    // 无告警时不多输出：既无逐条告警，汇总行也不带告警条数
+    assert.doesNotMatch(stderr, /告警/);
 });
 
 test('相对路径按当前工作目录解析，输出为绝对路径', async () => {
@@ -681,4 +713,409 @@ test('同批混合目标：md 的 sample.docx 与 docx 的 sample/ 分属不同�
     assert.deepEqual(fs.readdirSync(outDir).sort(), ['sample', 'sample.docx']);
     assert.equal(fs.statSync(path.join(outDir, 'sample')).isDirectory(), true);
     assert.equal(fs.statSync(path.join(outDir, 'sample.docx')).isFile(), true);
+});
+
+// ============================================================
+// convert：人类模式的告警输出
+// ============================================================
+
+test('人类模式：每项告警逐条写 stderr，汇总行追加告警条数；--json 模式 stderr 仍为空', async () => {
+    // Arrange：patent profile 下 330 DPI 的图片必出「预检：」告警
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'warn-'));
+    const args = ['convert', SAMPLE_MD, '--to', 'xml', '--xml-profile', 'patent', '--out', outDir];
+
+    // Act
+    const human = await runCli(args);
+    const json = await runCli([...args, '--json']);
+
+    // Assert
+    assert.equal(human.code, 0, human.stderr);
+    assert.equal(human.stdout.trim(), path.join(outDir, 'sample'));
+    assert.match(human.stderr, /\n {2}告警：预检：/);
+    const count = parseSingleLineJson(json.stdout).results[0].warnings.length;
+    assert.ok(count > 0);
+    assert.equal((human.stderr.match(/^ {2}告警：/gm) || []).length, count);
+    assert.match(human.stderr, new RegExp(`汇总：成功 1 项，失败 0 项，输出目录 .*，告警 ${count} 条`));
+    assert.equal(json.code, 0);
+    assert.equal(json.stderr, '');
+});
+
+// ============================================================
+// convert：按本批目标校验转换选项
+// ============================================================
+
+test('--to docx --font-size 9：html 段不属于本批，越界跳过并保留 16；docx 段写入 9', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'fs-docx-'));
+
+    // Act
+    const { code, stdout, stderr } = await runCli(['convert', SAMPLE_MD, '--to', 'docx', '--font-size', '9', '--out', outDir, '--json']);
+
+    // Assert
+    assert.equal(code, 0, stderr);
+    const { options } = parseSingleLineJson(stdout).results[0];
+    assert.equal(options.docx.fontSize, 9);
+    assert.equal(options.html.fontSize, 16);
+});
+
+test('--to html --font-size 34：html 段属于本批，越界以 1 退出且不产生产物', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'fs-html-'));
+
+    // Act
+    const { code, stdout, stderr } = await runCli(['convert', SAMPLE_MD, '--to', 'html', '--font-size', '34', '--out', outDir]);
+
+    // Assert
+    assert.equal(code, 1);
+    assert.equal(stdout, '');
+    assert.match(stderr, /选项 html\.fontSize 须为 10–32 之间的数字/);
+    assert.deepEqual(fs.readdirSync(outDir), []);
+});
+
+test('混合批次（md → docx、pdf → bundle）按各自目标校验：--font-size 9 只写入 docx 段', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'fs-mixed-'));
+
+    // Act
+    const { code, stdout, stderr } = await runCli([
+        'convert', SAMPLE_MD, SAMPLE_PDF, '--pdf-backend', 'local', '--font-size', '9', '--out', outDir, '--json',
+    ]);
+
+    // Assert
+    assert.equal(code, 0, stderr);
+    const payload = parseSingleLineJson(stdout);
+    assert.deepEqual(payload.results.map((item) => item.target), ['docx', 'bundle']);
+    payload.results.forEach((item) => {
+        assert.equal(item.options.docx.fontSize, 9);
+        assert.equal(item.options.html.fontSize, 16);
+    });
+});
+
+// ============================================================
+// 参数解析：中文报错、--no-<开关>、布尔开关误带取值、--concurrency 告警
+// ============================================================
+
+test('参数解析错误按错误码中文化，不回显 parseArgs 的英文原文', async () => {
+    // Arrange
+    const cases = [
+        [['convert', SAMPLE_MD, '--to'], /参数错误：选项 --to 缺少取值/],
+        [['convert', SAMPLE_MD, '--json=1'], /参数错误：布尔开关 --json 不接受取值/],
+        [['convert', SAMPLE_MD, '--no-to', 'html'], /参数错误：未知选项 --no-to（--no- 前缀只适用于布尔开关）/],
+        [['convert', SAMPLE_MD, '--to', '--json'], /参数错误：选项 --to 的取值以短横线开头/],
+        [['convert', SAMPLE_MD, '-x'], /参数错误：未知选项 -x/],
+    ];
+
+    for (const [args, expected] of cases) {
+        // Act
+        const { code, stdout, stderr } = await runCli(args);
+
+        // Assert
+        assert.equal(code, 1, args.join(' '));
+        assert.equal(stdout, '');
+        assert.match(stderr, expected);
+        assert.doesNotMatch(stderr, ENGLISH_PARSE_ERROR_RE);
+    }
+});
+
+test('--no-<开关> 显式关闭布尔开关，同一开关以最后一次出现为准', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'negate-'));
+    const run = (flags) => runCli(['convert', SAMPLE_MD, '--to', 'html', '--out', outDir, '--json', ...flags]);
+
+    // Act
+    const off = await run(['--mineru-ocr', '--no-mineru-ocr', '--no-mineru-formula']);
+    const on = await run(['--no-mineru-ocr', '--mineru-ocr']);
+    const onlyOff = await run(['--no-mineru-ocr']);
+
+    // Assert
+    assert.equal(off.code, 0, off.stderr);
+    const offOptions = parseSingleLineJson(off.stdout).results[0].options;
+    assert.equal(offOptions.mineru.ocr, false);
+    assert.equal(offOptions.mineru.formula, false, 'mineru.formula 默认 true，--no- 关闭');
+    assert.equal(parseSingleLineJson(on.stdout).results[0].options.mineru.ocr, true);
+    assert.equal(parseSingleLineJson(onlyOff.stdout).results[0].options.mineru.ocr, false);
+});
+
+test('布尔开关误带取值（--mineru-ocr false）以 1 退出，提示布尔开关不接受取值', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'bool-value-'));
+
+    // Act
+    const { code, stdout, stderr } = await runCli(['convert', SAMPLE_MD, '--mineru-ocr', 'false', '--out', outDir]);
+
+    // Assert
+    assert.equal(code, 1);
+    assert.equal(stdout, '');
+    assert.match(stderr, /布尔开关 --mineru-ocr 不接受取值「false」/);
+    assert.match(stderr, /--no-mineru-ocr/);
+    assert.deepEqual(fs.readdirSync(outDir), []);
+});
+
+test('--concurrency 非法值不报错：stderr 告警并按默认并发执行，--json 的 stdout 仍为一行', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'conc-'));
+
+    // Act
+    const zero = await runCli(['convert', SAMPLE_MD, '--out', outDir, '--concurrency', '0', '--json']);
+    const text = await runCli(['convert', SAMPLE_MD, '--out', outDir, '--concurrency', 'abc']);
+
+    // Assert
+    assert.equal(zero.code, 0);
+    assert.equal(parseSingleLineJson(zero.stdout).ok, true);
+    assert.match(zero.stderr, /注意：--concurrency 取值「0」无效（须为正整数），已按默认值 2 执行/);
+    assert.equal(text.code, 0);
+    assert.match(text.stderr, /注意：--concurrency 取值「abc」无效/);
+});
+
+// ============================================================
+// convert：与桌面端对齐的转换选项
+// ============================================================
+
+test('新增转换选项旗标进入结果 options，布尔项可用 --no- 关闭', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'new-flags-'));
+
+    // Act
+    const { code, stdout, stderr } = await runCli([
+        'convert', SAMPLE_MD, '--to', 'html', '--out', outDir, '--json',
+        '--content-width', '900', '--spacing', 'loose', '--inline-images', '--page-size', 'Letter', '--landscape',
+        '--font-size', '18', '--docx-font-size', '12', '--font-ascii', 'Georgia', '--font-east-asia', '宋体',
+        '--xml-indent', '4', '--numbering-width', '3', '--no-mineru-formula', '--no-mineru-table', '--mineru-timeout', '120',
+        '--patent-image-dpi', '200', '--section-detection', 'headings', '--no-rasterize-tables', '--no-rasterize-formulas',
+        '--raster-scale', '3', '--raster-max-width', '1200',
+    ]);
+
+    // Assert
+    assert.equal(code, 0, stderr);
+    const { options } = parseSingleLineJson(stdout).results[0];
+    assert.equal(options.html.contentWidth, 900);
+    assert.equal(options.html.spacing, 'loose');
+    assert.equal(options.html.inlineImages, true);
+    assert.equal(options.html.fontSize, 18);
+    assert.equal(options.pdf.pageSize, 'Letter');
+    assert.equal(options.docx.pageSize, 'Letter');
+    assert.equal(options.pdf.landscape, true);
+    assert.equal(options.docx.fontSize, 12, '--docx-font-size 优先于 --font-size');
+    assert.deepEqual(options.docx.fontFamily, { ascii: 'Georgia', eastAsia: '宋体' });
+    assert.equal(options.xml.indent, 4);
+    assert.equal(options.xml.numbering.width, 3);
+    assert.equal(options.mineru.formula, false);
+    assert.equal(options.mineru.table, false);
+    assert.equal(options.mineru.timeoutSec, 120);
+    assert.deepEqual(options.xml.patent, {
+        parts: 'auto', rasterizeTables: false, rasterizeFormulas: false, imageDpi: 200, sectionDetection: 'headings',
+    });
+    assert.deepEqual(options.raster, { scale: 3, maxWidth: 1200 });
+});
+
+// ============================================================
+// extract
+// ============================================================
+
+// 预加载放行本机地址的子进程，cwd 指向空目录，便于断言「一个文件都没写」
+const runExtract = (args, cwd) => runCli(['extract', ...args], { cwd, nodeArgs: ['--require', PRELOAD] });
+const listFilesDeep = (dir) => fs.readdirSync(dir, { recursive: true }).map(String).sort();
+
+test('extract 人类模式：Markdown 正文写 stdout、摘要写 stderr，不下载图片、不落盘', async (t) => {
+    // Arrange
+    const server = await startArticleServer();
+    t.after(() => server.close());
+    const workDir = fs.mkdtempSync(path.join(tmpDir, 'extract-'));
+
+    // Act
+    const { code, stdout, stderr } = await runExtract([`${server.base}/article`], workDir);
+
+    // Assert
+    assert.equal(code, 0, stderr);
+    ARTICLE_PARAGRAPHS.forEach((paragraph) => assert.ok(stdout.includes(paragraph), `stdout 应含正文：${paragraph.slice(0, 10)}…`));
+    assert.ok(!stdout.includes('读者甲'), '评论区不应出现在正文里');
+    assert.match(stderr, new RegExp(`标题：${ARTICLE_TITLE}`));
+    assert.doesNotMatch(stderr, /已截断/);
+    assert.deepEqual(server.requests, ['/article'], '图片不应被下载');
+    assert.deepEqual(listFilesDeep(workDir), []);
+});
+
+test('extract --json：stdout 为一行 JSON，字段与 MCP extract_article 一致；--max-chars 截断并标记', async (t) => {
+    // Arrange
+    const server = await startArticleServer();
+    t.after(() => server.close());
+    const workDir = fs.mkdtempSync(path.join(tmpDir, 'extract-json-'));
+
+    // Act
+    const full = await runExtract([`${server.base}/article`, '--json'], workDir);
+    const cut = await runExtract([`${server.base}/article`, '--json', '--max-chars', '20'], workDir);
+    const cutHuman = await runExtract([`${server.base}/article`, '--max-chars', '20'], workDir);
+
+    // Assert
+    assert.equal(full.code, 0, full.stderr);
+    assert.equal(full.stderr, '');
+    const article = parseSingleLineJson(full.stdout);
+    assert.deepEqual(Object.keys(article), [
+        'url', 'finalUrl', 'title', 'author', 'publishedAt', 'siteName', 'excerpt', 'lang',
+        'wordCount', 'extraction', 'markdown', 'truncated', 'images',
+    ]);
+    assert.equal(article.title, ARTICLE_TITLE);
+    assert.equal(article.truncated, false);
+    const truncated = parseSingleLineJson(cut.stdout);
+    assert.equal(truncated.truncated, true);
+    assert.equal(truncated.markdown.length, 20);
+    assert.equal(truncated.wordCount, article.wordCount, '截断只影响 markdown');
+    assert.equal(cutHuman.code, 0);
+    assert.match(cutHuman.stderr, /已截断/);
+    assert.ok(cutHuman.stdout.startsWith(truncated.markdown));
+    assert.deepEqual(listFilesDeep(workDir), []);
+});
+
+// ============================================================
+// convert：目录输入、路径写法、重跑策略与取消
+// ============================================================
+
+// 造一个含两个受支持文件与一个不受支持文件的输入目录
+function seedInputDir(prefix) {
+    const dir = fs.mkdtempSync(path.join(tmpDir, prefix));
+    fs.copyFileSync(SAMPLE_MD, path.join(dir, 'a.md'));
+    fs.copyFileSync(SAMPLE_MD, path.join(dir, 'b.md'));
+    fs.writeFileSync(path.join(dir, 'notes.txt'), '不受支持的文件');
+    return dir;
+}
+
+test('目录输入展开为其下受支持的文件，展开情况写入 stderr 与 --json 信封', async () => {
+    // Arrange
+    const inDir = seedInputDir('dir-in-');
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'dir-out-'));
+
+    // Act
+    const json = await runCli(['convert', inDir, '--to', 'html', '--out', outDir, '--json']);
+    const human = await runCli(['convert', inDir, '--to', 'html', '--out', outDir]);
+
+    // Assert
+    assert.equal(json.code, 0, json.stderr);
+    const payload = parseSingleLineJson(json.stdout);
+    assert.deepEqual(payload.results.map((item) => item.name).sort(), ['a', 'b']);
+    assert.deepEqual(payload.inputExpansion.directories, [{ path: inDir, count: 2 }]);
+    assert.deepEqual(payload.inputExpansion.skipped, [path.join(inDir, 'notes.txt')]);
+    assert.equal(payload.inputExpansion.truncated, false);
+    assert.equal(human.code, 0, human.stderr);
+    assert.match(human.stderr, /目录展开：1 个目录 → 2 个文件；已跳过 1 个不支持的文件/);
+});
+
+test('目录内没有可转换文件时以 1 退出，不启动转换', async () => {
+    // Arrange
+    const inDir = fs.mkdtempSync(path.join(tmpDir, 'dir-empty-'));
+    fs.writeFileSync(path.join(inDir, 'notes.txt'), '不受支持的文件');
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'dir-empty-out-'));
+
+    // Act
+    const { code, stdout, stderr } = await runCli(['convert', inDir, '--out', outDir]);
+
+    // Assert
+    assert.equal(code, 1);
+    assert.equal(stdout, '');
+    assert.match(stderr, /没有可转换的文件/);
+    assert.deepEqual(fs.readdirSync(outDir), []);
+});
+
+test('--out 支持 ~ 与 file:// 写法', async () => {
+    // Arrange
+    const { pathToFileURL } = require('node:url');
+    const home = fs.mkdtempSync(path.join(tmpDir, 'home-'));
+    const outDir = path.join(home, 'out');
+    fs.mkdirSync(outDir);
+
+    // Act
+    const tilde = await runCli(['convert', SAMPLE_MD, '--out', '~/out', '--json'], { env: { HOME: home, USERPROFILE: home } });
+    const asUrl = await runCli(['convert', SAMPLE_MD, '--out', pathToFileURL(outDir).href, '--json']);
+
+    // Assert
+    assert.equal(tilde.code, 0, tilde.stderr);
+    assert.equal(parseSingleLineJson(tilde.stdout).outputDir, outDir);
+    assert.equal(asUrl.code, 0, asUrl.stderr);
+    assert.equal(parseSingleLineJson(asUrl.stdout).outputDir, outDir);
+});
+
+test('--skip-existing：产物已存在时跳过且不重写，人类模式与 --json 各自标记', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'skip-'));
+    const first = await runCli(['convert', SAMPLE_MD, '--to', 'docx', '--out', outDir, '--json']);
+    const produced = parseSingleLineJson(first.stdout).results[0].outputPath;
+    const mtimeBefore = fs.statSync(produced).mtimeMs;
+
+    // Act
+    const second = await runCli(['convert', SAMPLE_MD, '--to', 'docx', '--out', outDir, '--json', '--skip-existing']);
+    const human = await runCli(['convert', SAMPLE_MD, '--to', 'docx', '--out', outDir, '--skip-existing']);
+
+    // Assert
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(parseSingleLineJson(first.stdout).results[0].skipped, undefined, '未启用时结果不带 skipped');
+    assert.equal(parseSingleLineJson(second.stdout).results[0].skipped, true);
+    assert.equal(fs.statSync(produced).mtimeMs, mtimeBefore, '跳过时不得重写产物');
+    assert.match(human.stderr, /已跳过：.*（产物已存在）/);
+    assert.match(human.stderr, /跳过 1 项/);
+});
+
+test('--clean：重转前清理旧产物，用户放入的其它文件保留', async () => {
+    // Arrange
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'clean-'));
+    const first = await runCli(['convert', SAMPLE_MD, '--to', 'html', '--out', outDir, '--json']);
+    const dir = parseSingleLineJson(first.stdout).results[0].outputPath;
+    const stale = path.join(dir, 'images', 'image_99.jpg');
+    fs.writeFileSync(stale, '旧产物');
+    const mine = path.join(dir, '我的笔记.txt');
+    fs.writeFileSync(mine, '保留我');
+
+    // Act
+    const again = await runCli(['convert', SAMPLE_MD, '--to', 'html', '--out', outDir, '--json', '--clean']);
+
+    // Assert
+    assert.equal(again.code, 0, again.stderr);
+    assert.equal(fs.existsSync(stale), false, '旧的 MarkFlow 产物应被清理');
+    assert.equal(fs.readFileSync(mine, 'utf8'), '保留我', '用户放入的文件应保留');
+    assert.ok(fs.existsSync(path.join(dir, 'sample.html')), '本次产物应照常写出');
+});
+
+test('SIGINT 中止批次：进行中的任务跑完，未开始的记为已取消，退出码 2', async (t) => {
+    // Arrange：本机 HTTP 服务延时应答，确保首项仍在进行时 SIGINT 已经送达
+    const server = await startArticleServer({ pages: { '/slow': { html: buildArticlePage(), delayMs: 400 } } });
+    t.after(() => server.close());
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'sigint-'));
+    const urls = Array.from({ length: 4 }, () => `${server.base}/slow`);
+    const child = spawn(process.execPath, ['--require', PRELOAD, CLI, 'convert', ...urls, '--out', outDir, '--concurrency', '1'], { cwd: ROOT });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+    // Act：等首项真正开始（服务器收到请求）后发 SIGINT
+    await new Promise((resolve) => {
+        const timer = setInterval(() => {
+            if (server.requests.length >= 1) { clearInterval(timer); resolve(); }
+        }, 10);
+    });
+    child.kill('SIGINT');
+    const code = await new Promise((resolve) => child.on('close', resolve));
+
+    // Assert
+    assert.match(stderr, /已中止，正在等待进行中的任务结束/);
+    assert.match(stderr, /已取消 3 项/);
+    assert.equal(code, 2);
+    assert.equal(server.requests.filter((item) => item === '/slow').length, 1, '中止后不应再领取新任务');
+});
+
+test('extract 参数错误以 1 退出，抓取失败以 2 退出，均给出中文说明', async () => {
+    // Act
+    const missing = await runCli(['extract']);
+    const notUrl = await runCli(['extract', 'ftp://example.com/a']);
+    const badMax = await runCli(['extract', 'https://example.com/a', '--max-chars', '0']);
+    // 默认进程不放行本机地址：SSRF 守卫拒绝，失败可复现且无需外网
+    const failed = await runCli(['extract', 'http://127.0.0.1:9/', '--json']);
+
+    // Assert
+    assert.equal(missing.code, 1);
+    assert.match(missing.stderr, /extract 需要一个 http\(s\) 网址/);
+    assert.equal(notUrl.code, 1);
+    assert.match(notUrl.stderr, /extract 只接受 http\(s\) 网址/);
+    assert.equal(badMax.code, 1);
+    assert.match(badMax.stderr, /--max-chars 须为正整数/);
+    assert.equal(failed.code, 2);
+    assert.equal(failed.stdout, '');
+    assert.match(failed.stderr, /提取失败：.*[一-龥]/);
 });

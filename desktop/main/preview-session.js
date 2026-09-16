@@ -101,7 +101,7 @@ function loadCore(core) {
         parseDocument: (core && core.parseDocument) || ((params) => require('../../converters/index').parseDocument(params)),
         renderDocument: (core && core.renderDocument) || ((doc, target, options, context) => require('../../converters/index').renderDocument(doc, target, options, context)),
         writeDocument: (core && core.writeDocument) || ((params) => require('../../converters/index').writeDocument(params)),
-        buildOptions: (core && core.buildOptions) || ((flat) => require('../../converters/service').buildOptions(flat)),
+        buildOptions: (core && core.buildOptions) || ((flat, scope) => require('../../converters/service').buildOptions(flat, scope)),
         redactOptions: (core && core.redactOptions) || ((options) => require('../../converters/options').redactOptions(options)),
     };
 }
@@ -124,10 +124,15 @@ function createPreviewSessions(deps = {}) {
         const current = settings.get();
         return current && current.defaults ? current.defaults : {};
     };
-    /** 令牌只在此处注入，绝不落进 session.flat，也就绝不进入任何回包 */
-    const optionsFor = (flat) => {
+    /**
+     * 令牌只在此处注入，绝不落进 session.flat，也就绝不进入任何回包。
+     * 选项按本次目标校验（见 service.buildOptions 的 targets）：只服务于其它目标的段，取值越界时跳过写入并
+     * 保留该段默认值，故 docx 目标下的 9 号字不会因 html 段的 10–32 而被拒。
+     */
+    const optionsFor = (flat, target) => {
         const token = typeof settings.getMineruToken === 'function' ? settings.getMineruToken() : null;
-        return core.buildOptions(token ? { ...flat, mineruToken: token } : { ...flat });
+        const scope = target ? { targets: [target] } : undefined;
+        return core.buildOptions(token ? { ...flat, mineruToken: token } : { ...flat }, scope);
     };
 
     async function dispose(session) {
@@ -211,7 +216,7 @@ function createPreviewSessions(deps = {}) {
     /** 唯一调用 parseDocument 的地方：open 一次，render 命中 REPARSE_KEYS 时再一次 */
     async function parseInto(session) {
         const flat = { ...session.flat };
-        const parsed = await core.parseDocument({ input: session.input, options: optionsFor(flat) });
+        const parsed = await core.parseDocument({ input: session.input, options: optionsFor(flat, session.target) });
         session.doc = parsed.doc;
         session.name = parsed.name;
         session.title = parsed.title;
@@ -276,7 +281,7 @@ function createPreviewSessions(deps = {}) {
         assertTargetAllowed(session.target, session.type);
         const base = `${assetBaseFor(session.sid)}${PRODUCT_DIRNAME}/`;
         await resetDir(session.productDir);
-        const options = optionsFor(session.flat);
+        const options = optionsFor(session.flat, session.target);
         const builders = { html: productHtml, xml: productXml, docx: productDocx, pdf: productPdf, bundle: productBundle };
         const build = builders[session.target];
         if (!build) throw new Error(`预览暂不支持目标：${session.target}`);
@@ -408,7 +413,7 @@ function createPreviewSessions(deps = {}) {
         const epoch = session.epoch;
         const dir = editDirOf(session);
         await resetDir(dir);
-        const rendered = await core.renderDocument(session.doc, 'bundle', optionsFor(session.flat), { imageMode: 'relative' });
+        const rendered = await core.renderDocument(session.doc, 'bundle', optionsFor(session.flat, session.target), { imageMode: 'relative' });
         await writeAssets(dir, rendered.assets);
         if (session.epoch !== epoch) throw new Error('产物已重新渲染，请重试');
         const mdName = Object.keys(rendered.files).find((key) => key.endsWith('.md'));
@@ -437,7 +442,7 @@ function createPreviewSessions(deps = {}) {
         edit.gen += 1;
         const gen = edit.gen;
         const viewRoot = path.join(session.tempDir, EDIT_VIEW_DIRNAME);
-        const options = optionsFor(session.flat);
+        const options = optionsFor(session.flat, session.target);
         const built = await renderMarkdownText({
             text, baseDir: edit.dir, sourceName: `${session.name}.md`,
             assetDir: path.join(viewRoot, `g${gen}`), assetBase: `${assetBaseFor(session.sid)}${EDIT_VIEW_DIRNAME}/g${gen}/`,
@@ -536,7 +541,7 @@ function createPreviewSessions(deps = {}) {
         const result = {
             input: session.source.value, target: 'bundle', name: session.name, title: session.title, sourceType: session.type,
             outputPath: written.outputPath, outputs: written.outputs, imagesCount: assets.length, warnings,
-            options: core.redactOptions(optionsFor(session.flat)), extras: written.extras || [],
+            options: core.redactOptions(optionsFor(session.flat, session.target)), extras: written.extras || [],
             backends: session.backends || { pdfParser: null, raster: null },
         };
         const libraryId = await registerLibrary(result, { managed, dir });
@@ -573,7 +578,7 @@ function createPreviewSessions(deps = {}) {
         await fsp.mkdir(dir, { recursive: true });
         if (hasEditedMarkdown(session)) return exclusive(session, () => exportEdited(session, { dir, managed }));
 
-        const options = optionsFor(session.flat);
+        const options = optionsFor(session.flat, session.target);
         const rendered = await core.renderDocument(session.doc, session.target, options);
         const written = await core.writeDocument({ rendered, target: session.target, outputDir: dir, name: session.name });
         const warnings = [...asArray(session.doc.warnings), ...asArray(rendered.warnings)];
