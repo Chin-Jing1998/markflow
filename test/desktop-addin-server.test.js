@@ -299,7 +299,8 @@ test('超限 413：Content-Length 声明超限当场拒绝，分块上传实际�
 
     const exact = await request(ctx.port, { method: 'POST', target: '/v1/jobs', headers: uploadHeaders(token), body: Buffer.concat([DOCX, Buffer.alloc(1024 - DOCX.length, 1)]) });
     assert.equal(exact.status, 202, '恰好等于上限的文档照常受理');
-    await until(() => leftovers(ctx.tmpRoot).length === 0, '临时目录清空');
+    // 临时文件的删除先于任务状态落定：两个条件一起等，否则机器负载高时会在「已清空、仍 running」的间隙里取到快照
+    await until(() => leftovers(ctx.tmpRoot).length === 0 && ctx.jobs.stats().running === 0, '临时目录清空且任务结束');
     assert.deepEqual(ctx.jobs.stats(), { pending: 0, running: 0, records: 1 });
 });
 
