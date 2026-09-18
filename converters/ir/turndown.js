@@ -314,4 +314,4 @@ function cellText(cell, escape) {
     return escape(cell.textContent.replace(/\s+/g, ' ').trim()).replace(/\|/g, '\\|');
 }
 
-module.exports = { createTurndownService };
+module.exports = { createTurndownService, URL_REMOVED_TAGS };

@@ -5,7 +5,8 @@
  *       → 正文提取（web/extract 的三级链路：站点选择器 → Readability → 旧兜底）
  *       → 噪声清洗（web/noise）→ 图片逐张经 fetch-guard 下载进 assets（失败记 warning
  *       并保留原 URL），同时记下显示尺寸（web/image-display → data-mf-display）
- *       → 内联样式预处理（样式 → 语义标签、段首缩进 → INDENT 标记、合并相邻 <strong>）
+ *       → 超长空白截断（web/whitespace）→ 内联样式预处理（样式 → 语义标签、段首缩进 → INDENT 标记、
+ *       合并相邻 <strong>）
  *       → turndown('url') → collapseBreakMarkers（BR 标记折叠）→ 文本规范化（web/normalize）
  *       → remark-parse + remark-gfm → liftInlineHtml → restoreMarkers → markCaptions
  *
@@ -15,6 +16,8 @@
  *   - 成功下载的图片按文档顺序编号为 images/image_N.ext（N 从 1 起），与 assets 一一对应；
  *     取得到显示尺寸的图片节点带 data.display（见 converters/ir/schema.js）
  *   - 段首缩进进 paragraph.data.indent，图注进 paragraph.data.role；<br> 单个为硬换行、连续两个为分段
+ *   - 属性值与会进入输出的文本里，连续空白超过 256 个的部分在进入 turndown 前截断，不超过的逐字不动：
+ *     turndown 的 postProcess 正则在长空白串上平方级回溯，下游的 BR 折叠与行尾空白清理同此
  *   - ctx.skipImages 为 true 时一张图都不下载：图片地址就地绝对化，清单挂在 data.images 上，
  *     assets 保持为空（供 MCP 的 extract_article 只读提取使用）
  *   - meta 除 title/sourceType/sourceName/sourceUrl/finalUrl 外，另含 extraction（实际命中的
@@ -24,7 +27,7 @@
 const cheerio = require('cheerio');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
-const { createTurndownService } = require('../ir/turndown');
+const { createTurndownService, URL_REMOVED_TAGS } = require('../ir/turndown');
 const { MARKERS, indentMarker, stripMarkers, restoreMarkers } = require('../ir/markers');
 const { liftInlineHtml } = require('../ir/inline-html');
 const { markCaptions } = require('../ir/captions');
@@ -33,6 +36,7 @@ const { getExtFromContentType, getExtFromUrl } = require('../ir/util');
 const { extractContent, matchesHost } = require('../web/extract');
 const { cleanNoise, isAttached } = require('../web/noise');
 const { normalizeMarkdown } = require('../web/normalize');
+const { capWhitespaceRuns } = require('../web/whitespace');
 const { extractMetadata, countWords } = require('../web/metadata');
 const { displaySizeOf, formatDisplayAttr } = require('../web/image-display');
 const {
@@ -307,6 +311,7 @@ const STYLE_TO_TAG_RULES = [
 
 function preprocessHtml(html) {
     const $ = cheerio.load(html, null, false);
+    capWhitespaceRuns($, URL_REMOVED_TAGS);
     for (const { selector, re, tag } of STYLE_TO_TAG_RULES) {
         $(selector).each((_, el) => {
             if (re.test($(el).attr('style') || '')) {

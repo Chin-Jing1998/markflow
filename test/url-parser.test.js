@@ -134,6 +134,36 @@ const ESCAPE_PAGE = `<!doctype html>
 </body></html>`;
 
 // ------------------------------------------------------------
+// 超长空白夹具：turndown 7.2.4 的 postProcess 对整篇输出跑 /[\t\r\n\s]+$/，
+// 输出里任何一段不在末尾、长度为 R 的连续空白都要花约 R²/2 步
+// ------------------------------------------------------------
+
+const WS_NBSP = String.fromCharCode(0x00a0);
+// 载荷规模。取 20 万，是为了让仅 turndown 一处在未截断时就需约 16 秒，为下方上限的 5 倍以上：
+// 即便日后 collapseBreakMarkers 与 normalizeMarkdown 的两条正则被改成线性，本用例仍能发现截断被移除
+const WS_PAYLOAD_LENGTH = 200000;
+// 整次 parse 的绝对上限。截断后实测在百毫秒量级，距此上限 30 倍以上，慢机与 node --test 多文件
+// 并行时不会误报；不用倍率断言是因为毫秒级测量噪声大
+const WS_PARSE_BUDGET_MS = 3000;
+// 正文提取需要足量普通段落才会命中
+const WS_FILLER = '<p>这是一段用于让正文提取命中的普通文字，长度足够，内容与本用例无关。</p>'.repeat(8);
+
+const wsPage = (title, payload) => `<!doctype html>
+<html><head><meta charset="utf-8"><title>${title}</title></head><body>
+<article>
+<h1>${title}</h1>
+${WS_FILLER}
+${payload}
+${WS_FILLER}
+</article>
+</body></html>`;
+
+// ① 图片 alt 里的超长 ASCII 空格：属性值不经 turndown 的空白折叠，原样进入输出
+const WS_ALT_PAGE = wsPage('超长空白 alt', `<p><img src="/a.png" alt="x${' '.repeat(WS_PAYLOAD_LENGTH)}y"></p>`);
+// ② 正文里的超长不换行空格：turndown 只折叠 [ \r\n\t]，不换行空格逐字进入输出
+const WS_NBSP_PAGE = wsPage('超长空白正文', `<p>甲x${WS_NBSP.repeat(WS_PAYLOAD_LENGTH)}y乙</p>`);
+
+// ------------------------------------------------------------
 // 提取质量对比夹具
 // ------------------------------------------------------------
 
@@ -211,6 +241,14 @@ function startServer() {
             case '/escape':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(ESCAPE_PAGE);
+                return;
+            case '/ws-alt':
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(WS_ALT_PAGE);
+                return;
+            case '/ws-nbsp':
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(WS_NBSP_PAGE);
                 return;
             case '/sidebar':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -701,4 +739,51 @@ test('转义写法页面：表格单元格与图片 alt 的「~」「*」逐字�
     // Assert：md 产物中区间号不是删除线
     assert.ok(!markdown.includes('10~~20'), markdown);
     assert.ok(!markdown.includes('~~'), markdown);
+});
+
+// ============================================================
+// 超长空白：整条管线的耗时上限
+// ============================================================
+
+// 计时到毫秒，返回 [结果, 毫秒数]
+async function timed(fn) {
+    const started = process.hrtime.bigint();
+    const value = await fn();
+    return [value, Number(process.hrtime.bigint() - started) / 1e6];
+}
+
+test('图片 alt 含 20 万个空格：整条管线在耗时上限内跑完，载荷两侧的文字与图片都在', async (t) => {
+    // Arrange
+    const server = await startServer();
+    t.after(() => server.close());
+
+    // Act
+    const [doc, ms] = await timed(() => parse({ url: `${server.base}/ws-alt` }, { allowPrivateNetwork: true }));
+
+    // Assert：耗时
+    assert.ok(ms < WS_PARSE_BUDGET_MS, `解析耗时 ${ms.toFixed(0)} 毫秒，应低于 ${WS_PARSE_BUDGET_MS} 毫秒`);
+
+    // Assert：内容没有被少做
+    const images = collect(doc.ir, (n) => n.type === 'image');
+    assert.equal(images.length, 1);
+    assert.equal(images[0].url, 'images/image_1.png');
+    assert.ok(images[0].alt.startsWith('x') && images[0].alt.endsWith('y'), `alt 两端的可见文字应保留，实际：${JSON.stringify(images[0].alt.slice(0, 4))}`);
+    assert.equal(doc.assets.length, 1);
+});
+
+test('正文含 20 万个不换行空格：整条管线在耗时上限内跑完，载荷两侧的文字都在', async (t) => {
+    // Arrange
+    const server = await startServer();
+    t.after(() => server.close());
+
+    // Act
+    const [doc, ms] = await timed(() => parse({ url: `${server.base}/ws-nbsp` }, { allowPrivateNetwork: true }));
+
+    // Assert：耗时
+    assert.ok(ms < WS_PARSE_BUDGET_MS, `解析耗时 ${ms.toFixed(0)} 毫秒，应低于 ${WS_PARSE_BUDGET_MS} 毫秒`);
+
+    // Assert：内容没有被少做
+    const literals = allLiterals(doc.ir);
+    assert.ok(literals.includes('甲x'), `载荷前的可见文字应保留，实际：${literals.slice(0, 120)}`);
+    assert.ok(literals.includes('y乙'), `载荷后的可见文字应保留，实际：${literals.slice(0, 120)}`);
 });
