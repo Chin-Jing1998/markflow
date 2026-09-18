@@ -39,6 +39,7 @@ const { runsText, trimRuns, stripPrefix, textRun } = require('./inline');
 const { ISSUE_CODES, createIssue } = require('./precheck');
 const { CLAIM_START_RE } = require('./claims');
 const { isPureLabel } = require('./figures');
+const { mergeSplitGroups, splitGroupOf } = require('./blocks');
 
 const BOOK_RULES = Object.freeze([
     ['abstractFigure', /^摘\s*要\s*附\s*图$/],
@@ -118,12 +119,15 @@ function detectSections(blocks, { sectionDetection = 'auto', meta = {} } = {}) {
 
 const emptyBooks = () => Object.fromEntries(BOOK_KEYS.map((key) => [key, []]));
 
-// 无「摘要附图」标题时，摘要区域内的图片段推定为摘要附图
+// 无「摘要附图」标题时，摘要区域内独立成段的图片推定为摘要附图。与摘要文字同属一个 Word 段落的图片
+// （大图拆段拆出来的、与某个文字块同组的图片块）是段内图片——多为结构式或公式——留在摘要里，由渲染器并回原段
 function moveAbstractImages(books, inferred) {
     if (books.abstractFigure.length > 0) return;
-    const images = books.abstract.filter((block) => block.kind === 'image');
+    const textGroups = new Set(books.abstract.filter((block) => block.kind === 'paragraph').map(splitGroupOf).filter((group) => group !== null));
+    const isStandaloneImage = (block) => block.kind === 'image' && !textGroups.has(splitGroupOf(block));
+    const images = books.abstract.filter(isStandaloneImage);
     if (images.length === 0) return;
-    books.abstract = books.abstract.filter((block) => block.kind !== 'image');
+    books.abstract = books.abstract.filter((block) => !isStandaloneImage(block));
     books.abstractFigure.push(...images);
     inferred.push({ key: 'abstractFigure', blocks: images });
 }
@@ -331,12 +335,15 @@ function trailingDrawingsStart(list) {
     return list.slice(start).some((block) => block.kind === 'image') ? start : list.length;
 }
 
-// 权利要求块（或首个五部分标题）之前的无标题前导正文：≤ 3 段、无编号、无图表 → 摘要；否则并入说明书
+// 权利要求块（或首个五部分标题）之前的无标题前导正文：≤ 3 段、无编号、无图表 → 摘要；否则并入说明书。
+// 段数与「无图表」按 Word 段落计：解析层的大图拆段会把「文字 + 段尾大图」拆成文字块与图片块（同一 splitGroup），
+// 判定前先并回，否则摘要段只因图片够大就落入「无法归类」；归书的仍是未并回的原块，由 patent 渲染器统一并回
 function classifyLeading(leading, { books, issues, explicit, inferred, hasBodyAfter }) {
     if (leading.length === 0) return;
-    const paragraphs = leading.filter((block) => block.kind === 'paragraph');
+    const units = mergeSplitGroups(leading);
+    const paragraphs = units.filter((block) => block.kind === 'paragraph');
     const isAbstractLike = hasBodyAfter && !explicit.has('abstract') && books.abstract.length === 0
-        && paragraphs.length === leading.length && paragraphs.length <= MAX_ABSTRACT_PREAMBLE
+        && paragraphs.length === units.length && paragraphs.length <= MAX_ABSTRACT_PREAMBLE
         && paragraphs.every((block) => !isClaimStartBlock(block));
     if (isAbstractLike) {
         books.abstract.push(...leading);

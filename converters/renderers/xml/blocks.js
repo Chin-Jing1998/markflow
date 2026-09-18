@@ -17,6 +17,8 @@
  *   （权利要求书、说明书、摘要）渲染前先并回；说明书附图与摘要附图不调用本函数——那两本书里「图片 + 同段图号」
  *   必须保持拆开才能认成 figure 与图号。分节把同组的块切到两本不同的书里时，各书的块序列中它们不再相邻，
  *   自然各归各书、不并。
+ * splitGroupOf(block) → 整数 | null：块所属的拆段分组号（未被拆的块与不参与并回的块型为 null），
+ *   供分节模块判断「这块图片与哪段文字同属一个 Word 段落」。
  */
 const { collectText, stripHtml } = require('../../ir/util');
 const { flattenInline, runsText, trimRuns, isWholeMark, textRun } = require('./inline');
@@ -142,4 +144,4 @@ function mergePair(first, second) {
 
 const runsOf = (block) => (block.kind === 'image' ? block.images.map((node) => ({ kind: 'image', node })) : block.runs);
 
-module.exports = { flattenBlocks, mergeSplitGroups };
+module.exports = { flattenBlocks, mergeSplitGroups, splitGroupOf: groupOf };

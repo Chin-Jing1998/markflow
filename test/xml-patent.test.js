@@ -1255,4 +1255,40 @@ describe('patent profile：大图拆段的并回', () => {
         assert.equal(abstract('cn-abstract > p > img').length, 1);
         assert.equal($of(result.files[ABSTRACT_FIGURE])('cn-abst-figure > figure').length, 1);
     });
+
+    test('无书目标题的文稿：摘要段带段尾大图时仍按位置推定为摘要，图片随段落归入摘要', async () => {
+        const children = split([
+            para(createText('本发明公开了一种化合物，其结构式如下：'), bigImage('images/image_1.jpg')),
+            p('1. 一种化合物，其特征在于具有上述结构。'),
+            p('2. 根据权利要求1所述的化合物，其特征在于纯度不低于百分之九十九。'),
+            h(1, '技术领域'),
+            p('本发明涉及化合物领域。'),
+        ]);
+        assert.equal(children.length, 6, '摘要段被拆成文字块与图片块');
+
+        const result = await renderPatent(children, { assets: [asset('images/image_1.jpg')] });
+        const abstract = $of(result.files[ABSTRACT]);
+
+        assert.ok(!codesOf(result).includes(ISSUE_CODES.SECTION_UNCLASSIFIED), '拆出来的图片块不应让前导段落入「无法归类」');
+        assert.equal(abstract('cn-abstract > p').length, 1);
+        assert.equal(abstract('cn-abstract > p > img').length, 1, '图片随所属段落归入摘要');
+        assert.ok(textOf(abstract('cn-abstract > p').get(0)).includes('本发明公开了一种化合物'));
+        assert.ok(!$of(result.files[DESCRIPTION])('description').text().includes('本发明公开了一种化合物'), '摘要段不再并入说明书');
+    });
+
+    test('说明书摘要：与摘要文字同段的大图留在段内，不被推定为摘要附图；独立成段的图片照旧推定', async () => {
+        const children = split([
+            bold('说明书摘要'),
+            para(createText('本发明公开了一种化合物，其结构式如下：'), bigImage('images/image_1.jpg')),
+            imgP('images/image_2.jpg'),
+        ]);
+
+        const result = await renderPatent(children, { assets: [asset('images/image_1.jpg'), asset('images/image_2.jpg')] });
+        const abstract = $of(result.files[ABSTRACT]);
+
+        assert.equal(abstract('cn-abstract > p').length, 1);
+        assert.deepEqual(abstract('cn-abstract > p > img').toArray().map((node) => node.attribs.file), ['100004_1.jpg'], '同段图片留在摘要段内');
+        assert.deepEqual($of(result.files[ABSTRACT_FIGURE])('cn-abst-figure > figure > img').toArray().map((node) => node.attribs.file),
+            ['100005_1.jpg'], '独立成段的图片仍推定为摘要附图');
+    });
 });
