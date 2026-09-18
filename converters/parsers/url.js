@@ -17,7 +17,8 @@
  *     取得到显示尺寸的图片节点带 data.display（见 converters/ir/schema.js）
  *   - 段首缩进进 paragraph.data.indent，图注进 paragraph.data.role；<br> 单个为硬换行、连续两个为分段
  *   - 属性值与会进入输出的文本里，连续空白超过 256 个的部分在进入 turndown 前截断，不超过的逐字不动：
- *     turndown 的 postProcess 正则在长空白串上平方级回溯，下游的 BR 折叠与行尾空白清理同此
+ *     turndown 的 postProcess 正则在长空白串上平方级回溯，而依赖不能改。下游的 BR 折叠与行尾空白清理
+ *     自身线性于文本长度，不依赖这一截断
  *   - ctx.skipImages 为 true 时一张图都不下载：图片地址就地绝对化，清单挂在 data.images 上，
  *     assets 保持为空（供 MCP 的 extract_article 只读提取使用）
  *   - meta 除 title/sourceType/sourceName/sourceUrl/finalUrl 外，另含 extraction（实际命中的
@@ -68,8 +69,10 @@ const INDENT_SPACE_ONLY_RE = new RegExp(`^[${INDENT_SPACE_CLASS}]*$`);
 const VISIBLE_TEXT_RE = /[^\s]/;
 // 空 span 里须保留的空白：U+00A0 不换行空格、U+3000 全角空格（码点声明，源码不出现不可见字面量）
 const KEPT_SPACE_RE = new RegExp(`[${String.fromCharCode(0x00a0)}${String.fromCharCode(0x3000)}]`);
-// BR 标记折叠：一段连续的 BR（可夹空白与换行），不吞下一行行首的缩进
-const BREAK_RUN_RE = new RegExp(`[ \\t]*${MARKERS.BR}(?:[ \\t\\n]*${MARKERS.BR})*[ \\t]*\\n*`, 'g');
+// BR 标记折叠：一段连续的 BR（可夹空白与换行），不吞下一行行首的缩进。
+// 首字符是必需的 BR，非 BR 位置一步即弃；紧邻其前的行内空白不写进正则，改由 collapseBreakMarkers
+// 向前回看并入——写成前导的 [ \t]* 会让不含 BR 的超长空白串上每个起点都吞到段尾再逐位回溯，耗时随长度平方增长
+const BREAK_RUN_RE = new RegExp(`${MARKERS.BR}(?:[ \\t\\n]*${MARKERS.BR})*[ \\t]*\\n*`, 'g');
 const HEADING_LINE_RE = /^#{1,6}\s/;
 const LONE_IMG_LINE_RE = /^<img\b[^<>\n]*>[ \t]*$/;
 const FENCE_RE = /^\s{0,3}(```|~~~)/;
@@ -418,18 +421,36 @@ function buildMarkdown(html, title) {
 /**
  * BR 标记折叠：连续两个及以上 → 分段（\n\n）；行首、行尾的 → 删除；单个 → 反斜杠硬换行（\ + 换行，
  * 不依赖行尾两空格，normalize 去行尾空白也不受影响）；标题行内的单个 BR 换成空格（标题不能跨行）
+ *
+ * BREAK_RUN_RE 只匹配以 BR 开头的部分，紧邻其前的极大行内空白在此逐次向前回看并入，回看不越过上一次
+ * 匹配的结束位置。折叠区间与「前导 [ \t]* + BR 段」的旧写法逐字相同——BR 段之前的空白里不含 BR，
+ * 故两种写法找到的 BR 段与前导空白的起点都一致；而各次回看扫过的区间互不重叠，总成本线性于文本长度
  */
 function collapseBreakMarkers(markdown) {
-    return String(markdown).replace(BREAK_RUN_RE, (run, offset, whole) => {
-        const count = run.split(MARKERS.BR).length - 1;
-        const newlines = run.replace(/[^\n]/g, '');
-        const lineStart = offset === 0 || whole[offset - 1] === '\n';
-        const lineEnd = newlines.length > 0 || offset + run.length >= whole.length;
-        if (lineStart || lineEnd) return newlines;
-        if (count >= 2) return '\n\n';
-        const lineHead = whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset);
-        return HEADING_LINE_RE.test(lineHead) ? ' ' : '\\\n';
-    });
+    const whole = String(markdown);
+    const pieces = [];
+    let cursor = 0;
+    for (const match of whole.matchAll(BREAK_RUN_RE)) {
+        let start = match.index;
+        while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
+        pieces.push(whole.slice(cursor, start));
+        cursor = match.index + match[0].length;
+        pieces.push(collapseOneBreakRun(whole.slice(start, cursor), start, whole));
+    }
+    pieces.push(whole.slice(cursor));
+    return pieces.join('');
+}
+
+/** 单段的折叠判定：run 为「前导行内空白 + BR 段」，offset 为其在 whole 中的起点 */
+function collapseOneBreakRun(run, offset, whole) {
+    const count = run.split(MARKERS.BR).length - 1;
+    const newlines = run.replace(/[^\n]/g, '');
+    const lineStart = offset === 0 || whole[offset - 1] === '\n';
+    const lineEnd = newlines.length > 0 || offset + run.length >= whole.length;
+    if (lineStart || lineEnd) return newlines;
+    if (count >= 2) return '\n\n';
+    const lineHead = whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset);
+    return HEADING_LINE_RE.test(lineHead) ? ' ' : '\\\n';
 }
 
 /**

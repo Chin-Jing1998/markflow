@@ -10,7 +10,8 @@ const zlib = require('node:zlib');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { parse } = require('../converters/parsers/url');
+const { parse, collapseBreakMarkers } = require('../converters/parsers/url');
+const { MARKERS } = require('../converters/ir/markers');
 const { _setLookup } = require('../converters/net/fetch-guard');
 const mdRenderer = require('../converters/renderers/md');
 
@@ -786,4 +787,112 @@ test('正文含 20 万个不换行空格：整条管线在耗时上限内跑完�
     const literals = allLiterals(doc.ir);
     assert.ok(literals.includes('甲x'), `载荷前的可见文字应保留，实际：${literals.slice(0, 120)}`);
     assert.ok(literals.includes('y乙'), `载荷后的可见文字应保留，实际：${literals.slice(0, 120)}`);
+});
+
+// ============================================================
+// BR 标记折叠：耗时上限与语义等价
+// ============================================================
+
+// BR 标记取自 markers（U+EF03），源码不出现不可见字面量
+const BR = MARKERS.BR;
+const TAB = String.fromCharCode(0x09);
+
+// 耗时用例的载荷规模：16 万个不含 BR 的行内空白。线性化之前的 BREAK_RUN_RE 写作「前导 [ \t]* + 必需的
+// BR」，在不含 BR 的长空白串上每个起点都要吞到段尾再逐位回溯，耗时随长度平方增长——本机实测
+// 2 万 178 ms、4 万 694 ms、8 万 2719 ms、16 万 10618 ms
+const BREAK_STRESS_LENGTH = 160000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。
+// 1000 ms 使两侧余量都不小于 5 倍——线性化之前的 10618 ms 是它的 10.6 倍，线性化之后实测不足 1 ms、
+// 不到它的千分之一，故慢机以及 node --test 多文件并行抢占 CPU 时都不会误报
+const BREAK_STRESS_BUDGET_MS = 1000;
+
+// 线性化之前的 BREAK_RUN_RE 与其回调，仅作短输入的差分参照：前导的 [ \t]* 在不含 BR 的长空白串上逐位
+// 回溯，不可用于耗时用例的输入规模
+const LEGACY_BREAK_RUN_RE = new RegExp(`[ \\t]*${BR}(?:[ \\t\\n]*${BR})*[ \\t]*\\n*`, 'g');
+const LEGACY_HEADING_LINE_RE = /^#{1,6}\s/;
+
+function legacyCollapseBreakMarkers(markdown) {
+    return String(markdown).replace(LEGACY_BREAK_RUN_RE, (run, offset, whole) => {
+        const count = run.split(BR).length - 1;
+        const newlines = run.replace(/[^\n]/g, '');
+        const lineStart = offset === 0 || whole[offset - 1] === '\n';
+        const lineEnd = newlines.length > 0 || offset + run.length >= whole.length;
+        if (lineStart || lineEnd) return newlines;
+        if (count >= 2) return '\n\n';
+        const lineHead = whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset);
+        return LEGACY_HEADING_LINE_RE.test(lineHead) ? ' ' : '\\\n';
+    });
+}
+
+// 字母表上长度 0 到 maxLength 的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    let level = [''];
+    const all = [...level];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((character) => prefix + character));
+        all.push(...level);
+    }
+    return all;
+}
+
+test('BR 折叠：16 万个不含 BR 的空格不触发回溯，耗时在绝对上限内且文本逐字不变', async () => {
+    // Arrange：折叠只针对 BR，载荷里一个 BR 都没有，正确的输出就是原样返回
+    const input = `甲${' '.repeat(BREAK_STRESS_LENGTH)}乙`;
+
+    // Act
+    const [output, ms] = await timed(() => collapseBreakMarkers(input));
+
+    // Assert：先验输出正确，以免「快」来自少做了事
+    assert.equal(output, input, '不含 BR 的文本应逐字返回');
+    assert.ok(ms < BREAK_STRESS_BUDGET_MS, `折叠实测 ${ms.toFixed(1)} 毫秒，超出上限 ${BREAK_STRESS_BUDGET_MS} 毫秒`);
+});
+
+test('BR 折叠：16 万个空格与制表符混排同样不触发回溯', async () => {
+    // Arrange：前导空白类含制表符，回溯路径与纯空格一致
+    const input = `甲${` ${TAB}`.repeat(BREAK_STRESS_LENGTH / 2)}乙`;
+
+    // Act
+    const [output, ms] = await timed(() => collapseBreakMarkers(input));
+
+    // Assert
+    assert.equal(output, input, '不含 BR 的文本应逐字返回');
+    assert.ok(ms < BREAK_STRESS_BUDGET_MS, `折叠实测 ${ms.toFixed(1)} 毫秒，超出上限 ${BREAK_STRESS_BUDGET_MS} 毫秒`);
+});
+
+test('BR 折叠与线性化之前的实现逐字等价：{空格, 制表符, 换行, BR, a, #} 上长度不超过 6 的全部字符串', () => {
+    // Arrange：6 个字符的字母表上长度 0 到 6 的全部字符串共 55987 个
+    const samples = everyStringUpTo(6, [' ', TAB, '\n', BR, 'a', '#']);
+    assert.equal(samples.length, 55987);
+
+    // Act & Assert
+    for (const text of samples) {
+        assert.equal(collapseBreakMarkers(text), legacyCollapseBreakMarkers(text), JSON.stringify(text));
+    }
+});
+
+test('BR 折叠：行首、行中、行尾、标题行与前导空白的判定逐字符合预期', () => {
+    // Arrange：[输入, 期望输出, 说明]
+    const cases = [
+        [`甲 ${BR}乙`, '甲\\\n乙', '行中的单个 BR 连同前导空白折成反斜杠硬换行'],
+        [`  ${BR}甲`, '甲', '前导空白位于行首时整段删除'],
+        [`甲 ${BR}\n乙`, '甲\n乙', 'BR 段位于行尾时只留下段内换行'],
+        [`甲 ${BR}`, '甲', 'BR 段位于串尾时整段删除'],
+        [`甲 ${BR} ${BR} 乙`, '甲\n\n乙', '两个 BR 夹空格为分段'],
+        [`甲${BR}${BR}${BR}乙`, '甲\n\n乙', '三个 BR 相连同样为分段'],
+        [`甲 ${BR}\n${BR}乙`, '甲\n乙', '段内含换行时按行尾处置，原样留下这一个换行'],
+        [`甲 ${BR}\n${BR}\n乙`, '甲\n\n乙', '段内含两个换行时两个都留下，效果即分段'],
+        [`# 标题 ${BR}续写`, '# 标题 续写', '标题行内的单个 BR 换成空格'],
+        [`###### 标题${BR}续写`, '###### 标题 续写', '六级标题同样按标题处置'],
+        [`甲${BR}\n    乙`, '甲\n    乙', 'BR 段不吞下一行行首的缩进'],
+        [`甲 ${TAB} ${BR}乙`, '甲\\\n乙', '前导空白为制表符与空格混排'],
+        [`甲${BR}乙${BR}丙`, '甲\\\n乙\\\n丙', '相邻两段只隔可见字符时各自独立判定'],
+        [`甲${BR}\n  ${BR}乙`, '甲\n乙', '前一段吞掉换行后，后一段的前导空白回看止于前一段的末尾'],
+        [`\n  ${BR}${BR}甲`, '\n甲', '行首的连续 BR 连同前导空白一并删除'],
+        ['甲    乙', '甲    乙', '不含 BR 的空白逐字不动'],
+    ];
+
+    // Act & Assert
+    for (const [input, expected, note] of cases) {
+        assert.equal(collapseBreakMarkers(input), expected, `${note}：${JSON.stringify(input)}`);
+    }
 });

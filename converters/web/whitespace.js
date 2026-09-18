@@ -2,8 +2,9 @@
  * 超长连续空白截断（url 解析器 preprocessHtml 的第一步）
  *
  * 动机：turndown 7.2.4 的 postProcess 对整篇输出跑 output.replace(/[\t\r\n\s]+$/, '')，
- * 输出里任何一段不在末尾、长度为 R 的连续空白都要花约 R²/2 步；本仓库下游的 BR 折叠与
- * 行尾空白清理同样按段长平方增长。网页正文属不可信输入，故在进入 turndown 之前就地把
+ * 输出里任何一段不在末尾、长度为 R 的连续空白都要花约 R²/2 步，而依赖不能改。本仓库下游的
+ * BR 折叠（parsers/url 的 collapseBreakMarkers）与行尾空白清理（web/normalize）自身线性于
+ * 文本长度，不依赖本截断。网页正文属不可信输入，故在进入 turndown 之前就地把
  * 「会进入 turndown 输出的连续空白」截到 MAX_WHITESPACE_RUN 个，此后残余成本线性于页面大小。
  *
  *   capWhitespaceRuns($, droppedTags)  就地修改 DOM、无返回值（与 parsers/url 的 markIndents、tidyEmptySpans 同一惯例）
