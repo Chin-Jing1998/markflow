@@ -68,8 +68,12 @@ const FONT_FAMILY_RE = /^[^;{}<>]+$/;
 // ============================================================
 
 const enumField = (values, def, description) => ({ kind: 'enum', values, default: def, description });
-const numberField = ({ min, max, integer = false, default: def, description }) =>
-    ({ kind: 'number', min, max, integer, default: def, description });
+/**
+ * profileDefaults 给出「xml.profile 为某值且调用方未显式给出该键时实际生效的默认值」，
+ * 随 describeOptions() 一并下发，使界面能显示会真正生效的缺省值而不必自行硬编码（见 applyProfileDefaults）
+ */
+const numberField = ({ min, max, integer = false, default: def, profileDefaults = null, description }) =>
+    ({ kind: 'number', min, max, integer, default: def, profileDefaults, description });
 const booleanField = (def, description) => ({ kind: 'boolean', default: def, description });
 const stringField = ({ default: def = null, maxLength = 200, pattern = null, secret = false, description }) =>
     ({ kind: 'string', default: def, nullable: def === null, maxLength, pattern, secret, description });
@@ -87,7 +91,10 @@ const marginFields = (def) => ({
 const SCHEMA = {
     imageFormat: enumField(OPTION_ENUMS.imageFormats, 'jpg', '图片归一格式：jpg 把位图统一转为 JPEG，keep 保持原格式'),
     jpegQuality: numberField({ min: 60, max: 100, integer: true, default: 90, description: 'JPEG 质量' }),
-    jpegPpi: numberField({ min: 72, max: 600, integer: true, default: 330, description: 'JPEG 分辨率（PPI）；xml.profile 为 patent 且未显式指定时取 300' }),
+    jpegPpi: numberField({
+        min: 72, max: 600, integer: true, default: 330, profileDefaults: { patent: PATENT_JPEG_PPI },
+        description: 'JPEG 分辨率（PPI）；xml.profile 为 patent 且未显式指定时取 300',
+    }),
     math: enumField(OPTION_ENUMS.mathModes, 'image', 'docx 公式的处理方式：image 栅格为图片，text 降级为线性化文本'),
     pdfBackend: enumField(OPTION_ENUMS.pdfBackends, 'auto', 'PDF 解析后端：auto 有 MinerU 令牌走云端否则本地，mineru 强制云端，local 强制本地'),
     mineru: objectField({
@@ -304,7 +311,10 @@ function describeField(spec) {
                 fields: Object.fromEntries(Object.entries(spec.fields).map(([key, sub]) => [key, describeField(sub)])),
             };
         case 'enum': return { ...base, values: [...spec.values], default: spec.default };
-        case 'number': return { ...base, min: spec.min, max: spec.max, integer: spec.integer, default: spec.default };
+        case 'number': return {
+            ...base, min: spec.min, max: spec.max, integer: spec.integer, default: spec.default,
+            ...(spec.profileDefaults ? { profileDefaults: { ...spec.profileDefaults } } : {}),
+        };
         case 'boolean': return { ...base, default: spec.default };
         case 'string':
             return {

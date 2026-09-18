@@ -15,6 +15,7 @@ import { store } from '../store.js';
 import { api } from '../api.js';
 import { icon } from '../icons.js';
 import { escapeHtml, escapeAttr, targetLabel, THEME_LABELS } from '../dom.js';
+import { XML_PROFILE_LABELS } from '../format-options.mjs';
 import { notify } from './mf-toast.js';
 
 const THEMES = Object.freeze(['system', 'light', 'dark']);
@@ -26,12 +27,15 @@ const DEFAULT_FIELDS = Object.freeze([
     { key: 'pdfBackend', label: 'PDF 解析后端', enumKey: 'pdfBackends', placeholder: '默认（auto）' },
     { key: 'math', label: 'docx 公式', enumKey: 'mathModes', placeholder: '默认（image）' },
     { key: 'mineruModel', label: 'MinerU 模型', enumKey: 'mineruModels', placeholder: '默认（pipeline）' },
+    { key: 'xmlProfile', label: 'XML 方言', enumKey: 'xmlProfiles', placeholder: '默认（通用结构）' },
 ]);
 const ENUM_LABELS = Object.freeze({
     jpg: 'JPG 归一', keep: '保持原格式',
     auto: '自动', mineru: 'MinerU 云端', local: '本地 pdfjs',
     image: '栅格为图片', text: '线性化文本',
     pipeline: 'pipeline', vlm: 'vlm',
+    // XML 方言与转换页底栏共用同一份文案
+    ...XML_PROFILE_LABELS,
 });
 
 /** Word 加载项：回环服务状态 / 清单安装状态 → 状态胶囊的文案与档位（on 绿 / off 橙 / 空为灰） */
@@ -357,6 +361,7 @@ class MfSettingsPage extends HTMLElement {
             pdfBackends: pick(options.pdfBackend),
             mathModes: pick(options.math),
             mineruModels: pick(options.mineru && options.mineru.fields && options.mineru.fields.model),
+            xmlProfiles: pick(options.xml && options.xml.fields && options.xml.fields.profile),
         };
     }
 

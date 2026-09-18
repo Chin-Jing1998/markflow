@@ -12,81 +12,21 @@
  * 带「需重新解析」标记的字段改动后，主进程会在同一会话内重新 parseDocument（见 preview-session.REPARSE_KEYS），
  * 面板在该组标题上给出提示。
  *
- * 用法：panel.context = { formats, target, type, options, busy }；改动经 300 ms 防抖后
+ * 「显式值」语义：面板只提交会话选项里本来就显式存在的键，以及用户在本面板上实际改动过的键（this.touched）。
+ * 未给出又未改动的字段不提交，交内核按 profile 补缺省值；其显示值取 format-options.effectiveDefault，
+ * 故 patent 方言下「JPG 分辨率」显示的是实际会生效的 300 而非通用默认 330。判定与字段表见 ../format-options.mjs。
+ *
+ * 用法：panel.context = { formats, sessionId, target, type, options, busy }；改动经 300 ms 防抖后
  * 冒泡 mf-options-change（detail = { options, reparse }），由 <mf-compare-view> 决定实时重渲染还是等「刷新预览」。
+ * sessionId 变化即换了预览会话，改动记录随之清空。
  */
 import { escapeHtml, escapeAttr } from '../dom.js';
+import {
+    FIELDS, GROUPS, labelOf, pickNode as pick,
+    effectiveDefault, shouldSubmit, visibleFields as pickVisibleFields,
+} from '../format-options.mjs';
 
 const DEBOUNCE_MS = 300;
-const ALL_TARGETS = '*';
-
-const GROUPS = Object.freeze([
-    { key: 'layout', title: '排版', hint: '改动即时重渲染' },
-    { key: 'xml', title: 'XML', hint: '' },
-    { key: 'parse', title: '解析', hint: '改动后需重新解析源文件' },
-]);
-
-/**
- * path 为 describeOptions() 描述树中的路径（对象层用 fields 下钻）；
- * targets / types 限定该字段对哪些目标与输入类型有意义；profile 限定只在该 xml profile 下出现；
- * hint 给出时替代描述树里的 description 作为该字段的悬停说明。
- */
-const FIELDS = Object.freeze([
-    { key: 'theme', label: '主题', group: 'layout', targets: ['html', 'pdf'], path: ['html', 'theme'] },
-    { key: 'font', label: '正文字体', group: 'layout', targets: ['html', 'pdf'], path: ['html', 'fontFamily'], placeholder: '留空取主题默认' },
-    { key: 'fontSize', label: '正文字号', group: 'layout', targets: ['html', 'pdf', 'docx'], path: ['html', 'fontSize'] },
-    { key: 'lineHeight', label: '行高', group: 'layout', targets: ['html', 'pdf'], path: ['html', 'lineHeight'], step: 0.05 },
-    { key: 'contentWidth', label: '正文栏宽', group: 'layout', targets: ['html'], path: ['html', 'contentWidth'] },
-    { key: 'spacing', label: '段落间距', group: 'layout', targets: ['html', 'pdf'], path: ['html', 'spacing'] },
-    { key: 'inlineImages', label: '图片内联为 data URI', group: 'layout', targets: ['html'], path: ['html', 'inlineImages'] },
-    { key: 'pageSize', label: '纸张', group: 'layout', targets: ['pdf', 'docx'], path: ['pdf', 'pageSize'] },
-    { key: 'landscape', label: '横向', group: 'layout', targets: ['pdf'], path: ['pdf', 'landscape'] },
-
-    { key: 'xmlProfile', label: 'XML 方言', group: 'xml', targets: ['xml'], path: ['xml', 'profile'], reparse: true },
-    { key: 'xmlIndent', label: '缩进空格数', group: 'xml', targets: ['xml'], path: ['xml', 'indent'] },
-    // DTD 校验只在渲染阶段发生（不进 REPARSE_KEYS），勾选后重渲染即可拿到 precheck.json 的 validation
-    { key: 'validate', label: 'DTD 校验（官方 DTD）', group: 'xml', targets: ['xml'], path: ['xml', 'validate'], profile: 'patent' },
-    { key: 'numberingStart', label: '段号起始', group: 'xml', targets: ['xml'], path: ['xml', 'numbering', 'start'], profile: 'patent' },
-    { key: 'numberingWidth', label: '段号补零位数', group: 'xml', targets: ['xml'], path: ['xml', 'numbering', 'width'], profile: 'patent' },
-    { key: 'patentParts', label: '输出的五书', group: 'xml', targets: ['xml'], path: ['xml', 'patent', 'parts'], profile: 'patent', reparse: true },
-    { key: 'sectionDetection', label: '分节识别', group: 'xml', targets: ['xml'], path: ['xml', 'patent', 'sectionDetection'], profile: 'patent', reparse: true },
-    { key: 'rasterizeTables', label: '表格栅格为图片', group: 'xml', targets: ['xml'], path: ['xml', 'patent', 'rasterizeTables'], profile: 'patent', reparse: true },
-    { key: 'rasterizeFormulas', label: '公式栅格为图片', group: 'xml', targets: ['xml'], path: ['xml', 'patent', 'rasterizeFormulas'], profile: 'patent', reparse: true },
-    { key: 'imageDpi', label: '图片密度（DPI）', group: 'xml', targets: ['xml'], path: ['xml', 'patent', 'imageDpi'], profile: 'patent', reparse: true },
-
-    { key: 'imageFormat', label: '图片格式', group: 'parse', targets: ALL_TARGETS, path: ['imageFormat'], reparse: true },
-    { key: 'jpegPpi', label: 'JPG 分辨率（PPI）', group: 'parse', targets: ALL_TARGETS, path: ['jpegPpi'], reparse: true },
-    { key: 'math', label: '文档公式', group: 'parse', targets: ALL_TARGETS, path: ['math'], types: ['docx'], reparse: true },
-    { key: 'pdfBackend', label: 'PDF 解析后端', group: 'parse', targets: ALL_TARGETS, path: ['pdfBackend'], types: ['pdf'], reparse: true },
-    // 专利五书 XML 反向导入：只对 xml / zip 输入有意义，作用于解析阶段，故与目标无关且需重新解析
-    {
-        key: 'xmlImportParagraphNumbers', label: '段号写进正文', group: 'parse', targets: ALL_TARGETS,
-        path: ['xmlImport', 'paragraphNumbers'], types: ['xml', 'zip'], reparse: true,
-        hint: '把五书 XML 的段号写进 Word 正文（[0001]），便于对照审查意见里的段号；代价是段号留在正文里会妨碍增删段落。不勾选时段号不写入，转回 XML 时按顺序重编',
-    },
-]);
-
-const ENUM_LABELS = Object.freeze({
-    apple: '苹果浅色', 'apple-dark': '苹果深色', github: 'GitHub', academic: '论文（衬线）', reader: '长文阅读', print: '打印',
-    compact: '紧凑', normal: '标准', loose: '宽松',
-    jpg: 'JPG 归一', keep: '保持原格式',
-    image: '栅格为图片', text: '线性化文本',
-    auto: '自动', mineru: 'MinerU 云端', local: '本地 pdfjs',
-    generic: 'generic 通用结构', patent: 'patent 国知局五书',
-    headings: '仅标题',
-    claims: '权利要求书', description: '说明书', drawings: '说明书附图', abstract: '摘要', 'abstract-figure': '摘要附图',
-});
-const labelOf = (value) => ENUM_LABELS[value] || String(value);
-
-/** 描述树下钻：对象层的子字段挂在 fields 下 */
-function pick(tree, path) {
-    let node = tree;
-    for (let i = 0; i < path.length; i += 1) {
-        if (!node) return null;
-        node = i === 0 ? node[path[i]] : (node.fields ? node.fields[path[i]] : null);
-    }
-    return node || null;
-}
 
 class MfFormatPanel extends HTMLElement {
     connectedCallback() {
@@ -94,6 +34,9 @@ class MfFormatPanel extends HTMLElement {
         this.dataset.ready = '1';
         this.shape = '';
         this.timer = null;
+        // 用户在本面板上实际改动过的键；换会话时清空
+        this.touched = new Set();
+        this.sessionId = null;
         this.innerHTML = '<header class="panel-header">格式</header><div class="panel-body"></div>';
         this.addEventListener('input', (event) => this.onEdit(event));
         this.addEventListener('change', (event) => this.onEdit(event));
@@ -104,8 +47,21 @@ class MfFormatPanel extends HTMLElement {
     }
 
     set context(value) {
-        this.ctx = value || null;
+        const next = value || null;
+        const sessionId = next && next.sessionId ? next.sessionId : null;
+        // 换了预览会话即另起一份改动记录：上一份文件的改动不该被当成这一份的显式值
+        if (sessionId !== this.sessionId) {
+            this.sessionId = sessionId;
+            this.touched = new Set();
+        }
+        this.ctx = next;
         this.sync();
+    }
+
+    /** 当前 xml 方言：决定按 profile 的缺省值与哪些字段可见 */
+    get profile() {
+        const options = this.ctx && this.ctx.options;
+        return options && options.xmlProfile ? options.xmlProfile : 'generic';
     }
 
     get tree() {
@@ -115,14 +71,8 @@ class MfFormatPanel extends HTMLElement {
 
     /** 当前目标 / profile / 输入类型下应显示的字段 */
     visibleFields() {
-        const { target, type, options } = this.ctx;
-        const profile = options && options.xmlProfile ? options.xmlProfile : 'generic';
-        return FIELDS.filter((field) => {
-            if (field.targets !== ALL_TARGETS && !field.targets.includes(target)) return false;
-            if (field.types && !field.types.includes(type)) return false;
-            if (field.profile && field.profile !== profile) return false;
-            return Boolean(pick(this.tree, field.path));
-        });
+        const { target, type } = this.ctx;
+        return pickVisibleFields({ target, type, profile: this.profile }, (field) => pick(this.tree, field.path));
     }
 
     sync() {
@@ -179,19 +129,24 @@ class MfFormatPanel extends HTMLElement {
             <input class="input input-slim" type="text" data-key="${name}" placeholder="${escapeAttr(field.placeholder || '')}" spellcheck="false"></label>`;
     }
 
-    /** 填值：正在输入的控件不覆盖，避免防抖回包把光标里的内容顶掉 */
+    /**
+     * 填值：正在输入的控件不覆盖，避免防抖回包把光标里的内容顶掉。
+     * 未给出的字段显示「实际会生效的缺省值」（effectiveDefault 按当前 xml 方言取，如 patent 下 jpegPpi 为 300）。
+     */
     fill(fields, options) {
         const active = document.activeElement;
+        const { profile } = this;
         for (const field of fields) {
             const node = pick(this.tree, field.path);
             const control = this.querySelector(`[data-key="${field.key}"]`);
             if (!control || control === active) continue;
             const value = options[field.key];
-            if (node.type === 'boolean') control.checked = value === undefined || value === null ? Boolean(node.default) : Boolean(value);
+            const fallback = effectiveDefault(node, profile);
+            if (node.type === 'boolean') control.checked = value === undefined || value === null ? Boolean(fallback) : Boolean(value);
             else if (node.type === 'parts') this.fillParts(field, node, value);
-            else if (node.type === 'number') control.value = value === undefined || value === null || value === '' ? String(node.default) : String(value);
-            else if (node.type === 'enum') control.value = value === undefined || value === null || value === '' ? node.default : value;
-            else control.value = value === undefined || value === null ? (node.default || '') : value;
+            else if (node.type === 'number') control.value = value === undefined || value === null || value === '' ? String(fallback) : String(value);
+            else if (node.type === 'enum') control.value = value === undefined || value === null || value === '' ? fallback : value;
+            else control.value = value === undefined || value === null ? (fallback || '') : value;
         }
     }
 
@@ -205,10 +160,16 @@ class MfFormatPanel extends HTMLElement {
         }
     }
 
-    /** 面板 → 扁平选项：数字取数值，空文本视为未给出（交由默认值），五书子集为 'auto' 或数组 */
+    /**
+     * 面板 → 扁平选项：数字取数值，空文本视为未给出（交由默认值），五书子集为 'auto' 或数组。
+     * 只收「会话里本来就显式给出的」与「用户在本面板改动过的」两类键（见 format-options.shouldSubmit）：
+     * 其余字段虽有显示值也不提交，否则会把按 profile 的缺省值（如 patent 的 jpegPpi=300）顶掉。
+     */
     collect() {
         const options = {};
+        const state = { touched: this.touched, options: (this.ctx && this.ctx.options) || {} };
         for (const field of this.visibleFields()) {
+            if (!shouldSubmit(field.key, state)) continue;
             const node = pick(this.tree, field.path);
             const control = this.querySelector(`[data-key="${field.key}"]`);
             if (!control) continue;
@@ -234,6 +195,8 @@ class MfFormatPanel extends HTMLElement {
         const key = control.dataset.key || (partsHost ? partsHost.dataset.parts : '');
         const field = FIELDS.find((item) => item.key === key);
         const reparse = Boolean(field && field.reparse);
+        // 用户动过的键此后一律作为显式值提交，即便取值恰好等于缺省值
+        if (key) this.touched.add(key);
         if (this.timer) clearTimeout(this.timer);
         this.timer = setTimeout(() => {
             this.timer = null;

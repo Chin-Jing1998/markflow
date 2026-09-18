@@ -1,14 +1,17 @@
 /**
  * <mf-convert-page>：转换页 = 拖放区 + 任务列表 + 底栏（输出目录、转换开关、开始 / 取消 / 清空）。
  * 任务状态存于全局 store.tasks；进度事件（mf:convert:event）在此消费并写回 store。
- * 底栏的两个开关只在与本批相关时出现，勾选后随本批 options 一起提交（未露出的项不参与本批）：
- *   「DTD 校验」        队列里有 xml 目标的待转任务时；
+ * 底栏的三个控件只在与本批相关时出现，取值随本批 options 一起提交（未露出的项不参与本批）：
+ *   「XML 方言」        队列里有 xml 目标的待转任务时；初值取设置里的 defaults.xmlProfile，未设置即描述树的默认值
+ *                       （generic）。取值范围与默认值一律来自 mf:formats:describe 的描述树，页面不硬编码。
+ *   「DTD 校验」        同上条件；generic 方言下做 well-formed 检查，patent 方言下走官方 DTD 校验。
  *   「段号写进正文」    队列里有专利五书输入（.xml、案卷 .zip、五书目录）的待转任务时。
  */
 import { store, addTasks, updateTask, removeTask, clearTasks } from '../store.js';
 import { api, onConvertEvent } from '../api.js';
 import { icon } from '../icons.js';
-import { classOf, nextId } from '../dom.js';
+import { classOf, escapeAttr, escapeHtml, nextId } from '../dom.js';
+import { profileLabel } from '../format-options.mjs';
 import { notify } from './mf-toast.js';
 import './mf-dropzone.js';
 import './mf-task-list.js';
@@ -41,7 +44,10 @@ class MfConvertPage extends HTMLElement {
             <footer class="page-footer">
                 <div class="footer-summary"></div>
                 <div class="footer-actions">
-                    <label class="field-check footer-option" data-role="validate-field" hidden title="渲染后用官方 DTD 校验五书，结果写入 precheck.json 与转换提示">
+                    <label class="field field-check footer-option" data-role="xml-profile-field" hidden title="XML 产物的结构方言：通用结构按文档自身的层次输出，国知局五书按官方案卷结构输出五份 XML 与图片">
+                        <span>XML 方言</span><select class="select select-slim" data-field="xmlProfile"></select>
+                    </label>
+                    <label class="field-check footer-option" data-role="validate-field" hidden title="渲染后校验 XML：国知局五书按官方 DTD 校验，结果写入 precheck.json 与转换提示；通用结构只做 well-formed 检查">
                         <input type="checkbox" data-field="validate"><span>DTD 校验</span>
                     </label>
                     <label class="field-check footer-option" data-role="import-numbers-field" hidden title="把五书 XML 的段号写进 Word 正文（[0001]），便于对照审查意见里的段号；代价是段号留在正文里会妨碍增删段落。不勾选时段号不写入，转回 XML 时按顺序重编">
@@ -58,6 +64,11 @@ class MfConvertPage extends HTMLElement {
         this.addEventListener('mf-task-change', (event) => updateTask(event.detail.id, { target: event.detail.target }));
         this.addEventListener('mf-task-remove', (event) => removeTask(event.detail.id));
         this.addEventListener('mf-task-action', (event) => this.act(event.detail));
+        // 底栏下拉被用户改过即置位：此后设置里的默认项不再回灌，避免保存设置时顶掉当前选择
+        this.addEventListener('change', (event) => {
+            const select = event.target instanceof Element ? event.target.closest('.page-footer select[data-field]') : null;
+            if (select) this.profileTouched = true;
+        });
         this.addEventListener('click', (event) => {
             const button = event.target instanceof Element ? event.target.closest('button[data-action]') : null;
             if (!button || button.closest('mf-task-list') || button.closest('mf-dropzone') || button.closest('mf-url-input')) return;
@@ -115,7 +126,8 @@ class MfConvertPage extends HTMLElement {
         if (badUrlTargets.length > 0) this.querySelector('.footer-summary').textContent = `${summary} · ${URL_TARGET_HINT}`;
         this.querySelector('[data-action="cancel"]').hidden = !running;
         this.querySelector('[data-action="clear"]').disabled = state.tasks.every((task) => !FINISHED.has(task.status));
-        // DTD 校验只对 xml 目标有意义，故只在队列里有 xml 任务时露出
+        // XML 方言与 DTD 校验只对 xml 目标有意义，故只在队列里有 xml 任务时露出
+        this.syncXmlProfile(state, pendingTasks);
         this.querySelector('[data-role="validate-field"]').hidden = !pendingTasks.some((task) => task.target === 'xml');
         // 段号写进正文只对专利五书输入有意义（.xml、案卷 .zip、五书目录）
         this.querySelector('[data-role="import-numbers-field"]').hidden = !pendingTasks.some((task) => IMPORT_TYPES.has(task.type));
@@ -155,12 +167,43 @@ class MfConvertPage extends HTMLElement {
         })));
     }
 
-    /** 底栏开关 → 本批扁平选项：只收当前露出且已勾选的项，两项默认均为关 */
+    /** 描述树里的 xml.profile 节点（取值范围与默认值的唯一来源）；尚未取到 formats 时为 null */
+    xmlProfileNode(state) {
+        const tree = state.formats && state.formats.options;
+        const node = tree && tree.xml && tree.xml.fields ? tree.xml.fields.profile : null;
+        return node && Array.isArray(node.values) ? node : null;
+    }
+
+    /**
+     * 「XML 方言」下拉：选项与默认值取自描述树，初值取设置里的 defaults.xmlProfile（未设置即描述树默认值）。
+     * 用户在本页改过之后不再被设置回灌覆盖，以免保存设置时把当前选择顶掉。
+     */
+    syncXmlProfile(state, pendingTasks) {
+        const field = this.querySelector('[data-role="xml-profile-field"]');
+        const node = this.xmlProfileNode(state);
+        field.hidden = !node || !pendingTasks.some((task) => task.target === 'xml');
+        if (!node) return;
+        const select = field.querySelector('select');
+        const wanted = node.values.map((value) => `<option value="${escapeAttr(value)}">${escapeHtml(profileLabel(value))}</option>`).join('');
+        if (select.dataset.options !== wanted) {
+            select.innerHTML = wanted;
+            select.dataset.options = wanted;
+        }
+        if (this.profileTouched) return;
+        const settings = state.settings && state.settings.settings;
+        const preferred = settings && settings.defaults ? settings.defaults.xmlProfile : null;
+        const next = preferred && node.values.includes(preferred) ? preferred : node.default;
+        if (select.value !== next) select.value = next;
+    }
+
+    /** 底栏控件 → 本批扁平选项：只收当前露出的项；复选框仅在勾选时提交，下拉提交其取值 */
     footerOptions() {
         const options = {};
-        for (const input of this.querySelectorAll('.page-footer .footer-option input[data-field]')) {
-            if (input.closest('.footer-option').hidden || !input.checked) continue;
-            options[input.dataset.field] = true;
+        for (const control of this.querySelectorAll('.page-footer .footer-option [data-field]')) {
+            if (control.closest('.footer-option').hidden) continue;
+            if (control.type === 'checkbox') {
+                if (control.checked) options[control.dataset.field] = true;
+            } else if (control.value !== '') options[control.dataset.field] = control.value;
         }
         return options;
     }

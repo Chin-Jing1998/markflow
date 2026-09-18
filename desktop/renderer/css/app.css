@@ -826,6 +826,8 @@ mf-compare-view .page-sidebar::-webkit-scrollbar-track { background: transparent
 .preview-name { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: var(--font-callout); color: var(--label-secondary); }
 .preview-title { font-weight: 600; color: var(--label-primary); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .footer-option { font-size: var(--font-callout); color: var(--label-secondary); margin-right: var(--s-2); }
+/* 底栏空间紧，标题不折行（「XML 方言」这类两段式标题在窄栏里会被拆成两行） */
+.footer-option > span { white-space: nowrap; }
 .precheck-validation { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--separator); }
 .precheck-validation summary { cursor: pointer; font-weight: 600; }
 .precheck-validation[data-state="ok"] summary { color: var(--system-green); }

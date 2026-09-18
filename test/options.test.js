@@ -241,12 +241,17 @@ describe('OPTION_ENUMS、describeOptions 与 redactOptions', () => {
         assert.deepEqual(desc.jpegQuality, {
             type: 'number', description: 'JPEG 质量', min: 60, max: 100, integer: true, default: 90,
         });
-        // 描述树给的是通用默认值；patent profile 的 300 由 normalizeOptions 在校验后补，故只在说明文字里点出
+        // default 是通用默认值；patent profile 实际生效的 300 由 normalizeOptions 在校验后补，
+        // 另经 profileDefaults 一并下发，使界面能显示会真正生效的缺省值而不必自行硬编码
         assert.deepEqual(desc.jpegPpi, {
             type: 'number',
             description: 'JPEG 分辨率（PPI）；xml.profile 为 patent 且未显式指定时取 300',
             min: 72, max: 600, integer: true, default: 330,
+            profileDefaults: { patent: 300 },
         });
+        assert.equal(desc.jpegPpi.profileDefaults.patent, normalizeOptions({ xml: { profile: 'patent' } }).jpegPpi,
+            'profileDefaults 必须与 applyProfileDefaults 实际补的值一致');
+        assert.ok(!('profileDefaults' in desc.jpegQuality), '没有按 profile 的缺省值时不写该字段');
         assert.equal(desc.html.type, 'object');
         assert.deepEqual(desc.html.fields.theme.values, OPTION_ENUMS.htmlThemes);
         assert.equal(desc.html.fields.theme.default, 'apple');
