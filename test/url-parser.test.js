@@ -122,6 +122,17 @@ const RANGE_PAGE = `<!doctype html>
 </article>
 </body></html>`;
 
+// 表格单元格与图片 alt：这两条文本通道曾绕过 turndown 的 escape，其中成对的单「~」被吞成删除线、
+// 星号被吞成斜体。该夹具走完整解析链路，一并覆盖 turndown 与 remark 之间的字符串级步骤
+const ESCAPE_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><title>转义写法</title></head><body>
+<article>
+<h1>转义写法</h1>
+<table><tr><th>温度</th><th>代号</th></tr><tr><td>10~20℃、30~40℃</td><td>a*b*c</td></tr></table>
+<p><img src="/a.png" alt="10~20℃与30~40℃对比"></p>
+</article>
+</body></html>`;
+
 // ------------------------------------------------------------
 // 提取质量对比夹具
 // ------------------------------------------------------------
@@ -196,6 +207,10 @@ function startServer() {
             case '/range':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(RANGE_PAGE);
+                return;
+            case '/escape':
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(ESCAPE_PAGE);
                 return;
             case '/sidebar':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -655,4 +670,35 @@ test('区间号页面：「~」逐字进入 IR，delete 只来自 <del>/<s>，<s
     // Assert：md 产物中区间号不再是删除线，上下标以 HTML 标签落地
     assert.ok(!markdown.includes('~~C30'), markdown);
     assert.ok(markdown.includes('<sup>2</sup>') && markdown.includes('<sub>1</sub>'), markdown);
+});
+
+test('转义写法页面：表格单元格与图片 alt 的「~」「*」逐字进入 IR，md 产物中不出现删除线', async (t) => {
+    // Arrange
+    const server = await startServer();
+    t.after(() => server.close());
+
+    // Act
+    const doc = await parse({ url: `${server.base}/escape` }, { allowPrivateNetwork: true });
+    const markdown = await mdRenderer.render(doc);
+
+    // Assert：单元格文本逐字保留
+    const tables = collect(doc.ir, (n) => n.type === 'table');
+    assert.equal(tables.length, 1);
+    assert.deepEqual(
+        collect(tables[0], (n) => n.type === 'tableRow').map((r) => r.children.map(plainText)),
+        [['温度', '代号'], ['10~20℃、30~40℃', 'a*b*c']],
+    );
+
+    // Assert：图片 alt 逐字保留
+    const images = collect(doc.ir, (n) => n.type === 'image');
+    assert.equal(images.length, 1);
+    assert.equal(images[0].alt, '10~20℃与30~40℃对比');
+
+    // Assert：两条通道都不再误生成 delete 与 emphasis 节点
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete'), []);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'emphasis'), []);
+
+    // Assert：md 产物中区间号不是删除线
+    assert.ok(!markdown.includes('10~~20'), markdown);
+    assert.ok(!markdown.includes('~~'), markdown);
 });

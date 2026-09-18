@@ -14,8 +14,11 @@
  *   - 文本中的「~」一律转义为 \~：HTML 文本里的「~」恒为字面量，多为区间号（化学专利的「C1~C30的烷基」、
  *     网页的「疗程3~5天」），而 remark-gfm 默认 singleTilde，成对的单个「~」会被解析成 delete 节点、
  *     波浪号连同区间含义一起丢失。转义只发生在 HTML → Markdown 这一侧，Markdown 输入的 ~删除线~ 语义不受影响。
- *     例外：不经 service.escape 的文本通道不在此列——表格单元格（cellText 取 textContent）与图片 alt，
- *     其中成对的「~」仍会被解析成删除线
+ *     不经 turndown 文本节点处理的两条通道另行接入同一个 service.escape，转义的是全部 Markdown 记号而不止
+ *     「~」：表格单元格由 cellText 直接取 cell.textContent，折叠空白后先 escape、再转义竖线；图片 alt 由内置
+ *     image 规则处理，该规则调用的是 turndown 模块私有的 escapeMarkdown（星号、方括号与反斜杠已转义），工厂层
+ *     补在实例 escape 上的「~」转义对它不生效，故由 addImageAltRule 接管内置规则、只替换其中的 alt 一段，
+ *     并把 alt 内的换行折叠为空格
  *
  * url profile 的输出约定（与 ir/markers、ir/inline-html 配套）：
  *   - 粗体、斜体、删除线一律输出 <strong>/<em>/<del> HTML 而非 ** / * / ~~：CommonMark 的 flanking 规则在中文
@@ -48,6 +51,9 @@ const URL_REMOVED_TAGS = ['script', 'style', 'noscript', 'iframe', 'nav', 'foote
 const WORD_INLINE_TAGS = ['u', 'sup', 'sub'];
 // 「~」及其前导反斜杠（判定是否已被 turndown 自身转义）
 const TILDE_RE = /(\\*)~/g;
+// 图片 alt 的分行符。不写成 /\s*[\r\n]+\s*/ 一步替换：前导的 \s* 在不含换行的超长空白串上逐位回溯，
+// 耗时随长度平方增长（16 万个空格约 9 秒），而网页的 alt 属不可信输入
+const LINE_BREAK_RE = /[\r\n]+/;
 
 // CSS font-weight 视为加粗的取值：bold、600-999、1000
 const BOLD_STYLE_RE = /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i;
@@ -69,6 +75,8 @@ function createTurndownService(profile = 'basic') {
         throw new Error(`未知的 turndown profile: ${String(profile)}（可选 basic | word | url）`);
     }
     const service = new TurndownService(BASE_OPTIONS);
+    // 最先注册、优先级低于各 profile 的规则：word 的 emptyImg 与 url 的 imgDisplay 仍先于它命中
+    addImageAltRule(service);
     configure(service);
     escapeTildesIn(service);
     return service;
@@ -119,8 +127,35 @@ function isWxImageCaption(node) {
 function addTableRule(service) {
     service.addRule('table', {
         filter: 'table',
-        replacement: (content, node) => convertTableToMarkdown(node),
+        // escape 在转换时才取值，拿到的是 escapeTildesIn 包装后的版本（含「~」转义）
+        replacement: (content, node) => convertTableToMarkdown(node, (text) => service.escape(text)),
     });
+}
+
+/**
+ * 接管内置 image 规则，只把其中的 alt 换成经 service.escape 转义的版本。src 与 title 仍交内置规则生成
+ * （分别走模块私有的 escapeLinkDestination 与 escapeLinkTitle，title 不按 Markdown 解析、其中的「~」
+ * 不必也不应转义），故克隆一个去掉 alt 的节点交它处理，再把转义后的 alt 拼回去，产物与内置规则逐字一致。
+ * alt 只折叠换行：换行后的「- 」「# 」「>」等块级记号会打断段落，整张图片连同 alt 一起丢失。
+ */
+function addImageAltRule(service) {
+    const builtinImage = service.options.rules.image;
+    service.addRule('imageAlt', {
+        filter: 'img',
+        replacement: (content, node, options) => {
+            const withoutAlt = node.cloneNode(false);
+            withoutAlt.removeAttribute('alt');
+            // 内置规则的产物为 ![](src "title")，无 src 时为空串
+            const rest = builtinImage.replacement(content, withoutAlt, options);
+            if (!rest) return '';
+            return `![${service.escape(joinAltLines(node.getAttribute('alt')))}${rest.slice(2)}`;
+        },
+    });
+}
+
+// 逐行 trim 后以单个空格连接，空行丢弃：被折叠的只有换行及其两侧的空白，行内的制表符与连续空格逐字保留
+function joinAltLines(alt) {
+    return String(alt || '').split(LINE_BREAK_RE).map((line) => line.trim()).filter(Boolean).join(' ');
 }
 
 // 带显示尺寸的图片：<img src alt width [height]>（属性值转义；无 src 的图片交默认规则）
@@ -223,12 +258,12 @@ function configureUrl(service) {
 const PROFILE_BUILDERS = { basic: configureBasic, word: configureWord, url: configureUrl };
 
 // ---------- HTML 表格 → GFM 表格（源自 旧版 word.js:164）----------
-// 单元格取纯文本；折叠换行并转义竖线，避免破坏 GFM 表格结构
+// 单元格取纯文本；折叠换行后经 service.escape 转义，再转义竖线，避免破坏 GFM 表格结构
 
-function convertTableToMarkdown(tableNode) {
+function convertTableToMarkdown(tableNode, escape) {
     const rows = ownRows(tableNode);
     if (rows.length === 0) return '';
-    const matrix = rows.map((row) => ownCells(row).map(cellText));
+    const matrix = rows.map((row) => ownCells(row).map((cell) => cellText(cell, escape)));
     // 列数取各行最大值：首行是表头时常比数据行短，只按首行算会截断整表
     const columnCount = matrix.reduce((max, cells) => Math.max(max, cells.length), 0);
     const lines = matrix.map((cells) => {
@@ -258,8 +293,16 @@ function closestByName(node, nodeName) {
     return null;
 }
 
-function cellText(cell) {
-    return cell.textContent.replace(/\s+/g, ' ').trim().replace(/\|/g, '\\|');
+/**
+ * 单元格纯文本：折叠空白 → escape → 转义竖线。三步顺序不可调换：
+ *   - escape 须先于竖线转义。escape 会把字面反斜杠加倍，此后每个竖线的前导反斜杠必为偶数个，再补一个即成
+ *     奇数，micromark 的表格分词器先成对吃掉 \\、再把 \| 当作转义竖线，「a\|b」才不会被拆成两个单元格；
+ *     反过来先转义竖线，补上的那个反斜杠会被随后的 escape 一并加倍而失效。
+ *   - 折叠须先于 escape。turndown 转义表里的 ^- 、^> 、^(\d+). 等只锚定字符串开头，先 trim 可使其是否
+ *     触发不取决于源 HTML 的前导空白；这些转义在单元格内虽非必需，但均为合法转义，IR 文本不变。
+ */
+function cellText(cell, escape) {
+    return escape(cell.textContent.replace(/\s+/g, ' ').trim()).replace(/\|/g, '\\|');
 }
 
 module.exports = { createTurndownService };

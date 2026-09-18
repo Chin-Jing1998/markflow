@@ -2,7 +2,8 @@
  * converters/ir/turndown.js 单元测试
  * 覆盖：HTML 表格 → GFM 表格的列数判定（取各行最大值、短行补空单元格、排除嵌套表格的行）、
  *       各 profile 的「~」转义、url profile 的保真约定（HTML 标签、标记、图注、上下标），
- *       以及 turndown 'url' → remark-gfm → ir/inline-html 的全链路结果
+ *       表格单元格与图片 alt 接入 service.escape（转义顺序、换行折叠、src 与 title 沿用内置规则），
+ *       以及 turndown → remark-gfm → ir/inline-html 的全链路结果
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -21,11 +22,14 @@ function toMarkdown(html, profile = 'word') {
     return createTurndownService(profile).turndown(html).trim();
 }
 
-// turndown → remark-parse + remark-gfm → liftInlineHtml，与 parsers/url 内的调用同序
+// liftInlineHtml 的 source 取值：word profile 的产物来自 parsers/docx，其余来自 parsers/url
+const SOURCE_OF = { basic: 'web', word: 'docx', url: 'web' };
+
+// turndown → remark-parse + remark-gfm → liftInlineHtml，与 parsers/docx、parsers/url 内的调用同序
 async function toIr(html, profile = 'url') {
     const md = toMarkdown(html, profile);
     const { unified, remarkParse, remarkGfm } = await loadUnified();
-    return { md, ir: liftInlineHtml(unified().use(remarkParse).use(remarkGfm).parse(md), { source: 'web' }) };
+    return { md, ir: liftInlineHtml(unified().use(remarkParse).use(remarkGfm).parse(md), { source: SOURCE_OF[profile] }) };
 }
 
 function collect(node, predicate, out = []) {
@@ -209,4 +213,157 @@ test('url profile 全链路：<del>/<s> 输出 <del> 标签而非 ~~，还原为
     assert.ok(!md.includes('~~'), md);
     assert.deepEqual(textsOfType(ir, 'delete'), ['3~5元', '作废']);
     assert.equal(plainText(ir), '原价3~5元，现价作废两元');
+});
+
+// ============================================================
+// 表格单元格接入 service.escape（全链路：turndown → remark-gfm → ir/inline-html）
+// ============================================================
+
+// 单列表格：表头固定为「项」，其余每个入参各占一行
+const tableOf = (...cells) => `<table><tr><th>项</th></tr>${cells.map((c) => `<tr><td>${c}</td></tr>`).join('')}</table>`;
+// IR 中逐行的单元格文本（含表头行）
+const rowCells = (ir) => collect(ir, (n) => n.type === 'tableRow').map((row) => row.children.map(plainText));
+// 单元格转义后不应再被误解析出来的行内节点
+const INLINE_TYPES = ['delete', 'emphasis', 'strong', 'inlineCode', 'link'];
+
+test('表格单元格：成对的「~」与星号等行内记号被转义，逐字进入 IR 且不生成行内节点', async () => {
+    // Arrange：区间号、强调星号、下划线与反引号与链接写法
+    const html = tableOf('10~20℃、30~40℃', 'a*b*c', '_x_ 与 `y` 与 [z](u)');
+
+    // Act & Assert：表格规则挂在 word 与 url 两个 profile 上，行为应一致
+    for (const profile of PROFILES_WITH_TABLE) {
+        const { md, ir } = await toIr(html, profile);
+        const lines = md.split('\n');
+
+        // Assert：Markdown 数据行逐字符相符
+        assert.equal(lines[2], '| 10\\~20℃、30\\~40℃ |', profile);
+        assert.equal(lines[3], '| a\\*b\\*c |', profile);
+        assert.equal(lines[4], '| \\_x\\_ 与 \\`y\\` 与 \\[z\\](u) |', profile);
+
+        // Assert：全链路后各单元格文本与源文本逐字相等
+        assert.deepEqual(
+            rowCells(ir),
+            [['项'], ['10~20℃、30~40℃'], ['a*b*c'], ['_x_ 与 `y` 与 [z](u)']],
+            profile,
+        );
+
+        // Assert：删除线、强调、行内代码与链接一个都不应出现
+        for (const type of INLINE_TYPES) {
+            assert.deepEqual(textsOfType(ir, type), [], `${profile} 不应出现 ${type} 节点`);
+        }
+    }
+});
+
+test('表格单元格：字面反斜杠与竖线相邻时仍属同一单元格，反斜杠与「~」逐字保留', async () => {
+    // Arrange：a\|b 中的反斜杠为字面量，若不先加倍就补转义竖线，两者会配成一对、竖线重新成为列分隔符
+    const html = tableOf('a\\|b', '甲\\~乙~丙');
+
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        const { md, ir } = await toIr(html, profile);
+        const lines = md.split('\n');
+
+        // Assert：escape 先把反斜杠加倍，再补的竖线转义使其前导反斜杠为奇数个
+        assert.equal(lines[2], '| a\\\\\\|b |', profile);
+        assert.equal(lines[3], '| 甲\\\\\\~乙\\~丙 |', profile);
+
+        // Assert：每行恰一个单元格，字面反斜杠与两个「~」都在
+        assert.deepEqual(rowCells(ir), [['项'], ['a\\|b'], ['甲\\~乙~丙']], profile);
+    }
+});
+
+test('表格单元格：换行折叠与竖线转义的既有行为不变；行首记号转义后 IR 文本逐字不变', async () => {
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        // Assert：单元格内换行折叠为空格，未转义的竖线补反斜杠后仍属同一单元格
+        const folded = await toIr('<table><tr><td>甲\n乙</td><td>a|b</td></tr></table>', profile);
+        assert.deepEqual(rowCells(folded.ir), [['甲 乙', 'a|b']], profile);
+
+        // Assert：行首记号经 escape 后带上反斜杠，remark 解析时逐字还原，IR 文本不变
+        const markers = await toIr(tableOf('-5', '1. 项', '# 题', '&gt;90%'), profile);
+        assert.deepEqual(
+            markers.md.split('\n').slice(2),
+            ['| \\-5 |', '| 1\\. 项 |', '| \\# 题 |', '| \\>90% |'],
+            profile,
+        );
+        assert.deepEqual(rowCells(markers.ir), [['项'], ['-5'], ['1. 项'], ['# 题'], ['>90%']], profile);
+    }
+});
+
+// ============================================================
+// 图片 alt 接入 service.escape（新规则接管内置 image 规则）
+// ============================================================
+
+const firstImage = (ir) => collect(ir, (n) => n.type === 'image')[0];
+
+test('图片 alt：成对的「~」被转义，alt 逐字进入 IR 且不生成 delete 节点', async () => {
+    // Act & Assert：内置 image 规则为三个 profile 共用，新规则同样覆盖三者
+    for (const profile of ALL_PROFILES) {
+        const { md, ir } = await toIr('<p><img src="a.png" alt="10~20℃与30~40℃对比"></p>', profile);
+
+        assert.equal(md, '![10\\~20℃与30\\~40℃对比](a.png)', profile);
+        const images = collect(ir, (n) => n.type === 'image');
+        assert.equal(images.length, 1, profile);
+        assert.equal(images[0].alt, '10~20℃与30~40℃对比', profile);
+        assert.deepEqual(textsOfType(ir, 'delete'), [], profile);
+    }
+});
+
+test('图片 alt：内置转义表原有的覆盖面不因接管而回退（方括号、星号、结尾反斜杠）', async () => {
+    // Act & Assert
+    for (const profile of ALL_PROFILES) {
+        const bracket = await toIr('<p><img src="a.png" alt="图[1] 甲~乙~丙 *强*"></p>', profile);
+        assert.equal(bracket.md, '![图\\[1\\] 甲\\~乙\\~丙 \\*强\\*](a.png)', profile);
+        assert.equal(firstImage(bracket.ir).alt, '图[1] 甲~乙~丙 *强*', profile);
+
+        // 以反斜杠结尾：escape 先把它加倍，方括号才不会被吃掉
+        const backslash = await toIr('<p><img src="a.png" alt="甲~乙~\\"></p>', profile);
+        assert.equal(firstImage(backslash.ir).alt, '甲~乙~\\', profile);
+    }
+});
+
+test('图片 alt：只折叠换行，行内的制表符与连续空格逐字保留', async () => {
+    // Act & Assert
+    for (const profile of ALL_PROFILES) {
+        // Assert：换行后的「- 」原本会打断段落、使整张图片丢失，折叠为空格后图片完整
+        const multiline = await toIr('<p><img src="a.png" alt="甲~乙\n- 丙~丁"></p>', profile);
+        assert.equal(multiline.md, '![甲\\~乙 - 丙\\~丁](a.png)', profile);
+        assert.equal(firstImage(multiline.ir).alt, '甲~乙 - 丙~丁', profile);
+        assert.deepEqual(collect(multiline.ir, (n) => n.type === 'list'), [], profile);
+
+        // Assert：Word 自动生成的替代文字形如「图形用户界面\n\n描述已自动生成」，空行一并折叠为单个空格
+        const auto = await toIr('<p><img src="a.png" alt="图形用户界面\n\n描述已自动生成"></p>', profile);
+        assert.equal(firstImage(auto.ir).alt, '图形用户界面 描述已自动生成', profile);
+
+        // Assert：换行之外的空白不属折叠范围，制表符与连续空格原样保留
+        const inlineSpace = await toIr('<p><img src="a.png" alt="甲\t\t乙   丙~丁~"></p>', profile);
+        assert.equal(firstImage(inlineSpace.ir).alt, '甲\t\t乙   丙~丁~', profile);
+
+        // Assert：换行两侧的空白随换行一并折叠，首尾的换行不留空格（&#13;&#10; 为字符引用写入的 CRLF）
+        assert.equal(toMarkdown('<p><img src="a.png" alt="\n甲  \n\t 乙&#13;&#10;丙\n"></p>', profile), '![甲 乙 丙](a.png)', profile);
+    }
+});
+
+test('图片 src 与 title 的输出与内置规则逐字一致，title 中的「~」不转义', async () => {
+    // Act & Assert
+    for (const profile of ALL_PROFILES) {
+        // Assert：src 含「~」、空格与括号，title 含「~」与引号；title 不按 Markdown 解析，无须转义
+        const full = await toIr('<p><img src="dir/~u/a (1).png" alt="5~6与7~8" title="5~10 &quot;与&quot; 20~30"></p>', profile);
+        assert.equal(full.md, '![5\\~6与7\\~8](<dir/~u/a \\(1\\).png> "5~10 \\"与\\" 20~30")', profile);
+        assert.equal(firstImage(full.ir).url, 'dir/~u/a (1).png', profile);
+        assert.equal(firstImage(full.ir).title, '5~10 "与" 20~30', profile);
+
+        // Assert：无 src 的图片输出空串，无 alt 的图片输出 ![](src)
+        assert.equal(toMarkdown('<p><img alt="1~2~3"></p>', profile), '', profile);
+        assert.equal(toMarkdown('<p><img src="b.png"></p>', profile), '![](b.png)', profile);
+    }
+});
+
+test('url profile：带 data-mf-display 的图片仍由 imgDisplay 规则接管，优先级未被 alt 规则抢占', async () => {
+    // Act
+    const { md, ir } = await toIr('<p><img src="a.png" alt="10~20℃与30~40℃" data-mf-display="320"></p>', 'url');
+
+    // Assert：输出 HTML 而非 Markdown 图片，其 alt 不经 Markdown 解析，逐字还原
+    assert.equal(md, '<img src="a.png" alt="10~20℃与30~40℃" width="320">');
+    assert.equal(firstImage(ir).alt, '10~20℃与30~40℃');
 });
