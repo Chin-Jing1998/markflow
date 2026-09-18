@@ -377,7 +377,7 @@ MinerU 结果包按文档名改名后与主产物平铺在同一目录：`*_cont
 
 护栏与降级：默认按 `raster.maxWidth`（1600 px）等比缩小，`patent` profile 下禁用缩放以保留原始像素；像素数超过 8000 万或字节数超过 200 MB 的图片保留原图并告警；多页 TIFF 取首页；单张失败只降级为告警，不影响整份转换。`patent` profile 下的 EMF/WMF 先试栅格化后端，再试 LibreOffice，两者皆不可用时告警。
 
-docx 中的 OMML 公式默认栅格为图片（`--math image`）：先转 MathML，再由 Chromium 内的 MathJax 渲染后截图。`--math text` 降级为线性化文本。旧版 Equation 3.0 公式（OLE + WMF）按图片处理并告警。
+docx 中的 OMML 公式默认栅格为图片（`--math image`）：先转 MathML，再由 Chromium 内的 MathJax 渲染后截图。出图字号取源稿该公式的 `w:sz`（公式内没有时取所在段落的段落属性，两处都取不到时按 14pt），并乘一个标定系数以抵消 MathJax 字形与 Word 数学字体的大小差异。`patent` profile 下公式图另按墨迹紧裁——取墨迹外接矩形后四周各补 4 px 白边，使幅面贴近官方工具的公式出图（官方按 Word 的公式版面盒出图，字形不同，故不追求逐像素相等）；表格图与其它 profile 不做紧裁。`--math text` 降级为线性化文本。旧版 Equation 3.0 公式（OLE + WMF）按图片处理并告警。
 
 PDF 出图与栅格化各有一条回退链，两者都以桌面端主进程内的 Electron 渲染为首选，其次为派生的独立 Electron 工作进程；PDF 出图另有第三级 LibreOffice，栅格化没有。两条链当前生效的后端由 `markflow formats` 分别报出。
 

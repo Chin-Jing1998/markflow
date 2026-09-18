@@ -7,6 +7,7 @@
  *   单元格内换行，避免超宽表格缩到页面上无法辨认）。单元格内容按 mdast 行内节点转 HTML，文本一律转义，
  *   html 节点先去标签再转义——片段页里绝不注入文档来源的标记。
  * buildMathFragment(mathNode, { display? }) → html
+ *   字号取 data.fontSizePt（源稿磅值）乘 MATH_FONT_SCALE 标定系数，取不到时用 DEFAULT_MATH_FONT_SIZE_PT；
  *   MathML（data.mathml）交 MathJax 4 mml-svg 渲染：脚本与 mathjax-newcm 字体包均以 file:// 绝对路径引用
  *   本地 node_modules（output.fontPath 显式本地化，否则 MathJax 会向 jsDelivr 取字体；svg.fontCache 'local'），
  *   并定义 window.__markflowReady() 供工作进程等待排版完成。无 mathml 时以 <mtext> 包裹线性化文本；
@@ -27,6 +28,19 @@ const { stripHtml } = require('../ir/util');
 const DEFAULT_FONT_STACK = '"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif';
 const MATH_FONT_STACK = '"STIX Two Math","Cambria Math",serif';
 const FONT_SIZE = '12pt';
+/** 公式片段页缺省字号（磅）：math 节点没带 data.fontSizePt 时使用，取专利正文常用的四号字 */
+const DEFAULT_MATH_FONT_SIZE_PT = 14;
+/**
+ * 公式字号标定系数：同一磅值下 MathJax 的 newcm 数学字形比 Word 的 Cambria Math 大约 1/6，
+ * 直接按源稿字号出图会明显偏大。系数按官方工具产出的公式图幅面实测标定（12 幅公式墨迹宽高比均值
+ * 分别为 1.02 与 0.97），使两者在同一源稿字号下墨迹幅面相当。
+ */
+const MATH_FONT_SCALE = 12 / 14;
+/** 字号合法区间（磅）：超出区间的 data.fontSizePt 视为脏数据，回落到缺省值 */
+const MIN_MATH_FONT_SIZE_PT = 1;
+const MAX_MATH_FONT_SIZE_PT = 1638;
+/** 字号写进 CSS 时保留的小数位 */
+const FONT_SIZE_DECIMALS = 2;
 const CELL_PADDING = '4pt';
 const TABLE_LINE_HEIGHT = '1.4';
 /** 表格自然宽度上限（CSS px）：约等于 A4 横向可打印宽度，超出时单元格内换行 */
@@ -93,6 +107,9 @@ function nodeHtml(node) {
         case 'strong': return `<b>${inlineHtml(node.children)}</b>`;
         case 'emphasis': return `<i>${inlineHtml(node.children)}</i>`;
         case 'delete': return `<s>${inlineHtml(node.children)}</s>`;
+        case 'underline': return `<u>${inlineHtml(node.children)}</u>`;
+        case 'superscript': return `<sup>${inlineHtml(node.children)}</sup>`;
+        case 'subscript': return `<sub>${inlineHtml(node.children)}</sub>`;
         case 'inlineCode': return `<code>${escapeHtml(node.value)}</code>`;
         case 'break': return '<br>';
         case 'html': return escapeHtml(stripHtml(node.value));
@@ -120,7 +137,8 @@ function buildMathFragment(mathNode, { display } = {}) {
     const mathml = pickMathml(mathNode, data, isDisplay);
     const mathjax = resolveMathJax();
     const nonce = crypto.randomBytes(NONCE_BYTES).toString('base64');
-    const css = `${BASE_CSS}body{display:inline-block;padding:${MATH_PADDING_PX}px;font-family:${DEFAULT_FONT_STACK};font-size:${FONT_SIZE};line-height:1.2}`
+    const fontSize = resolveMathFontSize(data.fontSizePt);
+    const css = `${BASE_CSS}body{display:inline-block;padding:${MATH_PADDING_PX}px;font-family:${DEFAULT_FONT_STACK};font-size:${fontSize};line-height:1.2}`
         + `math{font-family:${MATH_FONT_STACK}}`
         + 'mjx-container{margin:0 !important}';
     // MathJax 4 在 Web Worker 里生成读屏文本：不放行 worker-src / connect-src 时 startup.promise 永不落定（实测）
@@ -129,6 +147,14 @@ function buildMathFragment(mathNode, { display } = {}) {
         : "default-src 'none'; style-src 'unsafe-inline'";
     const scripts = mathjax ? mathJaxScripts(mathjax, nonce) : '';
     return document({ csp, css, head: scripts, body: mathml });
+}
+
+/** 源稿字号（磅）→ 片段页 CSS 字号：乘标定系数；取不到或超出合法区间时回落到缺省字号 */
+function resolveMathFontSize(fontSizePt) {
+    const valid = Number.isFinite(fontSizePt)
+        && fontSizePt >= MIN_MATH_FONT_SIZE_PT && fontSizePt <= MAX_MATH_FONT_SIZE_PT;
+    const pt = (valid ? fontSizePt : DEFAULT_MATH_FONT_SIZE_PT) * MATH_FONT_SCALE;
+    return `${Number(pt.toFixed(FONT_SIZE_DECIMALS))}pt`;
 }
 
 /** MathML 校验与 display 属性归一；不可用时以 <mtext> 包裹线性化文本 */
