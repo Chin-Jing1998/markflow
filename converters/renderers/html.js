@@ -67,7 +67,14 @@ async function render(doc, options, context = {}) {
     const hast = await unified()
         .use(remarkRehype, {
             allowDangerousHtml: false,
-            handlers: { image: createImageHandler(resolveSrc), html: htmlHandler, math: mathHandler, underline: underlineHandler },
+            handlers: {
+                image: createImageHandler(resolveSrc),
+                html: htmlHandler,
+                math: mathHandler,
+                underline: tagHandler('u'),
+                superscript: tagHandler('sup'),
+                subscript: tagHandler('sub'),
+            },
         })
         .run(root);
     // stringify 的 allowDangerousHtml 只影响 raw 节点，而 raw 节点仅由本文件在白名单校验通过后自建；
@@ -202,11 +209,13 @@ function displayAttributes(node) {
     return attrs;
 }
 
-/** underline：<u> 元素 */
-function underlineHandler(state, node) {
-    const result = { type: 'element', tagName: 'u', properties: {}, children: state.all(node) };
-    state.patch(node, result);
-    return state.applyData(node, result);
+/** underline / superscript / subscript：映射为同名 hast 元素（由本文件自建，不经原始 HTML 透传） */
+function tagHandler(tagName) {
+    return (state, node) => {
+        const result = { type: 'element', tagName, properties: {}, children: state.all(node) };
+        state.patch(node, result);
+        return state.applyData(node, result);
+    };
 }
 
 /**

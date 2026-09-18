@@ -387,3 +387,18 @@ test('underline 输出下划线 run；带 display 的图片按显示宽度内嵌
     assert.match(documentXml, /<w:u w:val="single"\/>/);
     assert.ok(documentXml.includes('<w:tab/>'), '制表符应为 w:tab');
 });
+
+test('superscript / subscript 输出 w:vertAlign 的上下标 run', async () => {
+    // Arrange：IR 经 ir/inline-html 提升（与 docx 解析器同一链路）
+    const { liftInlineHtml } = require('../converters/ir/inline-html');
+    const ir = liftInlineHtml(await parseMarkdown('C<sub>1</sub>的烷基、R<sup>2</sup>基团、<strong><sub>粗下标</sub></strong>\n'));
+
+    // Act
+    const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert
+    assert.match(documentXml, /<w:vertAlign w:val="subscript"\/>/);
+    assert.match(documentXml, /<w:vertAlign w:val="superscript"\/>/);
+    assert.ok(documentXml.includes('粗下标'), '嵌套在加粗内的下标文字不得丢失');
+    assert.equal((documentXml.match(/<w:vertAlign w:val="subscript"\/>/g) || []).length, 2, '两处下标各成一个 run');
+});

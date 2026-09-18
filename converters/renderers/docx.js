@@ -358,6 +358,11 @@ function inlineToRun(node, ctx, fmt) {
             return inlineToRuns(node.children, ctx, { ...fmt, strike: true });
         case 'underline':
             return inlineToRuns(node.children, ctx, { ...fmt, underline: {} });
+        // 上下标互斥（OOXML 的 w:vertAlign 只有一个取值），内层覆盖外层
+        case 'superscript':
+            return inlineToRuns(node.children, ctx, { ...fmt, subScript: false, superScript: true });
+        case 'subscript':
+            return inlineToRuns(node.children, ctx, { ...fmt, superScript: false, subScript: true });
         case 'inlineCode':
             return [makeRun({ ...fmt, text: String(node.value || ''), font: CODE_FONT }, ctx)];
         case 'break':

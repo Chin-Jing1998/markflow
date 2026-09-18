@@ -8,9 +8,13 @@
  *   - math          公式（docx 的 OMML 等）：{ type: 'math', data: { omml, mathml, text, display } }
  *                   display=true 表示独立成段的公式，须放在块级位置；false 表示行内公式，须放在段落内。
  *                   不支持公式的渲染器先经 degradeMath 把它降为线性化文本。
- * 另有一个行内扩展节点 underline（下划线）：{ type: 'underline', children }，由 ir/inline-html 从 <u> 提升而来。
- * downgradeCustomNodes 按普通容器原样递归保留它；md / html / docx / xml 各渲染器均有专门处理
- * （<u>、u 元素、下划线 run、u 标记），新增渲染器须同样认识它。
+ * 另有三个行内扩展节点，形态一致（{ type, children }），均由 ir/inline-html 从同名 HTML 标签提升而来：
+ *   - underline    下划线，源自 <u>（docx 由 mammoth 的 styleMap 'u => u' 产出）
+ *   - superscript  上标，源自 <sup>（docx 由 w:vertAlign superscript 产出）
+ *   - subscript    下标，源自 <sub>（docx 由 w:vertAlign subscript 产出）
+ * 三者可互相嵌套，也可与 strong / emphasis 嵌套。downgradeCustomNodes 按普通容器原样递归保留它们；
+ * md / html / docx / xml 各渲染器均有专门处理（行内 HTML 标签、同名 hast 元素、run 属性、DTD 行内元素），
+ * 新增渲染器须同样认识它们；只取文字的场合（collectText 一类）按普通容器递归即可。
  *
  * 节点 data 上的版面约定（解析器写入，渲染器读取）：
  *   image.data.display   = { width, height?, unit: 'px' | '%', source }   显示尺寸，与原文档 / 原网页一致；

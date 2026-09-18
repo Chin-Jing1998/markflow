@@ -113,3 +113,20 @@ test('url profile：带 data-mf-display 的 img 输出 <img src alt width>（属
 test('word profile 保留 <u>（mammoth 经 styleMap 产出），交 ir/inline-html 提升', () => {
     assert.equal(toMarkdown('<p>前<u>下划线</u>后</p>', 'word'), '前<u>下划线</u>后');
 });
+
+test('word profile 保留 <sup>/<sub>（mammoth 由 w:vertAlign 产出），交 ir/inline-html 提升', () => {
+    assert.equal(toMarkdown('<p>R<sup>2</sup>基团</p>', 'word'), 'R<sup>2</sup>基团');
+    assert.equal(toMarkdown('<p>C<sub>1</sub>的烷基</p>', 'word'), 'C<sub>1</sub>的烷基');
+});
+
+test('word profile：文本中的「~」转义为 \\~，避免成对的单波浪号被 remark-gfm 解析为删除线', () => {
+    // 区间号「~」成对出现时最易受害，须逐个转义
+    assert.equal(toMarkdown('<p>C1~C30的烷基、C1~C30的烷氧基</p>', 'word'), 'C1\\~C30的烷基、C1\\~C30的烷氧基');
+    // turndown 自身只转义行首的 ~~~，已带反斜杠的不重复转义，其余补齐
+    assert.equal(toMarkdown('<p>~~~甲</p>', 'word'), '\\~\\~\\~甲');
+    // 文本中的字面反斜杠先被转义成 \\，其后的 ~ 仍须转义
+    assert.equal(toMarkdown('<p>甲\\~乙</p>', 'word'), '甲\\\\\\~乙');
+    // url profile 与 basic profile 不受影响（Markdown 输入的 ~删除线~ 语义保持）
+    assert.equal(toMarkdown('<p>C1~C30</p>', 'url'), 'C1~C30');
+    assert.equal(toMarkdown('<p>C1~C30</p>', 'basic'), 'C1~C30');
+});

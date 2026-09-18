@@ -113,6 +113,26 @@ describe('generic profile', () => {
         assert.deepEqual([breaks.eq(1).attr('kind'), breaks.eq(1).attr('index'), breaks.eq(1).attr('title')], ['sheet', '0', '表一']);
     });
 
+    test('underline / superscript / subscript 映射为 u / sup / sub，可嵌套', async () => {
+        // Arrange
+        const children = [createParagraph([
+            createText('C'), { type: 'subscript', children: [createText('1')] },
+            createText('~C'), { type: 'subscript', children: [createText('30')] },
+            createText('，R'), { type: 'superscript', children: [createText('2')] },
+            createText('，'), { type: 'underline', children: [{ type: 'superscript', children: [createText('注')] }] },
+        ])];
+
+        // Act
+        const { xml } = await renderXml(children);
+        const $ = $of(xml);
+
+        // Assert
+        assert.deepEqual($('p > sub').toArray().map((n) => $(n).text()), ['1', '30']);
+        assert.deepEqual($('p > sup').toArray().map((n) => $(n).text()), ['2']);
+        assert.equal($('p > u > sup').text(), '注');
+        assert.ok(xml.includes('<p>C<sub>1</sub>~C<sub>30</sub>，R<sup>2</sup>，<u><sup>注</sup></u></p>'), xml);
+    });
+
     test('math 节点内嵌 MathML（重建后 well-formed，display 合并到 math 根），MathML 缺失或损坏时降级为线性化文本', async () => {
         const children = [
             createParagraph([createText('见 '), createMath({ mathml: MATHML, text: 'x=1', display: false })]),
