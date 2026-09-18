@@ -71,7 +71,7 @@ function pngHeader(width, height) {
 
 test('JSON：去 BOM 后格式化为两空格缩进，授权根为文件所在目录', async () => {
     const { reader, grants } = makeReader();
-    const file = write('json/ok.json', '﻿{"a":1,"b":[1,2]}');
+    const file = write('json/ok.json', '\ufeff{"a":1,"b":[1,2]}');
     const opened = await reader.open({ path: file });
     assert.ok(READER_EXTENSIONS.includes('.json'));
     assert.equal(opened.kind, 'json');

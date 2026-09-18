@@ -222,7 +222,7 @@ test('fetchLatestRelease：超时 / 非 200 / 响应体超长 / JSON 非法 / �
 });
 
 test('fetchLatestRelease：tag_name 中的控制字符被剔除', async () => {
-    const res = await fetchLatestRelease({ fetchImpl: async () => response(200, JSON.stringify({ tag_name: 'v3.1.0\n', html_url: RELEASES_PAGE_URL })) });
+    const res = await fetchLatestRelease({ fetchImpl: async () => response(200, JSON.stringify({ tag_name: 'v3.1.0\n\x07', html_url: RELEASES_PAGE_URL })) });
     assert.deepEqual(res, { ok: true, tagName: 'v3.1.0', url: RELEASES_PAGE_URL });
 });
 
