@@ -7,7 +7,9 @@
  *   两条路径按 table.data.grid（parsers/docx-tables 写入的结构化表格）是否存在分流：
  *     有 grid（docx 来源）→ 按 grid 重建：合并单元格写 colspan / rowspan（值为 1 时不写属性），单元格内每段
  *       一个 <p>（外边距归零、段间距 CELL_PARAGRAPH_GAP），表头单元格为 th、其余为 td——首行不再强制当表头；
- *     无 grid（md / xlsx / pptx 等来源）→ 沿用 GFM 路径：首行为表头（th），列对齐取 node.align。
+ *       th 不额外加粗（Word 的「重复标题行」w:tblHeader 只表示跨页重复，官方工具的表格图是 Word 的渲染结果），
+ *       粗体只取自单元格文字本身的行内格式；
+ *     无 grid（md / xlsx / pptx 等来源）→ 沿用 GFM 路径：首行为表头（th，加粗），列对齐取 node.align。
  *   两条路径的单元格内容都按 mdast 行内节点转 HTML，文本一律转义，html 节点先去标签再转义——
  *   片段页里绝不注入文档来源的标记。grid 的跨度取值在此重新校验（不可信输入），越界即回落到 1。
  * buildMathFragment(mathNode, { display? }) → html
@@ -49,6 +51,9 @@ const CELL_PADDING = '4pt';
 const TABLE_LINE_HEIGHT = '1.4';
 /** 单元格内多段时的段间距：表格里不留大段空白，段落自身的外边距先归零 */
 const CELL_PARAGRAPH_GAP = '2pt';
+/** 表头字重：GFM 路径的首行按惯例加粗；grid 路径（docx 来源）须显式归为常规——浏览器默认样式会给 th 加粗 */
+const GFM_HEADER_WEIGHT = 600;
+const GRID_HEADER_WEIGHT = 400;
 /**
  * grid 合并跨度的合法上限（与 parsers/docx-tables 的同名约定一致，两处各自把关、互不依赖）：
  * Word 表格最多 63 列，行数亦远小于此；非正整数或越界一律回落到 1
@@ -86,7 +91,7 @@ function buildTableFragment(tableNode, { fontFamily } = {}) {
         + `.mf-table{width:max-content;max-width:${MAX_TABLE_WIDTH_PX}px}`
         + `table{border-collapse:collapse;border-spacing:0;font-family:${resolveFontStack(fontFamily)};font-size:${FONT_SIZE};line-height:${TABLE_LINE_HEIGHT}}`
         + `th,td{border:1px solid #000;padding:${CELL_PADDING};vertical-align:top;text-align:left;overflow-wrap:break-word}`
-        + 'th{font-weight:600}'
+        + `th{font-weight:${grid ? GRID_HEADER_WEIGHT : GFM_HEADER_WEIGHT}}`
         + (grid ? `th>p,td>p{margin:0}th>p+p,td>p+p{margin-top:${CELL_PARAGRAPH_GAP}}` : '');
     return document({
         csp: "default-src 'none'; style-src 'unsafe-inline'",

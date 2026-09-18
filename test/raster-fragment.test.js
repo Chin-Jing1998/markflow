@@ -139,6 +139,29 @@ test('表格片段：有 grid 时首行不再强制加粗，只有 header 单元
     assert.equal(headed, '<thead><tr><th><p>表头</p></th></tr></thead><tbody><tr><td><p>正文</p></td></tr></tbody>');
 });
 
+test('表格片段：docx 来源（有 grid）的标题行不额外加粗，粗体只取自文字本身；GFM 路径的表头照旧加粗', () => {
+    // Arrange：Word 的「重复标题行」（w:tblHeader）只表示跨页重复，并不加粗；官方工具的表格图是 Word 的渲染结果
+    const BOLD_HEADER_RULE = 'th{font-weight:600}';
+    const fromDocx = gridTable([
+        { header: true, cells: [gridCell([[createText('表头')]], { header: true })] },
+        { header: false, cells: [gridCell([[createText('正文')]])] },
+    ]);
+    const fromMarkdown = createTable(null, [
+        createTableRow([createTableCell([createText('表头')])]),
+        createTableRow([createTableCell([createText('正文')])]),
+    ]);
+
+    // Act
+    const gridHtml = buildTableFragment(fromDocx);
+    const gfmHtml = buildTableFragment(fromMarkdown);
+
+    // Assert
+    assert.ok(!gridHtml.includes(BOLD_HEADER_RULE), 'grid 路径不应给 th 加粗');
+    assert.ok(gridHtml.includes('th{font-weight:400}'), '须显式归为常规字重：浏览器默认样式会给 th 加粗');
+    assert.ok(gridHtml.includes('<thead><tr><th><p>表头</p></th></tr></thead>'), '标题行仍归 thead／th，语义不变');
+    assert.ok(gfmHtml.includes(BOLD_HEADER_RULE), 'GFM 路径（md／xlsx／pptx 来源）的表头照旧加粗');
+});
+
 test('表格片段：单元格内每段一个 <p>，段落外边距归零并给出小段间距', () => {
     // Arrange
     const table = gridTable([{ header: false, cells: [gridCell([[createText('一')], [createText('二')], [createText('三')]])] }]);
