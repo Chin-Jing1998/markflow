@@ -1,11 +1,16 @@
 /**
  * xml 目标 patent profile 单元测试（converters/renderers/xml/patent.js 及 sections/claims/numbering/figures/precheck）
- * 覆盖：常量表；heading 分节与加粗短段分节两条路径下的五书分文件、文件头三行逐字、根元素；官方标记剥离；
- *       无标题行样稿（摘要前导段 + 顿号权项含续行 + depth=1 五部分标题 + 附图说明 + 尾部图片与纯图号段）；
- *       发明名称回退链；段号连续四位、[000N] 复用与跳变、numbering.start/width；claim-ref 范围展开与悬空容错；
- *       图号取「图N」、wi/he 毫米换算与 orientation；表格/公式 image 节点 → tables/maths（含 inline="yes"）；
- *       1C 未就绪的 table/math 降级 + warning；缺节 warning；parts 显式子集；预检各项与 precheck.json；
- *       zip 条目清单；平铺落盘无 images/；每份产物与参考夹具经 validateXml 均 valid；夹具 docx 端到端
+ * 覆盖：常量表；heading 分节与加粗短段分节两条路径下的五书分文件、文件头三行逐字（含 BOM 与 DOCTYPE 的
+ *       空内部子集）、根元素；官方标记剥离；无标题行样稿（摘要前导段 + 顿号权项含续行 + depth=1 五部分
+ *       标题 + 附图说明 + 尾部图片与纯图号段）；发明名称回退链；段号连续四位、[000N] 复用与跳变、
+ *       numbering.start/width；权项引用与正文图号一律保留纯文本（不生成 claim-ref / figref）；
+ *       表格/公式 image 节点 → tables/maths；1C 未就绪的 table/math 降级 + warning；缺节 warning；
+ *       parts 显式子集；预检各项与 precheck.json；zip 条目清单；平铺落盘无 images/；
+ *       每份产物与参考夹具经 validateXml 均 valid；夹具 docx 端到端。
+ *       另设「官方产出一致性」一组，逐项断言与官方「WORD 转 XML 编辑器」真实产出的对齐：wi/he 取 IR 的
+ *       displayWidthMm / displayHeightMm 并向下取整（缺失时回退像素换算）、img id 前缀 if / iaf / idf
+ *       各自独立编号、figure 与 maths / tables 的 @num 四位补零、figure-labels 承载图注、img 的
+ *       top/left/orientation/inline 取值与属性顺序、BOM 与 DOCTYPE 的 []、附图部分杂散文字丢弃并告警
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -33,9 +38,12 @@ fs.mkdirSync(TMP_ROOT, { recursive: true });
 const tmpDir = fs.mkdtempSync(path.join(TMP_ROOT, 'xml-patent-'));
 after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 
+// 官方产出带 UTF-8 BOM，DOCTYPE 带空内部子集 []
+const BOM = '\ufeff';
+const BOM_BYTES = Buffer.from([0xef, 0xbb, 0xbf]);
 const HEADER_LINES = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    '<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd">',
+    `${BOM}<?xml version="1.0" encoding="UTF-8"?>`,
+    '<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd"[]>',
     '<?xml-stylesheet type="text/xsl" href="/dtdandxsl/showxml.xsl"?>',
     '<cn-application-body lang="zh" country="CN">',
 ];
@@ -152,8 +160,19 @@ describe('patent profile：常量与五书分文件', () => {
         assert.equal(patent.ELEMENT_NAMES.drawings, 'cn-drawings');
         assert.equal(patent.ELEMENT_NAMES.abstract, 'cn-abstract');
         assert.equal(patent.ELEMENT_NAMES.abstractFigure, 'cn-abst-figure');
-        assert.equal(patent.ELEMENT_NAMES.drawingParagraph, 'cn-drawing-p');
+        assert.equal(patent.ELEMENT_NAMES.drawingParagraph, undefined, '官方产出不含 cn-drawing-p');
+        assert.equal(patent.ELEMENT_NAMES.claimRef, undefined, '官方产出不含 claim-ref');
+        assert.equal(patent.ELEMENT_NAMES.figref, undefined, '官方产出不含 figref');
         assert.ok(Object.isFrozen(patent.ELEMENT_NAMES));
+        assert.deepEqual(patent.ID_PREFIXES, {
+            heading: 'h', figure: 'f', drawingImg: 'if', abstractImg: 'iaf', bodyImg: 'idf',
+            tables: 'tabl', maths: 'math', chemistry: 'chem', claim: 'cl',
+        });
+        assert.deepEqual(patent.DOCTYPE, {
+            name: 'cn-application-body',
+            systemId: '/dtdandxsl/cn-application-body-20080416.dtd',
+            internalSubset: '',
+        });
         assert.deepEqual(patent.ROOT_ATTRS, { lang: 'zh', country: 'CN' });
         assert.equal(patent.PRECHECK_FILE, 'precheck.json');
     });
@@ -170,6 +189,7 @@ describe('patent profile：常量与五书分文件', () => {
             for (const name of XML_FILES) {
                 const lines = result.files[name].split('\n');
                 assert.deepEqual(lines.slice(0, 4), HEADER_LINES, name);
+                assert.deepEqual(Buffer.from(result.files[name], 'utf8').subarray(0, 3), BOM_BYTES, `${name} 文件头应为 UTF-8 BOM`);
                 assert.equal(lines[lines.length - 2], '</cn-application-body>', name);
                 assert.equal(lines[lines.length - 1], '', '末尾换行');
             }
@@ -178,10 +198,9 @@ describe('patent profile：常量与五书分文件', () => {
             const claims = $of(result.files['claims.xml']);
             assert.equal(claims('cn-application-body > cn-claims > claim').length, 3);
             assert.deepEqual(claims('claim').toArray().map((node) => [node.attribs.id, node.attribs.num]), [['cl001', '1'], ['cl002', '2'], ['cl003', '3']]);
-            assert.equal(claims('claim').eq(1).find('claim-ref').attr('idref'), 'cl001');
-            assert.equal(claims('claim').eq(2).find('claim-ref').attr('idref'), 'cl001 cl002');
-            assert.equal(claims('claim').eq(2).find('claim-ref').text(), '1或2');
-            assert.ok(result.files['claims.xml'].includes('<claim-text>根据权利要求<claim-ref idref="cl001">1</claim-ref>所述的测试装置，其特征在于，所述壳体为筒状。</claim-text>'));
+            assert.equal(claims('claim-ref').length, 0, '官方不生成 claim-ref');
+            assert.equal(claims('claim').eq(2).find('claim-text').text(), '根据权利要求1或2所述的测试装置，其特征在于，所述壳体为金属。');
+            assert.ok(result.files['claims.xml'].includes('<claim-text>根据权利要求1所述的测试装置，其特征在于，所述壳体为筒状。</claim-text>'));
 
             // Assert：说明书
             const desc = $of(result.files['description.xml']);
@@ -191,24 +210,39 @@ describe('patent profile：常量与五书分文件', () => {
             assert.deepEqual(desc('description > p').toArray().map((node) => [node.attribs.id, node.attribs.num, node.attribs.Italic]),
                 [['p0001', '0001', '0'], ['p0002', '0002', '0'], ['p0003', '0003', '0'], ['p0004', '0004', '0'], ['p0005', '0005', '0']]);
             assert.equal(desc('description').attr('id'), undefined, '容器不写 id');
-            assert.deepEqual(desc('figref').toArray().map((node) => [node.attribs.num, textOf(node)]), [['1', '图1'], ['2', '图2'], ['1', '图1']]);
-            assert.equal(desc('figref').attr('idref'), undefined);
+            assert.equal(desc('figref').length, 0, '官方不生成 figref');
+            assert.equal(desc('description > p').eq(3).text(), '图1为整体结构示意图；图2为局部放大图。', '正文图号保留为纯文本');
+            assert.equal(desc('description > p').eq(4).text(), '如图1所示，壳体呈筒状。');
 
             // Assert：说明书附图
             const drawings = $of(result.files['drawings.xml']);
             const children = drawings('cn-drawings').children().toArray().map((node) => node.name);
-            assert.deepEqual(children, ['cn-drawing-p', 'figure', 'cn-drawing-p', 'figure']);
-            assert.deepEqual(drawings('cn-drawing-p > p').toArray().map((node) => [node.attribs.id, node.attribs.num, textOf(node)]), [['l0001', 'XXXX', '图1'], ['l0002', 'XXXX', '图2']]);
-            assert.deepEqual(drawings('figure').toArray().map((node) => [node.attribs.id, node.attribs.num]), [['f0001', '1'], ['f0002', '2']]);
+            assert.deepEqual(children, ['figure', 'figure'], '图注改由 figure-labels 承载，不再有 cn-drawing-p');
+            assert.equal(drawings('cn-drawing-p').length, 0);
+            assert.deepEqual(drawings('figure').toArray().map((node) => [node.attribs.id, node.attribs.num, node.attribs['figure-labels']]),
+                [['f0001', '0001', '图1'], ['f0002', '0002', '图2']]);
             const img1 = drawings('figure').eq(0).find('img');
-            assert.deepEqual(img1.attr(), { id: 'i0001', he: '25', wi: '51', file: 'drawing-1.jpg', 'img-format': 'jpg', 'img-content': 'drawing', inline: 'no', orientation: 'landscape' });
-            assert.deepEqual(drawings('figure').eq(1).find('img').attr(), { id: 'i0002', he: '51', wi: '25', file: 'drawing-2.jpg', 'img-format': 'jpg', 'img-content': 'drawing', inline: 'no', orientation: 'portrait' });
+            assert.deepEqual(img1.attr(), {
+                id: 'if0001', file: 'drawing-1.jpg', wi: '50', he: '25', top: '0', left: '0',
+                'img-content': 'drawing', 'img-format': 'jpg', orientation: 'portrait', inline: 'yes',
+            });
+            assert.deepEqual(drawings('figure').eq(1).find('img').attr(), {
+                id: 'if0002', file: 'drawing-2.jpg', wi: '25', he: '50', top: '0', left: '0',
+                'img-content': 'drawing', 'img-format': 'jpg', orientation: 'portrait', inline: 'yes',
+            }, '横图与竖图的 orientation 同为 portrait');
+            assert.ok(result.files['drawings.xml'].includes(
+                '<img id="if0001" file="drawing-1.jpg" wi="50" he="25" top="0" left="0" img-content="drawing" img-format="jpg" orientation="portrait" inline="yes"/>'),
+            'img 属性顺序与官方逐字一致');
 
             // Assert：摘要与摘要附图（复用 image_1 → 同一裸文件名）
             const abstract = $of(result.files['abstract.xml']);
             assert.deepEqual(abstract('cn-abstract > p').toArray().map((node) => [node.attribs.id, node.attribs.num]), [['p0001', '0001']]);
             const abstractFigure = $of(result.files['abstract-figure.xml']);
             assert.equal(abstractFigure('cn-abstract > cn-abst-figure > figure > img').attr('file'), 'drawing-1.jpg');
+            assert.equal(abstractFigure('figure > img').attr('id'), 'iaf0001', '摘要附图的 img 用 iaf 前缀');
+            assert.equal(abstractFigure('figure > img').attr('inline'), 'yes');
+            assert.equal(abstractFigure('figure').attr('num'), '0001');
+            assert.equal(abstractFigure('figure').attr('figure-labels'), undefined, '官方摘要附图的 figure 不写 figure-labels');
             assert.equal(abstractFigure('cn-drawing-p').length, 0, 'cn-abst-figure 不含 cn-drawing-p');
             assert.ok(result.warnings.includes('附图：已生成摘要附图；官方提示摘要附图不再单独接收，建议提交前删除'));
             assert.ok(!codesOf(result).includes(ISSUE_CODES.SECTION_MISSING));
@@ -246,7 +280,7 @@ describe('patent profile：常量与五书分文件', () => {
         assert.equal(desc('invention-title').text(), '一种装置');
         assert.equal(desc('heading').text(), '技术领域');
         assert.deepEqual(desc('description > p').toArray().map((node) => [node.attribs.num, textOf(node)]), [['0001', '本发明涉及装置。'], ['0002', '第二段。']]);
-        assert.equal($of(result.files['drawings.xml'])('cn-drawing-p > p').text(), '图1');
+        assert.equal($of(result.files['drawings.xml'])('figure').attr('figure-labels'), '图1');
         assert.ok(!codesOf(result).includes(ISSUE_CODES.NUMBERING_JUMP));
         assert.ok(!codesOf(result).includes(ISSUE_CODES.PRECHECK_CHARSET), '官方标记码位不计入字符集问题');
         await assertAllValid(result.files);
@@ -258,7 +292,7 @@ describe('patent profile：常量与五书分文件', () => {
 // ============================================================
 
 describe('patent profile：无标题行样稿的位置推定', () => {
-    test('四书归属、权 1 主题回退、「12-3」不生成 claim-ref、正文编号段不当权项、附图顺序', async () => {
+    test('四书归属、权 1 主题回退、权项引用保留纯文本、正文编号段不当权项、附图顺序', async () => {
         // Act
         const result = await renderPatent(noTitleDoc(), { assets: standardAssets(), meta: { title: '技术领域' } });
 
@@ -276,13 +310,12 @@ describe('patent profile：无标题行样稿的位置推定', () => {
         assert.equal(claims('claim').length, 4);
         assert.equal(claims('claim').eq(0).find('claim-text').length, 3);
         assert.equal(claims('claim').eq(0).find('claim-text').eq(1).text(), '机架；');
-        assert.equal(claims('claim').eq(2).find('claim-ref').length, 0);
+        assert.equal(claims('claim-ref').length, 0, '官方不生成 claim-ref');
         assert.ok(claims('claim').eq(2).find('claim-text').text().includes('根据权利要求12-3任一项'));
-        assert.ok(result.warnings.includes('权项：权利要求 3 的引用“12-3”无法解析（起点大于终点），已保留原文、未生成 claim-ref'));
-        assert.equal(claims('claim').eq(3).find('claim-ref').attr('idref'), 'cl001 cl002 cl003');
-        assert.equal(claims('claim').eq(3).find('claim-ref').text(), '1-3');
+        assert.ok(claims('claim').eq(3).find('claim-text').text().includes('根据权利要求1-3任一项'));
+        assert.ok(!result.warnings.some((item) => item.includes('claim-ref')), '不再产生权项引用问题项');
 
-        // Assert：说明书（发明名称来自权 1；正文「1、顶盖；2、底盖」是段落不是权项；figref）
+        // Assert：说明书（发明名称来自权 1；正文「1、顶盖；2、底盖」是段落不是权项；图号为纯文本）
         const desc = $of(result.files['description.xml']);
         assert.equal(desc('invention-title').text(), '一种试剂灌装装置');
         assert.ok(result.warnings.includes('发明名称：未找到发明名称段，已从权利要求 1 推定为“一种试剂灌装装置”'));
@@ -291,12 +324,12 @@ describe('patent profile：无标题行样稿的位置推定', () => {
         assert.ok(texts.includes('如图1所示，1、顶盖；2、底盖。'));
         assert.equal(desc('description > p').length, 6);
         assert.equal(desc('description > p').last().attr('num'), '0006');
-        assert.equal(desc('figref').length, 2);
+        assert.equal(desc('figref').length, 0, '官方不生成 figref');
 
         // Assert：附图
         const drawings = $of(result.files['drawings.xml']);
-        assert.deepEqual(drawings('cn-drawings').children().toArray().map((node) => node.name), ['cn-drawing-p', 'figure', 'cn-drawing-p', 'figure']);
-        assert.deepEqual(drawings('figure').toArray().map((node) => node.attribs.num), ['1', '2']);
+        assert.deepEqual(drawings('cn-drawings').children().toArray().map((node) => node.name), ['figure', 'figure']);
+        assert.deepEqual(drawings('figure').toArray().map((node) => [node.attribs.num, node.attribs['figure-labels']]), [['0001', '图1'], ['0002', '图2']]);
         assert.deepEqual(result.assets.map((item) => item.name), ['drawing-1.jpg', 'drawing-2.jpg']);
         await assertAllValid(result.files);
     });
@@ -364,7 +397,7 @@ describe('patent profile：段号与行内', () => {
         await assertAllValid(result.files);
     });
 
-    test('claim-ref：范围与「至」「或」「、」展开；引用不存在的权项保留原文并 warning；项号不连续 warning', async () => {
+    test('权项引用一律保留纯文本：「1至2」「1、3」「2-3」「9」均不生成 claim-ref；项号不连续 warning', async () => {
         const children = [
             h(2, '权利要求书'),
             p('1. 一种装置。'), p('2. 根据权利要求1所述的装置。'), p('3. 根据权利要求1至2所述的装置。'),
@@ -372,11 +405,12 @@ describe('patent profile：段号与行内', () => {
         ];
         const result = await renderPatent(children);
         const claims = $of(result.files['claims.xml']);
-        assert.equal(claims('claim').eq(2).find('claim-ref').attr('idref'), 'cl001 cl002');
-        assert.deepEqual(claims('claim').eq(3).find('claim-ref').toArray().map((node) => node.attribs.idref), ['cl001 cl003', 'cl002 cl003']);
-        assert.equal(claims('claim').eq(4).find('claim-ref').length, 0);
+        assert.equal(claims('claim-ref').length, 0);
+        assert.equal(claims('claim').eq(2).find('claim-text').text(), '根据权利要求1至2所述的装置。');
+        assert.equal(claims('claim').eq(3).find('claim-text').text(), '根据权利要求1、3所述的装置，且如权利要求2-3所述。');
+        assert.equal(claims('claim').eq(4).find('claim-text').text(), '根据权利要求9所述的装置。', '引用不存在的权项也只是纯文本');
         assert.equal(claims('claim').eq(4).attr('id'), 'cl006');
-        assert.ok(result.warnings.includes('权项：权利要求 6 的引用“9”无法解析（引用不存在的权项），已保留原文、未生成 claim-ref'));
+        assert.ok(!result.warnings.some((item) => item.includes('claim-ref')));
         assert.ok(result.warnings.some((item) => item.startsWith('权项：权利要求项号不连续或重复：实际为 1、2、3、4、6')));
         await assertAllValid(result.files);
     });
@@ -397,9 +431,12 @@ describe('patent profile：附图、表格与公式', () => {
         ];
         const result = await renderPatent(children, { assets: [asset('images/image_1.jpg'), asset('images/image_2.png', PNG, 'image/png'), asset('images/image_3.jpg', JPG_TALL)] });
         const drawings = $of(result.files['drawings.xml']);
-        assert.deepEqual(drawings('figure').toArray().map((node) => [node.attribs.num, node.attribs['figure-labels'] || null]), [['2', null], ['3', null], ['5', '装置示意图']]);
+        assert.deepEqual(drawings('figure').toArray().map((node) => [node.attribs.num, node.attribs['figure-labels']]),
+            [['0002', '图2'], ['0003', '图3'], ['0005', '图5：装置示意图']], '图注取原稿图号段文本，缺图号段时回退为「图N」');
         assert.deepEqual(drawings('img').toArray().map((node) => [node.attribs.file, node.attribs['img-format'], node.attribs.wi, node.attribs.he]),
-            [['drawing-1.jpg', 'jpg', '51', '25'], ['drawing-2.png', 'jpg', '1', '1'], ['drawing-3.jpg', 'jpg', '25', '51']]);
+            [['drawing-1.jpg', 'jpg', '50', '25'], ['drawing-2.png', 'jpg', '1', '1'], ['drawing-3.jpg', 'jpg', '25', '50']], '毫米向下取整');
+        assert.deepEqual(drawings('img').toArray().map((node) => [node.attribs.id, node.attribs.orientation, node.attribs.inline]),
+            [['if0001', 'portrait', 'yes'], ['if0002', 'portrait', 'yes'], ['if0003', 'portrait', 'yes']], '缺图的编号不占用 img 序号');
         assert.ok(codesOf(result).includes(ISSUE_CODES.FIGURE_NUMBER_GAP));
         assert.ok(codesOf(result).includes(ISSUE_CODES.FIGURE_MISSING_ASSET));
         assert.ok(result.warnings.includes('预检：图片 images/image_2.png 为 png 格式，官方只受理 JPG/TIF'));
@@ -408,7 +445,7 @@ describe('patent profile：附图、表格与公式', () => {
         await assertAllValid(result.files);
     });
 
-    test('说明书正文枚举式图号引用逐个生成 figref（顿号、和/与、区间按数字展开），权项内不生成', async () => {
+    test('说明书正文的图号引用一律保留纯文本，不生成 figref', async () => {
         const children = [
             h(2, '权利要求书'), p('1. 一种装置，如图1、2所示。'),
             h(2, '说明书'), h(1, '附图说明'),
@@ -419,19 +456,15 @@ describe('patent profile：附图、表格与公式', () => {
         assert.equal($of(result.files['claims.xml'])('figref').length, 0);
         const xml = result.files['description.xml'];
         const desc = $of(xml);
+        assert.equal(desc('figref').length, 0);
+        assert.equal(xml.includes('<figref'), false, 'description.xml 内不出现 figref 元素');
         const first = desc('description > p').first();
-        assert.deepEqual(first.find('figref').toArray().map((node) => node.attribs.num),
-            ['4', '5', '3', '4', '5', '4', '5', '4', '5', '4', '5', '6', '4', '5', '6', '4', '5', '6', '7']);
-        assert.ok(xml.includes('如<figref num="4">图4</figref>、<figref num="5">5</figref>所示'), xml);
-        assert.ok(xml.includes('<figref num="4">图4</figref>-<figref num="5"/><figref num="6">6</figref>'), xml);
-        assert.ok(xml.includes('<figref num="4">图4</figref>至<figref num="5"/><figref num="6">6</figref>'), xml);
         assert.equal(first.text(), '如图4、5所示，图3、4、5，图4和5，图4与5，图4-6，图4～6，图4至6，图7。', '正文原样保留');
-        const second = desc('description > p').eq(1);
-        assert.deepEqual(second.find('figref').toArray().map((node) => [node.attribs.num, textOf(node)]), [['8', '图 8'], ['6', '图6'], ['4', '4']]);
+        assert.equal(desc('description > p').eq(1).text(), '图 8 与图9a无关，图6-4为倒序。');
         await assertAllValid(result.files);
     });
 
-    test('栅格化产物：role=table → tables 独立成段，role=formula → maths（行内 inline="yes"，独立段 inline="no"）', async () => {
+    test('栅格化产物：role=table → tables 独立成段，role=formula → maths；正文内的图一律 inline="no"、id 前缀 idf、@num 四位补零', async () => {
         const children = [
             h(2, '说明书'), h(1, '技术领域'),
             createParagraph([createText('承压按 '), image('images/omath-2-1.jpg', { role: 'formula', inline: true }), createText(' 计算。')]),
@@ -440,12 +473,15 @@ describe('patent profile：附图、表格与公式', () => {
         ];
         const result = await renderPatent(children, { assets: [asset('images/omath-2-1.jpg'), asset('images/omath-3-1.jpg'), asset('images/table-1.jpg')] });
         const xml = result.files['description.xml'];
-        assert.ok(xml.includes('<p id="p0001" num="0001" Italic="0">承压按 <maths id="math0001" num="1"><img id="i0001" he="25" wi="51" file="omath-2-1.jpg" img-format="jpg" img-content="drawing" inline="yes"/></maths> 计算。</p>'), xml);
+        assert.ok(xml.includes('<p id="p0001" num="0001" Italic="0">承压按 <maths id="math0001" num="0001">'
+            + '<img id="idf0001" file="omath-2-1.jpg" wi="50" he="25" top="0" left="0" img-content="drawing" img-format="jpg" orientation="portrait" inline="no"/>'
+            + '</maths> 计算。</p>'), xml);
         const desc = $of(xml);
-        assert.equal(desc('description > p').eq(1).find('maths > img').attr('inline'), 'no');
-        assert.equal(desc('description > p').eq(1).find('maths').attr('id'), 'math0002');
-        assert.deepEqual(desc('description > p').eq(2).find('tables').attr(), { id: 'tabl0001', num: '1' });
+        assert.equal(desc('description > p').eq(1).find('maths > img').attr('inline'), 'no', '段内公式官方同样写 inline="no"');
+        assert.deepEqual(desc('description > p').eq(1).find('maths').attr(), { id: 'math0002', num: '0002' });
+        assert.deepEqual(desc('description > p').eq(2).find('tables').attr(), { id: 'tabl0001', num: '0001' });
         assert.equal(desc('tables > img').attr('file'), 'table-1.jpg');
+        assert.deepEqual(desc('img').toArray().map((node) => node.attribs.id), ['idf0001', 'idf0002', 'idf0003'], '正文内的图独立编号');
         assert.deepEqual(result.assets.map((item) => item.name), ['omath-2-1.jpg', 'omath-3-1.jpg', 'table-1.jpg']);
         assert.ok(!codesOf(result).includes(ISSUE_CODES.RASTER_UNAVAILABLE));
         await assertAllValid(result.files);
@@ -465,6 +501,135 @@ describe('patent profile：附图、表格与公式', () => {
         assert.equal(raster.length, 3);
         assert.ok(raster.every((issue) => issue.message.startsWith('栅格化：')));
         assert.ok(result.warnings.includes('栅格化：表格未栅格化（栅格化后端不可用或已关闭），已降级为 2 行文本'));
+        await assertAllValid(result.files);
+    });
+});
+
+// ============================================================
+// 官方「WORD 转 XML 编辑器」真实产出的逐项对齐
+// ============================================================
+
+describe('patent profile：官方产出一致性', () => {
+    // 与官方样例同形的稿件：说明书正文含公式与表格，附图 2 幅，另有摘要与摘要附图
+    function conformanceDoc({ display = false } = {}) {
+        const dims = (wi, he) => (display ? { displayWidthMm: wi, displayHeightMm: he } : {});
+        return [
+            h(2, '权利要求书'),
+            p('1. 一种测试装置，其特征在于，包括壳体。'),
+            p('2. 根据权利要求1所述的测试装置，其特征在于，所述壳体为筒状。'),
+            h(2, '说明书'),
+            h(1, '技术领域'),
+            createParagraph([createText('如图1所示，承压按 '), image('images/omath-1.jpg', { role: 'formula', inline: true, ...dims(23.7, 8.9) }), createText(' 计算。')]),
+            imgP('images/table-1.jpg', { role: 'table', ...dims(120.9, 60.2) }),
+            h(2, '说明书附图'),
+            imgP('images/image_1.jpg', dims(146.5, 72.2)), p('图1'),
+            imgP('images/image_2.jpg', dims(150.1, 182.6)), p('图2'),
+            h(2, '说明书摘要'), p('本发明公开了一种测试装置。'),
+            h(2, '摘要附图'), imgP('images/image_3.jpg', dims(146.5, 71.8)),
+        ];
+    }
+    const conformanceAssets = () => [
+        asset('images/omath-1.jpg'), asset('images/table-1.jpg'),
+        asset('images/image_1.jpg'), asset('images/image_2.jpg', JPG_TALL), asset('images/image_3.jpg'),
+    ];
+
+    test('img 的 wi/he 取 IR 的源 Word 显示尺寸并向下取整（第 1、2 项契约）', async () => {
+        // Arrange & Act
+        const result = await renderPatent(conformanceDoc({ display: true }), { assets: conformanceAssets() });
+
+        // Assert：三个部分各取各自节点上的毫米值，一律截尾而非四舍五入
+        assert.deepEqual($of(result.files['drawings.xml'])('img').toArray().map((node) => [node.attribs.wi, node.attribs.he]),
+            [['146', '72'], ['150', '182']]);
+        assert.deepEqual($of(result.files['abstract-figure.xml'])('img').toArray().map((node) => [node.attribs.wi, node.attribs.he]),
+            [['146', '71']]);
+        assert.deepEqual($of(result.files['description.xml'])('img').toArray().map((node) => [node.attribs.wi, node.attribs.he]),
+            [['23', '8'], ['120', '60']]);
+        await assertAllValid(result.files);
+    });
+
+    test('显示尺寸缺失时回退为像素 ÷ 密度换算，取整同样向下（非 docx 来源）', async () => {
+        // JPG_WIDE 为 600×300 @300dpi：600×25.4/300 = 50.8 → 50；300×25.4/300 = 25.4 → 25
+        const result = await renderPatent(conformanceDoc({ display: false }), { assets: conformanceAssets() });
+        assert.deepEqual($of(result.files['drawings.xml'])('img').toArray().map((node) => [node.attribs.wi, node.attribs.he]),
+            [['50', '25'], ['25', '50']]);
+        assert.deepEqual($of(result.files['description.xml'])('img').toArray().map((node) => [node.attribs.wi, node.attribs.he]),
+            [['50', '25'], ['50', '25']]);
+    });
+
+    test('img/@id 前缀按用途分 if / iaf / idf 三种，各自独立四位编号（第 6 项）', async () => {
+        const result = await renderPatent(conformanceDoc({ display: true }), { assets: conformanceAssets() });
+        assert.deepEqual($of(result.files['drawings.xml'])('img').toArray().map((node) => node.attribs.id), ['if0001', 'if0002']);
+        assert.deepEqual($of(result.files['abstract-figure.xml'])('img').toArray().map((node) => node.attribs.id), ['iaf0001']);
+        assert.deepEqual($of(result.files['description.xml'])('img').toArray().map((node) => node.attribs.id), ['idf0001', 'idf0002']);
+    });
+
+    test('figure / maths / tables 的 @num 一律四位补零，figure-labels 承载图注（第 3、4、5 项）', async () => {
+        const result = await renderPatent(conformanceDoc({ display: true }), { assets: conformanceAssets() });
+        const drawings = $of(result.files['drawings.xml']);
+        assert.deepEqual(drawings('figure').toArray().map((node) => [node.attribs.num, node.attribs['figure-labels']]),
+            [['0001', '图1'], ['0002', '图2']]);
+        assert.equal(drawings('cn-drawing-p').length, 0);
+        const desc = $of(result.files['description.xml']);
+        assert.deepEqual(desc('maths').toArray().map((node) => [node.attribs.id, node.attribs.num]), [['math0001', '0001']]);
+        assert.deepEqual(desc('tables').toArray().map((node) => [node.attribs.id, node.attribs.num]), [['tabl0001', '0001']]);
+        assert.equal($of(result.files['abstract-figure.xml'])('figure').attr('num'), '0001');
+    });
+
+    test('img 的 top/left/orientation/inline 与属性顺序逐字对齐官方（第 7、8、9 项）', async () => {
+        const result = await renderPatent(conformanceDoc({ display: true }), { assets: conformanceAssets() });
+        assert.ok(result.files['drawings.xml'].includes(
+            '<img id="if0001" file="drawing-1.jpg" wi="146" he="72" top="0" left="0" img-content="drawing" img-format="jpg" orientation="portrait" inline="yes"/>'),
+        result.files['drawings.xml']);
+        assert.ok(result.files['abstract-figure.xml'].includes(
+            '<img id="iaf0001" file="drawing-3.jpg" wi="146" he="71" top="0" left="0" img-content="drawing" img-format="jpg" orientation="portrait" inline="yes"/>'),
+        result.files['abstract-figure.xml']);
+        assert.ok(result.files['description.xml'].includes(
+            '<img id="idf0001" file="omath-1.jpg" wi="23" he="8" top="0" left="0" img-content="drawing" img-format="jpg" orientation="portrait" inline="no"/>'),
+        result.files['description.xml']);
+        // 竖图（150×182）与横图的 orientation 同为 portrait，不再按宽高比判定
+        assert.deepEqual($of(result.files['drawings.xml'])('img').toArray().map((node) => node.attribs.orientation), ['portrait', 'portrait']);
+    });
+
+    test('claim-ref 与 figref 一律不生成，引用与图号保留为纯文本（第 10、11 项）', async () => {
+        const result = await renderPatent(conformanceDoc({ display: true }), { assets: conformanceAssets() });
+        for (const name of XML_FILES) {
+            assert.equal(result.files[name].includes('<claim-ref'), false, `${name} 不应含 claim-ref`);
+            assert.equal(result.files[name].includes('<figref'), false, `${name} 不应含 figref`);
+        }
+        assert.equal($of(result.files['claims.xml'])('claim').eq(1).find('claim-text').text(),
+            '根据权利要求1所述的测试装置，其特征在于，所述壳体为筒状。');
+        assert.match($of(result.files['description.xml'])('description > p').first().text(), /^如图1所示，承压按/);
+    });
+
+    test('五份产物均带 UTF-8 BOM 且 DOCTYPE 带空内部子集（第 12、13 项）；generic profile 不受影响', async () => {
+        const result = await renderPatent(conformanceDoc({ display: true }), { assets: conformanceAssets() });
+        for (const name of XML_FILES) {
+            assert.deepEqual(Buffer.from(result.files[name], 'utf8').subarray(0, 3), BOM_BYTES, name);
+            assert.equal(result.files[name].split('\n')[1],
+                '<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd"[]>', name);
+        }
+        await assertAllValid(result.files);
+
+        const doc = createDocument({ ir: createRoot([h(1, '标题'), p('正文。')]), meta: { title: 'T' }, assets: [] });
+        const generic = await xmlRenderer.render(doc, normalizeOptions({ xml: { profile: 'generic' } }));
+        const genericXml = generic.files['{name}.xml'];
+        assert.equal(genericXml.startsWith('\ufeff'), false, 'generic profile 不加 BOM');
+        assert.equal(genericXml.includes('<!DOCTYPE'), false, 'generic profile 不写 DOCTYPE');
+    });
+
+    test('附图部分的杂散文字无处安放：丢弃并记「附图：」问题项', async () => {
+        const children = [
+            h(2, '说明书附图'),
+            p('本申请的附图说明如下，仅为示例。'),
+            imgP('images/image_1.jpg'), p('图1'),
+        ];
+        const result = await renderPatent(children, { assets: [asset('images/image_1.jpg')] });
+        const drawings = $of(result.files['drawings.xml']);
+        assert.deepEqual(drawings('cn-drawings').children().toArray().map((node) => node.name), ['figure']);
+        assert.equal(drawings('figure').attr('figure-labels'), '图1');
+        assert.ok(codesOf(result).includes(ISSUE_CODES.FIGURE_TEXT_DROPPED));
+        assert.ok(result.warnings.includes('附图：附图部分的文字“本申请的附图说明如下，仅为示例。”不是图号段，官方 cn-drawings 只容纳 figure，已丢弃'),
+            JSON.stringify(result.warnings));
         await assertAllValid(result.files);
     });
 });
@@ -582,12 +747,12 @@ describe('patent profile：parts、预检、zip 与落盘', () => {
             if (!checked.available) return;
             assert.equal(checked.valid, true, name);
         }
-        // 悬空 idref 由 claim-ref 容错避免；此处直接校验一份坏文件确认错误文案进入 warnings 通道
+        // 官方产出不含 claim-ref，悬空 idref 已不可能出现；改以重复 id 构造一份坏文件，确认错误文案进入 warnings 通道
         const { describeValidation } = require('../converters/renderers/xml/validate');
-        const bad = await validateXml(result.files['claims.xml'].replace('idref="cl001"', 'idref="cl009"'));
+        const bad = await validateXml(result.files['claims.xml'].replace('id="cl002"', 'id="cl001"'));
         const issues = describeValidation('claims.xml', bad);
         assert.equal(issues.length, 1);
-        assert.match(issues[0].message, /^DTD 校验：DTD 校验失败（claims\.xml 第 \d+ 行）：IDREFS attribute idref references an unknown ID "cl009"/);
+        assert.match(issues[0].message, /^DTD 校验：DTD 校验失败（claims\.xml 第 \d+ 行）：ID cl001 already defined/);
     });
 });
 
@@ -619,19 +784,20 @@ describe('patent profile：夹具 docx 端到端', () => {
         assert.ok(report.validation.files.every((item) => item.valid));
     });
 
-    test('sample-patent-notitle.docx：位置推定四书、发明名称回退、坏引用容错，DTD 通过', async () => {
+    test('sample-patent-notitle.docx：位置推定四书、发明名称回退、权项引用保留纯文本，DTD 通过', async () => {
         const res = await convert({ input: { path: path.join(FIXTURES, 'patent', 'sample-patent-notitle.docx') }, target: 'xml', outputDir: tmpDir, options });
 
         assert.equal(res.ok, true);
         assert.deepEqual(Object.keys(res.outputs).sort(), ['abstract', 'claims', 'description', 'drawings', 'precheck', 'zip'].sort());
         assert.deepEqual(res.warnings.filter((item) => item.startsWith('DTD 校验：')), []);
         assert.ok(res.warnings.includes('发明名称：未找到发明名称段，已从权利要求 1 推定为“一种液体容器”'));
-        assert.ok(res.warnings.includes('权项：权利要求 3 的引用“12-3”无法解析（起点大于终点），已保留原文、未生成 claim-ref'));
+        assert.ok(!res.warnings.some((item) => item.includes('claim-ref')), '不再产生权项引用问题项');
         assert.ok(res.warnings.some((item) => /^分节：未发现书目标题，按位置推定：说明书摘要=第 1 段；权利要求书=第 \d+–\d+ 段；说明书=第 \d+–\d+ 段；说明书附图=第 \d+ 段起$/.test(item)), JSON.stringify(res.warnings));
         assert.equal(res.title, '一种液体容器');
         const claims = $of(fs.readFileSync(res.outputs.claims, 'utf8'));
         assert.equal(claims('claim').length, 4);
         assert.equal(claims('claim').eq(0).find('claim-text').length, 3);
-        assert.equal(claims('claim').eq(3).find('claim-ref').attr('idref'), 'cl001 cl002 cl003');
+        assert.equal(claims('claim-ref').length, 0, '官方不生成 claim-ref');
+        assert.ok(claims('claim').eq(3).find('claim-text').text().includes('权利要求1-3'));
     });
 });

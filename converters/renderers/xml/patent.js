@@ -8,11 +8,16 @@
  *   title：发明名称文本，调度器据此覆盖结果信封的 title；
  *   assets：图片一律改为裸文件名平铺在 {name}/ 根下（FILE_REF_STYLE 'bare'，官方案卷包内 XML 与图片同目录、
  *          无任何子目录，见研究报告 §4.4），故 omitDocAssets 为 true，调度器不再合并 doc.assets。
- * 元素与属性约定见研究报告 §5.1：文件头三行 + <cn-application-body lang="zh" country="CN">；
- *   heading id="h0001" level="2"；p id="p0001" num="0001" Italic="0"；临时段 id="l0001" num="XXXX"；
- *   claim id="cl001" num="1"；figure f0001 / img i0001 / tables tabl0001 / maths math0001；
- *   img 的 wi/he 为毫米、file 为裸文件名、img-format="jpg"、img-content="drawing"、inline="no"|"yes"；
- *   figref 只写 @num；容器元素不写 id；不用 technical-field 等语义分节元素，统一 (heading*, p+)+。
+ * 元素与属性约定以官方「WORD 转 XML 编辑器」的真实产出为准：UTF-8 BOM + 文件头三行（DOCTYPE 带空内部
+ *   子集 []）+ <cn-application-body lang="zh" country="CN">；heading id="h0001" level="2"；
+ *   p id="p0001" num="0001" Italic="0"；临时段 id="l0001" num="XXXX"；claim id="cl001" num="1"；
+ *   figure id="f0001" num="0001" figure-labels="图1"（官方不产出 cn-drawing-p，图注即该属性）；
+ *   tables tabl0001 / maths math0001 / chemistry chem0001 的 @num 一律四位补零；
+ *   img 属性顺序为 id file wi he top left img-content img-format orientation inline，其中 wi/he 为毫米
+ *   （向下取整）、file 为裸文件名、top/left 恒 "0"、orientation 恒 "portrait"、说明书附图与摘要附图
+ *   inline="yes" 而说明书正文内的图 inline="no"，id 前缀按用途分 if / iaf / idf 三种并各自独立编号；
+ *   官方不生成 claim-ref 与 figref，权项引用与正文图号一律保留为纯文本；
+ *   容器元素不写 id；不用 technical-field 等语义分节元素，统一 (heading*, p+)+。
  * 表格 / 公式：栅格化后的 image 节点（data.role 'table' | 'formula'）→ <tables>/<maths> 内仅含 img；
  *   仍为 table / math 节点的（栅格化未就绪或已关闭）降级为逐行文本 / 线性化文本并记「栅格化：」问题项。
  * options.xml.validate 为 true 时逐份调 validateXml，错误以「DTD 校验：」问题项进 warnings 与 precheck.json。
@@ -21,13 +26,13 @@ const JSZip = require('jszip');
 const { el, serializeDocument } = require('./builder');
 const { flattenBlocks } = require('./blocks');
 const { detectSections, BOOK_KEYS } = require('./sections');
-const { buildClaims, resolveClaimRefs } = require('./claims');
-const { buildFigures, buildImg, assetNameOf, expandFigrefs, FIGREF_RE } = require('./figures');
+const { buildClaims } = require('./claims');
+const { buildFigures, buildImg, assetNameOf } = require('./figures');
 const { createIdFactory, createParagraphNumbering, createTempNumbering, stripParagraphNumber, padNumber } = require('./numbering');
 const { createAssetRegistry } = require('./assets');
 const { precheck, createIssue, ISSUE_CODES, LEVELS } = require('./precheck');
 const { validateXml, describeValidation } = require('./validate');
-const { emitRuns, isWholeMark, withoutMark, splitText, textRun } = require('./inline');
+const { emitRuns, isWholeMark, withoutMark, textRun } = require('./inline');
 const { mathToText } = require('../../ir/schema');
 
 const FILE_NAMES = Object.freeze({
@@ -36,13 +41,19 @@ const FILE_NAMES = Object.freeze({
 });
 const FILE_REF_STYLE = 'bare';
 const ELEMENT_NAMES = Object.freeze({
-    root: 'cn-application-body', claims: 'cn-claims', claim: 'claim', claimText: 'claim-text', claimRef: 'claim-ref',
+    root: 'cn-application-body', claims: 'cn-claims', claim: 'claim', claimText: 'claim-text',
     description: 'description', inventionTitle: 'invention-title', heading: 'heading', paragraph: 'p', lineBreak: 'br',
-    drawings: 'cn-drawings', drawingParagraph: 'cn-drawing-p', figure: 'figure', img: 'img', figref: 'figref',
+    drawings: 'cn-drawings', figure: 'figure', img: 'img',
     abstract: 'cn-abstract', abstractFigure: 'cn-abst-figure', tables: 'tables', maths: 'maths', chemistry: 'chemistry',
 });
-const ID_PREFIXES = Object.freeze({ heading: 'h', figure: 'f', img: 'i', tables: 'tabl', maths: 'math', chemistry: 'chem', claim: 'cl' });
-const DOCTYPE = Object.freeze({ name: ELEMENT_NAMES.root, systemId: '/dtdandxsl/cn-application-body-20080416.dtd' });
+// img 的 id 前缀按用途分三种：说明书附图 if、摘要附图 iaf、说明书正文内（公式、表格、段内图）idf
+const ID_PREFIXES = Object.freeze({
+    heading: 'h', figure: 'f', drawingImg: 'if', abstractImg: 'iaf', bodyImg: 'idf',
+    tables: 'tabl', maths: 'math', chemistry: 'chem', claim: 'cl',
+});
+// 官方 DOCTYPE 带空内部子集；BOM 为官方产出的文件头首三字节
+const DOCTYPE = Object.freeze({ name: ELEMENT_NAMES.root, systemId: '/dtdandxsl/cn-application-body-20080416.dtd', internalSubset: '' });
+const BOM = '\ufeff';
 const STYLESHEET = Object.freeze({ target: 'xml-stylesheet', data: 'type="text/xsl" href="/dtdandxsl/showxml.xsl"' });
 const ROOT_ATTRS = Object.freeze({ lang: 'zh', country: 'CN' });
 const PART_BY_OPTION = Object.freeze({ claims: 'claims', description: 'description', drawings: 'drawings', abstract: 'abstract', 'abstract-figure': 'abstractFigure' });
@@ -51,6 +62,7 @@ const PRECHECK_FILE = 'precheck.json';
 const NAME_TOKEN = '{name}';
 const HEADING_LEVEL = '2';
 const CLAIM_ID_WIDTH = 3;
+const NUM_WIDTH = 4;
 const VALIDATION_ENGINE = 'libxml2-wasm';
 const CELL_SEPARATOR = ' | ';
 const FORMULA_PREVIEW = 30;
@@ -111,7 +123,7 @@ function createFileContext({ options, registry, issues }) {
 
 function wrapDocument(bookNode, options) {
     const root = el(ELEMENT_NAMES.root, ROOT_ATTRS, [bookNode]);
-    return serializeDocument({ root, doctype: DOCTYPE, instructions: [STYLESHEET], indent: options.xml.indent });
+    return BOM + serializeDocument({ root, doctype: DOCTYPE, instructions: [STYLESHEET], indent: options.xml.indent });
 }
 
 function selectParts(emitted, parts, issues) {
@@ -135,19 +147,18 @@ function emitClaims(blocks, ctx) {
         preface = [];
     }
     if (claims.length === 0) return null;
-    const idByNum = new Map(claims.map((claim) => [claim.num, claim.id]));
-    const children = preface.flatMap((block) => emitBlock(block, ctx, { numbering: ctx.temp, stripNumbers: false, figrefs: false }));
+    const children = preface.flatMap((block) => emitBlock(block, ctx, { numbering: ctx.temp, stripNumbers: false }));
     for (const claim of claims) {
-        const texts = claim.parts.flatMap((part) => emitClaimPart(part, claim, idByNum, ctx));
+        const texts = claim.parts.flatMap((part) => emitClaimPart(part, ctx));
         children.push(el(ELEMENT_NAMES.claim, { id: claim.id, num: String(claim.num) }, texts.length > 0 ? texts : [el(ELEMENT_NAMES.claimText)]));
     }
     return el(ELEMENT_NAMES.claims, {}, children);
 }
 
-function emitClaimPart(part, claim, idByNum, ctx) {
+// 官方不生成 claim-ref：「根据权利要求1所述的…」原样留在 claim-text 内
+function emitClaimPart(part, ctx) {
     if (part.runs) {
-        const runs = resolveClaimRefs(part.runs, { claimNum: claim.num, idByNum, issues: ctx.issues, el });
-        const kids = emitInline(runs, ctx);
+        const kids = emitInline(part.runs, ctx);
         return kids.length > 0 ? [el(ELEMENT_NAMES.claimText, {}, kids)] : [];
     }
     return degradedRuns(part.block, ctx).map((runs) => el(ELEMENT_NAMES.claimText, {}, emitInline(runs, ctx))).filter((node) => node.children.length > 0);
@@ -163,7 +174,7 @@ function emitDescription(blocks, ctx, inventionTitle) {
             children.push(el(ELEMENT_NAMES.heading, { id: ctx.ids.next(ID_PREFIXES.heading).id, level: HEADING_LEVEL }, [block.headingText || block.text]));
             continue;
         }
-        children.push(...emitBlock(block, ctx, { numbering, stripNumbers: true, figrefs: true }));
+        children.push(...emitBlock(block, ctx, { numbering, stripNumbers: true }));
     }
     return children.some((node) => node.name === ELEMENT_NAMES.paragraph) ? el(ELEMENT_NAMES.description, {}, children) : null;
 }
@@ -173,13 +184,13 @@ function emitDescription(blocks, ctx, inventionTitle) {
 // 摘要内的图片段已由分节模块移入摘要附图；此处只剩文本段（段号独立从 1 计，预览不显示）
 function emitAbstract(blocks, ctx) {
     const numbering = createParagraphNumbering({ width: ctx.numbering.width, issues: ctx.issues });
-    const children = blocks.flatMap((block) => emitBlock(block, ctx, { numbering, stripNumbers: true, figrefs: false }));
+    const children = blocks.flatMap((block) => emitBlock(block, ctx, { numbering, stripNumbers: true }));
     return children.length > 0 ? el(ELEMENT_NAMES.abstract, {}, children) : null;
 }
 
 function emitAbstractFigure(blocks, ctx) {
     if (blocks.length === 0) return null;
-    const { children, count } = buildFigures(blocks, { ...ctx, labels: false, allowCaption: false });
+    const { children, count } = buildFigures(blocks, { ...ctx, labels: false, allowCaption: false, imgPrefix: ID_PREFIXES.abstractImg });
     if (count === 0) return null;
     if (count > 1) ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_ABSTRACT_MULTIPLE, `摘要附图有 ${count} 幅，官方要求不超过 1 幅`));
     ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_ABSTRACT_DEPRECATED, '已生成摘要附图；官方提示摘要附图不再单独接收，建议提交前删除'));
@@ -190,7 +201,7 @@ function emitAbstractFigure(blocks, ctx) {
 
 function emitDrawings(blocks, ctx) {
     if (blocks.length === 0) return null;
-    const { children, count } = buildFigures(blocks, { ...ctx, labels: true, allowCaption: true });
+    const { children, count } = buildFigures(blocks, { ...ctx, labels: true, allowCaption: true, imgPrefix: ID_PREFIXES.drawingImg });
     return count > 0 ? el(ELEMENT_NAMES.drawings, {}, children) : null;
 }
 
@@ -208,10 +219,10 @@ function emitBlock(block, ctx, settings) {
         block.images.forEach((image) => ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_INLINE_IMAGE,
             `正文含图片 ${assetNameOf(image) || '（无地址）'}，已作为段内图片输出；附图请置于说明书附图部分`)));
         const runs = block.images.map((image) => ({ kind: 'image', node: image }));
-        const node = emitParagraph(runs, ctx, { ...settings, stripNumbers: false, figrefs: false });
+        const node = emitParagraph(runs, ctx, { ...settings, stripNumbers: false });
         return node ? [node] : [];
     }
-    return degradedRuns(block, ctx).map((runs) => emitParagraph(runs, ctx, { ...settings, figrefs: false })).filter(Boolean);
+    return degradedRuns(block, ctx).map((runs) => emitParagraph(runs, ctx, settings)).filter(Boolean);
 }
 
 // 未栅格化的表格 / 块级公式 → 文本 runs（每行一段）
@@ -229,7 +240,8 @@ function degradedRuns(block, ctx) {
     return [];
 }
 
-function emitParagraph(inputRuns, ctx, { numbering, stripNumbers, figrefs }) {
+// 官方不生成 figref：正文「如图4所示」原样保留为文本
+function emitParagraph(inputRuns, ctx, { numbering, stripNumbers }) {
     let runs = inputRuns;
     const italic = isWholeMark(runs, 'i');
     if (italic) runs = withoutMark(runs, 'i');
@@ -239,7 +251,6 @@ function emitParagraph(inputRuns, ctx, { numbering, stripNumbers, figrefs }) {
         explicit = stripped.number;
         runs = stripped.runs;
     }
-    if (figrefs) runs = splitText(runs, FIGREF_RE, (match) => expandFigrefs(match[0], el));
     const children = emitInline(runs, ctx);
     if (children.length === 0) return null;
     const { id, num } = numbering.next(explicit);
@@ -253,7 +264,8 @@ function emitInline(runs, ctx) {
     });
 }
 
-// 栅格化产物按角色包成 tables / maths（仅含 img）；其余图片为段内 img
+// 栅格化产物按角色包成 tables / maths（仅含 img）；其余图片为段内 img。
+// 说明书正文内的图（含行内公式）官方一律写 inline="no"，id 前缀为 idf。
 function emitImage(node, ctx) {
     const role = node.data && node.data.role;
     const resolved = ctx.assets.use(assetNameOf(node), { kind: 'inline' });
@@ -261,15 +273,16 @@ function emitImage(node, ctx) {
         ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_MISSING_ASSET, `图片 ${assetNameOf(node) || '（无地址）'} 没有本地文件，已略过`));
         return null;
     }
+    const img = buildImg(ctx, { ...resolved, node, prefix: ID_PREFIXES.bodyImg, inline: false });
     if (role === 'table') {
         const seq = ctx.ids.next(ID_PREFIXES.tables);
-        return el(ELEMENT_NAMES.tables, { id: seq.id, num: String(seq.index) }, [buildImg(ctx, { ...resolved, inline: false })]);
+        return el(ELEMENT_NAMES.tables, { id: seq.id, num: padNumber(seq.index, NUM_WIDTH) }, [img]);
     }
     if (role === 'formula') {
         const seq = ctx.ids.next(ID_PREFIXES.maths);
-        return el(ELEMENT_NAMES.maths, { id: seq.id, num: String(seq.index) }, [buildImg(ctx, { ...resolved, inline: Boolean(node.data.inline) })]);
+        return el(ELEMENT_NAMES.maths, { id: seq.id, num: padNumber(seq.index, NUM_WIDTH) }, [img]);
     }
-    return buildImg(ctx, { ...resolved, inline: false });
+    return img;
 }
 
 function degradeInlineMath(node, ctx) {

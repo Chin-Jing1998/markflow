@@ -122,7 +122,9 @@ function writeInline(children, out) {
 
 /**
  * 完整文档：XML 声明 + 可选 DOCTYPE（SYSTEM 标识）+ 可选处理指令 + 根元素，各占一行，末尾换行。
- * @param {{ root: object, doctype?: { name: string, systemId: string } | null,
+ * doctype.internalSubset 为字符串时在系统标识符之后写出内部子集方括号（空串即 `[]`，官方
+ * WORD 转 XML 编辑器的产出即此形态）；该字段缺省或非字符串时不写方括号。
+ * @param {{ root: object, doctype?: { name: string, systemId: string, internalSubset?: string } | null,
  *           instructions?: Array<{ target: string, data: string }>, indent?: number }} params
  */
 function serializeDocument({ root, doctype = null, instructions = [], indent = DEFAULT_INDENT } = {}) {
@@ -130,7 +132,8 @@ function serializeDocument({ root, doctype = null, instructions = [], indent = D
     const lines = [XML_DECLARATION];
     if (doctype) {
         assertName(doctype.name, '文档类型');
-        lines.push(`<!DOCTYPE ${doctype.name} SYSTEM "${escapeAttr(cleanText(doctype.systemId))}">`);
+        const subset = typeof doctype.internalSubset === 'string' ? `[${cleanText(doctype.internalSubset)}]` : '';
+        lines.push(`<!DOCTYPE ${doctype.name} SYSTEM "${escapeAttr(cleanText(doctype.systemId))}"${subset}>`);
     }
     for (const pi of instructions) {
         assertName(pi.target, '处理指令');
