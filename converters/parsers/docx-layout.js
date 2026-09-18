@@ -16,14 +16,20 @@
  *     style（pt / in / cm / mm / px / pc → px 与 mm 各算一份）。
  *     标记随 alt 回到 parsers/docx 的 convertImage，据此把尺寸对到资产名上，与图片出现顺序无关
  *     （实测样稿 wp:extent 16 个而 a:blip 14 个，按顺序配对必然错位）
+ *   - 化学式：起始位置落在 docx-chemistry 给出的化学区间（OLE ProgID 与 EMBED 域代码两条判据）内的图片，
+ *     其序号记入 roles，值为 'chemistry'；另两条判据（替换文字、EMF 字节）由 parsers/docx 的 convertImage 判定
  *
  * 像素与毫米两套并存且互不换算：px 供既有的版面还原（data.display，按 96 DPI 定义、取整）；
  * mm 是 Word 中的物理显示尺寸（浮点、不取整），供 patent profile 按官方规则在 300 DPI 下重采样
  * 附图与写 img/@wi、@he。由 px 反推 mm 会先丢一次精度，故两者各自从 EMU / CSS 长度直接算出。
  *
  * 契约：
- *   prepareLayout(docxBuffer) → { buffer, displays: Map<k, { width, height?, floating, widthMm?, heightMm? }> }
- *     无 document.xml 或无任何改写时原样返回入参 buffer；mm 两项取不到即整条省略
+ *   prepareLayout(docxBuffer) → {
+ *     buffer,
+ *     displays: Map<k, { width, height?, floating, widthMm?, heightMm? }>,
+ *     roles: Map<k, 'chemistry'>,
+ *   }
+ *     无 document.xml 或无任何改写时原样返回入参 buffer；mm 两项取不到即整条省略；roles 只记命中的序号
  *   parseImageMarker(alt) → { index: number | null, alt }：取出序号并还原原 alt
  * 说明：document.xml 与 styles.xml 属不可信文档内容，本模块只做字符串定位与替换，不执行其中任何指令。
  */
@@ -31,6 +37,7 @@ const JSZip = require('jszip');
 const cheerio = require('cheerio');
 const { MARKERS, indentMarker } = require('../ir/markers');
 const { findBlocks, findCloseTag, readTag } = require('./docx-math');
+const { CHEMISTRY_ROLE, collectChemistryRanges, inChemistryRange } = require('./docx-chemistry');
 
 const DOCUMENT_PART = 'word/document.xml';
 const STYLES_PART = 'word/styles.xml';
@@ -60,23 +67,30 @@ const MATH_SENTINEL_RE = /MFMATH\d+/g;
 async function prepareLayout(docxBuffer) {
     const zip = await JSZip.loadAsync(docxBuffer);
     const entry = zip.file(DOCUMENT_PART);
-    if (!entry) return { buffer: docxBuffer, displays: new Map() };
+    if (!entry) return { buffer: docxBuffer, displays: new Map(), roles: new Map() };
     const xml = await entry.async('string');
     const stylesEntry = zip.file(STYLES_PART);
     const styles = readStyles(stylesEntry ? await stylesEntry.async('string') : '');
 
     const edits = [];
     const displays = new Map();
+    const roles = new Map();
     const counter = { next: 0 };
-    collectDrawingEdits(xml, edits, displays, counter);
-    collectVmlEdits(xml, edits, displays, counter);
+    const chem = { ranges: collectChemistryRanges(xml), roles };
+    collectDrawingEdits(xml, edits, displays, counter, chem);
+    collectVmlEdits(xml, edits, displays, counter, chem);
     collectParagraphEdits(xml, styles, edits);
     collectTabEdits(xml, edits);
-    if (edits.length === 0) return { buffer: docxBuffer, displays };
+    if (edits.length === 0) return { buffer: docxBuffer, displays, roles };
 
     zip.file(DOCUMENT_PART, applyEdits(xml, edits));
     const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-    return { buffer, displays };
+    return { buffer, displays, roles };
+}
+
+// 图片起始位置落在化学区间内即记角色（判据 a 与 c，见 docx-chemistry）
+function markChemistry(chem, at, k) {
+    if (inChemistryRange(chem.ranges, at)) chem.roles.set(k, CHEMISTRY_ROLE);
 }
 
 function parseImageMarker(alt) {
@@ -104,7 +118,7 @@ function applyEdits(xml, edits) {
 // 图片：DrawingML 与 VML
 // ============================================================
 
-function collectDrawingEdits(xml, edits, displays, counter) {
+function collectDrawingEdits(xml, edits, displays, counter, chem) {
     for (const block of findBlocks(xml, 'w:drawing')) {
         const body = xml.slice(block.start, block.end);
         if (!/<a:blip\b[^>]*\br:(?:embed|link)\s*=/.test(body)) continue;
@@ -114,6 +128,7 @@ function collectDrawingEdits(xml, edits, displays, counter) {
         if (!docPr) continue;
         counter.next += 1;
         const k = counter.next;
+        markChemistry(chem, block.start, k);
         const extentAt = body.search(/<wp:extent(?=[\s/>])/);
         const extentTag = extentAt >= 0 ? readTag(body, extentAt) : null;
         const extent = extentTag ? attrsOf(body.slice(extentAt, extentTag.end + 1)) : new Map();
@@ -137,7 +152,7 @@ function altEdit(xml, tagStart, tagEnd, k) {
     return { at: tagStart + '<wp:docPr'.length, remove: 0, insert: ` descr="${value}"` };
 }
 
-function collectVmlEdits(xml, edits, displays, counter) {
+function collectVmlEdits(xml, edits, displays, counter, chem) {
     const re = /<v:imagedata(?=[\s/>])/g;
     for (let matched = re.exec(xml); matched; matched = re.exec(xml)) {
         const tag = readTag(xml, matched.index);
@@ -147,6 +162,7 @@ function collectVmlEdits(xml, edits, displays, counter) {
         if (!attrs.get('r:id')) continue;
         counter.next += 1;
         const k = counter.next;
+        markChemistry(chem, matched.index, k);
         const style = shapeStyleBefore(xml, matched.index);
         displays.set(k, sizeOf(cssLengthPx(style, 'width'), cssLengthPx(style, 'height'), /position\s*:\s*absolute/i.test(style), {
             width: cssLengthMm(style, 'width'),

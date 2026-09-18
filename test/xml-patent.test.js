@@ -5,6 +5,8 @@
  *       标题 + 附图说明 + 尾部图片与纯图号段）；发明名称回退链；段号连续四位、[000N] 复用与跳变、
  *       numbering.start/width；权项引用与正文图号一律保留纯文本（不生成 claim-ref / figref）；
  *       表格/公式 image 节点 → tables/maths；1C 未就绪的 table/math 降级 + warning；缺节 warning；
+ *       化学式图片的分块与去向（附图区域内为 figure > img、正文内为 chemistry > img、摘要内移入摘要附图、
+ *       不报「附图：」提示，而 table / formula 角色的分块行为不变）；预检的 OLE 文案按化学白名单分两条；
  *       parts 显式子集；预检各项与 precheck.json；zip 条目清单；按官方案卷结构落盘（无 images/）；
  *       每份产物与参考夹具经 validateXml 均 valid；夹具 docx 端到端。
  *       「官方案卷结构」一组锁定产物布局：五书按表格代码分目录（100001/100001.xml …）、图片命名
@@ -547,6 +549,65 @@ describe('patent profile：附图、表格与公式', () => {
 });
 
 // ============================================================
+// 化学式图片的分块与去向（blocks 的 FIGURE_ROLES）
+// ============================================================
+
+describe('patent profile：化学式图片的分块与去向', () => {
+    // 四书各放一张结构式：权项内、说明书正文内、说明书附图内、摘要内（无「摘要附图」标题）
+    const chemDoc = (role) => [
+        h(2, '权利要求书'),
+        p('1. 一种有机化合物，其特征在于，具有如下结构：'),
+        imgP('images/image_1.jpg', { role }),
+        h(2, '说明书'),
+        h(1, '技术领域'), p('本发明涉及有机化合物。'),
+        h(1, '具体实施方式'), p('合成路线如下：'), imgP('images/image_2.jpg', { role }),
+        h(2, '说明书附图'), imgP('images/image_3.jpg', { role }), p('图1'),
+        h(2, '说明书摘要'), p('本发明公开了一种有机化合物。'), imgP('images/image_4.jpg', { role }),
+    ];
+    const chemAssets = () => [1, 2, 3, 4].map((n) => asset(`images/image_${n}.jpg`));
+
+    test('落在说明书附图与摘要附图里的化学式图片输出为 figure > img，不包 chemistry', async () => {
+        const result = await renderPatent(chemDoc('chemistry'), { assets: chemAssets() });
+        const drawings = $of(result.files[DRAWINGS]);
+        assert.deepEqual(drawings('figure').toArray().map((node) => [node.attribs.num, childTags(node)]), [['0001', ['img']]]);
+        assert.equal(drawings('chemistry').length, 0, 'DTD 的 figure 只容纳 img');
+        assert.equal(drawings('img').attr('file'), '100003_1.jpg');
+
+        const abstractFigure = $of(result.files[ABSTRACT_FIGURE]);
+        assert.deepEqual(abstractFigure('figure').toArray().map((node) => childTags(node)), [['img']],
+            '摘要里的化学式图片段照旧被推定为摘要附图');
+        assert.equal(abstractFigure('chemistry').length, 0);
+        assert.equal($of(result.files[ABSTRACT])('img').length, 0, '图片段已移出摘要正文');
+        await assertAllValid(result.files);
+    });
+
+    test('落在权利要求书与说明书正文里的化学式图片输出为 chemistry > img，且不报「附图：」提示', async () => {
+        const result = await renderPatent(chemDoc('chemistry'), { assets: chemAssets() });
+        const claims = $of(result.files[CLAIMS]);
+        assert.deepEqual(claims('claim-text > chemistry').toArray().map((node) => [node.attribs.id, node.attribs.num, childTags(node)]),
+            [['chem0001', '0001', ['img']]]);
+        const description = $of(result.files[DESCRIPTION]);
+        assert.deepEqual(description('p > chemistry').toArray().map((node) => [node.attribs.id, node.attribs.num, childTags(node)]),
+            [['chem0001', '0001', ['img']]]);
+        assert.equal(description('chem').length, 0, '官方转换器从不输出 chem');
+        assert.ok(!codesOf(result).includes(ISSUE_CODES.FIGURE_INLINE_IMAGE), '化学式图片不是误放的附图');
+    });
+
+    test('table 与 formula 角色的分块行为不变：不成附图、不移入摘要附图、附图区域内按杂散内容丢弃', async () => {
+        for (const [role, wrapper] of [['table', 'tables'], ['formula', 'maths']]) {
+            const result = await renderPatent(chemDoc(role), { assets: chemAssets() });
+            const description = $of(result.files[DESCRIPTION]);
+            assert.equal(description(`p > ${wrapper}`).length, 1, `${role} 仍包成 ${wrapper}`);
+            assert.equal(result.files[ABSTRACT_FIGURE], undefined, `${role} 角色的图片段不被推定为摘要附图`);
+            assert.equal($of(result.files[ABSTRACT])(wrapper).length, 1, `${role} 留在摘要正文内`);
+            assert.equal(result.files[DRAWINGS], undefined, `${role} 角色的图片不成附图，说明书附图无内容可输出`);
+            assert.ok(codesOf(result).includes(ISSUE_CODES.FIGURE_TEXT_DROPPED), `${role}：附图区域内的非图号内容按杂散丢弃并告警`);
+            assert.ok(!codesOf(result).includes(ISSUE_CODES.FIGURE_INLINE_IMAGE), `${role} 不报「附图：」提示`);
+        }
+    });
+});
+
+// ============================================================
 // 官方「WORD 转 XML 编辑器」真实产出的逐项对齐
 // ============================================================
 
@@ -952,6 +1013,22 @@ describe('patent profile：parts、预检、zip 与落盘', () => {
         const plain = precheck({ ir: createRoot([p('正文')]), assets: [], data: null }, { profile: 'patent' });
         assert.deepEqual(plain, { blocking: [], warnings: [], items: [] });
         assert.equal(result.precheck.source, '/abs/源.docx');
+    });
+
+    test('预检的 OLE 文案按 ProgID 是否命中化学白名单分两条', async () => {
+        const ooxml = (oleObjects) => ({ ooxml: { floatingImages: 0, textBoxes: 0, oleObjects, autoNumbering: 0, revisions: {}, protection: {}, comments: 0, fields: 0, eastAsiaFonts: [], headingStyleParagraphs: 0, paragraphs: 1 } });
+        const oleWarnings = async (oleObjects) => (await renderPatent([h(2, '说明书'), p('正文。')], { data: ooxml(oleObjects) }))
+            .issues.filter((issue) => issue.code === ISSUE_CODES.PRECHECK_OLE).map((issue) => issue.message);
+
+        assert.deepEqual(await oleWarnings([{ progId: 'ChemDraw.Document.6.0', chemistry: true }, { progId: 'Chem3D.Document', chemistry: true }]),
+            ['预检：文档含 2 个化学结构式 OLE 对象（ChemDraw.Document.6.0、Chem3D.Document），已按化学式图片输出']);
+        assert.deepEqual(await oleWarnings([{ progId: 'Equation.DSMT4', chemistry: false }]),
+            ['预检：文档含 1 个 OLE 对象（Equation.DSMT4），公式请改用公式编辑器或按图片处理']);
+        assert.deepEqual(await oleWarnings([{ progId: 'ChemDraw.Document', chemistry: true }, { progId: 'Visio.Drawing', chemistry: false }]), [
+            '预检：文档含 1 个化学结构式 OLE 对象（ChemDraw.Document），已按化学式图片输出',
+            '预检：文档含 1 个 OLE 对象（Visio.Drawing），公式请改用公式编辑器或按图片处理',
+        ], '两类并存时各出一条，化学式在前');
+        assert.deepEqual(await oleWarnings([]), []);
     });
 
     test('zip 条目 = 已输出的 XML + 各书图片的相对路径（不含 precheck.json）：无目录条目、无外层文件夹、每书先 XML 后图片', async () => {

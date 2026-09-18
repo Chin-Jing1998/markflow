@@ -30,8 +30,12 @@
  *   <tables> / <maths> / <chemistry> 内仅含 img；chemistry 不写 chem 元素（官方转换器从不输出它，官方样式表在
  *   chem 存在时会隐藏图片）。仍为 table / math 节点的（栅格化未就绪或已关闭）降级为逐行文本 / 线性化文本并记
  *   「栅格化：」问题项。
+ *   化学式图片与无角色图片同等参与分块（见 blocks 的 FIGURE_ROLES）：落在说明书附图 / 摘要附图里按附图输出
+ *   为 figure > img（DTD 的 figure 只容纳 img，不包 chemistry），落在权利要求书 / 说明书 / 摘要正文里才包成
+ *   chemistry > img。
  * 权利要求内的图片（化学结构式、公式图）：只含图片的段输出为 claim-text 内的 img，与说明书正文内图片同一规则
- *   （id 前缀 idf、inline="no"），不报问题项；说明书与摘要里只含图片的段按段内图片输出，并提示其可能是误放的附图。
+ *   （id 前缀 idf、inline="no"），不报问题项；说明书与摘要里只含图片的段按段内图片输出，并提示其可能是误放的附图
+ *   （带角色的图片除外——它输出为 chemistry / maths / tables，本就是正文内容）。
  * options.xml.validate 为 true 时逐份调 validateXml，错误以「DTD 校验：」问题项进 warnings 与 precheck.json。
  */
 const JSZip = require('jszip');
@@ -246,7 +250,7 @@ function emitDrawings(blocks, ctx) {
 
 // 块 → p 节点数组：表格 / 块级公式（未栅格化）降级为若干文本段；只含图片的段按段内 img 输出。
 // settings.imageNotice 为所在书目的名称时，对只含图片的段逐图提示（说明书、摘要里它可能是误放的附图）；
-// 缺省不提示（权利要求书里的图片属正常内容）。带角色的图片不会形成 image 块，故化学式、公式、表格图不在提示之列
+// 缺省不提示（权利要求书里的图片属正常内容）
 function emitBlock(block, ctx, settings) {
     if (block.kind === 'paragraph') {
         const node = emitParagraph(block.runs, ctx, settings);
@@ -262,8 +266,10 @@ function emitBlock(block, ctx, settings) {
 
 const imageRuns = (block) => block.images.map((image) => ({ kind: 'image', node: image }));
 
+// 带角色的图片（化学式）不提示：它在正文里输出为 chemistry 元素，本就是正文内容，不是误放的附图
 function noticeBodyImages(block, ctx, bookLabel) {
     for (const image of block.images) {
+        if (wrapperOf(image)) continue;
         ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_INLINE_IMAGE,
             `${bookLabel}正文含图片 ${assetNameOf(image) || '（无地址）'}，已作为段内图片输出；如为附图，请移至说明书附图部分`));
     }
@@ -317,11 +323,16 @@ function emitImage(node, ctx) {
         return null;
     }
     const img = buildImg(ctx, { ...resolved, node, prefix: ID_PREFIXES.bodyImg, inline: false });
-    const role = node.data && node.data.role;
-    const wrapper = typeof role === 'string' && Object.hasOwn(ROLE_WRAPPERS, role) ? ROLE_WRAPPERS[role] : null;
+    const wrapper = wrapperOf(node);
     if (!wrapper) return img;
     const seq = ctx.ids.next(wrapper.prefix);
     return el(wrapper.element, { id: seq.id, num: padNumber(seq.index, NUM_WIDTH) }, [img]);
+}
+
+// image 节点的角色 → ROLE_WRAPPERS 条目；无角色或角色不在表内时为 null
+function wrapperOf(node) {
+    const role = node && node.data && node.data.role;
+    return typeof role === 'string' && Object.hasOwn(ROLE_WRAPPERS, role) ? ROLE_WRAPPERS[role] : null;
 }
 
 function degradeInlineMath(node, ctx) {

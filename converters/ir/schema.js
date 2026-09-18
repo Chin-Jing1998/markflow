@@ -27,6 +27,13 @@
  *                          assets/image-normalize 据此在 patent profile 下把图重采样到 jpegPpi 对应的目标像素；
  *                          XML 渲染层据此写 img/@wi、@he（向下取整的毫米）
  *   image.data.floating  = true   docx 浮动图（wp:anchor）；ir/captions 据此把它从文字中取出
+ *   image.data.role      = 'table' | 'formula' | 'chemistry'   该图的内容性质：表格图与公式图由
+ *                          raster/rasterize-nodes 栅格化时写入，化学结构式由 parsers/docx-chemistry 按四条判据
+ *                          （OLE ProgID、替换文字 `<SIPOChemFile` 前缀、EMBED 域代码、EMF 内的 ChemDraw CDX）
+ *                          写入；三者亦可由替换文字里的 `markflow:role=<角色>` 前缀显式指定（XML 反向导入的往返）。
+ *                          patent profile 据此把图包进 tables / maths / chemistry 元素；其中 chemistry 仍可作附图
+ *                          （落在说明书附图 / 摘要附图里输出为 figure > img，见 renderers/xml/blocks 的 FIGURE_ROLES）。
+ *                          md / html / docx 渲染器不读该键，带角色的图片按普通图片输出
  *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
  *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入
  *   paragraph.data.role   = 'caption' | 'image_footnote'   图注 / 图片脚注；与图片靠「紧随其后」对应，不存图片名

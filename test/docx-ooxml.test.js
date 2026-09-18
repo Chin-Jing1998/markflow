@@ -1,7 +1,8 @@
 /**
  * converters/parsers/docx-ooxml.js 单元测试
  * 覆盖：浮动对象 / 文本框 / OLE / 自动编号 / 修订 / 保护 / 批注 / 域 / 东亚字体 /
- *       标题样式段与段落数的计数，缺部件按 0 计，非 zip 抛中文错误
+ *       标题样式段与段落数的计数，OLE 对象按 ProgID 标出的 chemistry 标志（含版本后缀），
+ *       缺部件按 0 计，非 zip 抛中文错误
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -83,7 +84,7 @@ test('各项计数：浮动对象、文本框、OLE、自动编号、修订、�
     // Assert
     assert.equal(ooxml.floatingImages, 1, '只计 wp:anchor，wp:inline 不算浮动');
     assert.equal(ooxml.textBoxes, 1, 'mc:Fallback 内的重复 txbxContent 不重复计数');
-    assert.deepEqual(ooxml.oleObjects, [{ progId: 'Equation.3' }]);
+    assert.deepEqual(ooxml.oleObjects, [{ progId: 'Equation.3', chemistry: false }]);
     assert.equal(ooxml.autoNumbering, 1);
     assert.deepEqual(ooxml.revisions, { insertions: 1, deletions: 1, trackRevisions: true });
     assert.deepEqual(ooxml.protection, { enforced: true, type: 'readOnly' });
@@ -92,6 +93,27 @@ test('各项计数：浮动对象、文本框、OLE、自动编号、修订、�
     assert.deepEqual(ooxml.eastAsiaFonts, ['宋体', '黑体'], 'document.xml 与 styles.xml 合并去重');
     assert.equal(ooxml.headingStyleParagraphs, 1);
     assert.equal(ooxml.paragraphs, 12, '含文本框内的两个嵌套段落');
+});
+
+test('OLE 对象按 ProgID 标出化学结构式：含版本后缀者照样命中，公式编辑器不命中', async () => {
+    // Arrange：三个 OLE 对象——带版本后缀的 ChemDraw、KingDraw、公式编辑器
+    const objects = ['ChemDraw.Document.6.0', 'KingDrawObject.Document', 'Equation.DSMT4']
+        .map((progId, index) => `<w:p><w:r><w:object><o:OLEObject Type="Embed" ProgID="${progId}" ShapeID="s${index}"/></w:object></w:r></w:p>`)
+        .join('');
+    const buffer = await buildHandwrittenDocx({
+        document: '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            + `xmlns:o="urn:schemas-microsoft-com:office:office"><w:body>${objects}</w:body></w:document>`,
+    });
+
+    // Act
+    const ooxml = await inspectOoxml(buffer);
+
+    // Assert
+    assert.deepEqual(ooxml.oleObjects, [
+        { progId: 'ChemDraw.Document.6.0', chemistry: true },
+        { progId: 'KingDrawObject.Document', chemistry: true },
+        { progId: 'Equation.DSMT4', chemistry: false },
+    ]);
 });
 
 test('缺部件按 0 计：无 settings / styles / comments 时不报错', async () => {

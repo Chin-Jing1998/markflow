@@ -4,7 +4,7 @@
  * flattenBlocks(root) → block[]，block 形态：
  *   { kind: 'heading',   depth, runs, text, node }
  *   { kind: 'paragraph', runs, text, node, isBold, isItalic }   文本段（可含行内图片、公式）
- *   { kind: 'image',     images: [imageNode...], node }         仅由未标注角色的图片组成的段（候选附图）
+ *   { kind: 'image',     images: [imageNode...], node }         仅由候选附图图片组成的段（见 FIGURE_ROLES）
  *   { kind: 'table',     rows: [[cellText...]], node }          未栅格化的 mdast 表格
  *   { kind: 'math',      node }                                 未栅格化的块级公式
  * 列表展开为段：有序列表项的首段冠以「N. 」前缀（权项常以列表形态出现在 Markdown 输入中），
@@ -16,6 +16,10 @@ const { collectText, stripHtml } = require('../../ir/util');
 const { flattenInline, runsText, trimRuns, isWholeMark, textRun } = require('./inline');
 
 const SKIPPED_TYPES = new Set(['thematicBreak', 'slideBreak', 'sheetSection', 'definition', 'footnoteDefinition', 'yaml', 'toml']);
+// 可以成为附图的图片角色：无角色，或 chemistry——化学式图片可能就是附图（说明书附图里的反应式、
+// 作为摘要附图的结构式），落在正文里才包成 chemistry 元素。table / formula 由栅格化产生、永远不会是附图，
+// 带这两种角色的图片一律当行内内容，不形成 image 块
+const FIGURE_ROLES = new Set(['chemistry']);
 
 function flattenBlocks(root) {
     const children = root && Array.isArray(root.children) ? root.children : [];
@@ -47,17 +51,22 @@ function headingBlock(node, origin) {
     return { kind: 'heading', depth: Number.isInteger(node.depth) ? node.depth : 1, runs, text: runsText(runs).trim(), node, origin };
 }
 
-// 只含未标注角色图片的段 → image 块；空段丢弃；其余为 paragraph 块
+// 只含候选附图图片（FIGURE_ROLES）的段 → image 块；空段丢弃；其余为 paragraph 块
 function paragraphBlocks(rawRuns, node, origin) {
     const runs = trimRuns(rawRuns);
     if (runs.length === 0) return [];
     const images = runs.filter((run) => run.kind === 'image').map((run) => run.node);
-    const isPlainImages = images.length > 0 && runs.every((run) => run.kind === 'image' && !(run.node.data && run.node.data.role));
-    if (isPlainImages) return [{ kind: 'image', images, node, origin }];
+    const isFigureImages = images.length > 0 && runs.every((run) => run.kind === 'image' && canBeFigure(run.node));
+    if (isFigureImages) return [{ kind: 'image', images, node, origin }];
     return [{
         kind: 'paragraph', runs, text: runsText(runs).trim(), node, origin,
         isBold: isWholeMark(runs, 'b'), isItalic: isWholeMark(runs, 'i'),
     }];
+}
+
+function canBeFigure(node) {
+    const role = node.data && node.data.role;
+    return !role || FIGURE_ROLES.has(role);
 }
 
 function tableBlock(node, origin) {

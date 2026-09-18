@@ -7,7 +7,8 @@
  *   message 自动冠以类别前缀；level 缺省按 BLOCKING_CODES 判定（官方工具会拒绝转换的项为 blocking）
  * precheck(doc, { profile, sections }) → { blocking: string[], warnings: string[], items: Issue[] }
  *   逐项检查：字符集（控制字符 / 私用区 / 非字符 / 孤立代理项，近似 GB18030 之外）、图片格式与 JPEG 密度、
- *   源 docx 的 OOXML 特征（doc.data.ooxml，缺失时跳过）、公式线性化文本以标点结尾、缺节（sections 给出时）。
+ *   源 docx 的 OOXML 特征（doc.data.ooxml，缺失时跳过；OLE 对象按 ProgID 是否命中化学白名单分两条文案）、
+ *   公式线性化文本以标点结尾、缺节（sections 给出时）。
  *   预检只产出提示，不阻断转换；blocking 与 warnings 为按 level 分组的文案，items 为完整清单。
  */
 const { collectText } = require('../../ir/util');
@@ -98,7 +99,11 @@ const MAX_CHARS_PER_REPORT = 3;
 const FORMULA_PREVIEW = 30;
 const TRAILING_PUNCT_RE = /[，。；：、,.;:!?！？]\s*$/;
 // 官方标记字符（Cnipr.ttf 私用区码位 U+E201、U+E204–U+E20F）不计入字符集问题，由分节模块剥离
-const OFFICIAL_MARK_RE = /[-]/;
+// 不可见字符一律以码点生成，源码里不出现看不见的字面量（与 ir/markers 同一约定）
+const fromCode = (code) => String.fromCharCode(code);
+const OFFICIAL_MARK_FIRST = 0xE200;
+const OFFICIAL_MARK_LAST = 0xE20F;
+const OFFICIAL_MARK_RE = new RegExp(`[${fromCode(OFFICIAL_MARK_FIRST)}-${fromCode(OFFICIAL_MARK_LAST)}]`);
 const SUSPECT_CHAR_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\uE000-\uF8FF\uFDD0-\uFDEF\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]|[\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]/gu;
 const SECTION_LABELS = Object.freeze({ claims: '权利要求书', description: '说明书', drawings: '说明书附图', abstract: '说明书摘要' });
 
@@ -127,11 +132,7 @@ function checkOoxml(ooxml) {
     if (floating > 0) items.push(createIssue(ISSUE_CODES.PRECHECK_FLOATING_OBJECT, `文档含 ${floating} 个浮动对象（wp:anchor），官方要求转为嵌入式后再转换`));
     const textBoxes = countOf(ooxml.textBoxes);
     if (textBoxes > 0) items.push(createIssue(ISSUE_CODES.PRECHECK_TEXTBOX, `文档含 ${textBoxes} 个文本框，官方工具不支持文本框内容`));
-    const ole = Array.isArray(ooxml.oleObjects) ? ooxml.oleObjects : [];
-    if (countOf(ooxml.oleObjects) > 0) {
-        const progIds = [...new Set(ole.map((item) => item && item.progId).filter(Boolean))];
-        items.push(createIssue(ISSUE_CODES.PRECHECK_OLE, `文档含 ${countOf(ooxml.oleObjects)} 个 OLE 对象${progIds.length ? `（${progIds.join('、')}）` : ''}，公式请改用公式编辑器或按图片处理`));
-    }
+    items.push(...checkOle(ooxml.oleObjects));
     const autoNumbering = countOf(ooxml.autoNumbering);
     if (autoNumbering > 0) items.push(createIssue(ISSUE_CODES.PRECHECK_AUTO_NUMBERING, `${autoNumbering} 段使用了 Word 自动编号（w:numPr），官方要求段号与权项号以文字录入`));
     const revisions = ooxml.revisions && typeof ooxml.revisions === 'object' ? ooxml.revisions : {};
@@ -149,6 +150,29 @@ function checkOoxml(ooxml) {
     const fonts = (Array.isArray(ooxml.eastAsiaFonts) ? ooxml.eastAsiaFonts : []).filter((font) => typeof font === 'string' && font && !STANDARD_FONTS.has(font));
     if (fonts.length > 0) items.push(createIssue(ISSUE_CODES.PRECHECK_FONT, `文档使用了常规字体之外的中文字体：${fonts.join('、')}（官方仅接受宋体、黑体、楷体、仿宋）`));
     return items;
+}
+
+// ProgID 命中化学白名单的 OLE 对象（ooxml.oleObjects[].chemistry，见 parsers/docx-chemistry）另立一条：
+// 它的预览图已按化学式图片输出，不必改用公式编辑器；其余 OLE 对象维持原提示
+function checkOle(oleObjects) {
+    const ole = (Array.isArray(oleObjects) ? oleObjects : []).filter((item) => item && typeof item === 'object');
+    const chemistry = ole.filter((item) => item.chemistry);
+    const others = ole.filter((item) => !item.chemistry);
+    const items = [];
+    if (chemistry.length > 0) {
+        items.push(createIssue(ISSUE_CODES.PRECHECK_OLE,
+            `文档含 ${chemistry.length} 个化学结构式 OLE 对象${describeProgIds(chemistry)}，已按化学式图片输出`));
+    }
+    if (others.length > 0) {
+        items.push(createIssue(ISSUE_CODES.PRECHECK_OLE,
+            `文档含 ${others.length} 个 OLE 对象${describeProgIds(others)}，公式请改用公式编辑器或按图片处理`));
+    }
+    return items;
+}
+
+function describeProgIds(list) {
+    const progIds = [...new Set(list.map((item) => item.progId).filter(Boolean))];
+    return progIds.length > 0 ? `（${progIds.join('、')}）` : '';
 }
 
 const countOf = (value) => {
