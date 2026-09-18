@@ -170,11 +170,27 @@ async function normalizeImages(doc, options) {
 
     if (!changed) return { doc, converted: 0, kept: assets.length, warnings };
     return {
-        doc: { ...doc, assets: nextAssets, ir: rewriteNode(doc.ir, (node) => imagePatch(node, renameMap)) },
+        doc: {
+            ...doc,
+            assets: nextAssets,
+            ir: rewriteNode(doc.ir, (node) => imagePatch(node, renameMap)),
+            ...staleNoticePatch(doc, nextAssets, metafiles),
+        },
         converted,
         kept: assets.length - converted,
         warnings,
     };
+}
+
+// mammoth 对 EMF / WMF 图片逐张给出「浏览器里多半显示不了」的英文提示。图元全部转成 JPG 之后这条提示已不成立，
+// 留着只会误导，故从解析阶段的 warnings 里滤除；仍有图元保持原格式时原样保留（对那几张图它依然成立）
+const STALE_METAFILE_NOTICE_RE = /^mammoth \w+: Image of type image\/(?:x-)?(?:emf|wmf)\b/i;
+
+function staleNoticePatch(doc, nextAssets, metafiles) {
+    if (!metafiles || !Array.isArray(doc.warnings)) return {};
+    if (nextAssets.some((asset) => METAFILE_MIMES.has(String(asset.mime || '').toLowerCase()))) return {};
+    const kept = doc.warnings.filter((text) => !(typeof text === 'string' && STALE_METAFILE_NOTICE_RE.test(text)));
+    return kept.length === doc.warnings.length ? {} : { warnings: kept };
 }
 
 // 原图只记最初那份：已归一过的资产再次归一时沿用它的 original

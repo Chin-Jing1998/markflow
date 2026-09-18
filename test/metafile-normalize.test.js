@@ -220,6 +220,26 @@ test('成功路径：改名与 mime、original 留存、IR 同步、JFIF 密度�
     assert.deepEqual(result.warnings, ['已由内置图元渲染器把 1 幅 EMF 图转为 JPG，提交前请对照原稿目视核对']);
 });
 
+test('图元全部转成 JPG 后滤除 mammoth 的 EMF 显示提示；仍有图元保持原格式时原样保留', async () => {
+    // Arrange
+    const notice = 'mammoth warning: Image of type image/x-emf is unlikely to display in web browser';
+    const other = 'mammoth warning: An unrecognised element was ignored: w:fldSimple';
+    const converted = { ...singleEmfDoc(drawEmf()), warnings: [notice, other, notice] };
+    const failing = { ...singleEmfDoc(drawEmf()), warnings: [notice, other] };
+
+    // Act
+    stubBackend();
+    const ok = await normalizeImages(converted, patentOptions());
+    stubBackend(() => new Error('渲染进程崩溃'));
+    const kept = await normalizeImages(failing, patentOptions());
+
+    // Assert
+    assert.deepEqual(ok.doc.warnings, [other], '两条已不成立的提示被滤除，其余原样');
+    assert.deepEqual(converted.warnings, [notice, other, notice], '入参不被修改');
+    assert.equal(kept.doc.assets[0].name, 'images/image_1.emf');
+    assert.deepEqual(kept.doc.warnings, [notice, other], '图元保持原格式时提示依然成立，不滤');
+});
+
 test('目标像素随 jpegPpi 走：150 PPI 得一半像素，JFIF 密度同为 150', async () => {
     // Arrange
     stubBackend();
