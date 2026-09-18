@@ -64,7 +64,8 @@ describe('normalizeOptions', () => {
         });
 
         assert.equal(opts.jpegQuality, 75);
-        assert.equal(opts.jpegPpi, 330);
+        // patent profile 下未显式给 jpegPpi，取 profile 默认的 300（官方只受理 72–300 DPI）
+        assert.equal(opts.jpegPpi, 300);
         assert.equal(opts.html.theme, 'github');
         assert.equal(opts.html.fontSize, 18);
         assert.equal(opts.html.lineHeight, 1.7);
@@ -73,6 +74,25 @@ describe('normalizeOptions', () => {
         assert.equal(opts.xml.patent.imageDpi, 300);
         assert.deepEqual(opts.xml.numbering, { start: 1, width: 4 });
         assert.equal(opts.pdf.theme, 'print');
+    });
+
+    test('jpegPpi 按 profile 取默认：patent 为 300、其余为 330，显式给出的值一律优先', () => {
+        // Act
+        const patent = normalizeOptions({ xml: { profile: 'patent' } });
+        const explicit = normalizeOptions({ jpegPpi: 420, xml: { profile: 'patent' } });
+        const generic = normalizeOptions({ xml: { profile: 'generic' } });
+
+        // Assert：官方只受理 72–300 DPI，通用默认 330 会被专利预检判为超范围
+        assert.equal(patent.jpegPpi, 300);
+        assert.equal(explicit.jpegPpi, 420);
+        assert.equal(generic.jpegPpi, 330);
+        assert.equal(normalizeOptions({}).jpegPpi, 330);
+
+        // Assert：补默认值发生在深冻结与幂等登记之前，两项性质都不受影响
+        assert.ok(Object.isFrozen(patent));
+        assert.equal(normalizeOptions(patent), patent);
+        // Assert：只改 jpegPpi，其余字段与通用默认值逐项一致
+        assert.deepEqual({ ...patent, jpegPpi: 330, xml: generic.xml }, { ...generic });
     });
 
     test('对已归一的结果重复归一返回同一引用；结构相同的普通对象则得到等值的新结果', () => {
@@ -206,8 +226,11 @@ describe('OPTION_ENUMS、describeOptions 与 redactOptions', () => {
         assert.deepEqual(desc.jpegQuality, {
             type: 'number', description: 'JPEG 质量', min: 60, max: 100, integer: true, default: 90,
         });
+        // 描述树给的是通用默认值；patent profile 的 300 由 normalizeOptions 在校验后补，故只在说明文字里点出
         assert.deepEqual(desc.jpegPpi, {
-            type: 'number', description: 'JPEG 分辨率（PPI）', min: 72, max: 600, integer: true, default: 330,
+            type: 'number',
+            description: 'JPEG 分辨率（PPI）；xml.profile 为 patent 且未显式指定时取 300',
+            min: 72, max: 600, integer: true, default: 330,
         });
         assert.equal(desc.html.type, 'object');
         assert.deepEqual(desc.html.fields.theme.values, OPTION_ENUMS.htmlThemes);

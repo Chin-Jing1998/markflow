@@ -97,7 +97,7 @@ const dims = (node) => ({ width: node.data.width, height: node.data.height, dpi:
 // rasterizeNodes
 // ============================================================
 
-test('table → image 节点与 JPG 资源：命名 table-<序>、role table、JFIF 密度 330、math 节点不受影响', async () => {
+test('table → image 节点与 JPG 资源：命名 table-<序>、role table、JFIF 密度取 patent 默认的 300、math 节点不受影响', async () => {
     // Arrange
     const calls = stubBackend();
     const doc = sampleDoc();
@@ -117,7 +117,8 @@ test('table → image 节点与 JPG 资源：命名 table-<序>、role table、J
     assert.equal(children[1].type, 'image');
     assert.equal(children[1].url, 'images/table-1.jpg');
     assert.equal(children[1].alt, '表格 1');
-    assert.deepEqual(children[1].data, { assetName: 'images/table-1.jpg', role: 'table', inline: false, width: 400, height: 40, dpi: 330 });
+    // patent profile 未显式给 jpegPpi 时取 300（converters/options.js 的 profile 默认值）
+    assert.deepEqual(children[1].data, { assetName: 'images/table-1.jpg', role: 'table', inline: false, width: 400, height: 40, dpi: 300 });
     assert.equal(children[5].url, 'images/table-2.jpg');
     assert.equal(children[0], doc.ir.children[0], '未命中的段落沿用原引用');
 
@@ -126,7 +127,7 @@ test('table → image 节点与 JPG 资源：命名 table-<序>、role table、J
     const asset = result.doc.assets[1];
     assert.equal(asset.name, 'images/table-1.jpg');
     assert.equal(asset.mime, 'image/jpeg');
-    assert.deepEqual(readJfif(asset.buffer), { units: 1, x: 330, y: 330 });
+    assert.deepEqual(readJfif(asset.buffer), { units: 1, x: 300, y: 300 });
     assert.equal(result.doc.assets[2].name, 'images/table-2.jpg');
 });
 
@@ -177,10 +178,10 @@ test('patent profile 按 imageDpi 出图且不缩放；JPEG 统一写入 jpegPpi
     const limited = await run({ raster: { scale: 1, maxWidth: 200 } });
     const scaled = await run({ raster: { scale: 3 } });
 
-    // Assert
+    // Assert：patent profile 未显式给 jpegPpi，密度取 profile 默认的 300；出图 DPI 仍由 imageDpi 决定
     assert.equal(patent.dpi, 150);
-    assert.deepEqual(dims(patent.node), { width: 400, height: 40, dpi: 330 });
-    assert.deepEqual(readJfif(patent.asset.buffer), { units: 1, x: 330, y: 330 });
+    assert.deepEqual(dims(patent.node), { width: 400, height: 40, dpi: 300 });
+    assert.deepEqual(readJfif(patent.asset.buffer), { units: 1, x: 300, y: 300 });
 
     assert.equal(limited.dpi, 96);
     assert.deepEqual(dims(limited.node), { width: 200, height: 20, dpi: 330 });

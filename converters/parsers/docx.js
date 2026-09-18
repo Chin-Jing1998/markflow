@@ -12,7 +12,8 @@
  *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, data, assets, warnings, meta }
  *   - 不写盘、不打印：mammoth 警告、图片读取失败、预检与公式抽取异常一律推入 warnings
  *   - 图片按出现顺序编号为 images/image_N.ext（N 从 1 起），IR 中 image 节点 url 与 assets 一一对应；
- *     取得到 wp:extent / VML 尺寸的图片带 data.display（px），浮动图另带 data.floating
+ *     取得到 wp:extent / VML 尺寸的图片带 data.display（px）与 data.displayWidthMm / displayHeightMm
+ *     （Word 中的物理显示尺寸，毫米浮点不取整），浮动图另带 data.floating
  *   - 标题取首个有文字的 Title 样式段（不带编号的在正文中仍为普通段落，带编号的与同一编号定义下的普通段同为列表项），
  *     其次首个 <h1> 文本，否则取去扩展名的文件名
  *   - data.ooxml 为 OOXML 预检信息（采集失败时为 null），meta.sourcePath 为源文件绝对路径
@@ -216,7 +217,8 @@ function normalizeMime(contentType) {
 
 // ---------- IR 后处理 ----------
 
-// 资产名 → 显示尺寸，写回 image 节点的 data.display（px）；浮动图另记 data.floating。不改动入参
+// 资产名 → 显示尺寸，写回 image 节点的 data.display（px）与 data.displayWidthMm / displayHeightMm
+// （毫米，浮点不取整）；浮动图另记 data.floating。毫米项取不到即不写该键。不改动入参
 function applyDisplay(node, displayByAsset) {
     if (!node || typeof node !== 'object' || displayByAsset.size === 0) return node;
     if (node.type === 'image') {
@@ -228,6 +230,8 @@ function applyDisplay(node, displayByAsset) {
         display.source = 'docx';
         const data = { ...(node.data || {}), display };
         if (size.floating) data.floating = true;
+        if (size.widthMm > 0) data.displayWidthMm = size.widthMm;
+        if (size.heightMm > 0) data.displayHeightMm = size.heightMm;
         return { ...node, data };
     }
     if (!Array.isArray(node.children)) return node;

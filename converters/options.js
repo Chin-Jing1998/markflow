@@ -6,14 +6,16 @@
  * normalizeOptions 归一：
  *
  *   normalizeOptions(raw)   深合并默认值、逐项校验、深冻结后返回；raw 省略即全默认；任何非法值抛中文 Error；
- *                           传入本函数产出的对象时原样返回同一引用（幂等且零开销），故 parser ctx 与渲染器拿到的是同一份
+ *                           传入本函数产出的对象时原样返回同一引用（幂等且零开销），故 parser ctx 与渲染器拿到的是同一份。
+ *                           校验之后再按 profile 补默认值（见 applyProfileDefaults）：xml.profile 为 patent 且调用方
+ *                           未显式给出 jpegPpi 时，jpegPpi 取 300 而非通用默认的 330——官方只受理 72–300 DPI
  *   DEFAULT_OPTIONS         normalizeOptions({}) 的结果（冻结）
  *   OPTION_ENUMS            各枚举项的取值表（冻结），供入口的参数枚举与帮助文案取用
  *   describeOptions()       选项描述树（纯 JSON：类型、默认值、枚举、范围、说明），供 CLI 帮助与桌面端面板生成
  *   redactOptions(options)  返回去掉敏感项（mineru.token）的深拷贝；凡是要写进结果、日志或 JSON 的选项一律先经此处理
  *
  * 结构（方案 §3.3.1）：
- *   imageFormat 'jpg'|'keep'    jpegQuality 60–100    jpegPpi 72–600    math 'image'|'text'
+ *   imageFormat 'jpg'|'keep'    jpegQuality 60–100    jpegPpi 72–600（patent 默认 300）    math 'image'|'text'
  *   pdfBackend 'auto'|'mineru'|'local'
  *   mineru { model, ocr, formula, table, language, pageRanges, timeoutSec, token }
  *   html   { theme, fontFamily, fontSize(px), lineHeight, contentWidth(px), spacing, inlineImages }
@@ -42,6 +44,8 @@ const OPTION_ENUMS = deepFreeze({
 // 敏感项路径：redactOptions 置空，错误信息不回显其值
 const SECRET_PATHS = Object.freeze([Object.freeze(['mineru', 'token'])]);
 const SHOW_LIMIT = 60;
+// patent profile 的 JPEG 密度默认值：官方只受理 72–300 DPI，通用默认 330 会被预检判为超范围
+const PATENT_JPEG_PPI = 300;
 // MinerU 页码范围：形如 "1-5,8,10-12"
 const PAGE_RANGES_RE = /^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/;
 // 语言代码：MinerU 的 ch / en / japan / chinese_cht 等
@@ -73,7 +77,7 @@ const marginFields = (def) => ({
 const SCHEMA = {
     imageFormat: enumField(OPTION_ENUMS.imageFormats, 'jpg', '图片归一格式：jpg 把位图统一转为 JPEG，keep 保持原格式'),
     jpegQuality: numberField({ min: 60, max: 100, integer: true, default: 90, description: 'JPEG 质量' }),
-    jpegPpi: numberField({ min: 72, max: 600, integer: true, default: 330, description: 'JPEG 分辨率（PPI）' }),
+    jpegPpi: numberField({ min: 72, max: 600, integer: true, default: 330, description: 'JPEG 分辨率（PPI）；xml.profile 为 patent 且未显式指定时取 300' }),
     math: enumField(OPTION_ENUMS.mathModes, 'image', 'docx 公式的处理方式：image 栅格为图片，text 降级为线性化文本'),
     pdfBackend: enumField(OPTION_ENUMS.pdfBackends, 'auto', 'PDF 解析后端：auto 有 MinerU 令牌走云端否则本地，mineru 强制云端，local 强制本地'),
     mineru: objectField({
@@ -144,9 +148,22 @@ function normalizeOptions(raw) {
     if (raw !== null && typeof raw === 'object' && NORMALIZED.has(raw)) return raw;
     const source = raw === undefined || raw === null ? {} : raw;
     if (!isPlainObject(source)) throw new Error(`选项 options 须为对象，实际：${show(source)}`);
-    const normalized = deepFreeze(normalizeObject(ROOT_FIELD, source, ''));
+    const normalized = deepFreeze(applyProfileDefaults(normalizeObject(ROOT_FIELD, source, ''), source));
     NORMALIZED.add(normalized);
     return normalized;
+}
+
+/**
+ * 按 profile 调整默认值：patent profile 下 jpegPpi 取 PATENT_JPEG_PPI。
+ * 通用默认 330 超出官方受理的 72–300 DPI，真实底稿实测因此产出 5 条密度预检告警；该密度同时决定
+ * assets/image-normalize 的重采样目标像素，故须与官方一致。只在调用方未给出 jpegPpi 时生效
+ * （未给出即 undefined——null 与非整数在 normalizeNumber 已抛错），显式传入的值一律尊重；
+ * 其余 profile 不受影响。
+ */
+function applyProfileDefaults(normalized, source) {
+    if (source.jpegPpi !== undefined) return normalized;
+    if (!normalized.xml || normalized.xml.profile !== 'patent') return normalized;
+    return { ...normalized, jpegPpi: PATENT_JPEG_PPI };
 }
 
 function normalizeField(spec, raw, at) {

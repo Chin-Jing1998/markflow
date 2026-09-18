@@ -16,6 +16,12 @@
  *   image.data.display   = { width, height?, unit: 'px' | '%', source }   显示尺寸，与原文档 / 原网页一致；
  *                          source 为 'web' | 'docx' | 'pptx' | 'mineru' | 'html'（Markdown 输入的 <img>）。
  *                          与栅格化用的像素尺寸 data.{width, height, dpi}（raster/rasterize-nodes 写入）分开存放
+ *   image.data.displayWidthMm / image.data.displayHeightMm = number
+ *                          该图在源文档中的物理显示尺寸（毫米，浮点，不取整）。docx 由 wp:extent
+ *                          （EMU ÷ 914400 × 25.4）或 VML 的 v:shape style 算出；取不到即不写该键。
+ *                          与 data.display 的 px 并存而不互相换算——px 按 96 DPI 定义且已取整，反推毫米会先丢一次精度。
+ *                          assets/image-normalize 据此在 patent profile 下把图重采样到 jpegPpi 对应的目标像素；
+ *                          XML 渲染层据此写 img/@wi、@he（向下取整的毫米）
  *   image.data.floating  = true   docx 浮动图（wp:anchor）；ir/captions 据此把它从文字中取出
  *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
  *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入

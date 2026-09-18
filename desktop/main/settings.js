@@ -24,6 +24,9 @@
  *   { version: 1, theme: 'system'|'light'|'dark', outputDir,
  *     defaultTargets: { office, markup, url },
  *     defaults: { theme?, imageFormat?, jpegQuality?, jpegPpi?, math?, pdfBackend?, mineruModel?, xmlProfile? }（扁平转换选项，交 service.buildOptions），
+ *               各项一律「缺席即按 converters/options.js 的默认值」，不在此预置具体数值——jpegPpi 尤其如此：
+ *               patent profile 的默认密度由 options.js 定为 300，此处若存下 330 就会把它盖掉，
+ *               故设置页的输入框留空即删除该项（见 mf-settings-page.js 的 fill / collectPatch），
  *     library: { mode: 'index'|'managed', root, repositories?, activeRepository? },
  *     checkUpdateOnStartup: boolean（启动时是否自动检测更新，默认 true，用户可在设置页改），
  *     update?: { checkedAt, status, message, latestVersion, url }（更新检测缓存，仅主进程写） }

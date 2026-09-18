@@ -129,7 +129,8 @@ class MfSettingsPage extends HTMLElement {
                 ${sectionCard('defaults', `
                     <h2>转换默认项</h2>
                     <div class="field-grid" data-role="defaults"></div>
-                    <label class="field"><span>JPG 分辨率（PPI）</span><input class="input" type="number" min="72" max="600" step="1" data-field="jpegPpi" placeholder="330"></label>`)}
+                    <label class="field"><span>JPG 分辨率（PPI）</span><input class="input" type="number" min="72" max="600" step="1" data-field="jpegPpi" placeholder="留空取默认：330，专利 XML 300"></label>
+                    <p class="hint">留空即按目标取默认密度：专利 XML 为官方受理的 300 PPI，其余为 330 PPI。填入数值则一律以该值为准。</p>`)}
                 ${sectionCard('mineru', `
                     <h2>MinerU 令牌</h2>
                     <p class="hint">用于 PDF 云端解析；令牌经系统安全存储加密保存在本机，不会显示、不会写入日志。</p>
@@ -216,7 +217,9 @@ class MfSettingsPage extends HTMLElement {
         this.querySelector('[data-field="outputDir"]').value = settings.outputDir;
         this.querySelector('[data-field="libraryMode"]').value = settings.library.mode;
         this.querySelector('[data-field="libraryRoot"]').value = settings.library.root;
-        this.querySelector('[data-field="jpegPpi"]').value = settings.defaults.jpegPpi != null ? settings.defaults.jpegPpi : 330;
+        // 未设过就留空：回填 330 会被 collectPatch 当成用户显式选择存回设置，
+        // 从而盖掉 converters/options.js 为 patent profile 定的 300 PPI 默认值
+        this.querySelector('[data-field="jpegPpi"]').value = settings.defaults.jpegPpi != null ? settings.defaults.jpegPpi : '';
         this.renderDefaultTargets(settings, state.formats);
         this.renderDefaults(settings, state.formats);
     }

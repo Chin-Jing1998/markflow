@@ -724,9 +724,10 @@ test('同批混合目标：md 的 sample.docx 与 docx 的 sample/ 分属不同�
 // ============================================================
 
 test('人类模式：每项告警逐条写 stderr，汇总行追加告警条数；--json 模式 stderr 仍为空', async () => {
-    // Arrange：patent profile 下 330 DPI 的图片必出「预检：」告警
+    // Arrange：patent profile 的默认密度已改为官方受理的 300 DPI，须显式给 330 才会出「预检：」告警；
+    // 这条顺带兜住「显式 --jpeg-ppi 优先于 profile 默认值」
     const outDir = fs.mkdtempSync(path.join(tmpDir, 'warn-'));
-    const args = ['convert', SAMPLE_MD, '--to', 'xml', '--xml-profile', 'patent', '--out', outDir];
+    const args = ['convert', SAMPLE_MD, '--to', 'xml', '--xml-profile', 'patent', '--jpeg-ppi', '330', '--out', outDir];
 
     // Act
     const human = await runCli(args);

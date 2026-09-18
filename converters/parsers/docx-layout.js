@@ -11,14 +11,19 @@
  *   - 制表符：run 内的 <w:tab/> → TAB 标记文本（w:tabs 里的制表位带属性，不受影响）
  *   - 题注：段落样式（含 basedOn 链）名为 caption / 题注 → 插 CAPTION 标记 run
  *   - 图片：每个含 a:blip 的 w:drawing 在 wp:docPr@descr 前写入序号标记 ⟦MF:k⟧（mammoth 以 descr、
- *     其次 title 作 alt），记录 wp:extent 的显示尺寸（EMU / 9525 = px）与是否浮动（wp:anchor）；
- *     VML 图片（v:imagedata）在 o:title 前写标记，尺寸取所属 v:shape 的 style（pt / in / cm / mm / px / pc → px）。
+ *     其次 title 作 alt），记录 wp:extent 的显示尺寸（EMU / 9525 = px，同时 EMU / 914400 × 25.4 = mm）
+ *     与是否浮动（wp:anchor）；VML 图片（v:imagedata）在 o:title 前写标记，尺寸取所属 v:shape 的
+ *     style（pt / in / cm / mm / px / pc → px 与 mm 各算一份）。
  *     标记随 alt 回到 parsers/docx 的 convertImage，据此把尺寸对到资产名上，与图片出现顺序无关
  *     （实测样稿 wp:extent 16 个而 a:blip 14 个，按顺序配对必然错位）
  *
+ * 像素与毫米两套并存且互不换算：px 供既有的版面还原（data.display，按 96 DPI 定义、取整）；
+ * mm 是 Word 中的物理显示尺寸（浮点、不取整），供 patent profile 按官方规则在 300 DPI 下重采样
+ * 附图与写 img/@wi、@he。由 px 反推 mm 会先丢一次精度，故两者各自从 EMU / CSS 长度直接算出。
+ *
  * 契约：
- *   prepareLayout(docxBuffer) → { buffer, displays: Map<k, { width, height?, floating }> }
- *     无 document.xml 或无任何改写时原样返回入参 buffer
+ *   prepareLayout(docxBuffer) → { buffer, displays: Map<k, { width, height?, floating, widthMm?, heightMm? }> }
+ *     无 document.xml 或无任何改写时原样返回入参 buffer；mm 两项取不到即整条省略
  *   parseImageMarker(alt) → { index: number | null, alt }：取出序号并还原原 alt
  * 说明：document.xml 与 styles.xml 属不可信文档内容，本模块只做字符串定位与替换，不执行其中任何指令。
  */
@@ -30,6 +35,8 @@ const { findBlocks, findCloseTag, readTag } = require('./docx-math');
 const DOCUMENT_PART = 'word/document.xml';
 const STYLES_PART = 'word/styles.xml';
 const EMU_PER_PX = 9525;
+const EMU_PER_INCH = 914400;
+const INCH_MM = 25.4;
 // 缺省字号：五号字 10.5pt = 21 半磅；一个字宽 = 半磅 × 10 twip
 const DEFAULT_HALF_POINTS = 21;
 const TWIPS_PER_HALF_POINT = 10;
@@ -43,6 +50,10 @@ const HEADING_NAME_RE = /^\s*(heading|标题)\s*\d/i;
 const HEADING_ID_RE = /^(Heading|标题)\s*\d/i;
 const CAPTION_NAME_RE = /^(caption|题注)$/i;
 const PX_PER_UNIT = Object.freeze({ pt: 96 / 72, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, px: 1, pc: 16 });
+// 同一组 CSS 单位换算到毫米；px 按 96 DPI 定义（VML 的裸数字按 px 处理，与 PX_PER_UNIT 一致）
+const MM_PER_UNIT = Object.freeze({
+    pt: INCH_MM / 72, in: INCH_MM, cm: 10, mm: 1, px: INCH_MM / 96, pc: INCH_MM / 6,
+});
 const TEXT_RUN_RE = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
 const MATH_SENTINEL_RE = /MFMATH\d+/g;
 
@@ -106,7 +117,10 @@ function collectDrawingEdits(xml, edits, displays, counter) {
         const extentAt = body.search(/<wp:extent(?=[\s/>])/);
         const extentTag = extentAt >= 0 ? readTag(body, extentAt) : null;
         const extent = extentTag ? attrsOf(body.slice(extentAt, extentTag.end + 1)) : new Map();
-        displays.set(k, sizeOf(emuToPx(extent.get('cx')), emuToPx(extent.get('cy')), /<wp:anchor(?=[\s>])/.test(body)));
+        displays.set(k, sizeOf(emuToPx(extent.get('cx')), emuToPx(extent.get('cy')), /<wp:anchor(?=[\s>])/.test(body), {
+            width: emuToMm(extent.get('cx')),
+            height: emuToMm(extent.get('cy')),
+        }));
         edits.push(altEdit(xml, block.start + docPrAt, block.start + docPr.end + 1, k));
     }
 }
@@ -134,7 +148,10 @@ function collectVmlEdits(xml, edits, displays, counter) {
         counter.next += 1;
         const k = counter.next;
         const style = shapeStyleBefore(xml, matched.index);
-        displays.set(k, sizeOf(cssLengthPx(style, 'width'), cssLengthPx(style, 'height'), /position\s*:\s*absolute/i.test(style)));
+        displays.set(k, sizeOf(cssLengthPx(style, 'width'), cssLengthPx(style, 'height'), /position\s*:\s*absolute/i.test(style), {
+            width: cssLengthMm(style, 'width'),
+            height: cssLengthMm(style, 'height'),
+        }));
         const existing = /\so:title\s*=\s*("([^"]*)"|'([^']*)')/.exec(tagText);
         if (existing) {
             const title = (existing[2] ?? existing[3] ?? '').replace(/"/g, '&quot;');
@@ -153,11 +170,21 @@ function shapeStyleBefore(xml, index) {
     return tag ? (attrsOf(xml.slice(at, tag.end + 1)).get('style') || '') : '';
 }
 
-function cssLengthPx(style, prop) {
+// CSS 长度 → { value, unit }；取不到返回 null。单位缺省按 px（VML 的裸数字即 px）
+function cssLength(style, prop) {
     const matched = new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*(\\d+(?:\\.\\d+)?)\\s*(pt|in|cm|mm|px|pc)?`, 'i').exec(style);
-    if (!matched) return 0;
-    const factor = PX_PER_UNIT[String(matched[2] || 'px').toLowerCase()] || 1;
-    return Math.round(Number(matched[1]) * factor);
+    return matched ? { value: Number(matched[1]), unit: String(matched[2] || 'px').toLowerCase() } : null;
+}
+
+function cssLengthPx(style, prop) {
+    const length = cssLength(style, prop);
+    return length ? Math.round(length.value * (PX_PER_UNIT[length.unit] || 1)) : 0;
+}
+
+// 毫米不取整：物理尺寸要参与 300 DPI 目标像素的换算，先取整会把误差放大数倍
+function cssLengthMm(style, prop) {
+    const length = cssLength(style, prop);
+    return length ? length.value * (MM_PER_UNIT[length.unit] || MM_PER_UNIT.px) : 0;
 }
 
 const emuToPx = (value) => {
@@ -165,10 +192,18 @@ const emuToPx = (value) => {
     return Number.isFinite(emu) && emu > 0 ? Math.round(emu / EMU_PER_PX) : 0;
 };
 
-function sizeOf(width, height, floating) {
+const emuToMm = (value) => {
+    const emu = Number(value);
+    return Number.isFinite(emu) && emu > 0 ? (emu / EMU_PER_INCH) * INCH_MM : 0;
+};
+
+// px 取整后 ≥ 1 才写，mm 为正即写；两者取不到时各自省略，下游据此判定是否有显示尺寸
+function sizeOf(width, height, floating, mm = {}) {
     const size = { width: width >= 1 ? width : 0 };
     if (height >= 1) size.height = height;
     size.floating = Boolean(floating);
+    if (mm.width > 0) size.widthMm = mm.width;
+    if (mm.height > 0) size.heightMm = mm.height;
     return size;
 }
 
