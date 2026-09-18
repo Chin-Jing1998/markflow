@@ -184,7 +184,11 @@ test('动图 GIF / SVG / EMF 均保持原样并记中文 warning', async () => {
     assert.equal(result.warnings.length, 3);
     assert.match(result.warnings[0], /images\/image_1\.gif 保持原格式：动图 GIF/);
     assert.match(result.warnings[1], /images\/image_2\.svg 保持原格式：矢量图 SVG/);
-    assert.match(result.warnings[2], /images\/image_3\.emf 保持原格式：EMF\/WMF 图元/);
+    // 图元只在 patent profile 下栅格化（详见 test/metafile-normalize.test.js），此处的 generic profile 一律保持原样
+    assert.equal(
+        result.warnings[2],
+        '图片 images/image_3.emf 保持原格式：EMF/WMF 图元只在专利（patent）profile 下栅格化为 JPG',
+    );
 });
 
 test('像素数超阈值的图片保持原样：文件头声明 12000×8000 即被拦下，4000×3000 照常转码', async () => {

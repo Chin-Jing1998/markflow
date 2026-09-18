@@ -15,8 +15,10 @@
  *                                        patent profile 下需重采样的 JPEG 例外：像素要变，故照常解码重编码，
  *                                        但仍按「格式未变」计入 kept
  *   svg / emf / wmf / 动图 gif / 未知 mime / 超体量护栏 / 解码失败 → 原样保留 + 中文 warning
- *   patent profile（options.xml.profile === 'patent'）下的 emf/wmf 先试 LibreOffice 栅格为 PNG 再转 JPEG，
- *   无 LibreOffice 或栅格失败时同样降级为 warning（不抛错，避免单张图元废掉整份转换）
+ *   patent profile（options.xml.profile === 'patent'）下的 emf 由 assets/metafile-normalize.js 在串行主循环
+ *   之前批量预处理：内置图元渲染器出 SVG → 只调用一次 Electron 栅格后端得 PNG → 铺白转 JPEG（详见该文件
+ *   的文件头）。WMF 本版本不渲染；任一步失败都降级为 warning（不抛错，避免单张图元废掉整份转换）。
+ *   其余 profile 的 emf/wmf 一律原样保留 + warning。
  *
  * patent profile 的显示尺寸重采样（对齐国知局「WORD 转 XML 编辑器」的实测行为）：
  *   官方对每幅图按其在 Word 中的显示尺寸在 300 DPI 下重采样，而非沿用嵌入像素——源图内嵌 981×569 的 PNG，
@@ -56,8 +58,9 @@
  * 路径上据此还原——桌面端预览先按无目标解析（已归一），导出 bundle 时再调用。
  *
  * converters/index.js 的 parseDocument 在 parser 之后、rasterizeNodes 之前经 moduleLoader 懒加载本模块。
- * 本模块顶层不得 require 重依赖：jimp 经 assets/jimp-loader.js 动态加载，soffice 仅在 patent 图元分支内 require；
- * image-size 是纯文件头解析器（assets/md-images.js 已在顶层引用同一份），不在此列。
+ * 本模块顶层不得 require 重依赖：jimp 经 assets/jimp-loader.js 动态加载；图元预处理模块
+ * assets/metafile-normalize（其下又懒加载 converters/metafile 与 raster/backend）与 converters/metafile
+ * 本身都只在用到时 require；image-size 是纯文件头解析器（assets/md-images.js 已在顶层引用同一份），不在此列。
  */
 const path = require('path');
 const { imageSize } = require('image-size');
@@ -73,7 +76,7 @@ const OCTET_STREAM_MIME = 'application/octet-stream';
 const CONVERTIBLE_MIMES = new Set(['image/png', 'image/bmp', 'image/x-ms-bmp', 'image/tiff', 'image/webp', GIF_MIME]);
 // 矢量图：转位图会丢失可缩放性，保持原样
 const VECTOR_MIMES = new Set(['image/svg+xml']);
-// Windows 图元格式：无纯 JS 解码器，仅 patent profile 下经 LibreOffice 栅格化
+// Windows 图元格式：仅 patent profile 下经内置图元渲染器（converters/metafile）栅格为 JPG，其余 profile 保持原样
 const METAFILE_MIMES = new Set([
     'image/emf', 'image/x-emf', 'image/wmf', 'image/x-wmf',
     'application/emf', 'application/x-msmetafile', 'windows/metafile',
@@ -114,8 +117,9 @@ const JFIF_Y_DENSITY_OFFSET = 14;
 const JFIF_MIN_DPI = 1;
 const JFIF_MAX_DPI = 65535;
 
-// EMF/WMF 经 LibreOffice 栅格化时的临时目录前缀
-const METAFILE_TEMP_PREFIX = 'markflow-metafile-';
+// 图元的处置文案（调研报告 4.7）：S3 的完整句式在本模块拼装，括号内的原因由 metafile-normalize 给出
+const METAFILE_NON_PATENT_REASON = 'EMF/WMF 图元只在专利（patent）profile 下栅格化为 JPG';
+const METAFILE_FAIL_TAIL = '。国知局只受理 JPG 与 TIF，请在 Word 中把该图另存为图片后替换';
 
 // ============================================================
 // 主流程
@@ -130,6 +134,8 @@ async function normalizeImages(doc, options) {
     const settings = readSettings(options, doc);
     // patent profile 才按显示尺寸重采样；其余 profile 传 undefined，走与既有行为逐字节一致的路径
     const displayMm = settings.isPatent ? collectDisplayMm(doc.ir) : null;
+    // 图元预处理：patent profile 下收齐全部图元资产，只调用一次栅格后端（assets/metafile-normalize.js）
+    const metafiles = settings.isPatent ? await prepareMetafiles(assets, settings, displayMm) : null;
     const warnings = [];
     const renameMap = new Map();
     const nextAssets = [];
@@ -139,7 +145,12 @@ async function normalizeImages(doc, options) {
 
     // 串行：单张大图解码后的位图占用可达数十 MB，并发会把内存峰值抬到不可控
     for (const asset of assets) {
-        const result = await convertAsset(asset, settings, displayMm ? displayMm.get(asset.name) : undefined);
+        const result = await convertAsset(
+            asset,
+            settings,
+            displayMm ? displayMm.get(asset.name) : undefined,
+            metafiles ? metafiles.results.get(asset) : undefined,
+        );
         if (result.warning) warnings.push(result.warning);
         if (!result.jpeg) {
             nextAssets.push(asset);
@@ -153,6 +164,9 @@ async function normalizeImages(doc, options) {
             renameMap.set(asset.name, { ...next, width: result.width, height: result.height });
         }
     }
+
+    // 整批级别的提示（图元汇总）排在逐图提示之后
+    if (metafiles) warnings.push(...metafiles.warnings);
 
     if (!changed) return { doc, converted: 0, kept: assets.length, warnings };
     return {
@@ -235,8 +249,9 @@ const numberOr = (value, fallback) => (Number.isFinite(value) ? value : fallback
  * 单张资产 → { jpeg?, width?, height?, keptFormat?, warning? }；jpeg 缺省即表示保持原格式与原内容。
  * keptFormat 表示「格式本就是 JPEG」：buffer 变了（补密度，patent 下还可能重采样）但不计入 converted。
  * displayMm 三态：undefined 不参与重采样；null 参与但取不到显示尺寸（降级并告警）；{ width, height? } 为目标显示尺寸。
+ * prepared 为该资产的图元预处理结果（只对图元资产有值），形态见 assets/metafile-normalize.js 的契约。
  */
-async function convertAsset(asset, settings, displayMm) {
+async function convertAsset(asset, settings, displayMm, prepared) {
     const label = asset && typeof asset.name === 'string' && asset.name ? asset.name : UNNAMED_LABEL;
     const buffer = toBuffer(asset && asset.buffer);
     if (!buffer || buffer.length === 0) return { warning: keepText(label, '资源内容为空') };
@@ -252,7 +267,8 @@ async function convertAsset(asset, settings, displayMm) {
     }
     if (oversize) return { warning: keepText(label, oversize) };
     if (mime !== JPEG_MIME) {
-        if (METAFILE_MIMES.has(mime)) return withNote(await convertMetafile(buffer, label, settings, resample.size), resample.warning);
+        // 图元的目标像素由预处理自行计算（含 frame 毫米回落），故不沿用 resample 的计划与提示
+        if (METAFILE_MIMES.has(mime)) return metafileResult(prepared, label, settings);
         if (VECTOR_MIMES.has(mime)) return { warning: keepText(label, '矢量图 SVG 转位图会丢失可缩放性') };
         if (!CONVERTIBLE_MIMES.has(mime)) return { warning: keepText(label, `不支持的图片类型 ${mime || '未知'}`) };
         if (mime === GIF_MIME && isAnimatedGif(buffer)) return { warning: keepText(label, '动图 GIF 转 JPEG 会丢失动画') };
@@ -417,32 +433,44 @@ const blendOnWhite = (channel, alpha, inverse) =>
 // EMF / WMF（仅 patent profile）
 // ============================================================
 
-// 经 LibreOffice headless 栅格为 PNG 再转 JPEG；任一步失败都降级为 warning 而非抛错，
-// 以免一张图元废掉整份转换（方案 §3.4.3 的「报错提示」在此以 warning 呈现）
-async function convertMetafile(buffer, label, settings, resample) {
-    if (!settings.isPatent) return { warning: keepText(label, 'EMF/WMF 图元格式无纯 JS 解码器') };
-
-    const soffice = require('../soffice');
-    const tmp = require('../tmp');
-    const fsp = require('fs').promises;
-    if (!(await soffice.isAvailable())) {
-        return { warning: keepText(label, `EMF/WMF 图元需 LibreOffice 栅格化，本机未找到 soffice（${soffice.getInstallHint()}）`) };
-    }
-
-    let workDir = null;
+/**
+ * 图元批量预处理 → { results: Map<asset, outcome>, warnings }；本文档没有图元资产时返回 null。
+ * 预处理整体异常不得中断归一化：各图元资产退回「保持原格式 + 告警」，其余资产不受影响。
+ */
+async function prepareMetafiles(assets, settings, displayMm) {
+    const items = collectMetafileItems(assets);
+    if (items.length === 0) return null;
     try {
-        workDir = await tmp.makeTempDir(METAFILE_TEMP_PREFIX);
-        const ext = path.posix.extname(label).toLowerCase() === '.wmf' ? '.wmf' : '.emf';
-        const input = path.join(workDir, `metafile${ext}`);
-        await fsp.writeFile(input, buffer);
-        const png = await soffice.convertFile(input, 'png', { outDir: workDir });
-        return await encodeJpeg(await fsp.readFile(png), settings, resample);
+        return await require('./metafile-normalize').rasterizeMetafiles(items, { settings, displayMm });
     } catch (err) {
-        return { warning: keepText(label, `EMF/WMF 栅格化失败（${errText(err)}）`) };
-    } finally {
-        if (workDir) await tmp.removeTempDir(workDir);
+        const failReason = `图元预处理异常：${errText(err)}`;
+        return { results: new Map(items.map((item) => [item.asset, { failReason }])), warnings: [] };
     }
 }
+
+/** 参与预处理的资产：mime（缺失时按魔数）判定为图元、内容非空、未被体量护栏拦下 */
+function collectMetafileItems(assets) {
+    const items = [];
+    for (const asset of assets) {
+        const buffer = toBuffer(asset && asset.buffer);
+        if (!buffer || buffer.length === 0) continue;
+        if (!METAFILE_MIMES.has(resolveMime(asset, buffer))) continue;
+        // 体量超护栏的资产由主循环统一告警，不进批次
+        if (oversizeReason(buffer)) continue;
+        items.push({ asset, buffer });
+    }
+    return items;
+}
+
+/** 图元资产的处置：patent 下取预处理结果，其余 profile 一律保持原格式并告警 */
+function metafileResult(prepared, label, settings) {
+    if (!settings.isPatent) return { warning: keepText(label, METAFILE_NON_PATENT_REASON) };
+    const outcome = prepared || { failReason: '图元预处理未产出结果' };
+    if (!outcome.jpeg) return { warning: keepText(label, metafileFailReason(outcome.failReason)) };
+    return { jpeg: outcome.jpeg, width: outcome.width, height: outcome.height, warning: outcome.note || null };
+}
+
+const metafileFailReason = (reason) => `EMF/WMF 图元渲染失败（${reason}）${METAFILE_FAIL_TAIL}`;
 
 // ============================================================
 // 资产名与 IR 同步
@@ -579,8 +607,24 @@ function sniffImageMime(buffer) {
     if (buf.readUInt32BE(0) === 0x49492A00 || buf.readUInt32BE(0) === 0x4D4D002A) return 'image/tiff';
     if (buf.length >= 12 && buf.subarray(0, 4).toString('latin1') === 'RIFF'
         && buf.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+    const metafile = sniffMetafileMime(buf);
+    if (metafile) return metafile;
     if (SVG_TAG_RE.test(buf.subarray(0, SVG_PROBE_BYTES).toString('utf8'))) return 'image/svg+xml';
     return null;
+}
+
+/**
+ * EMF／WMF 魔数：复用图元模块的 sniffMetafile（EMF 为首 4 字节 01 00 00 00 且偏移 40 处为 ' EMF'），
+ * 覆盖资产 mime 缺失或为 application/octet-stream 的情形。图元模块在此才 require，且失败一律按未识别处理。
+ */
+function sniffMetafileMime(buf) {
+    try {
+        const format = require('../metafile').sniffMetafile(buf);
+        if (format === null) return null;
+        return format === 'emf' ? 'image/x-emf' : 'image/x-wmf';
+    } catch (err) {
+        return null;
+    }
 }
 
 const isGifSignature = (buf) => buf.length >= 6 && ['GIF87a', 'GIF89a'].includes(buf.subarray(0, 6).toString('latin1'));
