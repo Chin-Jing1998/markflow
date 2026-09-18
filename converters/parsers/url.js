@@ -41,7 +41,7 @@ const { capWhitespaceRuns } = require('../web/whitespace');
 const { extractMetadata, countWords } = require('../web/metadata');
 const { displaySizeOf, formatDisplayAttr } = require('../web/image-display');
 const {
-    indentFromStyleChain, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS,
+    indentFromStyleChain, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_TAGS, INDENT_SPACE_CLASS,
 } = require('../web/indent');
 const { notify, errText, hostnameOf } = require('../util');
 
@@ -65,6 +65,8 @@ const MIME_BY_EXT = {
 };
 // 段首缩进识别：遇到首个可见字符即停；「可见」不含 ASCII 空白、不换行空格与全角类空格
 const INDENT_SPACE_ONLY_RE = new RegExp(`^[${INDENT_SPACE_CLASS}]*$`);
+// 嵌套块判定按标签名逐个后代比对（见 hasNestedBlock），故把标签名列表转成 Set
+const NESTED_BLOCK_TAG_SET = new Set(NESTED_BLOCK_TAGS);
 // JS 的 \s 含不换行空格与全角空格，据此判定「有可见文字」
 const VISIBLE_TEXT_RE = /[^\s]/;
 // 空 span 里须保留的空白：U+00A0 不换行空格、U+3000 全角空格（码点声明，源码不出现不可见字面量）
@@ -340,11 +342,50 @@ function markIndents($) {
     $(LEAF_BLOCK_SELECTOR).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
-        if ($el.find(NESTED_BLOCK_SELECTOR).length > 0) return;
+        if (hasNestedBlock(el)) return;
         if (!VISIBLE_TEXT_RE.test($el.text())) return;
         const count = indentFromStyleChain(styleChainOf(el)) + takeLeadingSpaces(el);
         if (count > 0) $el.prepend(indentMarker(count));
     });
+}
+
+/**
+ * 是否含嵌套块后代。语义等价于 $(el).find(NESTED_BLOCK_SELECTOR).length > 0，但命中即停、显式栈遍历
+ * （不递归，深层嵌套不爆栈），耗时线性于元素数：cheerio 的 .find() 把该元素的全部子元素交给
+ * css-select 的 prepareContext，其中 removeSubsets 对这组根逐个做 lastIndexOf，同级子元素 n 个即 O(n²)
+ *
+ * 与 .find() 逐字等价的四条依据，均以 cheerio 1.2.0 的实测行为为准而非直觉：
+ *   - 元素以 attribs 是否存在判定：<script>、<style> 的 type 分别是 'script'、'style' 而非 'tag'，
+ *     domhandler 的 isTag 同样把三者都算元素（与 web/whitespace 同一约定）；文本与注释节点没有 attribs
+ *   - 只比对标签名、不看命名空间：css-select 的标签匹配就是名字相等，故 <svg>、<math> 里的 section、
+ *     figure 一样算嵌套块（二者不在 HTML 规范的 breakout 列表中，会留在外来命名空间内）
+ *   - 注释没有子节点，<script>、<style> 的子节点只有原始文本，进去也匹配不到，不必单独排除
+ *   - <template> 的内容被 parse5 放进一个 type 为 'root' 的非元素子节点，它可见与否取决于 el 的父节点：
+ *     父节点是元素时，css-select 的 absolutize 给选择器加上 :scope 后代，而后代组合子的
+ *     getElementParent 不跨非元素节点，片段内的块一律匹配不到；el 位于载入根之下（父节点是 type 为
+ *     'root' 的载入根）时不加 :scope，退化为纯标签匹配，domutils 的 find 穿过片段、其中的块照样计数。
+ *     这是 cheerio 自身的不一致，此处照搬以保持标注结果逐字不变
+ *
+ * 命中即停使总成本线性：遍历从不进入嵌套块内部，而叶子块选择器是嵌套块标签的子集，故每个节点至多被
+ * 其最近的叶子块祖先扫描一次——大量并列与深层嵌套同样成立
+ */
+function hasNestedBlock(el) {
+    const shouldEnterFragments = !isElementNode(el.parent);
+    const stack = (el.children || []).slice();
+    while (stack.length > 0) {
+        const node = stack.pop();
+        const isElement = isElementNode(node);
+        if (isElement && NESTED_BLOCK_TAG_SET.has(node.name)) return true;
+        if (!isElement && !shouldEnterFragments) continue;
+        // 逐个 push 而非展开传参：子元素上万时 push(...children) 会超出实参个数上限
+        for (const child of node.children || []) stack.push(child);
+    }
+    return false;
+}
+
+// 元素节点的判定：<script>、<style> 的 type 不是 'tag'，故以 attribs 是否存在为准
+function isElementNode(node) {
+    return Boolean(node && node.attribs);
 }
 
 function styleChainOf(el) {
@@ -471,4 +512,4 @@ function isolateImageLines(markdown) {
     return out.join('\n');
 }
 
-module.exports = { parse, collapseBreakMarkers };
+module.exports = { parse, collapseBreakMarkers, markIndents };

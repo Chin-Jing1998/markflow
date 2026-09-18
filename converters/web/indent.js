@@ -8,12 +8,18 @@
  *                                 { count, length }：count = U+3000 与 em 空格个数 + ⌈NBSP 与 en 空格个数 / 2⌉，
  *                                 length 为应删除的前缀长度（含其间的 ASCII 空白）；否则返回 null。
  *                                 ASCII 空格在 HTML 中会被折叠、不产生缩进，故不计数
- *   LEAF_BLOCK_SELECTOR           缩进的承载者：这些块元素中不含 NESTED_BLOCK_SELECTOR 后代者为「叶子块」
- *   NESTED_BLOCK_SELECTOR
+ *   LEAF_BLOCK_SELECTOR           缩进的承载者：这些块元素中不含 NESTED_BLOCK_TAGS 后代者为「叶子块」
+ *   NESTED_BLOCK_TAGS             嵌套块的标签名列表，是唯一的事实来源
+ *   NESTED_BLOCK_SELECTOR         由 NESTED_BLOCK_TAGS 派生的选择器串，供按选择器查询的调用方使用
  */
 
 const LEAF_BLOCK_SELECTOR = 'p, section, div, li, blockquote';
-const NESTED_BLOCK_SELECTOR = 'p, section, div, li, blockquote, ul, ol, table, figure, pre, h1, h2, h3, h4, h5, h6';
+// 标签名列表与选择器串二者必须一致，故以列表为源头派生出串：url.js 的 markIndents 按标签名逐个后代比对，
+// web/extract.js 的 annotateLayout 把串交给 linkedom 的 querySelector
+const NESTED_BLOCK_TAGS = Object.freeze([
+    'p', 'section', 'div', 'li', 'blockquote', 'ul', 'ol', 'table', 'figure', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+]);
+const NESTED_BLOCK_SELECTOR = NESTED_BLOCK_TAGS.join(', ');
 
 const TEXT_INDENT_RE = /(?:^|;)\s*text-indent\s*:\s*(-?\d+(?:\.\d+)?)\s*(em|rem|px)?\s*(?:!important)?\s*(?=;|$)/i;
 const FONT_SIZE_RE = /(?:^|;)\s*font-size\s*:\s*(\d+(?:\.\d+)?)px/i;
@@ -72,4 +78,7 @@ function leadingIndentRun(text) {
     return { count: wide + Math.ceil(narrow / 2), length: matched[0].length };
 }
 
-module.exports = { indentFromStyleChain, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS };
+module.exports = {
+    indentFromStyleChain, leadingIndentRun,
+    LEAF_BLOCK_SELECTOR, NESTED_BLOCK_TAGS, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS,
+};

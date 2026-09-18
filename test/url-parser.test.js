@@ -10,8 +10,10 @@ const zlib = require('node:zlib');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { parse, collapseBreakMarkers } = require('../converters/parsers/url');
-const { MARKERS } = require('../converters/ir/markers');
+const cheerio = require('cheerio');
+const { parse, collapseBreakMarkers, markIndents } = require('../converters/parsers/url');
+const { MARKERS, indentMarker } = require('../converters/ir/markers');
+const { LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, NESTED_BLOCK_TAGS } = require('../converters/web/indent');
 const { _setLookup } = require('../converters/net/fetch-guard');
 const mdRenderer = require('../converters/renderers/md');
 
@@ -895,4 +897,153 @@ test('BR 折叠：行首、行中、行尾、标题行与前导空白的判定�
     for (const [input, expected, note] of cases) {
         assert.equal(collapseBreakMarkers(input), expected, `${note}：${JSON.stringify(input)}`);
     }
+});
+
+// ============================================================
+// 段首缩进标注：嵌套块判定的耗时上限与语义等价
+// ============================================================
+
+// 耗时用例的载荷规模：一个叶子块下 10 万个直接子元素。线性化之前的「是否含嵌套块」判定走 cheerio 的
+// $el.find(NESTED_BLOCK_SELECTOR)，它把该元素的全部子元素交给 css-select 的 prepareContext，
+// 其中 removeSubsets 对这组根逐个做 lastIndexOf / includes，同级子元素 n 个即 O(n²)——本机实测
+// 1 万 84 ms、2 万 311 ms、4 万 1215 ms、8 万 4789 ms、10 万 7607 ms（每翻倍约 4 倍）
+const INDENT_STRESS_CHILDREN = 100000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。
+// 1000 ms 使两侧余量都不小于 5 倍——线性化之前的 7607 ms 是它的 7.6 倍，线性化之后同一载荷实测
+// 27 ms 上下、余量 36 倍，故慢机以及 node --test 多文件并行抢占 CPU 时都不会误报。
+// 直接调用 markIndents 而不走全链路 parse：其余阶段（cheerio 载入、正文提取、turndown、remark）
+// 自身线性的耗时会垫高线性化之后的总时长，两侧余量无法同时达到 5 倍（4 万时全链路新旧之比仅约 3.2）
+const INDENT_STRESS_BUDGET_MS = 1000;
+
+// 差分用例的随机树：字母表含叶子块、嵌套块、行内元素，以及 .find() 行为需实测确认的边角标签
+const DIFF_TREE_TAGS = Object.freeze([
+    'p', 'section', 'div', 'li', 'blockquote', 'ul', 'ol', 'table', 'figure', 'pre', 'h1', 'h6',
+    'span', 'em', 'strong', 'i', 'a', 'template', 'svg', 'math', 'script', 'style',
+]);
+const DIFF_TREE_SEED = 20260919;
+const DIFF_TREE_COUNT = 6000;
+const DIFF_TREE_MAX_DEPTH = 3;
+const DIFF_TREE_MAX_CHILDREN = 3;
+
+// 与 url.js 的 VISIBLE_TEXT_RE 同一判据：JS 的 \s 含不换行空格与全角空格，故「有可见文字」即含非 \s 字符
+const VISIBLE_TEXT_IN_TEST_RE = /[^\s]/;
+// 选择器串的现状字面量：web/extract.js 也用同一个串走 linkedom 的 querySelector，故必须逐字节不变
+const NESTED_BLOCK_LITERAL = 'p, section, div, li, blockquote, ul, ol, table, figure, pre, h1, h2, h3, h4, h5, h6';
+
+// markIndents 以 prepend 插入标记，标注过的元素首个子节点即以 INDENT 标记开头的文本节点
+function isIndentMarked(el) {
+    const first = el && (el.children || [])[0];
+    return Boolean(first && first.type === 'text' && String(first.data || '').startsWith(MARKERS.INDENT));
+}
+
+// 定种子的 mulberry32 伪随机数：同一种子每次生成同一批树，用例失败可原样复现
+function seededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6D2B79F5) >>> 0;
+        let t = Math.imul(state ^ (state >>> 15), 1 | state);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// 随机小树：每个元素都带 text-indent:2em 与可见文字，故凡过判定者折算字数必为 2，判定与标注一一对应
+function randomTree(random, depth) {
+    const tag = DIFF_TREE_TAGS[Math.floor(random() * DIFF_TREE_TAGS.length)];
+    const count = depth <= 0 ? 0 : Math.floor(random() * (DIFF_TREE_MAX_CHILDREN + 1));
+    const inner = Array.from({ length: count }, () => randomTree(random, depth - 1)).join('');
+    return `<${tag} style="text-indent:2em">甲${inner}</${tag}>`;
+}
+
+test('段首缩进标注：叶子块下 10 万个并列子元素不触发平方级扫描，耗时在绝对上限内且缩进照常标注', async () => {
+    // Arrange：段首四个不换行空格折两字；载荷两端留可见文字，便于核对没有少做
+    const html = `<p>&nbsp;&nbsp;&nbsp;&nbsp;甲x${'<i>&nbsp;</i>'.repeat(INDENT_STRESS_CHILDREN)}y乙</p>`;
+    const $ = cheerio.load(html, null, false);
+
+    // Act：计时区间只包 markIndents 一次调用，cheerio.load 在区间之外
+    const [, ms] = await timed(() => markIndents($));
+
+    // Assert：先验标注正确，以免「快」来自少做了事
+    const text = $('p').text();
+    const codes = [...text.slice(0, 4)].map((char) => char.codePointAt(0).toString(16)).join(',');
+    assert.ok(text.startsWith(`${indentMarker(2)}甲x`), `段首应为两字缩进标记接「甲x」，实际前四个码点：${codes}`);
+    assert.ok(text.endsWith('y乙'), '载荷末端的可见文字应保留');
+    assert.ok(ms < INDENT_STRESS_BUDGET_MS, `标注实测 ${ms.toFixed(1)} 毫秒，超出上限 ${INDENT_STRESS_BUDGET_MS} 毫秒`);
+});
+
+test('段首缩进标注：定种子随机树上，实际被标注的元素集合与旧判定算出的集合逐个一致', () => {
+    // Arrange
+    const random = seededRandom(DIFF_TREE_SEED);
+    let candidateCount = 0;
+
+    for (let index = 0; index < DIFF_TREE_COUNT; index += 1) {
+        const html = randomTree(random, DIFF_TREE_MAX_DEPTH);
+        const $ = cheerio.load(html, null, false);
+
+        // Arrange：给每个候选叶子块编号，标注前后据此对应
+        const candidates = $(LEAF_BLOCK_SELECTOR).toArray();
+        candidates.forEach((el, at) => $(el).attr('data-mf-probe', String(at)));
+        const probeOf = (el) => $(el).attr('data-mf-probe');
+
+        // Arrange：旧判定（cheerio 的 .find() 加可见文字）算出的「应被标注的元素集合」
+        const expected = candidates
+            .filter((el) => $(el).find(NESTED_BLOCK_SELECTOR).length === 0 && VISIBLE_TEXT_IN_TEST_RE.test($(el).text()))
+            .map(probeOf);
+
+        // Act
+        markIndents($);
+
+        // Assert
+        assert.deepEqual(candidates.filter(isIndentMarked).map(probeOf), expected, `第 ${index} 棵树：${html}`);
+        candidateCount += candidates.length;
+    }
+
+    // Assert：核对面确实铺开了，不是一批空树
+    assert.ok(candidateCount > DIFF_TREE_COUNT, `候选叶子块应多于树的棵数，实际 ${candidateCount} 个`);
+});
+
+test('段首缩进标注：每个嵌套块标签都让外层块不再是叶子块，其自身照常标注', () => {
+    // Arrange & Act & Assert
+    for (const tag of NESTED_BLOCK_TAGS) {
+        const $ = cheerio.load(`<div style="text-indent:2em">甲<${tag}>乙</${tag}></div>`, null, false);
+        markIndents($);
+        assert.equal(isIndentMarked($('div').first()[0]), false, `外层 div 含 <${tag}> 后代时不应标注`);
+    }
+
+    // Assert：对照组——同一形态换成行内后代，外层照常标注
+    const $inline = cheerio.load('<div style="text-indent:2em">甲<em>乙</em></div>', null, false);
+    markIndents($inline);
+    assert.equal(isIndentMarked($inline('div').first()[0]), true, '只含行内后代的 div 应标注');
+});
+
+test('段首缩进标注：嵌套块藏在行内元素、template 与外来内容里同样不算叶子块；注释与 script／style 不影响标注', () => {
+    // Arrange：[HTML, 外层 div 是否应被标注, 说明]
+    const cases = [
+        ['<div style="text-indent:2em">甲<span><p>乙</p></span></div>', false, '嵌套块藏在 span 里'],
+        ['<div style="text-indent:2em">甲<span><em><blockquote>乙</blockquote></em></span></div>', false, '嵌套块藏在两层行内元素里'],
+        ['<div style="text-indent:2em">甲<template><p>乙</p></template></div>', false, '候选块在载入根之下时，template 内容片段里的块照样计数'],
+        ['<em>甲<div style="text-indent:2em">乙<template><p>丙</p></template></div></em>', true, '候选块的父节点是元素时，cheerio 给选择器加 :scope 后代，其后代组合子不跨 template 的内容片段，片段里的块一律匹配不到'],
+        ['<em>甲<div style="text-indent:2em">乙<span><p>丙</p></span></div></em>', false, '同为嵌套候选，块不在 template 里时照常计数'],
+        ['<div style="text-indent:2em">甲<svg><section>乙</section></svg></div>', false, 'svg 外来内容里的同名元素照样计数'],
+        ['<div style="text-indent:2em">甲<math><section>乙</section></math></div>', false, 'math 外来内容里的同名元素照样计数'],
+        ['<div style="text-indent:2em">甲<span><em>乙</em></span></div>', true, '只含行内后代'],
+        ['<div style="text-indent:2em">甲<!--这里写了 p 标签--></div>', true, '注释不是元素'],
+        ['<div style="text-indent:2em">甲<script>var html = "<p>乙</p>";</script></div>', true, 'script 的内容是原始文本，其中的标签名不算块'],
+        ['<div style="text-indent:2em">甲<style>p { color: red; }</style></div>', true, 'style 的内容同样是原始文本'],
+        ['<div style="text-indent:2em">甲<svg><circle></circle></svg></div>', true, 'svg 里没有同名块'],
+        ['<div style="text-indent:2em">甲<template><span>乙</span></template></div>', true, 'template 里只有行内元素'],
+    ];
+
+    // Act & Assert
+    for (const [html, marked, note] of cases) {
+        const $ = cheerio.load(html, null, false);
+        markIndents($);
+        assert.equal(isIndentMarked($('div').first()[0]), marked, `${note}：${html}`);
+    }
+});
+
+test('嵌套块选择器由标签名列表派生，与现有字面串逐字节相同', () => {
+    // Assert：web/extract.js 把同一个串交给 linkedom 的 querySelector，串变了那条链路就跟着变
+    assert.equal(NESTED_BLOCK_SELECTOR, NESTED_BLOCK_LITERAL);
+    assert.equal(NESTED_BLOCK_SELECTOR, NESTED_BLOCK_TAGS.join(', '));
 });
