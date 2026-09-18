@@ -1,7 +1,8 @@
 /**
  * converters/parsers/url.js 单元测试
  * 覆盖：标题提取顺序、正文结构（heading/table/image）、script 剔除、图片入 assets 与 Referer、
- *       懒加载属性、下载失败降级、data URL 图片、SSRF 守卫拒绝本地地址
+ *       懒加载属性、下载失败降级、data URL 图片、SSRF 守卫拒绝本地地址、
+ *       字面尖括号与字符引用写法逐字进入 IR
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -136,6 +137,25 @@ const ESCAPE_PAGE = `<!doctype html>
 </article>
 </body></html>`;
 
+// 零宽空格 U+200B，以码点生成
+const ZWSP = String.fromCharCode(0x200B);
+// 文本中的「<b>」曾被当成行内 HTML（还会被提升成 strong 节点）、「&lt;」曾被解码；零宽字符夹在「&」与「lt;」
+// 之间时，normalizeMarkdown 在 turndown 之后才删掉它，实体重新成立；该夹具走完整解析链路，一并覆盖
+// turndown 与 remark 之间的字符串级步骤。
+const HTML_SYNTAX_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><title>尖括号写法</title></head><body>
+<article>
+<h1>尖括号写法</h1>
+<p>当a&lt;b&gt;c时成立</p>
+<p>见&amp;lt;与&amp;amp;，另有 &amp;#60; 与 AT&amp;T，网址 http://example.com/?a=1&amp;b=2 结束</p>
+<p>&lt;div&gt;块级开头&lt;/div&gt;</p>
+<p>零宽：&amp;${ZWSP}lt; 与 &lt;${ZWSP}b&gt;粗&lt;/b&gt;</p>
+<p><strong>粗&lt;em&gt;</strong>、<em>斜&amp;amp;</em>、<del>删&lt;s&gt;</del>、R<sup>a&lt;b</sup>、C<sub>x&lt;y</sub></p>
+<table><tr><th>项</th><th>值</th></tr><tr><td>a&lt;b&gt;c</td><td>见&amp;lt;与&amp;amp;</td></tr></table>
+<p><img src="/a.png" alt="见&amp;lt;与&amp;amp; 及 a&lt;b&gt;c"></p>
+</article>
+</body></html>`;
+
 // ------------------------------------------------------------
 // 超长空白夹具：turndown 7.2.4 的 postProcess 对整篇输出跑 /[\t\r\n\s]+$/，
 // 输出里任何一段不在末尾、长度为 R 的连续空白都要花约 R²/2 步
@@ -244,6 +264,10 @@ function startServer() {
             case '/escape':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(ESCAPE_PAGE);
+                return;
+            case '/html-syntax':
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(HTML_SYNTAX_PAGE);
                 return;
             case '/ws-alt':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -1612,4 +1636,54 @@ test('HTML 预处理：顶层 6 万个并列段落不触发平方级的片段载
     // Assert：先验结果正确——段落无样式、无缩进空白，预处理不改动任何节点
     assert.ok(output === html, '整段 HTML 应逐字不变');
     assert.ok(ms < PREPROCESS_STRESS_BUDGET_MS, `预处理实测 ${ms.toFixed(1)} 毫秒，超出上限 ${PREPROCESS_STRESS_BUDGET_MS} 毫秒`);
+});
+
+test('尖括号写法页面：字面的标签与字符引用写法逐字进入 IR，零宽字符删除后仍不成立，裸网址的查询串不多出反斜杠', async (t) => {
+    // Arrange
+    const server = await startServer();
+    t.after(() => server.close());
+
+    // Act
+    const doc = await parse({ url: `${server.base}/html-syntax` }, { allowPrivateNetwork: true });
+    const markdown = await mdRenderer.render(doc);
+
+    // Assert：正文段落逐字保留，字符引用、零宽字符与裸网址查询串均未被误处理
+    const paragraphs = doc.ir.children.filter((n) => n.type === 'paragraph' && plainText(n));
+    assert.deepEqual(paragraphs.map(plainText), [
+        '当a<b>c时成立',
+        '见&lt;与&amp;，另有 &#60; 与 AT&T，网址 http://example.com/?a=1&b=2 结束',
+        '<div>块级开头</div>',
+        '零宽：&lt; 与 <b>粗</b>',
+        '粗<em>、斜&amp;、删<s>、Ra<b、Cx<y',
+    ]);
+
+    // Assert：表格单元格文本逐字保留
+    const tables = collect(doc.ir, (n) => n.type === 'table');
+    assert.equal(tables.length, 1);
+    assert.deepEqual(
+        collect(tables[0], (n) => n.type === 'tableRow').map((r) => r.children.map(plainText)),
+        [['项', '值'], ['a<b>c', '见&lt;与&amp;']],
+    );
+
+    // Assert：图片替代文字逐字保留
+    const images = collect(doc.ir, (n) => n.type === 'image');
+    assert.equal(images.length, 1);
+    assert.equal(images[0].alt, '见&lt;与&amp; 及 a<b>c');
+
+    // Assert：未产生 html 节点，各行内节点文字逐字保留
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'html'), []);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'strong').map(plainText), ['粗<em>']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'emphasis').map(plainText), ['斜&amp;']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete').map(plainText), ['删<s>']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'superscript').map(plainText), ['a<b']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'subscript').map(plainText), ['x<y']);
+
+    // Assert：裸网址被识别为 link，查询串中的「&」未被转义成反斜杠形式
+    const links = collect(doc.ir, (n) => n.type === 'link');
+    assert.equal(links.length, 1);
+    assert.equal(links[0].url, 'http://example.com/?a=1&b=2');
+
+    // Assert：md 产物中「<」与「&」经转义
+    assert.ok(markdown.includes('当a\\<b>c时成立'), markdown);
+    assert.ok(markdown.includes('见\\&lt;与\\&amp;'), markdown);
 });

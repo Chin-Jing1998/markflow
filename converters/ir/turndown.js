@@ -19,6 +19,18 @@
  *     image 规则处理，该规则调用的是 turndown 模块私有的 escapeMarkdown（星号、方括号与反斜杠已转义），工厂层
  *     补在实例 escape 上的「~」转义对它不生效，故由 addImageAltRule 接管内置规则、只替换其中的 alt 一段，
  *     并把 alt 内的换行折叠为空格
+ *   - 文本中的「<」一律转义为 \<，不按后随字符判定：能构成标签、注释、声明、处理指令与自动链接开头的后随
+ *     字符几乎覆盖全部 ASCII 字母数字与多数标点（micromark 的邮箱自动链接首字符可为数字及 #$%&'*+-./=?^_{|}
+ *     等），而 escape 逐文本节点调用、看不到下一个节点的内容，url 管线又在其后删掉零宽字符、使后随字符改变，
+ *     按后随字符放行必有遗漏。\< 恒为合法的反斜杠转义，多转义不改变 IR 文本
+ *   - 文本中的「&」只在可能构成字符引用时转义为 \&：自「&」起可选一个 #、至多 31 个 ASCII 字母数字
+ *     （micromark 的 characterReferenceNamedSizeMax，十进制 7 位与十六进制 6 位的数值引用均在其内）、其后
+ *     为分号则转义，零宽字符视为不存在。不可一律转义：GFM 裸网址（autolink literal）内部的反斜杠是字面量，
+ *     一律转义会使 http://example.com/?a=1&b=2 的链接地址与文本都多出反斜杠。扫到串尾仍未定时从严判为
+ *     「可能」，因为分号可能落在下一个文本节点里
+ *   - 已知限制（均源于 GFM 裸网址内部不认反斜杠转义，与既有的 a\_b 同类，属另案）：紧跟在裸网址之后的「<」，
+ *     其转义反斜杠会被网址吞掉（裸网址止于「<」或空白，反斜杠先并入链接地址），「<」重新裸露；尖括号包着的
+ *     网址（<http://a.com/x>）转义后文本逐字保留，但其中的裸网址仍被识别为链接，右尖括号一并计入链接地址
  *
  * url profile 的输出约定（与 ir/markers、ir/inline-html 配套）：
  *   - 粗体、斜体、删除线一律输出 <strong>/<em>/<del> HTML 而非 ** / * / ~~：CommonMark 的 flanking 规则在中文
@@ -35,6 +47,8 @@
  */
 const TurndownService = require('turndown');
 const { MARKERS } = require('./markers');
+// 零宽字符码点：web/normalize 不依赖本模块，引入不成环
+const { ZERO_WIDTH_CODE_POINTS } = require('../web/normalize');
 
 const BASE_OPTIONS = {
     headingStyle: 'atx',
@@ -57,6 +71,15 @@ const TILDE_RE = /\\+~?|~/g;
 // 图片 alt 的分行符。不写成 /\s*[\r\n]+\s*/ 一步替换：前导的 \s* 在不含换行的超长空白串上逐位回溯，
 // 耗时随长度平方增长（16 万个空格约 9 秒），而网页的 alt 属不可信输入
 const LINE_BREAK_RE = /[\r\n]+/;
+
+// 「<」「&」及其前导反斜杠串（判定是否已被 turndown 自身转义）。反斜杠串整段一次取走，不写成 /(\\*)[<&]/g：
+// 带前导量词的写法在超长反斜杠串上逐位回溯，耗时随长度平方增长，而网页与 alt 属不可信输入
+const HTML_SYNTAX_RE = /\\+[<&]?|[<&]/g;
+// 字符引用的引用名上限，取自 micromark 的 characterReferenceNamedSizeMax
+const CHAR_REF_BODY_MAX = 31;
+const ASCII_ALNUM_RE = /[0-9A-Za-z]/;
+// 零宽字符在 parsers/url 的 normalizeMarkdown 里会被删除，判定字符引用时须当它不存在
+const ZERO_WIDTH_CHARS = new Set(ZERO_WIDTH_CODE_POINTS.map((cp) => String.fromCodePoint(cp)));
 
 // CSS font-weight 视为加粗的取值：bold、600-999、1000
 const BOLD_STYLE_RE = /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i;
@@ -82,6 +105,7 @@ function createTurndownService(profile = 'basic') {
     addImageAltRule(service);
     configure(service);
     escapeTildesIn(service);
+    escapeHtmlSyntaxIn(service);
     return service;
 }
 
@@ -707,6 +731,51 @@ function escapeTildes(text) {
         const slashCount = matched.length - 1;
         return slashCount % 2 === 1 ? matched : `${matched.slice(0, slashCount)}\\~`;
     });
+}
+
+/** 在实例的转义链末端补上「<」与「&」的转义（各 profile 共用，故挂在工厂层而非某个 configure 内） */
+function escapeHtmlSyntaxIn(service) {
+    const escapeUpstream = service.escape.bind(service);
+    service.escape = (text) => escapeHtmlSyntax(escapeUpstream(text));
+}
+
+/**
+ * 在既有的转义结果上补转义「<」与「&」：「<」一律转义，「&」只在可能构成字符引用时转义（理由见文件头）。
+ * 与 escapeTildes 同样按前导反斜杠的奇偶判定：奇数个表示该字符已被上游转义，原样保留；偶数个（含 0 个）补一个。
+ */
+function escapeHtmlSyntax(text) {
+    return text.replace(HTML_SYNTAX_RE, (matched, offset) => {
+        const target = matched[matched.length - 1];
+        // 反斜杠串后面不是「<」或「&」（普通字符或串尾），与本转义无关
+        if (target === '\\') return matched;
+        if ((matched.length - 1) % 2 === 1) return matched;
+        if (target === '&' && !mayStartCharRef(text, offset + matched.length)) return matched;
+        return `${matched.slice(0, -1)}\\${target}`;
+    });
+}
+
+/**
+ * 判断 text 自下标 from 起是否可能是字符引用的引用体：可选一个 #，随后至多 CHAR_REF_BODY_MAX 个 ASCII
+ * 字母数字，其后为分号；零宽字符视为不存在；扫到串尾仍未定时从严判为「可能」。放宽之处（&#; 与不存在的
+ * 引用名也判为可能）只会多转义一个反斜杠，不改变 IR 文本。
+ * 耗时随文本长度线性增长：每个「&」的扫描区间止于下一个不合规字符（含下一个「&」），各区间互不重叠。
+ */
+function mayStartCharRef(text, from) {
+    let body = 0;
+    let hashSeen = false;
+    for (let at = from; at < text.length; at += 1) {
+        const ch = text[at];
+        if (ZERO_WIDTH_CHARS.has(ch)) continue;
+        if (ch === ';') return true;
+        if (ch === '#' && !hashSeen && body === 0) {
+            hashSeen = true;
+            continue;
+        }
+        if (!ASCII_ALNUM_RE.test(ch)) return false;
+        body += 1;
+        if (body > CHAR_REF_BODY_MAX) return false;
+    }
+    return true;
 }
 
 // [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整。
