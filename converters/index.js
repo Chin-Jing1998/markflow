@@ -35,7 +35,9 @@
  *   nameRegistry 与 order 为服务层内部参数（非用户 options）：批量转换时由 runConversion 传入同一张
  *   converters/naming.js 的登记表与本任务的批内序号，使同批内派生出同名产物的任务改名而不互相覆盖，
  *   且最终名只由序号决定（与解析快慢无关）；不传登记表即用派生名原样落盘，行为与引入登记表之前一致。
- *   options 经 converters/options.js 归一（非法值抛中文错误），透传 parser ctx（ctx.options）与渲染器；
+ *   options 经 converters/options.js 归一（非法值抛中文错误），归一之后按输入类型补默认值
+ *   （applyPatentImportDefaults：专利五书 XML 输入且未显式给出中文字体时取宋体，依据见 options.js），
+ *   再透传 parser ctx（ctx.options）与渲染器；
  *   返回值中的 options 为脱敏后的生效值（mineru.token 置 null），extras 为已落盘附属文件的相对路径。
  *
  * 渲染器契约 v3：render(doc, options, { imageMode }) → string | Buffer
@@ -70,7 +72,7 @@ const {
     detectInputType, assertTargetAllowed, getTargetRule, listTargets,
     SUPPORTED_EXTENSIONS, REMOTE_URL_RE, BUNDLE_DIR_TYPE,
 } = require('./targets');
-const { normalizeOptions, redactOptions } = require('./options');
+const { normalizeOptions, applyPatentImportDefaults, redactOptions } = require('./options');
 const { prependFrontMatter } = require('./web/frontmatter');
 const output = require('./output');
 const { runBatch } = require('./batch');
@@ -107,7 +109,7 @@ async function convert(params = {}) {
     const source = await resolveSource(input);
     await assertOutputDir(outputDir);
     assertTargetAllowed(target, source.type);
-    const options = normalizeOptions(rawOptions);
+    const options = applyPatentImportDefaults(normalizeOptions(rawOptions), source.type);
     const emit = createProgressEmitter(onProgress);
     const skipCheck = skipExisting === true ? { outputDir, target, options, source } : null;
 
@@ -201,7 +203,7 @@ async function skipIfExisting({ outputDir, target, options, source, name, title,
 async function parseDocument({ input, target, options: rawOptions, allowPrivateNetwork = false, onProgress } = {}) {
     const source = await resolveSource(input);
     if (target !== undefined && target !== null) getTargetRule(target);
-    const options = normalizeOptions(rawOptions);
+    const options = applyPatentImportDefaults(normalizeOptions(rawOptions), source.type);
     return parseResolved({ source, target, options, allowPrivateNetwork, emit: createProgressEmitter(onProgress) });
 }
 
@@ -339,7 +341,8 @@ function formatTimestamp(date = new Date()) {
 async function renderDocument(doc, target, rawOptions, { imageMode } = {}) {
     if (!doc || typeof doc !== 'object' || !doc.ir) throw new Error('renderDocument 需要有效的 IR 文档');
     const rule = getTargetRule(target);
-    const options = normalizeOptions(rawOptions);
+    // 桌面端按扁平选项重新构造 options 后才调本函数（不经 convert / parseDocument），输入类型只能从 doc.meta 读
+    const options = applyPatentImportDefaults(normalizeOptions(rawOptions), doc.meta && doc.meta.sourceType);
     const mode = imageMode || defaultImageMode(target, options);
     const rendered = target === 'bundle'
         ? await renderBundle(doc, options, mode)

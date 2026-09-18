@@ -17,6 +17,8 @@
  *       displayWidthMm / displayHeightMm 并向下取整（缺失时回退像素换算）、img id 前缀 if / iaf / idf
  *       各自独立编号、figure 与 maths / tables 的 @num 四位补零、figure-labels 承载图注、img 的
  *       top/left/orientation/inline 取值与属性顺序、BOM 与 DOCTYPE 的 []、附图部分杂散文字丢弃并告警
+ *       另设「大图拆段的并回」一组：正文三书里同一原段落拆出的相邻块并回一个段落（段号不顺延、图片仍在段内），
+ *       两本附图书维持拆开，并回后含文字的段落不再报「如为附图请移至…」。
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -31,6 +33,7 @@ const { validateXml } = require('../converters/renderers/xml/validate');
 const { ISSUE_CODES, CATEGORIES, precheck } = require('../converters/renderers/xml/precheck');
 const { readJpegInfo } = require('../converters/renderers/xml/image-info');
 const { normalizeOptions } = require('../converters/options');
+const { splitImageParagraphs } = require('../converters/ir/captions');
 const { convert, renderDocument, writeDocument } = require('../converters');
 const {
     createDocument, createRoot, createHeading, createParagraph, createText, createMath, createTable, createTableRow, createTableCell,
@@ -1150,5 +1153,106 @@ describe('patent profile：夹具 docx 端到端', () => {
         assert.equal(claims('claim').eq(0).find('claim-text').length, 3);
         assert.equal(claims('claim-ref').length, 0, '官方不生成 claim-ref');
         assert.ok(claims('claim').eq(3).find('claim-text').text().includes('权利要求1-3'));
+    });
+});
+
+// ============================================================
+// 大图拆段的并回
+// ============================================================
+
+describe('patent profile：大图拆段的并回', () => {
+    // 解析层的大图拆段阈值为 200 px；显示宽度取 300 px 以确保被拆
+    const SPLIT_PX = 300;
+    const bigImage = (name, extra = {}) => image(name, { display: { width: SPLIT_PX, height: 120, unit: 'px' }, ...extra });
+    const floatImage = (name) => bigImage(name, { floating: true });
+    const para = (...items) => createParagraph(items);
+    // 顶层节点先过一遍解析层的大图拆段，与 docx 链路（parsers/docx 的 markCaptions）同一形态
+    const split = (children) => splitImageParagraphs(createRoot(children)).children;
+    const threeAssets = () => [asset('images/image_1.jpg'), asset('images/image_2.jpg'), asset('images/image_3.jpg')];
+
+    test('说明书：文字 + 段尾大图 / 段首大图 + 文字 / 文字 + 浮动图各得一个 p，段号连续', async () => {
+        const children = split([
+            bold('说明书'), h(1, '技术领域'),
+            para(createText('按下式计算：'), bigImage('images/image_1.jpg')),
+            para(bigImage('images/image_2.jpg'), createText('如上图所示。')),
+            para(createText('另见浮动图。'), floatImage('images/image_3.jpg')),
+            p('末段。'),
+        ]);
+        assert.equal(children.length, 9, '拆段后顶层节点为 书目标题 + 小标题 + 三段各拆成两块 + 末段');
+
+        const result = await renderPatent(children, { assets: threeAssets() });
+        const $ = $of(result.files[DESCRIPTION]);
+        const paragraphs = $('description > p').toArray();
+
+        assert.equal(paragraphs.length, 4, '三个原段落各得一个 p，段号不顺延');
+        assert.deepEqual(paragraphs.map((node) => node.attribs.num), ['0001', '0002', '0003', '0004']);
+        assert.deepEqual(paragraphs.map((node) => $(node).find('img').length), [1, 1, 1, 0]);
+        assert.deepEqual(paragraphs.map((node) => textOf(node)), ['按下式计算：', '如上图所示。', '另见浮动图。', '末段。']);
+        assert.deepEqual(paragraphs.map((node) => $(node).find('img').attr('file')).slice(0, 3),
+            ['100002_1.jpg', '100002_2.jpg', '100002_3.jpg']);
+    });
+
+    test('说明书：并回后含文字的段落不再提示「如为附图请移至…」，整段只有图片的块仍提示', async () => {
+        const children = split([
+            bold('说明书'), h(1, '技术领域'),
+            para(createText('正文：'), bigImage('images/image_1.jpg')),
+            imgP('images/image_2.jpg'),
+        ]);
+
+        const result = await renderPatent(children, { assets: [asset('images/image_1.jpg'), asset('images/image_2.jpg')] });
+
+        assert.deepEqual(result.issues.filter((issue) => issue.code === ISSUE_CODES.FIGURE_INLINE_IMAGE).map((issue) => issue.message),
+            ['附图：说明书正文含图片 images/image_2.jpg，已作为段内图片输出；如为附图，请移至说明书附图部分']);
+        assert.equal($of(result.files[DESCRIPTION])('description > p').length, 2);
+    });
+
+    test('权利要求书：并回后仍是一条 claim-text，权项数与项号不变', async () => {
+        const children = split([
+            bold('权利要求书'),
+            para(createText('1. 一种装置，其结构式如下：'), bigImage('images/image_1.jpg')),
+            p('2. 根据权利要求1所述的装置，其特征在于设有底座。'),
+        ]);
+
+        const result = await renderPatent(children, { assets: [asset('images/image_1.jpg')] });
+        const $ = $of(result.files[CLAIMS]);
+
+        assert.deepEqual($('claim').toArray().map((node) => node.attribs.num), ['1', '2']);
+        const first = $('claim').eq(0);
+        assert.equal(first.find('claim-text').length, 1, '文字与图片同在一条 claim-text 内');
+        assert.equal(first.find('claim-text > img').length, 1);
+        assert.ok(first.find('claim-text').text().includes('一种装置，其结构式如下：'));
+        assert.ok(!codesOf(result).includes(ISSUE_CODES.CLAIM_NUMBER_GAP));
+    });
+
+    test('说明书附图：大图 + 同段图号仍拆开，认成 figure 与图号', async () => {
+        const children = split([
+            bold('说明书附图'),
+            para(bigImage('images/image_1.jpg'), createText('图1')),
+        ]);
+        assert.equal(children.length, 3, '附图段照旧拆成图片段与图号段');
+
+        const result = await renderPatent(children, { assets: [asset('images/image_1.jpg')] });
+        const $ = $of(result.files[DRAWINGS]);
+
+        assert.equal($('cn-drawings > figure').length, 1);
+        assert.equal($('figure').attr('figure-labels'), '图1');
+        assert.equal($('figure').attr('num'), '0001');
+        assert.equal($('figure > img').length, 1);
+    });
+
+    test('说明书摘要：文字 + 段尾大图并回为一个 p；摘要附图另行输出', async () => {
+        const children = split([
+            bold('说明书摘要'),
+            para(createText('本发明公开了一种装置，其结构式如下：'), bigImage('images/image_1.jpg')),
+            bold('摘要附图'), imgP('images/image_2.jpg'),
+        ]);
+
+        const result = await renderPatent(children, { assets: [asset('images/image_1.jpg'), asset('images/image_2.jpg')] });
+        const abstract = $of(result.files[ABSTRACT]);
+
+        assert.equal(abstract('cn-abstract > p').length, 1);
+        assert.equal(abstract('cn-abstract > p').attr('num'), '0001');
+        assert.equal(abstract('cn-abstract > p > img').length, 1);
+        assert.equal($of(result.files[ABSTRACT_FIGURE])('cn-abst-figure > figure').length, 1);
     });
 });

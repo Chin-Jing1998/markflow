@@ -36,11 +36,17 @@
  * 权利要求内的图片（化学结构式、公式图）：只含图片的段输出为 claim-text 内的 img，与说明书正文内图片同一规则
  *   （id 前缀 idf、inline="no"），不报问题项；说明书与摘要里只含图片的段按段内图片输出，并提示其可能是误放的附图
  *   （带角色的图片除外——它输出为 chemistry / maths / tables，本就是正文内容）。
+ * 大图拆段的并回：解析层（ir/captions）为 Markdown 可读性把段首 / 段尾的大图拆成独立段落，并给同一原段落拆出的
+ *   各块打上同组标记（data.splitGroup）。官方转换器逐个 Word 段落转换（一个 Word 段落 = 一个 p），故正文三书
+ *   （权利要求书、说明书、摘要）在渲染前用 blocks 的 mergeSplitGroups 把同组的相邻块并回一个段落：段号只占一个、
+ *   不再顺延，段内图片仍走 emitInline 的既有规则（chemistry / maths / tables 包裹照旧），并回后含文字的段落不再报
+ *   「如为附图请移至说明书附图部分」（该提示只针对整段只有图片的块）。说明书附图与摘要附图不并——那两本书里
+ *   「图片 + 同段图号」须保持拆开才能认成 figure 与图号。
  * options.xml.validate 为 true 时逐份调 validateXml，错误以「DTD 校验：」问题项进 warnings 与 precheck.json。
  */
 const JSZip = require('jszip');
 const { el, serializeDocument } = require('./builder');
-const { flattenBlocks } = require('./blocks');
+const { flattenBlocks, mergeSplitGroups } = require('./blocks');
 const { detectSections, BOOK_KEYS } = require('./sections');
 const { buildClaims } = require('./claims');
 const { buildFigures, buildImg, assetNameOf } = require('./figures');
@@ -144,9 +150,10 @@ function emitBooks(analysis, deps) {
     const out = {};
     out.drawings = emitDrawings(books.drawings, createFileContext(deps, 'drawings'));
     out.abstractFigure = emitAbstractFigure(books.abstractFigure, createFileContext(deps, 'abstractFigure'));
-    out.claims = emitClaims(books.claims, createFileContext(deps, 'claims'));
-    out.description = emitDescription(books.description, createFileContext(deps, 'description'), inventionTitle);
-    out.abstract = emitAbstract(books.abstract, createFileContext(deps, 'abstract'));
+    // 正文三书先把大图拆段拆出的同组相邻块并回（见文件头「大图拆段的并回」）；两本附图书维持拆开
+    out.claims = emitClaims(mergeSplitGroups(books.claims), createFileContext(deps, 'claims'));
+    out.description = emitDescription(mergeSplitGroups(books.description), createFileContext(deps, 'description'), inventionTitle);
+    out.abstract = emitAbstract(mergeSplitGroups(books.abstract), createFileContext(deps, 'abstract'));
     return Object.fromEntries(BOOK_KEYS.map((key) => [key, out[key] ? wrapDocument(out[key], deps.options) : null]));
 }
 

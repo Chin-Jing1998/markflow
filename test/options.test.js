@@ -1,13 +1,14 @@
 /**
  * converters/options.js 单元测试
  * 覆盖：默认值与深冻结、部分覆盖时的深合并、幂等、枚举/数值/布尔/字符串/parts 各类校验的中文错误、
- *       敏感项不回显、可空对象、未知键拒绝、枚举表、描述树、脱敏拷贝
+ *       敏感项不回显、可空对象、未知键拒绝、枚举表、描述树、脱敏拷贝、
+ *       applyPatentImportDefaults（专利五书 XML 输入的 docx 中文字体缺省）
  */
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-    normalizeOptions, describeOptions, redactOptions, OPTION_ENUMS, DEFAULT_OPTIONS,
+    normalizeOptions, applyPatentImportDefaults, describeOptions, redactOptions, OPTION_ENUMS, DEFAULT_OPTIONS,
 } = require('../converters/options');
 
 // ============================================================
@@ -275,5 +276,55 @@ describe('OPTION_ENUMS、describeOptions 与 redactOptions', () => {
             JSON.parse(JSON.stringify(opts)),
         );
         assert.equal(redactOptions(undefined), undefined);
+    });
+});
+
+// ============================================================
+// applyPatentImportDefaults
+// ============================================================
+
+describe('applyPatentImportDefaults', () => {
+    // 专利预检只接受宋体、黑体、楷体、仿宋；通用默认为微软雅黑
+    const PATENT_FONT = '宋体';
+    const GENERIC_FONT = '微软雅黑';
+    const eastAsiaOf = (options) => options.docx.fontFamily.eastAsia;
+
+    test('专利五书 XML 的三种输入类型（xml、zip）未显式给出中文字体时取宋体', () => {
+        const base = normalizeOptions({});
+
+        assert.equal(eastAsiaOf(base), GENERIC_FONT);
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(base, 'xml')), PATENT_FONT);
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(base, 'zip')), PATENT_FONT);
+    });
+
+    test('显式给出的照用，无论取值是否等于通用默认', () => {
+        const explicit = normalizeOptions({ docx: { fontFamily: { eastAsia: '黑体' } } });
+        const sameAsDefault = normalizeOptions({ docx: { fontFamily: { eastAsia: GENERIC_FONT } } });
+
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(explicit, 'xml')), '黑体');
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(sameAsDefault, 'xml')), GENERIC_FONT);
+    });
+
+    test('其它输入类型原样返回同一引用，其余字段一律不动', () => {
+        const base = normalizeOptions({});
+
+        assert.equal(applyPatentImportDefaults(base, 'docx'), base);
+        assert.equal(applyPatentImportDefaults(base, 'md'), base);
+        assert.equal(applyPatentImportDefaults(base, undefined), base);
+
+        const patent = applyPatentImportDefaults(base, 'xml');
+        assert.deepEqual(
+            { ...patent, docx: { ...patent.docx, fontFamily: base.docx.fontFamily } },
+            base,
+            '只改中文字体一项',
+        );
+    });
+
+    test('返回值仍是归一结果：深冻结、再交 normalizeOptions 原样返回、重复调用幂等', () => {
+        const patent = applyPatentImportDefaults(normalizeOptions({}), 'xml');
+
+        assert.ok(Object.isFrozen(patent) && Object.isFrozen(patent.docx.fontFamily));
+        assert.equal(normalizeOptions(patent), patent);
+        assert.equal(applyPatentImportDefaults(patent, 'xml'), patent);
     });
 });

@@ -6,6 +6,8 @@
  *     （含「像素换回的毫米越过整数线」的那一幅）与图片字节逐项复原，产物目录与案卷同形；
  *   单书输入、v3.0.0 平铺形态、人工参照夹具的往返：正文文字不丢；
  *   已知必丢项清单（与 README「XML 反向导入」一节逐条对应）；
+ *   段落与段号保真——XML 里「文字 + 段尾大图」的一个 p，转成 Word 再转回仍是一个 p、段号不顺延
+ *     （解析层为 Markdown 可读性拆出的块由专利渲染层按同组标记并回）；
  *   convert() 直接受理五书目录，产物名取目录名（目录名里的点不是扩展名）。
  * 公式 / 表格 / 化学式的角色经图片替换文字 markflow:role=… 往返，读取侧在 parsers/docx；读取侧尚未就绪时 maths 会退化为
  * 段内 img，故相关断言按「XML₂ 里有没有 maths」两种情形分别核对，读取侧就绪后自动收紧为严格相等。
@@ -249,10 +251,10 @@ describe('v3.0.0 平铺形态与人工参照夹具的往返', () => {
 });
 
 // ============================================================
-// 由转回链路决定的已知差异
+// 转回链路的段落与段号保真
 // ============================================================
 
-test('段尾的大幅段内图片：文字与图片都不丢；docx 解析层的「大图拆段」规则可能把它拆成独立段落（README 已载明）', async () => {
+test('段尾的大幅段内图片：文字与图片都不丢，段落数与段号不变（解析层拆出的块由专利渲染层并回）', async () => {
     const { makeJpeg } = require('./fixtures/patent/roundtrip/build-roundtrip-fixtures');
     const xml = '<?xml version="1.0" encoding="UTF-8"?><cn-application-body lang="zh" country="CN"><description>'
         + '<invention-title>一种测试装置</invention-title><heading level="2">技术领域</heading>'
@@ -266,7 +268,8 @@ test('段尾的大幅段内图片：文字与图片都不丢；docx 解析层的
 
     assert.equal(findAll(description, 'img').length, 1, '图片不丢');
     assert.equal(textsOf(description, 'p').join(''), '按下式计算：后一段。', '文字不丢、顺序不变');
-    assert.ok([2, 3].includes(findAll(description, 'p').length), '未拆段为 2 段；按现行的大图拆段规则为 3 段');
+    assert.equal(findAll(description, 'p').length, 2, '一个 Word 段落 = 一个 p：段尾大图不再把段落拆多');
+    assert.deepEqual(findAll(description, 'p').map((node) => node.attrs.num), ['0001', '0002'], '段号不顺延');
 });
 
 // ============================================================

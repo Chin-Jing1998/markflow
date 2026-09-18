@@ -9,6 +9,10 @@
  *                           传入本函数产出的对象时原样返回同一引用（幂等且零开销），故 parser ctx 与渲染器拿到的是同一份。
  *                           校验之后再按 profile 补默认值（见 applyProfileDefaults）：xml.profile 为 patent 且调用方
  *                           未显式给出 jpegPpi 时，jpegPpi 取 300 而非通用默认的 330——官方只受理 72–300 DPI
+ *   applyPatentImportDefaults(options, sourceType)
+ *                           按输入类型补默认值（见函数注释）：专利五书 XML 输入（xml / zip）且调用方未显式给出
+ *                           docx.fontFamily.eastAsia 时取「宋体」。归一之后才知道输入类型（CLI 与 MCP 在调度器之外
+ *                           就已归一），故另作一步；返回的仍是归一结果，再交 normalizeOptions 原样返回
  *   DEFAULT_OPTIONS         normalizeOptions({}) 的结果（冻结）
  *   OPTION_ENUMS            各枚举项的取值表（冻结），供入口的参数枚举与帮助文案取用
  *   describeOptions()       选项描述树（纯 JSON：类型、默认值、枚举、范围、说明），供 CLI 帮助与桌面端面板生成
@@ -47,6 +51,11 @@ const SECRET_PATHS = Object.freeze([Object.freeze(['mineru', 'token'])]);
 const SHOW_LIMIT = 60;
 // patent profile 的 JPEG 密度默认值：官方只受理 72–300 DPI，通用默认 330 会被预检判为超范围
 const PATENT_JPEG_PPI = 300;
+// 专利五书 XML 反向导入为 Word 时的中文字体默认值：专利预检（renderers/xml/precheck.js 的 STANDARD_FONTS）
+// 只接受宋体、黑体、楷体、仿宋，通用默认「微软雅黑」会让「五书 XML → Word → 再转 XML」自招一条字体告警
+const PATENT_IMPORT_EAST_ASIA = '宋体';
+// 专利五书 XML 的输入类型：单书 .xml、案卷 .zip 与五书目录（目录的类型同为 xml，见 targets.js 的 BUNDLE_DIR_TYPE）
+const PATENT_IMPORT_SOURCE_TYPES = new Set(['xml', 'zip']);
 // MinerU 页码范围：形如 "1-5,8,10-12"
 const PAGE_RANGES_RE = /^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/;
 // 语言代码：MinerU 的 ch / en / japan / chinese_cht 等
@@ -147,6 +156,8 @@ const ROOT_FIELD = objectField(SCHEMA, '转换选项');
 
 // 本模块产出过的归一结果（已深冻结，不可能被改动），再次传入直接原样返回
 const NORMALIZED = new WeakSet();
+// 归一结果 → 调用方的原始入参：供归一之后才能判定的默认值（applyPatentImportDefaults）查某键是否为显式给出
+const RAW_SOURCES = new WeakMap();
 
 function normalizeOptions(raw) {
     if (raw !== null && typeof raw === 'object' && NORMALIZED.has(raw)) return raw;
@@ -154,6 +165,7 @@ function normalizeOptions(raw) {
     if (!isPlainObject(source)) throw new Error(`选项 options 须为对象，实际：${show(source)}`);
     const normalized = deepFreeze(applyProfileDefaults(normalizeObject(ROOT_FIELD, source, ''), source));
     NORMALIZED.add(normalized);
+    RAW_SOURCES.set(normalized, source);
     return normalized;
 }
 
@@ -169,6 +181,30 @@ function applyProfileDefaults(normalized, source) {
     if (!normalized.xml || normalized.xml.profile !== 'patent') return normalized;
     return { ...normalized, jpegPpi: PATENT_JPEG_PPI };
 }
+
+/**
+ * 按输入类型调整默认值：输入为专利五书 XML（单书 .xml、案卷 .zip、五书目录）时，docx.fontFamily.eastAsia
+ * 取 PATENT_IMPORT_EAST_ASIA。判据与 applyProfileDefaults 一致——看归一前的入参里该键是否为 undefined，
+ * 显式给出的（CLI 的 --font-east-asia、MCP 的 docx.fontEastAsia 与直接的嵌套写法都归一到同一条路径）一律照用。
+ * 不按目标区分：docx 段只被 docx 渲染器读取，而桌面端三段式 API 解析时不一定知道目标。
+ * 返回值同样登记为归一结果，故可再交 normalizeOptions 原样返回；其余输入类型原样返回入参。
+ */
+function applyPatentImportDefaults(options, sourceType) {
+    if (!PATENT_IMPORT_SOURCE_TYPES.has(sourceType)) return options;
+    if (!isPlainObject(options) || !isPlainObject(options.docx) || !isPlainObject(options.docx.fontFamily)) return options;
+    if (options.docx.fontFamily.eastAsia === PATENT_IMPORT_EAST_ASIA) return options;
+    const raw = RAW_SOURCES.get(options);
+    if (isGivenEastAsia(raw)) return options;
+    const fontFamily = { ...options.docx.fontFamily, eastAsia: PATENT_IMPORT_EAST_ASIA };
+    const next = deepFreeze({ ...options, docx: { ...options.docx, fontFamily } });
+    NORMALIZED.add(next);
+    if (raw !== undefined) RAW_SOURCES.set(next, raw);
+    return next;
+}
+
+// 归一前的入参里是否显式给出了中文字体
+const isGivenEastAsia = (raw) => isPlainObject(raw) && isPlainObject(raw.docx)
+    && isPlainObject(raw.docx.fontFamily) && raw.docx.fontFamily.eastAsia !== undefined;
 
 function normalizeField(spec, raw, at) {
     switch (spec.kind) {
@@ -332,4 +368,4 @@ function show(value) {
 
 const DEFAULT_OPTIONS = normalizeOptions({});
 
-module.exports = { normalizeOptions, describeOptions, redactOptions, OPTION_ENUMS, DEFAULT_OPTIONS, SECRET_PATHS };
+module.exports = { normalizeOptions, applyPatentImportDefaults, describeOptions, redactOptions, OPTION_ENUMS, DEFAULT_OPTIONS, SECRET_PATHS };
