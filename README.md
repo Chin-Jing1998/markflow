@@ -20,6 +20,7 @@
 |---|---|---|---|
 | Office / PDF | `.docx` `.xlsx` `.pptx` `.pdf` | `bundle` `html` `xml` | `bundle` |
 | Markdown | `.md` `.markdown` | `docx` `pdf` `html` `xml` | `docx` |
+| 国知局专利五书 XML | 单个 `.xml`、案卷 `.zip`、五书目录（内含 `10000N/10000N.xml` 或五书 XML） | `docx` `pdf` `html` `xml` | `docx` |
 | 网页链接 | `http` / `https` | `bundle` `html` `xml` | `bundle` |
 
 各目标的产物形态：
@@ -34,6 +35,8 @@
 | `xml`（`patent`） | 目录 | `{名称}/` 下按表格代码分目录的五书 XML 与图片（`100001/100001.xml`、`100003/100003_1.jpg` 等）+ `{名称}.zip` + `precheck.json` |
 
 `pdf` 目标只在 PDF 出图后端可用时列出；后端状态见 `markflow formats`。
+
+目录输入展开为其下受支持的文件；`.xml` 与 `.zip` 只在显式给出时受理，不随目录展开（文档目录里的这两类文件绝大多数与专利无关），成套的五书目录则整体作为一项输入，详见「专利五书 XML 反向导入」。
 
 ## 安装
 
@@ -164,6 +167,7 @@ markflow mcp
 | `--section-detection <方式>` | `auto` \| `headings` | `auto` | `patent` 分节识别：`auto` 标题或加粗短段，`headings` 仅标题 |
 | `--rasterize-tables` | 布尔开关 | `true` | `patent` 表格栅格为图片；关闭写 `--no-rasterize-tables` |
 | `--rasterize-formulas` | 布尔开关 | `true` | `patent` 公式栅格为图片；关闭写 `--no-rasterize-formulas` |
+| `--xml-import-paragraph-numbers` | 布尔开关 | `false` | 仅专利五书 XML 输入：把说明书与摘要的段号写回段首（`[0001]`），转回 XML 时原样复用；缺省不写，转回时按顺序重编 |
 | `--raster-scale <倍数>` | 1–4 | `2` | 栅格化缩放倍数（`patent` profile 下忽略） |
 | `--raster-max-width <n>` | 整数 200–10000 | `1600` | 图片最大宽度（px，`patent` profile 下忽略） |
 | `--validate` | 布尔开关 | `false` | 仅 `xml` 目标生效：渲染后用官方 DTD 校验，结果写入 warnings 与 `precheck.json` |
@@ -185,6 +189,9 @@ markflow convert https://example.com/a https://example.com/b --out ~/Documents/�
 
 # 专利底稿转五书 XML 并做 DTD 校验
 markflow convert 专利底稿.docx --to xml --xml-profile patent --validate --out ~/Desktop
+
+# 五书 XML 案卷反向导入为可再编辑的 Word
+markflow convert 专利案卷.zip --out ~/Desktop
 ```
 
 ### extract：网页正文只读提取
@@ -258,7 +265,7 @@ markflow config unset mineru-token         # 从配置文件移除；其它来�
 
 | 入参 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `paths` | `string[]` | 与 `urls` 至少一项 | 本地文件路径列表；建议绝对路径 |
+| `paths` | `string[]` | 与 `urls` 至少一项 | 本地文件路径列表；建议绝对路径。专利五书可给单个 `.xml`、案卷 `.zip` 或整个五书目录 |
 | `urls` | `string[]` | 与 `paths` 至少一项 | 网页 URL 列表 |
 | `outputDir` | `string` | 是 | 已存在的输出目录；服务端不创建目录 |
 | `target` | `bundle` \| `docx` \| `pdf` \| `html` \| `xml` | 否 | 省略时按输入类型取默认目标 |
@@ -277,6 +284,7 @@ markflow config unset mineru-token         # 从配置文件移除；其它来�
 | `pdf` | `{ pageSize, landscape }` | 否 | PDF 目标参数：纸张与横向 |
 | `docx` | `{ pageSize, fontSize, fontAscii, fontEastAsia }` | 否 | DOCX 目标参数：纸张、正文字号（pt）与中西文字体 |
 | `xml` | `{ indent, numberingStart, numberingWidth, imageDpi, sectionDetection, rasterizeTables, rasterizeFormulas }` | 否 | XML 目标参数：缩进与说明书段号；后四项仅 `patent` profile 生效 |
+| `xmlImport` | `{ paragraphNumbers }` | 否 | 专利五书 XML 反向导入参数：是否把段号写回段首，默认否 |
 | `raster` | `{ scale, maxWidth }` | 否 | 栅格化参数（`patent` profile 下忽略） |
 
 返回结构与命令行 `--json` 相同，另有三处只出现在 MCP 的字段：`validate` 为真时信封带 `validate: true`；传入本工具不认得的键时信封带 `ignoredArguments`（形如 `["font", "html.colour"]`，段内未知字段记为 `段.字段`），这些键被忽略而非静默丢弃，转换照常进行；`returnContent` 为真时结果项带 `content` 与 `contentTruncated`。调用时在 `_meta` 中带上 `progressToken` 即可收到 `notifications/progress`，进度单调递增，`message` 为中文阶段名。
@@ -361,9 +369,55 @@ xmllint --nonet --noout --dtdvalid converters/renderers/xml/dtd/cn-application-b
 
 两点须知：`xmllint` 把 `--dtdvalid` 的参数当 URI 处理，含中文的绝对路径会报 `Could not parse DTD`，故须用上面的相对路径；stderr 中的 `failed to load external entity "/dtdandxsl/…"` 属预期（文档内的 SYSTEM 标识符指向官方部署路径，本地不存在），说明书附图（`100003/100003.xml`）的 `Content model of cn-drawings is not deterministic` 是官方 DTD 自身的缺陷，两者都不影响校验结论。
 
-与官方编辑器的差异——本工具跨平台运行、不依赖 Office 或 WPS、不要求套用五书模板、公式按目标 DPI 放大后再栅格、转档前即给出预检清单。本期不覆盖：化学式识别、XML 反向导入、一键提交到客户端草稿箱。
+与官方编辑器的差异——本工具跨平台运行、不依赖 Office 或 WPS、不要求套用五书模板、公式按目标 DPI 放大后再栅格、转档前即给出预检清单。本期不覆盖：化学式识别、一键提交到客户端草稿箱。
 
 完整的政策背景、官方编辑器内部结构、DTD 解读与映射决策见 [docs/patent-xml-research.md](docs/patent-xml-research.md)。
+
+### 专利五书 XML 反向导入（XML → Word）
+
+国知局专利五书 XML 可以反向导入为可再编辑的 Word：在 Word 里改完，再按上一节转回五书 XML。受理三种输入，书目一律按内容判定（根元素 `cn-application-body` 下的 `cn-claims`、`description`、`cn-drawings`、`cn-abstract`、`cn-abst-figure`），与文件名无关：
+
+| 输入 | 说明 |
+|---|---|
+| 单个 `.xml` | 五书中的一书；图片取自该 XML 的同级目录 |
+| 案卷 `.zip` | 官方「WORD 转 ACXML 编辑器」与本工具现行产物（`10000N/10000N.xml` + 同目录图片）、v3.0.0 的平铺产物、外面多套一层文件夹的 zip 均可 |
+| 五书目录 | 目录下直接含 `10000N/10000N.xml`，或含根元素为 `cn-application-body` 的 `.xml`；整个目录作为一项输入 |
+
+```bash
+# 省略 --to 即转 docx；多书合并为一份文档
+markflow convert 专利案卷.zip --out ~/Desktop
+markflow convert ./专利案卷目录 --out ~/Desktop
+
+# 改完后转回五书 XML
+markflow convert ~/Desktop/专利案卷.docx --to xml --xml-profile patent --validate --out ~/Desktop
+```
+
+产物形态：多书合并为一份 docx，每书一个 Word 分节（下一页起），书目名写在该节页眉里，顺序为 说明书摘要 → 摘要附图 → 权利要求书 → 说明书 → 说明书附图——与官方五书模板同一做法，转回 XML 时按页眉直接归书，不经位置推定，书目名也不会混进正文。只导入一书时文档只有一节，单节文档的页眉不足以认回书目，故正文首段另留一个书目标题段。权项首段冠以「N. 」，发明名称与小标题为 Word 标题样式，附图为「图片段 + 图号段」。段号缺省不写进正文（官方模板里段号由转换器生成，留在 Word 里反而妨碍增删段落），转回时按顺序重编；需要对照审查意见里的段号时加 `--xml-import-paragraph-numbers`，段首会写入 `[0001]`，转回时原样剥离并复用。`--to html`、`--to pdf` 与 `--to xml` 同样可用；`bundle` 目标不接受本类输入。
+
+图片按其自身的像素与 JFIF 密度定显示尺寸（1 像素 @300 DPI 恰为 3048 EMU），再在半个像素之内向 `img/@wi`、`@he` 对齐，不直接采用向下取整过的 `wi`/`he`；因此转回 XML 时像素尺寸、JFIF 密度与 `wi`/`he` 同时复原，未经重采样的图片逐字节不变。公式、表格与化学式在五书 XML 里本就是图片，导入后仍是图片（Word 中不能编辑其内容），其替换文字写作 `markflow:role=formula`（或 `table`、`chemistry`，原 alt 非空时以分号接在其后），转回时据此还原为 `maths`／`tables`／`chemistry`，请勿删改。
+
+往返保真度：对本工具自己产出的五书，`XML → docx → XML` 逐字节相同（五份 XML 与全部图片）；对官方编辑器产出的五书，权项、发明名称、小标题、段落与段号、附图的 id／num／figure-labels、`img` 的全部属性、图片字节与案卷目录结构逐项复原。以下信息回转时无法恢复，导入时逐项计数并以「导入：」开头写入 warnings（清单的唯一定义处为 `converters/parsers/xml/report.js`）：
+
+| 已知必丢项 | 回转后的结果 |
+|---|---|
+| `claim-ref`、`figref`、`crossref` 引用元素 | 按纯文本导入；官方转换器不生成这些元素，回转时不恢复 |
+| `pb` 分页标记 | 丢弃 |
+| 说明书与摘要内的临时段（`num="XXXX"`） | 按普通段落导入，回转时编入顺序段号 |
+| 非自 1 连续的段号 | 回转时按顺序重编（开启 `--xml-import-paragraph-numbers` 可保留向前跳变的段号） |
+| `heading` 的 `level` 不是 2 | 回转后一律 `level="2"` |
+| `invention-title` 内的行内标记与图片 | 回转后只保留纯文本 |
+| `claim-text` 的嵌套 | 拍平为并列的 `claim-text` |
+| `claim` 的 `claim-type` | 丢弃 |
+| 权项内以「数字＋. 、」开头的后续 `claim-text` | 回转时会被识别为新的权项，须在 Word 中核对 |
+| `maths`／`tables`／`chemistry` 的代码化内容（`math`、`table`、`chem`、`cn-mathf`、`cn-tablef`） | 只保留其图片；没有图片时退为文字 |
+| `smallcaps`、`overscore` 与 `u` 的 `style` | 只保留文字与普通下划线 |
+| `img` 的 `top`／`left`／`img-content` 非缺省取值，`orientation` 与 `inline` | 回转时按官方转换器的固定取值重写 |
+| 摘要附图的 `figure-labels`、附图区内非图号的说明文字 | 不写回 XML |
+| 其它未映射的元素（`dl`／`ul`／`ol`、`patcit`、`nplcit`、`pre`、`bio-deposit`、`doc-page`、`cn-unregulated-part` 等） | 只保留其文字 |
+
+另有一处由转回链路决定的差异：段首或段尾、显示宽度不小于约 53 mm（96 DPI 下 200 px）的段内图片，转回时会被 docx 解析层的「大图拆段」规则拆成独立段落，该段之后的段号随之顺延。
+
+安全边界（输入属不可信内容）：XML 扫描器不解析实体声明、不读取外部实体，元素嵌套上限 64 层；单份 XML 不超过 32 MB、单张图片 64 MB、zip 本体 512 MB、条目 2000 个、全部已读内容 1 GB，zip 条目边解压边计数（中央目录申报的大小不作为依据）；含 `..` 片段、绝对路径或盘符的 zip 条目名一经发现即整包拒绝，符号链接条目忽略；`img/@file` 只接受同目录下的裸文件名与 jpg／tif／png／gif／bmp 扩展名，类型按魔数判定，目录形态下解开符号链接后仍须落在该 XML 所在目录之内；缺图、越界引用与超限只让该图降级为文字占位（`［缺图：…］`），不中断导入。非专利 XML（含 `generic` profile）与不含五书的 zip 给出中文错误。
 
 ## PDF 输入：MinerU 与本地后端
 
@@ -429,7 +483,8 @@ converters/
   naming.js                批内产物名登记表
   output.js                产物落盘（单文件与目录两种布局）
   batch.js                 并发批处理与事件流
-  parsers/                 docx / xlsx / pptx / pdf / md / url 解析为中间表示
+  parsers/                 docx / xlsx / pptx / pdf / md / url / xml（专利五书 XML、案卷 zip 与五书目录）解析为中间表示
+  xml/dom.js               无依赖 XML 扫描器（反向导入与桌面端 XML 视图共用）
   renderers/               中间表示渲染为 md / json / html / docx / pdf / xml
     html-themes/           六款 HTML 主题
     xml/                   generic 与 patent 两套方言、预检、DTD 校验与随包 DTD
@@ -479,8 +534,9 @@ npm run build:all    # 两个平台一并打包
 - 本地 PDF 后端（`--pdf-backend local`）只取文本层，不提取图片、不还原版面与表格；完整能力需 MinerU 令牌。
 - Excel 不提取内嵌图片；PowerPoint 只提取幻灯片正文中的图片，不含背景图与母版图，也不处理表格、SmartArt 与动画；Excel 不处理合并单元格，公式取结果值。Excel 解析依赖 exceljs，其不识别以命名空间前缀书写的工作簿部件（如 `<x:workbook>`，见于部分 Open XML SDK 系工具生成的文件），此类文件会报「Cannot read properties of undefined (reading 'sheets')」，用 Excel 或 WPS 另存一次即可。
 - `.doc`、`.xls`、`.ppt` 三种旧二进制格式不再受理，请先另存为对应的 Open XML 格式。
-- `bundle` 只接受 Office、PDF 与网页输入；`docx` 与 `pdf` 只接受 Markdown 输入。
-- `patent` profile 不识别化学式，不生成案卷包，不支持 XML 反向导入与一键提交。
+- `bundle` 只接受 Office、PDF 与网页输入；`docx` 与 `pdf` 只接受 Markdown 与专利五书 XML 输入。
+- `patent` profile 不识别化学式，不生成案卷包，不支持一键提交。
+- 专利五书 XML 反向导入只受理 `patent` 方言（根元素 `cn-application-body`），不受理 `generic` profile 的 XML；公式、表格与化学式导入后仍是图片；桌面端的转档入口尚未接入 `.xml` 与 `.zip`（命令行与 MCP 可用）；其余必丢项见「专利五书 XML 反向导入」。
 - `--validate` 需要可选依赖 libxml2-wasm；未安装时跳过校验并在 warnings 中说明。
 - Readability 的可读性阈值已按中文段落长度下调（中文段落多在 50 至 150 字，默认阈值会把多数中文文章判为不可读）；判定失误时由字符数下限双重兜底，回退通用提取。
 

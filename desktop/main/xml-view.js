@@ -4,7 +4,8 @@
  * 纯逻辑，不依赖 Electron 与文件系统，可在普通 Node 中单测。
  *
  *   parseXml(text)                      → { ok: true, prolog, root } | { ok: false, error }
- *       自带的极简 XML 扫描器：声明 / DOCTYPE（含内部子集）/ 处理指令 / 注释 / CDATA / 元素 / 文本；
+ *       极简 XML 扫描器，实现在 converters/xml/dom.js（与五书反向导入共用），此处原样转出：
+ *       声明 / DOCTYPE（含内部子集）/ 处理指令 / 注释 / CDATA / 元素 / 文本；
  *       标签不闭合、闭合名不匹配、多根、根后有内容一律判为不合法并给出中文错误，绝不抛出。
  *       预定义实体与数字引用解码，未知命名实体原样保留（官方 DTD 实体集不在本应用内解析）。
  *   formatXml(text, { indent })         → { xml, ok, error }   合法则按缩进重排，非法则原样回吐
@@ -26,6 +27,8 @@
 const path = require('path');
 
 const { ASSET_EXTENSIONS } = require('./asset-protocol');
+// 扫描器与 converters/parsers/xml（五书反向导入）共用同一份实现
+const { parseXml } = require('../../converters/xml/dom');
 
 const PROFILES = Object.freeze({ patent: 'patent', generic: 'generic' });
 const PATENT_ROOT = 'cn-application-body';
@@ -35,168 +38,7 @@ const DEFAULT_INDENT = 2;
 const MAX_INDENT = 8;
 const PROFILE_LABELS = Object.freeze({ patent: '国知局专利五书', generic: 'MarkFlow 通用文档' });
 
-const NAME_START = /[A-Za-z_:]/;
-const NAME_CHAR = /[-A-Za-z0-9._:]/;
-const WHITESPACE = /\s/;
-const ENTITY_RE = /&(#x[0-9a-fA-F]+|#[0-9]+|lt|gt|amp|quot|apos);/g;
-const NAMED_ENTITIES = Object.freeze({ lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" });
 const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
-
-// ============================================================
-// 扫描器
-// ============================================================
-
-const element = (name, attrs) => ({ type: 'element', name, attrs, children: [] });
-const text = (value) => ({ type: 'text', value });
-
-function parseXml(input) {
-    const src = String(input == null ? '' : input);
-    const prolog = [];
-    const stack = [];
-    let root = null;
-    let i = 0;
-
-    const fail = (message, at) => ({ ok: false, error: `${message}（位置 ${describePosition(src, at)}）` });
-
-    while (i < src.length) {
-        if (src[i] !== '<') {
-            const next = src.indexOf('<', i);
-            const end = next === -1 ? src.length : next;
-            const chunk = src.slice(i, end);
-            if (stack.length === 0) {
-                if (chunk.trim() !== '') return fail(root ? '根元素之外出现了文本' : 'XML 序言之后、根元素之前出现了文本', i);
-            } else {
-                stack[stack.length - 1].children.push(text(decodeEntities(chunk)));
-            }
-            i = end;
-            continue;
-        }
-        if (src.startsWith('<!--', i)) {
-            const end = src.indexOf('-->', i + 4);
-            if (end === -1) return fail('注释没有结束标记 -->', i);
-            i = end + 3;
-            continue;
-        }
-        if (src.startsWith('<![CDATA[', i)) {
-            const end = src.indexOf(']]>', i + 9);
-            if (end === -1) return fail('CDATA 段没有结束标记 ]]>', i);
-            if (stack.length > 0) stack[stack.length - 1].children.push(text(src.slice(i + 9, end)));
-            i = end + 3;
-            continue;
-        }
-        if (src.startsWith('<?', i)) {
-            const end = src.indexOf('?>', i + 2);
-            if (end === -1) return fail('处理指令没有结束标记 ?>', i);
-            const raw = src.slice(i, end + 2);
-            if (stack.length === 0) prolog.push({ kind: raw.startsWith('<?xml ') || raw === '<?xml?>' ? 'declaration' : 'instruction', raw });
-            i = end + 2;
-            continue;
-        }
-        if (src.startsWith('<!DOCTYPE', i)) {
-            const end = findDoctypeEnd(src, i);
-            if (end === -1) return fail('DOCTYPE 声明没有结束标记 >', i);
-            if (stack.length === 0) prolog.push({ kind: 'doctype', raw: src.slice(i, end + 1) });
-            i = end + 1;
-            continue;
-        }
-        if (src.startsWith('</', i)) {
-            const parsed = readName(src, i + 2);
-            if (!parsed) return fail('结束标记缺少元素名', i);
-            let cursor = parsed.next;
-            while (cursor < src.length && WHITESPACE.test(src[cursor])) cursor += 1;
-            if (src[cursor] !== '>') return fail(`结束标记 </${parsed.name}> 格式不正确`, i);
-            const open = stack.pop();
-            if (!open) return fail(`多余的结束标记 </${parsed.name}>`, i);
-            if (open.name !== parsed.name) return fail(`结束标记 </${parsed.name}> 与开始标记 <${open.name}> 不匹配`, i);
-            i = cursor + 1;
-            continue;
-        }
-
-        const parsed = readName(src, i + 1);
-        if (!parsed) return fail('开始标记缺少元素名', i);
-        const attrs = readAttributes(src, parsed.next);
-        if (attrs.error) return fail(attrs.error, i);
-        const node = element(parsed.name, attrs.attrs);
-        if (stack.length === 0) {
-            if (root) return fail(`出现了第二个根元素 <${parsed.name}>，XML 只允许一个根元素`, i);
-            root = node;
-        } else {
-            stack[stack.length - 1].children.push(node);
-        }
-        if (!attrs.selfClosing) stack.push(node);
-        i = attrs.next;
-    }
-
-    if (stack.length > 0) return { ok: false, error: `元素 <${stack[stack.length - 1].name}> 没有对应的结束标记` };
-    if (!root) return { ok: false, error: '没有找到根元素，内容可能不是 XML' };
-    return { ok: true, prolog, root };
-}
-
-function readName(src, start) {
-    if (start >= src.length || !NAME_START.test(src[start])) return null;
-    let i = start + 1;
-    while (i < src.length && NAME_CHAR.test(src[i])) i += 1;
-    return { name: src.slice(start, i), next: i };
-}
-
-function readAttributes(src, start) {
-    const attrs = {};
-    let i = start;
-    while (i < src.length) {
-        while (i < src.length && WHITESPACE.test(src[i])) i += 1;
-        if (src.startsWith('/>', i)) return { attrs, selfClosing: true, next: i + 2 };
-        if (src[i] === '>') return { attrs, selfClosing: false, next: i + 1 };
-        const name = readName(src, i);
-        if (!name) return { error: '属性名不合法' };
-        i = name.next;
-        while (i < src.length && WHITESPACE.test(src[i])) i += 1;
-        if (src[i] !== '=') return { error: `属性 ${name.name} 缺少取值` };
-        i += 1;
-        while (i < src.length && WHITESPACE.test(src[i])) i += 1;
-        const quote = src[i];
-        if (quote !== '"' && quote !== "'") return { error: `属性 ${name.name} 的取值必须用引号括起` };
-        const end = src.indexOf(quote, i + 1);
-        if (end === -1) return { error: `属性 ${name.name} 的引号没有闭合` };
-        attrs[name.name] = decodeEntities(src.slice(i + 1, end));
-        i = end + 1;
-    }
-    return { error: '标记没有闭合' };
-}
-
-/** DOCTYPE 可带 [ ... ] 内部子集，其中的 > 不算结束 */
-function findDoctypeEnd(src, start) {
-    let depth = 0;
-    for (let i = start; i < src.length; i += 1) {
-        if (src[i] === '[') depth += 1;
-        else if (src[i] === ']') depth -= 1;
-        else if (src[i] === '>' && depth <= 0) return i;
-    }
-    return -1;
-}
-
-function decodeEntities(value) {
-    return String(value).replace(ENTITY_RE, (match, name) => {
-        if (name.startsWith('#x') || name.startsWith('#X')) return codePoint(parseInt(name.slice(2), 16), match);
-        if (name.startsWith('#')) return codePoint(parseInt(name.slice(1), 10), match);
-        return NAMED_ENTITIES[name] !== undefined ? NAMED_ENTITIES[name] : match;
-    });
-}
-
-function codePoint(value, fallback) {
-    if (!Number.isInteger(value) || value < 0 || value > 0x10ffff) return fallback;
-    try {
-        return String.fromCodePoint(value);
-    } catch (err) {
-        return fallback;
-    }
-}
-
-function describePosition(src, at) {
-    const before = src.slice(0, Math.max(0, at));
-    const line = before.split('\n').length;
-    const column = before.length - (before.lastIndexOf('\n') + 1) + 1;
-    return `第 ${line} 行第 ${column} 列`;
-}
 
 // ============================================================
 // 美化原文

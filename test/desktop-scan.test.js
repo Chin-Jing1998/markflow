@@ -111,7 +111,7 @@ test('空入参与非数组入参返回空结果', async () => {
 // ============================================================
 
 const { BROWSE_EXTENSIONS, READER_EXTENSIONS } = require('../desktop/main/file-kinds');
-const { SUPPORTED_EXTENSIONS } = require('../converters/targets');
+const { SUPPORTED_EXTENSIONS, DIRECTORY_SCAN_EXTENSIONS, EXPLICIT_ONLY_EXTENSIONS } = require('../converters/targets');
 
 const browse = path.join(root, 'browse');
 const browseFiles = ['browse/page.html', 'browse/old.htm', 'browse/sub/data.xml', 'browse/sub/data.json', 'browse/note.md', 'browse/skip.txt'];
@@ -126,10 +126,23 @@ test('browse 范围列出 .html / .htm / .xml / .json 与转档白名单内的�
 test('默认范围（转档入口）仍不含 html / xml / json（回归守卫）', async () => {
     const { files: found } = await scanPaths([browse]);
     assert.deepEqual(found.map((entry) => entry.name), ['note.md']);
-    assert.ok(!SUPPORTED_EXTENSIONS.some((ext) => ['.html', '.htm', '.xml', '.json'].includes(ext)), '转档白名单不得放宽');
+    // .xml 与 .zip 自专利五书反向导入起列入 SUPPORTED_EXTENSIONS，但只在显式给出时受理：
+    // 转档入口的默认扫描范围（DIRECTORY_SCAN_EXTENSIONS）不得因此放宽
+    assert.ok(![...normalizeExts(undefined)].some((ext) => ['.html', '.htm', '.xml', '.json', '.zip'].includes(ext)), '转档入口的默认扫描范围不得放宽');
+    assert.deepEqual(DIRECTORY_SCAN_EXTENSIONS, SUPPORTED_EXTENSIONS.filter((ext) => !EXPLICIT_ONLY_EXTENSIONS.includes(ext)));
+    assert.deepEqual(EXPLICIT_ONLY_EXTENSIONS, ['.xml', '.zip']);
 });
 
-test('BROWSE_EXTENSIONS ⊇ READER_EXTENSIONS ∪ SUPPORTED_EXTENSIONS', () => {
-    for (const ext of [...READER_EXTENSIONS, ...SUPPORTED_EXTENSIONS]) assert.ok(BROWSE_EXTENSIONS.includes(ext), ext);
+test('直接给出的 .xml / .zip 仍记为不支持：桌面端转档入口尚未接入专利五书反向导入', async () => {
+    const xml = write('direct/case.xml', '<cn-application-body/>');
+    const zip = write('direct/case.zip', 'PK');
+    const { files: found, unsupported } = await scanPaths([xml, zip]);
+    assert.deepEqual(found, []);
+    assert.deepEqual(unsupported.sort(), [xml, zip].sort());
+});
+
+test('BROWSE_EXTENSIONS ⊇ READER_EXTENSIONS ∪ 转档入口的扫描白名单；不含 .zip（它同时是「用默认应用打开」白名单的来源）', () => {
+    for (const ext of [...READER_EXTENSIONS, ...DIRECTORY_SCAN_EXTENSIONS]) assert.ok(BROWSE_EXTENSIONS.includes(ext), ext);
     assert.ok(READER_EXTENSIONS.includes('.json'));
+    assert.equal(BROWSE_EXTENSIONS.includes('.zip'), false);
 });

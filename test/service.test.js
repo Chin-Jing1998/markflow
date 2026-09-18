@@ -3,7 +3,9 @@
  * 覆盖：buildOptions 的扁平参数映射与类型转换、嵌套段深合并与 xml 扁平别名、未知键忽略、非法值中文错误、
  *       按本批目标校验（targets）、docx 专属扁平键与 xml 段的 patent 别名；describeOptionHint 的取值说明；
  *       probeCapabilities 的形状（含 raster、DTD 校验器与 LibreOffice 的探测结果与 mineru 状态，不含令牌）、
- *       describeFormats 的受理扩展名、runConversion 结果信封的新字段
+ *       describeFormats 的受理扩展名、runConversion 结果信封的新字段；
+ *       专利五书 XML 反向导入：xmlImport 段与扁平键 xmlImportParagraphNumbers（不绑定目标）、planTasks 受理五书目录、
+ *       runConversion 对 zip 与五书目录两种输入的结果信封
  */
 const { test, describe, afterEach, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -302,7 +304,7 @@ describe('probeCapabilities', () => {
 
         // Assert
         assert.deepEqual(Object.keys(formats), ['targets', 'capabilities', 'extensions', 'version']);
-        assert.deepEqual(formats.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']);
+        assert.deepEqual(formats.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown', '.xml', '.zip']);
         assert.equal(typeof formats.targets.capabilities.pdfBackend, 'object', 'targets.capabilities.pdfBackend 与 capabilities.pdfBackend 并存');
         assert.equal(typeof formats.capabilities.validator.available, 'boolean');
         assert.equal(typeof formats.capabilities.libreoffice.available, 'boolean');
@@ -506,5 +508,57 @@ describe('runConversion 的产物名登记', () => {
         assert.equal(second.results[0].name, 'sample');
         assert.equal(second.results[0].outputPath, first.results[0].outputPath);
         assert.deepEqual(fs.readdirSync(outputDir), ['sample']);
+    });
+});
+
+// ============================================================
+// 专利五书 XML 反向导入
+// ============================================================
+
+describe('专利五书 XML 反向导入', () => {
+    const { buildOfficialBundle, writeFiles, zipFiles, OFFICIAL_EXPECTED } = require('./fixtures/patent/roundtrip/build-roundtrip-fixtures');
+
+    test('xmlImport 段与扁平键 xmlImportParagraphNumbers：布尔词转换、嵌套段深合并、不绑定目标故任何批次都校验', () => {
+        assert.equal(service.buildOptions({}).xmlImport.paragraphNumbers, false);
+        assert.equal(service.buildOptions({ xmlImportParagraphNumbers: 'yes' }).xmlImport.paragraphNumbers, true);
+        assert.equal(service.buildOptions({ xmlImportParagraphNumbers: true }, { targets: ['html'] }).xmlImport.paragraphNumbers, true);
+        assert.equal(service.buildOptions({ xmlImport: { paragraphNumbers: true } }).xmlImport.paragraphNumbers, true);
+        assert.throws(() => service.buildOptions({ xmlImportParagraphNumbers: '也许' }, { targets: ['html'] }), /参数 xmlImportParagraphNumbers 须为布尔值/);
+        assert.throws(() => service.buildOptions({ xmlImport: { paragraphNumbers: 1 } }, { targets: ['bundle'] }), /选项 xmlImport\.paragraphNumbers 须为布尔值/);
+        assert.throws(() => service.buildOptions({ xmlImport: [] }), /参数 xmlImport 须为对象/);
+        assert.match(service.describeOptionHint(['xmlImport.paragraphNumbers']), /默认 false/);
+    });
+
+    test('planTasks：.xml 与 .zip 默认转 docx；五书目录须经 hints.bundles 告知，否则按扩展名拒绝', () => {
+        const dir = path.join(root, '案卷-2026.09.18');
+        const tasks = service.planTasks(['a.xml', 'b.zip', dir], undefined, root, { bundles: [dir] });
+        assert.deepEqual(tasks.map((task) => [task.target, task.input.path]),
+            [['docx', path.join(root, 'a.xml')], ['docx', path.join(root, 'b.zip')], ['docx', dir]]);
+        assert.deepEqual(service.planTasks([dir], 'html', root, { bundles: [dir] }).map((task) => task.target), ['html']);
+        assert.throws(() => service.planTasks([dir], undefined, root), /不支持的输入格式/);
+        assert.throws(() => service.planTasks([dir], 'bundle', root, { bundles: [dir] }), /目标 bundle 不接受 xml 输入/);
+    });
+
+    test('runConversion：zip 与五书目录各得一份 docx，sourceType 分别为 zip 与 xml，导入问题项带「导入：」前缀', async () => {
+        const bundle = await buildOfficialBundle();
+        const work = fs.mkdtempSync(path.join(root, 'import-'));
+        const dir = writeFiles(path.join(work, '目录案卷'), bundle.files);
+        const zip = path.join(work, '压缩案卷.zip');
+        fs.writeFileSync(zip, await zipFiles(bundle.files));
+        const outputDir = fs.mkdtempSync(path.join(root, 'import-out-'));
+
+        const tasks = service.planTasks([zip, dir], undefined, ROOT, { bundles: [dir] });
+        const payload = await service.runConversion({ tasks, outputDir, options: service.buildOptions({}, { targets: ['docx'] }) });
+
+        assert.equal(payload.ok, true, JSON.stringify(payload.errors));
+        assert.deepEqual(payload.results.map((item) => [item.name, item.sourceType, item.target, item.title]), [
+            ['压缩案卷', 'zip', 'docx', OFFICIAL_EXPECTED.inventionTitle], ['目录案卷', 'xml', 'docx', OFFICIAL_EXPECTED.inventionTitle],
+        ]);
+        for (const item of payload.results) {
+            assert.ok(fs.statSync(item.outputs.docx).size > 0);
+            assert.equal(item.imagesCount, 4);
+            assert.ok(item.warnings.length > 0 && item.warnings.every((warning) => warning.startsWith('导入：')), item.warnings.join('\n'));
+            assert.deepEqual(item.options.xmlImport, { paragraphNumbers: false });
+        }
     });
 });

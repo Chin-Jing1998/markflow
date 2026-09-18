@@ -20,6 +20,8 @@
  *     （范围见 output.js），single 布局本就覆盖同一文件、不清理
  *   convert({ input: { path? | url? }, target, outputDir, options?, onProgress?, allowPrivateNetwork?, nameRegistry?, order?, clean?, skipExisting? }) 依次组合三者
  *     → { ok, target, name, title, sourceType, outputPath, outputs, imagesCount, warnings, options, extras, backends }
+ *   input.path 一般是文件；唯一受理的目录是「专利五书目录」（converters/scan.js 的 isPatentBundleDir），整个目录
+ *   作为一项 xml 输入交 parsers/xml 合并导入，产物名取目录名（不去扩展名——目录名里的点不是扩展名）。
  *   clean 与 skipExisting 为写盘策略参数（非用户 options：不经 normalizeOptions、不回显到结果的 options；缺省 false，
  *   非布尔值抛中文错误）：
  *     skipExisting 为 true 且主产物已存在即跳过本次转换——主产物 folder 布局为 {outputDir}/{name}/{name}.{ext}、
@@ -66,7 +68,7 @@ const { sanitizeFolderName, stripExt, collectText } = require('./ir/util');
 const { statOrNull, toBuffer, isFile } = require('./util');
 const {
     detectInputType, assertTargetAllowed, getTargetRule, listTargets,
-    SUPPORTED_EXTENSIONS, REMOTE_URL_RE,
+    SUPPORTED_EXTENSIONS, REMOTE_URL_RE, BUNDLE_DIR_TYPE,
 } = require('./targets');
 const { normalizeOptions, redactOptions } = require('./options');
 const { prependFrontMatter } = require('./web/frontmatter');
@@ -212,7 +214,7 @@ async function parseResolved({ source, target, options, allowPrivateNetwork, emi
 
     // 标题：meta.title → 首个 H1 → 文件名（去扩展名）→ 默认值；渲染前写回 meta.title
     const rawTitle = extractRawTitle(parsed);
-    const title = rawTitle || (source.type === 'url' ? '' : stripExt(source.sourceName)) || DEFAULT_TITLE;
+    const title = rawTitle || (source.type === 'url' ? '' : baseNameOf(source)) || DEFAULT_TITLE;
     const name = resolveOutputName(source, rawTitle);
     let doc = {
         ...parsed,
@@ -270,6 +272,10 @@ async function resolveSource(input) {
     if (!path.isAbsolute(filePath)) throw new Error(`输入路径必须是绝对路径：${filePath}`);
     const stat = await statOrNull(filePath);
     if (!stat) throw new Error(`输入文件不存在：${filePath}`);
+    // 唯一受理的目录输入：专利五书目录。scan.js 只依赖 targets 与零依赖的 xml/dom，按需加载即可
+    if (stat.isDirectory() && await require('./scan').isPatentBundleDir(filePath)) {
+        return { type: BUNDLE_DIR_TYPE, path: filePath, sourceName: path.basename(filePath), isDirectory: true };
+    }
     if (!stat.isFile()) throw new Error(`输入路径不是文件：${filePath}`);
 
     const type = detectInputType(filePath);
@@ -303,9 +309,12 @@ function firstH1Text(node) {
     return '';
 }
 
+// 本地输入的基名：文件去扩展名；目录（专利五书目录）原样采用，目录名里的点不是扩展名
+const baseNameOf = (source) => (source.isDirectory ? source.sourceName : stripExt(source.sourceName));
+
 // 文件输入取文件名；网页输入取标题，无标题时取「主机名-时间戳」
 function resolveOutputName(source, rawTitle) {
-    if (source.type !== 'url') return sanitizeFolderName(stripExt(source.sourceName));
+    if (source.type !== 'url') return sanitizeFolderName(baseNameOf(source));
     if (rawTitle) return sanitizeFolderName(rawTitle);
     return sanitizeFolderName(`${hostnameForFileName(source.url)}-${formatTimestamp()}`);
 }

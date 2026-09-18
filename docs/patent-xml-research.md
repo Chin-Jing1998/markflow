@@ -932,13 +932,16 @@ PCT 路径仅作记录。
 - 预检报告（GB18030、图片 DPI 与格式、浮动对象、自动编号、文档保护、公式后标点）。
 - DTD 校验（见第 7 章）。
 - `{name}.zip` 打包。
+- XML → Word 反向导入（单个五书 XML、案卷 zip、五书目录 → 可再编辑的 docx，多书合并为一份、每书一个 Word 分节并以页眉承载
+  书目名）：对本工具自产的五书做到 `XML → docx → XML` 逐字节不动点；对官方编辑器的产出，正文、编号、附图属性与图片字节逐项复原。
+  往返中必丢的信息（`claim-ref`／`figref`、`pb`、临时段、`heading/@level`、`claim-text` 嵌套、代码化的公式与表格等）逐项计数并写入
+  warnings，清单见 README「专利五书 XML 反向导入」一节；实现位于 `converters/parsers/xml.js` 与 `converters/parsers/xml/`。
 
 ### 6.2 本期不覆盖
 
 | 项 | 原因 |
 |---|---|
 | 化学式识别与编辑（OSRA／NCDK／CML 内嵌） | 范围外；源文档中的化学式对象按图片处理 |
-| XML → Word 反向导入 | 范围外；XML 可被应用直接打开阅读 |
 | 一键提交到专利业务办理客户端 | 依赖未公开的本地接口 `http://localhost:9999/common/wsImport` |
 | 外观设计（`cn-design-application-body` / `cn-brief` / 外观图片） | 单独 DTD，另行评估 |
 | 其它文件（`cn-other-file`，意见陈述书等） | 单独 DTD，另行评估 |

@@ -276,7 +276,7 @@ describe('化学式判据端到端（合成夹具）', () => {
 // 其它目标不受角色影响
 // ============================================================
 
-describe('md / html / docx 目标不读图片角色', () => {
+describe('md / html 目标不读图片角色，docx 目标只把角色写进替换文字', () => {
     const roledIr = () => createRoot([
         createParagraph([createText('化合物 '), { type: 'image', url: 'images/image_1.png', alt: '结构式', data: { role: 'chemistry' } }, createText(' 的制备。')]),
         createParagraph([{ type: 'image', url: 'images/image_2.png', alt: '公式', data: { role: 'formula' } }]),
@@ -303,9 +303,14 @@ describe('md / html / docx 目标不读图片角色', () => {
         assert.equal(withRole, await htmlRenderer.render(makeDoc(withoutRoles(roledIr())), options()));
     });
 
-    test('docx 产物的 document.xml 与去掉角色后逐字相同', async () => {
+    // docx 渲染器是角色标记的写入侧（五书 XML 反向导入的往返载体）：角色只进替换文字的前缀，版式与其余内容不变
+    test('docx 产物只在替换文字里多出 markflow:role= 前缀，去掉前缀后与无角色的产物逐字相同', async () => {
         const withRole = await documentXmlOf(await docxRenderer.render(makeDoc(roledIr()), options()));
         const without = await documentXmlOf(await docxRenderer.render(makeDoc(withoutRoles(roledIr())), options()));
-        assert.equal(withRole, without);
+        for (const marker of ['markflow:role=chemistry;结构式', 'markflow:role=formula;公式', 'markflow:role=table;表格']) {
+            assert.ok(withRole.includes(marker), `缺少 ${marker}`);
+        }
+        assert.equal(without.includes('markflow:role='), false);
+        assert.equal(withRole.replace(/markflow:role=(?:formula|table|chemistry);/g, ''), without);
     });
 });

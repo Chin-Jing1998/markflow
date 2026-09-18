@@ -21,7 +21,7 @@ const { parseArgs } = require('node:util');
 
 const service = require('../converters/service');
 const { setConfig, readConfig, getMineruToken, getConfigPath, CONFIG_TOKEN_KEY } = require('../converters/config');
-const { REMOTE_URL_RE, resolveUserPath, SUPPORTED_EXTENSIONS } = require('../converters/targets');
+const { REMOTE_URL_RE, resolveUserPath, DIRECTORY_SCAN_EXTENSIONS } = require('../converters/targets');
 const { expandInputs, DEFAULT_MAX_FILES } = require('../converters/scan');
 const { errText, isFile, isDirectory } = require('../converters/util');
 const pkg = require('../package.json');
@@ -71,6 +71,10 @@ const CONVERT_FLAGS = Object.freeze([
     { flag: 'section-detection', key: 'sectionDetection', paths: ['xml.patent.sectionDetection'], value: '<方式>', note: '仅 patent profile' },
     { flag: 'rasterize-tables', key: 'rasterizeTables', paths: ['xml.patent.rasterizeTables'], type: 'boolean', note: '仅 patent profile' },
     { flag: 'rasterize-formulas', key: 'rasterizeFormulas', paths: ['xml.patent.rasterizeFormulas'], type: 'boolean', note: '仅 patent profile' },
+    {
+        flag: 'xml-import-paragraph-numbers', key: 'xmlImportParagraphNumbers', paths: ['xmlImport.paragraphNumbers'], type: 'boolean',
+        note: '仅专利五书 XML 输入',
+    },
     { flag: 'raster-scale', key: 'rasterScale', paths: ['raster.scale'], value: '<倍数>' },
     { flag: 'raster-max-width', key: 'rasterMaxWidth', paths: ['raster.maxWidth'], value: '<n>' },
     { flag: 'validate', key: 'validate', paths: ['xml.validate'], type: 'boolean', note: '仅 xml 目标生效，校验结果进 warnings' },
@@ -211,11 +215,11 @@ async function cmdConvert(values, inputs, tokens) {
     // 目录就地展开为其下受支持的文件（产物平铺在同一输出目录，不保留子目录层级）；未给目录时逐项与入参相同
     const expansion = await expandInputs(inputs, { cwd: process.cwd() });
     if (expansion.inputs.length === 0) {
-        throw new UsageError(`输入目录中没有可转换的文件（受理扩展名：${SUPPORTED_EXTENSIONS.join(' ')}）`);
+        throw new UsageError(`输入目录中没有可转换的文件（目录展开受理：${DIRECTORY_SCAN_EXTENSIONS.join(' ')}；.xml 与 .zip 须显式给出）`);
     }
     if (!asJson) reportExpansion(expansion);
     // 选项按本批目标校验，故先规划任务再构建 options
-    const tasks = await planTasks(expansion.inputs, values.to);
+    const tasks = await planTasks(expansion.inputs, values.to, expansion.bundles);
     const options = buildConvertOptions(values, tasks);
     const validate = Boolean(values.validate);
     const outputDir = await resolveCliOutputDir(values.out);
@@ -325,16 +329,18 @@ function buildConvertOptions(values, tasks) {
     }
 }
 
-// 在服务层规划之上追加 CLI 专属的存在性预检；任一不合法即抛 UsageError（不启动转换）
-async function planTasks(inputs, requested) {
+// 在服务层规划之上追加 CLI 专属的存在性预检；任一不合法即抛 UsageError（不启动转换）。
+// bundles 为目录展开时判定出的专利五书目录：它们是目录而非文件，已确认存在，不再按文件预检
+async function planTasks(inputs, requested, bundles) {
     let tasks;
     try {
-        tasks = service.planTasks(inputs, requested, process.cwd());
+        tasks = service.planTasks(inputs, requested, process.cwd(), { bundles });
     } catch (err) {
         throw new UsageError(errText(err));
     }
+    const bundleDirs = new Set(bundles);
     for (const task of tasks) {
-        if (task.input.path && !(await isFile(task.input.path))) {
+        if (task.input.path && !bundleDirs.has(task.input.path) && !(await isFile(task.input.path))) {
             throw new UsageError(`输入文件不存在：${task.input.path}`);
         }
     }
@@ -411,7 +417,7 @@ async function cmdFormats(values) {
     if (values.json) { out(JSON.stringify(formats)); return EXIT.OK; }
     out(`MarkFlow ${pkg.version} 可用转换目标`);
     out(`  Office/PDF 文件 → ${targets.office.join('、')}`);
-    out(`  Markdown        → ${targets.markup.join('、')}`);
+    out(`  Markdown/专利XML → ${targets.markup.join('、')}`);
     out(`  网页 URL        → ${targets.url.join('、')}`);
     out(`  可用输入类型    → ${Object.keys(targets.inputs).join(' ')}`);
     out(`  受理扩展名      → ${extensions.join(' ')}`);
@@ -539,13 +545,15 @@ function printUsage() {
 用法：markflow <子命令> [选项]
 
   convert <输入...>   转换本地文件、目录或 http(s) 网页，输入可多个；目录展开为其下受支持的文件
+                      （.xml、.zip 须显式给出）；专利五书目录（内含 10000N/10000N.xml 或五书 XML）整体作为一项输入
   extract <网址>      抓取网页正文：Markdown 写标准输出，不落盘、不下载图片
   formats             列出可用的输入类型、转换目标与运行时能力
   config              读写 ~/.markflow/config.json：get | set <项> <值> | unset <项>
   mcp                 以 stdio 方式启动 MCP 服务，供 agent 调用
 
 通用选项：
-  --to <目标>         bundle | docx | pdf | html | xml；省略时按输入类型取默认值（Office/PDF/网页 → bundle，Markdown → docx）
+  --to <目标>         bundle | docx | pdf | html | xml；省略时按输入类型取默认值（Office/PDF/网页 → bundle，
+                      Markdown 与专利五书 XML（.xml、案卷 .zip、五书目录）→ docx）
   --out <目录>        输出目录，必须已存在；默认取 MARKFLOW_OUTPUT_DIR，再回退到当前目录
   --json              stdout 只输出一行 JSON 结果；不输出进度，告警随结果进 JSON，其余信息走 stderr
   --concurrency <n>   convert 的并发数，默认 ${DEFAULT_CONCURRENCY}；取值非法时告警并按默认值执行

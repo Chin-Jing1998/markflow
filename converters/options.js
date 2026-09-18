@@ -22,6 +22,7 @@
  *   pdf    { theme, pageSize, landscape, margins{top,bottom,left,right} }           页边距单位英寸
  *   docx   { pageSize, fontSize(pt), fontFamily{ascii,eastAsia}, margins|null }     页边距英寸；null 表示沿用渲染器默认
  *   xml    { profile, validate, indent, numbering{start,width}, patent{parts,rasterizeTables,rasterizeFormulas,imageDpi,sectionDetection} }
+ *   xmlImport { paragraphNumbers }   专利五书 XML 反向导入（输入侧选项，作用于 parsers/xml，与目标无关）
  *   raster { scale, maxWidth }
  *
  * 未列出的键一律拒绝（防止拼写错误静默失效）；可空字段（html.fontFamily、mineru.pageRanges、mineru.token、
@@ -130,6 +131,9 @@ const SCHEMA = {
             sectionDetection: enumField(OPTION_ENUMS.sectionDetection, 'auto', '分节识别：auto 标题或加粗短段，headings 仅标题'),
         }, '专利 profile 参数'),
     }, 'XML 目标参数'),
+    xmlImport: objectField({
+        paragraphNumbers: booleanField(false, '导入专利五书 XML 时把说明书与摘要的段号写回段首（[0001]），回转 XML 时原样复用；缺省不写，回转时按顺序重编'),
+    }, '专利五书 XML 反向导入参数'),
     raster: objectField({
         scale: numberField({ min: 1, max: 4, default: 2, description: '栅格化缩放倍数（patent profile 下忽略）' }),
         maxWidth: numberField({ min: 200, max: 10000, integer: true, default: 1600, description: '图片最大宽度（px，patent profile 下忽略）' }),

@@ -42,6 +42,7 @@ describe('normalizeOptions', () => {
             profile: 'generic', validate: false, indent: 2, numbering: { start: 1, width: 4 },
             patent: { parts: 'auto', rasterizeTables: true, rasterizeFormulas: true, imageDpi: 300, sectionDetection: 'auto' },
         });
+        assert.deepEqual(opts.xmlImport, { paragraphNumbers: false });
         assert.deepEqual(opts.raster, { scale: 2, maxWidth: 1600 });
 
         // Assert：深冻结（Reflect.set 在冻结对象上返回 false，不依赖严格模式）
@@ -126,6 +127,19 @@ describe('normalizeOptions', () => {
         assert.equal(normalizeOptions({ html: { lineHeight: 2.2 } }).html.lineHeight, 2.2);
         assert.equal(normalizeOptions({ jpegQuality: 60 }).jpegQuality, 60);
         assert.equal(normalizeOptions({ jpegQuality: 100 }).jpegQuality, 100);
+    });
+
+    test('xmlImport.paragraphNumbers 为布尔项，默认关闭；非布尔值与段内未知键拒绝；描述树带中文说明', () => {
+        assert.equal(normalizeOptions({ xmlImport: { paragraphNumbers: true } }).xmlImport.paragraphNumbers, true);
+        assert.equal(normalizeOptions({ xmlImport: {} }).xmlImport.paragraphNumbers, false);
+        assert.throws(() => normalizeOptions({ xmlImport: { paragraphNumbers: 'yes' } }), /选项 xmlImport\.paragraphNumbers 须为布尔值，实际："yes"/);
+        assert.throws(() => normalizeOptions({ xmlImport: { images: 'link' } }), /未知选项：xmlImport\.images（可用：paragraphNumbers）/);
+        assert.throws(() => normalizeOptions({ xmlImport: null }), /选项 xmlImport 不可为空/);
+        const spec = describeOptions().xmlImport;
+        assert.equal(spec.type, 'object');
+        assert.deepEqual(Object.keys(spec.fields), ['paragraphNumbers']);
+        assert.deepEqual([spec.fields.paragraphNumbers.type, spec.fields.paragraphNumbers.default], ['boolean', false]);
+        assert.match(spec.fields.paragraphNumbers.description, /段号写回段首/);
     });
 
     test('xml.validate 为布尔项，默认关闭，非布尔值拒绝', () => {

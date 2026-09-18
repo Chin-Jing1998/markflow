@@ -49,7 +49,7 @@ describe('模块导出与懒加载', () => {
         assert.equal(runBatch, require('../converters/batch').runBatch);
         assert.ok(Array.isArray(SUPPORTED_EXTENSIONS));
         assert.ok(Object.isFrozen(SUPPORTED_EXTENSIONS));
-        for (const ext of ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']) {
+        for (const ext of ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown', '.xml', '.zip']) {
             assert.ok(SUPPORTED_EXTENSIONS.includes(ext), ext);
         }
         for (const ext of ['.doc', '.xls', '.ppt']) {
@@ -76,6 +76,8 @@ describe('detectInputType', () => {
             'x.md': 'md',
             'x.markdown': 'md',
             '/路径/中文 文件.Md': 'md',
+            '/案卷/100002.xml': 'xml',
+            '案卷.ZIP': 'zip',
         };
         for (const [input, expected] of Object.entries(cases)) {
             assert.equal(detectInputType(input), expected, input);
@@ -104,7 +106,7 @@ describe('listTargets', () => {
             office: ['bundle', 'html', 'xml'],
             markup: ['docx', 'html', 'xml'],
             url: ['bundle', 'html', 'xml'],
-            inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', url: 'url' },
+            inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', xml: 'markup', zip: 'markup', url: 'url' },
             capabilities: { pdfBackend: null },
         });
     });
@@ -112,7 +114,7 @@ describe('listTargets', () => {
     test('inputs 不含 markdown 键（.markdown 已由 detectInputType 归入 md），也不含旧二进制格式', () => {
         const { inputs } = listTargets();
         assert.equal('markdown' in inputs, false);
-        assert.deepEqual(Object.keys(inputs), ['docx', 'xlsx', 'pptx', 'pdf', 'md', 'url']);
+        assert.deepEqual(Object.keys(inputs), ['docx', 'xlsx', 'pptx', 'pdf', 'md', 'xml', 'zip', 'url']);
     });
 
     test('pdfBackend 存在时 markup 含 pdf 且顺序固定；与 targets.js 同一实现', () => {
