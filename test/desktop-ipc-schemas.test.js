@@ -44,10 +44,11 @@ test('所有 §3.3.5 通道均有 schema，未知通道拒绝', () => {
         'mf:library:list', 'mf:library:update', 'mf:library:remove', 'mf:library:reveal', 'mf:library:open', 'mf:library:reconvert', 'mf:library:migrate',
         'mf:settings:get', 'mf:settings:set', 'mf:settings:setMineruToken', 'mf:settings:testMineru', 'mf:update:check',
         'mf:theme:get', 'mf:theme:set', 'mf:shell:openExternal', 'mf:file:action',
+        'mf:addin:status', 'mf:addin:setEnabled', 'mf:addin:install', 'mf:addin:uninstall',
     ];
     for (const channel of expected) assert.ok(SCHEMAS[channel], `缺少 schema：${channel}`);
     assert.equal(Object.keys(SCHEMAS).length, expected.length);
-    assert.equal(expected.length, 30, '通道总数为 30');
+    assert.equal(expected.length, 34, '通道总数为 34（含 Word 加载项的 4 个）');
     assert.ok(!SCHEMAS['mf:library:relocate'], 'relocate 不暴露为 IPC 通道');
     assert.throws(() => validatePayload('mf:library:relocate', {}), /未知的 IPC 通道/);
     assert.equal(CHANNELS.convertEvent, 'mf:convert:event');
@@ -121,6 +122,13 @@ const REJECTS = [
     ['mf:file:action', { sessionId: 'r1' }, '缺 action'],
     ['mf:file:action', { sessionId: 'r1', action: 'delete' }, '非法 action'],
     ['mf:file:action', { sessionId: 'r1', action: 'open', path: '/etc/passwd' }, '渲染层不得指定文件路径'],
+    ['mf:addin:setEnabled', undefined, '缺入参'],
+    ['mf:addin:setEnabled', {}, '缺 enabled'],
+    ['mf:addin:setEnabled', { enabled: 'yes' }, 'enabled 非布尔'],
+    ['mf:addin:setEnabled', { enabled: true, port: 8080 }, '渲染层不得指定端口'],
+    ['mf:addin:status', { verbose: true }, '多余键'],
+    ['mf:addin:install', { wefDir: '/tmp/x' }, '渲染层不得指定安装目录'],
+    ['mf:addin:uninstall', { path: '/etc/passwd' }, '渲染层不得指定删除路径'],
 ];
 
 for (const [channel, payload, label] of REJECTS) {
@@ -157,6 +165,11 @@ test('schema 放行合法入参并原样返回', () => {
     assert.deepEqual(validatePayload('mf:dialog:pickFiles', { directory: true, purpose: 'convert' }), { directory: true, purpose: 'convert' });
     assert.deepEqual(validatePayload('mf:update:check', undefined), undefined);
     assert.deepEqual(validatePayload('mf:update:check', { force: true }), { force: true });
+    // Word 加载项：只收一个布尔开关，其余三个通道不收入参
+    assert.deepEqual(validatePayload('mf:addin:setEnabled', { enabled: false }), { enabled: false });
+    assert.equal(validatePayload('mf:addin:status', undefined), undefined);
+    assert.deepEqual(validatePayload('mf:addin:install', {}), {});
+    assert.equal(validatePayload('mf:addin:uninstall', null), null);
 });
 
 test('validate 经 service.buildOptions 映射到 xml.validate', () => {

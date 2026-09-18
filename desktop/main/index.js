@@ -2,7 +2,7 @@
  * MarkFlow 桌面端主进程入口（方案 §3.2「新增（桌面端）」、§3.4.9）
  *
  * 职责：单实例锁；app.ready 前注册 mf-app / mf-asset 特权 scheme 并恢复主题；ready 后安装协议处理器、
- * 权限处理器（仅放行剪贴板写入）、进程内 PDF / 栅格后端、文件库、IPC、菜单与主窗口；
+ * 权限处理器（仅放行剪贴板写入）、进程内 PDF / 栅格后端、文件库、Word 加载项（默认关闭，启用后才监听回环端口）、IPC、菜单与主窗口；
  * window-all-closed / activate 按平台差异处理；未捕获异常写 stderr 并弹窗。
  *
  * 在普通 Node 进程中 require 本文件不产生任何副作用（require('electron') 得到的是路径字符串，
@@ -25,6 +25,8 @@ const { createUpdateChecker } = require('./update-check');
 const { scanPaths } = require('./scan');
 const { createReader, isReaderPath, READER_EXTENSIONS } = require('./reader');
 const { createPreviewSessions } = require('./preview-session');
+const { createWordAddin } = require('./addin/controller');
+const { defaultWefDir } = require('./addin/manifest-installer');
 const pkg = require('../../package.json');
 
 const RENDERER_DIR = path.join(__dirname, '..', 'renderer');
@@ -34,6 +36,10 @@ const APP_URL = 'mf-app://app/';
 const LIBRARY_DIRNAME = 'library';
 const OUTPUT_DIRNAME = 'MarkFlow';
 const LIBRARY_ROOT_DIRNAME = 'MarkFlow Library';
+/** Word 加载项：随应用分发的清单模板与任务窗格静态资源 / 上传临时目录（应用临时目录之下）/ 清单副本目录（userData 之下） */
+const ADDIN_DIR = path.join(__dirname, '..', '..', 'office-addin');
+const ADDIN_TMP_DIRNAME = 'markflow-word-addin';
+const ADDIN_STAGING_DIRNAME = 'word-addin';
 /** 渲染进程可申请的权限：只放行剪贴板写入（复制路径），其余一律拒绝 */
 const PERMISSIONS_ALLOWED = Object.freeze(new Set(['clipboard-sanitized-write']));
 
@@ -110,7 +116,7 @@ function bootstrap(electron) {
     const updateChecker = createUpdateChecker({ settings, currentVersion: pkg.version, log });
     const state = {
         mainWindow: null, chromiumJobs: null, library: null, libraryMigrate: null,
-        preview: null, reader: null, backendStatus: { pdf: false, raster: false },
+        preview: null, reader: null, addin: null, backendStatus: { pdf: false, raster: false },
     };
 
     /** 关闭全部预览 / 阅读会话：撤销 mf-asset 授权并删掉会话临时目录（窗口关闭与退出时各调一次） */
@@ -187,6 +193,48 @@ function bootstrap(electron) {
         state.mainWindow.focus();
     }
 
+    /**
+     * Word 任务窗格的「在 MarkFlow 中预览」：把主窗口带到前台（此刻前台是 Word），
+     * 再走菜单「打开文件…」同一条推送通道，交阅读模式打开产物 XML；预览与阅读模块本身不改。
+     */
+    function openInReader(filePath) {
+        focusMainWindow();
+        if (process.platform === 'darwin') app.focus({ steal: true });
+        const win = state.mainWindow;
+        if (!win || win.isDestroyed()) throw new Error('MarkFlow 主窗口不可用');
+        const send = () => { if (!win.isDestroyed()) win.webContents.send(CHANNELS.previewEvent, { type: 'reader-open', path: filePath }); };
+        if (win.webContents.isLoading()) win.webContents.once('did-finish-load', send);
+        else send();
+    }
+
+    /**
+     * Word 加载项总装：设置里未启用时不监听任何端口；启动失败（如端口被占用）只记日志，原因由设置页展示。
+     * 这是可选功能：总装本身出错也只记日志（设置页随后显示「Word 加载项模块未就绪」），不得拖垮应用启动。
+     */
+    function setupWordAddin() {
+        try {
+            state.addin = buildWordAddin();
+        } catch (err) {
+            log(`[desktop] Word 加载项未就绪：${errText(err)}`);
+            return;
+        }
+        state.addin.init().catch((err) => log(`[desktop] Word 加载项初始化失败：${errText(err)}`));
+    }
+
+    function buildWordAddin() {
+        return createWordAddin({
+            settings, service: require('../../converters/service'), version: pkg.version, log,
+            actions: { reveal: (target) => shell.showItemInFolder(target), preview: openInReader },
+            paths: {
+                staticDir: path.join(ADDIN_DIR, 'taskpane'),
+                templatePath: path.join(ADDIN_DIR, 'manifest.xml'),
+                wefDir: defaultWefDir(app.getPath('home')),
+                stagingDir: path.join(userData, ADDIN_STAGING_DIRNAME),
+                tmpRoot: path.join(app.getPath('temp'), ADDIN_TMP_DIRNAME),
+            },
+        });
+    }
+
     // ---------- 菜单动作 ----------
 
     /**
@@ -261,7 +309,10 @@ function bootstrap(electron) {
 
     app.on('second-instance', () => focusMainWindow());
     app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-    app.on('before-quit', () => { closeViewSessions(); });
+    app.on('before-quit', () => {
+        closeViewSessions();
+        if (state.addin) state.addin.dispose().catch((err) => log(`[desktop] 停止 Word 加载项失败：${errText(err)}`));
+    });
     app.on('web-contents-created', (event, contents) => {
         contents.on('will-attach-webview', (attachEvent) => attachEvent.preventDefault());
     });
@@ -280,11 +331,12 @@ function bootstrap(electron) {
         // 预览与阅读会话：两者共用 grants（mf-asset 授权表），预览另需设置（选项默认值、MinerU 令牌）与文件库
         state.reader = createReader({ grants, log });
         state.preview = createPreviewSessions({ grants, settings, library: state.library, log });
+        setupWordAddin();
 
         const { handlers } = createIpcHandlers({
             electron, settings, grants,
             library: state.library, libraryMigrate: state.libraryMigrate,
-            preview: state.preview, reader: state.reader, update: updateChecker,
+            preview: state.preview, reader: state.reader, update: updateChecker, addin: state.addin,
             service: require('../../converters/service'),
             scan: { scanPaths },
             backendStatus: state.backendStatus,
@@ -305,7 +357,7 @@ function bootstrap(electron) {
 module.exports = {
     _internal: {
         loadElectron, shouldBootstrap, loadLibraryModules, defaultDirs, bootstrap, shouldCheckUpdateOnStartup,
-        RENDERER_DIR, PRELOAD_PATH, ICON_PNG, APP_URL, PERMISSIONS_ALLOWED, LIBRARY_DIRNAME,
+        RENDERER_DIR, PRELOAD_PATH, ICON_PNG, APP_URL, PERMISSIONS_ALLOWED, LIBRARY_DIRNAME, ADDIN_DIR,
     },
 };
 

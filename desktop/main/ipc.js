@@ -3,7 +3,7 @@
  *
  * createIpcHandlers(deps) → { handlers: { [channel]: async (event, payload) }, channels }
  *   deps = { electron, settings, grants, library|null, libraryMigrate|null, service, scan, backendStatus,
- *            getMainWindow, applyTheme, log }
+ *            getMainWindow, applyTheme, log, addin|null }
  * registerIpc(ipcMain, handlers)：逐通道 ipcMain.handle，先 validatePayload 再交处理器
  * validatePayload(channel, payload)：按 SCHEMAS 校验，失败抛「参数不合法（通道）：…」中文错误（纯逻辑，可单测）
  *
@@ -33,6 +33,7 @@
  *   mf:shell:openExternal { url }            → 仅 http(s)
  *   mf:file:action { sessionId, action }     → 顶部栏的当前文件操作：reveal 在访达中显示 / open 用默认应用打开 / copyPath 复制路径；
  *                                              渲染层不传路径，主进程依次在预览会话（来源文件）与阅读会话（所开文件）中按 sessionId 取
+ *   mf:addin:status/setEnabled/install/uninstall → Word for Mac 加载项（通道、schema 与处理器定义在 addin/ipc.js，此处只并入总表）
  */
 const path = require('path');
 const fsp = require('fs').promises;
@@ -43,6 +44,7 @@ const { OPTION_ENUMS, describeOptions } = require('../../converters/options');
 const { errText, statOrNull, hostnameOf } = require('../../converters/util');
 const { THEMES, LIBRARY_MODES, SettingsPatchSchema } = require('./settings');
 const { BROWSE_EXTENSIONS, READER_EXTENSIONS, IMAGE_IMPORT_EXTENSIONS, MAX_TEXT_BYTES } = require('./file-kinds');
+const { ADDIN_CHANNELS, ADDIN_SCHEMAS, createAddinHandlers } = require('./addin/ipc');
 
 const CONVERT_CONCURRENCY = 2;
 const MAX_ITEMS_PER_RUN = 500;
@@ -91,6 +93,7 @@ const CHANNELS = Object.freeze({
     themeChanged: 'mf:theme:changed',
     shellOpenExternal: 'mf:shell:openExternal',
     fileAction: 'mf:file:action',
+    ...ADDIN_CHANNELS,
 });
 
 /** mf:file:action 的动作：在访达中显示 / 用默认应用打开 / 复制路径 */
@@ -225,6 +228,7 @@ const SCHEMAS = Object.freeze({
     [CHANNELS.shellOpenExternal]: z.object({ url: z.string().max(MAX_PATH_LENGTH).regex(EXTERNAL_URL_RE, '仅接受 http(s) 网址') }).strict(),
     // 渲染层只给会话与动作，不给路径：路径一律由主进程按 sessionId 在预览会话与阅读会话中取
     [CHANNELS.fileAction]: z.object({ sessionId: recordId, action: z.enum([...FILE_ACTIONS]) }).strict(),
+    ...ADDIN_SCHEMAS,
 });
 
 function formatIssues(error) {
@@ -290,7 +294,7 @@ const scrubAll = (text, tokens) => tokens.filter(Boolean).reduce((out, token) =>
 function createIpcHandlers(deps = {}) {
     const {
         electron, settings, library = null, libraryMigrate = null, service, scan,
-        preview = null, reader = null, update = null,
+        preview = null, reader = null, update = null, addin = null,
         backendStatus = { pdf: false, raster: false }, getMainWindow = () => null, applyTheme = () => undefined,
         log = (line) => process.stderr.write(`${line}\n`),
     } = deps;
@@ -711,6 +715,7 @@ function createIpcHandlers(deps = {}) {
         [CHANNELS.themeSet]: themeSet,
         [CHANNELS.shellOpenExternal]: shellOpenExternal,
         [CHANNELS.fileAction]: fileAction,
+        ...createAddinHandlers(addin),
     };
     return { handlers, channels: CHANNELS, runs };
 }

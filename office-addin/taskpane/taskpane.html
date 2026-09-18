@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<!--
+    MarkFlow 专利 XML —— Word for Mac 任务窗格页面。
+    本页由 MarkFlow 主进程内的回环服务同源提供：三个 meta 的占位符（MARKFLOW_TOKEN / MARKFLOW_VERSION / MARKFLOW_MAX_BYTES，
+    外裹双花括号）在每次响应时注入；令牌只存内存、随页面下发，不进任何脚本文件与 URL。唯一的外部脚本是微软官方 CDN 的 office.js，运行时加载、不落盘。
+    页面只显示文件名、进度、告警与产物路径，不显示也不记录文档正文。
+-->
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="markflow-token" content="{{MARKFLOW_TOKEN}}">
+    <meta name="markflow-version" content="{{MARKFLOW_VERSION}}">
+    <meta name="markflow-max-bytes" content="{{MARKFLOW_MAX_BYTES}}">
+    <title>MarkFlow 专利 XML</title>
+    <link rel="stylesheet" href="taskpane.css">
+    <script type="text/javascript" src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+</head>
+<body>
+    <header class="pane-header">
+        <h1>MarkFlow 专利 XML</h1>
+        <p class="lead">把当前文档（含未保存的编辑）转换为国知局专利五书 XML，产物由本机的 MarkFlow 写入磁盘。</p>
+    </header>
+
+    <main>
+        <section class="card" aria-label="当前文档">
+            <div class="row"><span class="label">当前文档</span><span class="value" id="doc-name">读取中…</span></div>
+            <div class="row"><span class="label">MarkFlow</span><span class="pill" id="service-state" data-state="pending">连接中…</span></div>
+        </section>
+
+        <button class="primary" id="convert" type="button" disabled>转换为专利 XML</button>
+
+        <section class="card" id="progress" hidden aria-live="polite">
+            <p class="progress-label" id="progress-label"></p>
+            <progress id="progress-bar" max="100" value="0"></progress>
+        </section>
+
+        <section class="card error" id="error" hidden role="alert">
+            <p id="error-text"></p>
+            <button class="secondary" id="retry" type="button" hidden>重试连接</button>
+        </section>
+
+        <section id="result" hidden aria-live="polite"></section>
+    </main>
+
+    <footer class="pane-footer" id="footer"></footer>
+
+    <script type="text/javascript" src="taskpane.js"></script>
+</body>
+</html>

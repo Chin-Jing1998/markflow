@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MarkFlow 专利 XML —— Word for Mac 任务窗格加载项清单（随 MarkFlow 分发的模板，由设置页的「安装到 Word」写入 Word 的旁加载目录）
+
+  形态与 2026-09-18 门禁实测通过的清单一致，只换了 Id、名称与说明：
+  - SourceLocation 指向本机 MarkFlow 进程内的回环服务 http://localhost:49731（页面与接口同源，不需要 HTTPS 与证书）；
+    端口与 desktop/main/addin/server.js 的 DEFAULT_PORT 必须一致，test/desktop-addin-installer.test.js 守护这一点。
+  - 不写 Requirements、IconUrl、SupportUrl 与 VersionOverrides：官方示例注明 VersionOverrides 的 Resources 里的 URL 须为 HTTPS，
+    故本期没有功能区按钮，加载项从「开始 > 加载项」或「插入 > 我的加载项 > 开发人员加载项」打开。
+  - 清单只在 Word 启动时读取，安装或移除后须完全退出并重开 Word。
+-->
+<OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:type="TaskPaneApp">
+  <Id>E4E146E8-7926-41F1-9D50-340228E0CAE9</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>MarkFlow</ProviderName>
+  <DefaultLocale>zh-CN</DefaultLocale>
+  <DisplayName DefaultValue="MarkFlow 专利 XML" />
+  <Description DefaultValue="把当前 Word 文档（含未保存的编辑）交给本机的 MarkFlow，转换为国知局专利五书 XML。" />
+  <Hosts>
+    <Host Name="Document" />
+  </Hosts>
+  <DefaultSettings>
+    <SourceLocation DefaultValue="http://localhost:49731/taskpane.html" />
+  </DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+</OfficeApp>

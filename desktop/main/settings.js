@@ -17,6 +17,8 @@
  *                          safeStorage.isEncryptionAvailable() 为 false 时拒绝并抛中文错误
  *   getUpdateCache()       最近一次更新检测的结果（深拷贝）；无缓存或已损坏返回 null
  *   setUpdateCache(entry)  校验后写入 settings.json 的 update 段（与 set 同一把写队列与原子写）
+ *   setWordAddin(patch)    校验后写入 settings.json 的 wordAddin 段（{ enabled }），返回新的 wordAddin；
+ *                          只由主进程的 Word 加载项总装（addin/controller.js）调用，写完随即启停回环服务
  *   describe()             { settings, mineruTokenConfigured, encryptionAvailable, paths, warnings }（供 IPC 回包，不含令牌）
  *   warnings()             最近一次 load 的警告
  *
@@ -29,11 +31,14 @@
  *               故设置页的输入框留空即删除该项（见 mf-settings-page.js 的 fill / collectPatch），
  *     library: { mode: 'index'|'managed', root, repositories?, activeRepository? },
  *     checkUpdateOnStartup: boolean（启动时是否自动检测更新，默认 true，用户可在设置页改），
+ *     wordAddin: { enabled: boolean }（Word for Mac 加载项的回环服务是否随应用启动，默认 false——不启用就不监听任何端口），
  *     update?: { checkedAt, status, message, latestVersion, url }（更新检测缓存，仅主进程写） }
  * secrets.json：{ mineruToken: <base64 密文> }。令牌永不进入 settings.json、日志与 IPC 回包。
  *
  * update 段不在 SettingsPatchSchema 内，渲染层经 mf:settings:set 无法写入；损坏时按缺失处理（.catch），
  * 不让一段缓存把整份设置退回默认值。
+ * wordAddin 段同样不在 SettingsPatchSchema 内：开关只能经 mf:addin:setEnabled 改，由总装在落盘后立即启停服务，
+ * 设置值与监听状态因此不会脱节；该段损坏时按「关闭」处理（.catch），既不牵连其余设置，也不会误开端口。
  */
 const fs = require('fs');
 const fsp = fs.promises;
@@ -93,6 +98,10 @@ const LibrarySchema = z.object({
     activeRepository: nonEmptyPath.optional(),
 }).strict();
 
+/** Word 加载项：只有一个开关；端口、目录与清单内容都不是用户设置 */
+const WordAddinSchema = z.object({ enabled: z.boolean() }).strict();
+const WORD_ADDIN_OFF = Object.freeze({ enabled: false });
+
 const UpdateCacheSchema = z.object({
     checkedAt: z.number().int().min(0),
     status: z.enum([...UPDATE_STATUSES]),
@@ -110,6 +119,8 @@ const SettingsSchema = z.object({
     library: LibrarySchema,
     // 旧设置文件没有该字段：load 里与默认值深合并后取 true，不会因缺字段把整份设置判为不合法
     checkUpdateOnStartup: z.boolean(),
+    // 段损坏按「关闭」处理：不牵连其余设置项，也不会因为一段坏数据而开始监听端口
+    wordAddin: WordAddinSchema.catch({ ...WORD_ADDIN_OFF }),
     // 缓存损坏按缺失处理，不牵连其余设置项
     update: UpdateCacheSchema.optional().catch(undefined),
 }).strict();
@@ -144,6 +155,7 @@ function buildDefaultSettings({ outputDir, libraryRoot } = {}) {
         defaults: {},
         library: { mode: 'index', root: path.resolve(libraryRoot) },
         checkUpdateOnStartup: true,
+        wordAddin: { ...WORD_ADDIN_OFF },
     };
 }
 
@@ -343,6 +355,18 @@ function createSettingsStore({ dir, safeStorage, defaults } = {}) {
         return clone(checked.data);
     });
 
+    // ---------- Word 加载项开关（settings.json 的 wordAddin 段；只由主进程写） ----------
+
+    const setWordAddin = (patch) => enqueue(async () => {
+        if (!state.loaded) load();
+        const checked = WordAddinSchema.safeParse({ ...state.settings.wordAddin, ...(isPlainObject(patch) ? patch : {}) });
+        if (!isPlainObject(patch) || !checked.success) throw new Error(`Word 加载项设置不合法：${checked.success ? '须为对象' : formatIssues(checked.error)}`);
+        const next = { ...clone(state.settings), wordAddin: checked.data };
+        await writeJsonAtomic(settingsPath, next);
+        state.settings = next;
+        return clone(checked.data);
+    });
+
     function describe() {
         return {
             settings: get(),
@@ -362,7 +386,7 @@ function createSettingsStore({ dir, safeStorage, defaults } = {}) {
     }
 
     return {
-        load, get, set, hasMineruToken, getMineruToken, setMineruToken, getUpdateCache, setUpdateCache, describe,
+        load, get, set, hasMineruToken, getMineruToken, setMineruToken, getUpdateCache, setUpdateCache, setWordAddin, describe,
         warnings: () => [...state.warnings],
         paths: { dir: baseDir, settingsPath, secretsPath },
     };
@@ -373,6 +397,6 @@ const targetClassOf = (inputType) => INPUT_CLASS[inputType] || null;
 
 module.exports = {
     createSettingsStore, buildDefaultSettings, targetClassOf,
-    SettingsSchema, SettingsPatchSchema, DefaultsPatchSchema, UpdateCacheSchema,
+    SettingsSchema, SettingsPatchSchema, DefaultsPatchSchema, UpdateCacheSchema, WordAddinSchema,
     THEMES, LIBRARY_MODES, UPDATE_STATUSES, SETTINGS_VERSION, SETTINGS_FILENAME, SECRETS_FILENAME,
 };

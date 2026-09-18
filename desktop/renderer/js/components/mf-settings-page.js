@@ -1,10 +1,12 @@
 /**
- * <mf-settings-page>：设置页，单列长滚动，7 张分区卡片自上而下依次排列。
+ * <mf-settings-page>：设置页，单列长滚动，8 张分区卡片自上而下依次排列。
  * 卡片带 data-section 供 CSS 定位——外观的分段控件与「转换默认项」的三列网格各有专门排版，
  * 用该钩子而非「第几个子卡片」，卡片增删或换序时排版不会错位。
  * 外观主题即时生效（mf:theme:set）；输出目录、默认目标、转换默认项、文件库模式、启动时是否自动检查更新
  * 经「保存设置」一次提交（mf:settings:set）；
  * MinerU 令牌单独保存 / 清除 / 测试连接（只显示「已配置 / 未配置」与测试结果，不回显令牌）；
+ * 「Word 加载项」一节的启用开关即时生效（mf:addin:setEnabled：主进程落盘后立即启停回环服务，不经「保存设置」，
+ *   也不计入未保存改动），并显示服务状态与清单安装状态、提供「安装到 Word」「从 Word 移除」；非 macOS 整节禁用；
  * 「关于」一节写明三端使用方法，并经 mf:update:check 取 GitHub 最新 release 与当前版本比对
  * （请求一律由主进程发起，渲染层既不发网络请求也不指定地址；开关开启时拿到设置后读一次缓存，点按钮才强制重新检测，
  *   开关关闭时连这一次都不读——页面元素随应用启动即创建，无条件读会在缓存过期时把启动联网放回来）。
@@ -31,6 +33,22 @@ const ENUM_LABELS = Object.freeze({
     image: '栅格为图片', text: '线性化文本',
     pipeline: 'pipeline', vlm: 'vlm',
 });
+
+/** Word 加载项：回环服务状态 / 清单安装状态 → 状态胶囊的文案与档位（on 绿 / off 橙 / 空为灰） */
+const ADDIN_SERVER_LABELS = Object.freeze({
+    listening: ['监听中', 'on'], 'port-in-use': ['端口被占用', 'off'], error: ['启动失败', 'off'], stopped: ['已关闭', ''],
+});
+const ADDIN_MANIFEST_LABELS = Object.freeze({
+    installed: ['已安装', 'on'], outdated: ['需要重新安装：清单与当前版本不一致', 'off'], 'not-installed': ['未安装', ''], unsupported: ['不支持', ''],
+    // 未启用时主进程不去读 Word 的数据目录（读它可能触发 macOS 的授权框），故不知道装没装
+    unchecked: ['启用后显示', ''],
+});
+const ADDIN_RESTART_NOTE = '清单只在 Word 启动时读取：请完全退出 Word（⌘Q）后重新打开。';
+const ADDIN_STEPS = Object.freeze([
+    ['第一步', '勾选上方的「启用 Word 加载项」，确认服务状态为「监听中」。'],
+    ['第二步', '点「安装到 Word」。macOS 询问是否允许 MarkFlow 访问其他 App 的数据时，请选择允许。'],
+    ['第三步', '完全退出 Word（⌘Q）后重新打开，在「开始 › 加载项」中选择「MarkFlow 专利 XML」；旧版界面在「插入 › 我的加载项 › 开发人员加载项」。'],
+]);
 
 const REPOSITORY_URL = 'https://github.com/Chin-Jing1998/markflow';
 const REPOSITORY_LABEL = 'github.com/Chin-Jing1998/markflow';
@@ -155,6 +173,21 @@ class MfSettingsPage extends HTMLElement {
                     <label class="field"><span>托管根目录</span>
                         <span class="field-row"><input class="input" type="text" data-field="libraryRoot" spellcheck="false"><button class="btn btn-secondary" type="button" data-action="pick-library">${icon('folder')}选择</button></span>
                     </label>`)}
+                ${sectionCard('word-addin', `
+                    <h2>Word 加载项</h2>
+                    <p class="hint" data-role="addin-intro">在 Mac 版 Word 的任务窗格里一键把当前文档（含未保存的编辑）转换为专利五书 XML。启用后 MarkFlow 只在本机回环地址上提供任务窗格页面与接口，局域网内的其他设备无法访问；不启用则不监听任何端口。不要求登录 Microsoft 账户，也不要求 Microsoft 365 订阅。</p>
+                    <label class="field field-check"><input type="checkbox" data-role="addin-enabled" disabled><span>启用 Word 加载项（随 MarkFlow 启动）</span></label>
+                    <ul class="capabilities">
+                        <li><span>服务状态</span><span class="status-pill" data-role="addin-server">读取中…</span></li>
+                        <li><span>Word 清单</span><span class="status-pill" data-role="addin-manifest">读取中…</span></li>
+                    </ul>
+                    <p class="mineru-result" data-role="addin-result" hidden></p>
+                    <div class="field-row">
+                        <button class="btn btn-secondary btn-small" type="button" data-action="addin-install" disabled>${icon('open')}安装到 Word</button>
+                        <button class="btn btn-secondary btn-small" type="button" data-action="addin-uninstall" disabled>从 Word 移除</button>
+                    </div>
+                    <ul class="capabilities">${ADDIN_STEPS.map(([name, text]) => `<li><span><strong>${escapeHtml(name)}</strong>：${escapeHtml(text)}</span></li>`).join('')}</ul>
+                    <p class="hint">使用期间 MarkFlow 须保持运行。移除后如果加载项仍出现在 Word 里，需按微软的说明整体清空 Office 的加载项缓存——那会同时移除其他旁加载的加载项，故 MarkFlow 不代为执行。</p>`)}
                 ${sectionCard('capabilities', `
                     <h2>运行能力</h2>
                     <ul class="capabilities" data-role="capabilities"></ul>`)}
@@ -184,8 +217,12 @@ class MfSettingsPage extends HTMLElement {
         this.addEventListener('input', (event) => {
             if (event.target instanceof Element && event.target.matches('[data-field]') && event.target.dataset.field !== 'token') this.dirty = true;
         });
+        this.addEventListener('change', (event) => {
+            if (event.target instanceof Element && event.target.matches('[data-role="addin-enabled"]')) this.toggleAddin(event.target);
+        });
         this.unsubscribe = store.subscribe((state) => this.fill(state));
         this.fill(store.get());
+        this.loadAddin();
         // 首次读取更新状态改由 fill() 在拿到设置后触发，见 maybeLoadUpdateOnce
     }
 
@@ -197,6 +234,73 @@ class MfSettingsPage extends HTMLElement {
         this.dirty = false;
         api.settingsGet().then((described) => store.set({ settings: described })).catch((err) => notify(err.message, 'error'));
         api.describeFormats().then((formats) => store.set({ formats })).catch(() => undefined);
+        this.loadAddin();
+    }
+
+    // ---------- Word 加载项 ----------
+
+    /** 读一次状态并渲染；读失败（模块未就绪等）只在本节提示，不影响设置页其余部分 */
+    async loadAddin() {
+        try {
+            this.renderAddin(await api.addinStatus());
+        } catch (err) {
+            this.showAddinResult(err.message, 'error');
+        }
+    }
+
+    renderAddin(status) {
+        if (!status || !status.server || !status.manifest) return;
+        const supported = status.supported === true;
+        const checkbox = this.querySelector('[data-role="addin-enabled"]');
+        checkbox.checked = supported && status.enabled === true;
+        checkbox.disabled = !supported;
+        const [serverText, serverState] = ADDIN_SERVER_LABELS[status.server.state] || [status.server.state, ''];
+        const listening = status.server.state === 'listening';
+        this.setAddinPill('addin-server', supported ? (listening ? `${serverText}（127.0.0.1:${status.server.port}）` : serverText) : status.unsupportedMessage, supported ? serverState : '');
+        const [manifestText, manifestState] = ADDIN_MANIFEST_LABELS[status.manifest.state] || [status.manifest.state, ''];
+        this.setAddinPill('addin-manifest', supported ? manifestText : status.unsupportedMessage, supported ? manifestState : '');
+        this.querySelector('[data-action="addin-install"]').disabled = !supported;
+        this.querySelector('[data-action="addin-uninstall"]').disabled = !supported || status.manifest.state === 'not-installed';
+        // 服务起不来（端口被占用等）时把原因与排查办法摆出来；恢复正常后撤掉这条错误提示
+        if (supported && status.server.message) this.showAddinResult(`${status.server.message}。${status.server.hint || ''}`, 'error');
+        else if (this.querySelector('[data-role="addin-result"]').dataset.kind === 'error') this.querySelector('[data-role="addin-result"]').hidden = true;
+    }
+
+    setAddinPill(role, text, state) {
+        const pill = this.querySelector(`[data-role="${role}"]`);
+        pill.textContent = text;
+        if (state) pill.dataset.state = state;
+        else delete pill.dataset.state;
+    }
+
+    showAddinResult(message, kind) {
+        const el = this.querySelector('[data-role="addin-result"]');
+        el.hidden = false;
+        el.textContent = message;
+        el.dataset.kind = kind;
+    }
+
+    /** 开关即时生效；失败时把勾选状态拨回去并在本节提示原因 */
+    async toggleAddin(checkbox) {
+        const wanted = checkbox.checked;
+        checkbox.disabled = true;
+        try {
+            this.renderAddin(await api.addinSetEnabled(wanted));
+        } catch (err) {
+            checkbox.checked = !wanted;
+            checkbox.disabled = false;
+            this.showAddinResult(err.message, 'error');
+        }
+    }
+
+    /** 安装 / 移除清单：成功后提示重开 Word；失败文案自带可粘贴到终端的手动命令 */
+    async runAddinAction(action) {
+        try {
+            this.renderAddin(action === 'install' ? await api.addinInstall() : await api.addinUninstall());
+            this.showAddinResult(`${action === 'install' ? '已安装到 Word。' : '已从 Word 移除。'}${ADDIN_RESTART_NOTE}`, 'ok');
+        } catch (err) {
+            this.showAddinResult(err.message, 'error');
+        }
     }
 
     fill(state) {
@@ -406,6 +510,12 @@ class MfSettingsPage extends HTMLElement {
                 }
                 case 'check-update':
                     await this.loadUpdate({ force: true });
+                    break;
+                case 'addin-install':
+                    await this.runAddinAction('install');
+                    break;
+                case 'addin-uninstall':
+                    await this.runAddinAction('uninstall');
                     break;
                 case 'open-repo':
                     await api.openExternal(REPOSITORY_URL);
