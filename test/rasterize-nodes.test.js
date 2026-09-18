@@ -3,7 +3,8 @@
  * 覆盖：table → image 节点与 JPG 资源（JFIF 密度 330、白底）、omath-<段>-<序> 命名与行内 inline 标记、
  *       patent 不缩放 / 非 patent 按 scale 与 maxWidth、后端不可用与单任务 / 整批失败的降级 + warning、
  *       入参不变与未触及节点保持引用、无命中不触碰后端、资源名冲突、片段页内容与无 http(s) 引用、
- *       patent 下公式图按墨迹紧裁（四周定量留白、全白不裁）与 data.section 继承
+ *       patent 下公式图按墨迹紧裁（四周定量留白、全白不裁）与 data.section 继承、
+ *       table.data.grid 表格的片段页跨度与多段、降级仍走 mdast 行列、真实 electron 出图非空白（无后端时跳过）
  */
 const { test, before, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -552,3 +553,106 @@ test('后端不可用而降级时，顶层表格与块级公式的降级段落�
     assert.deepEqual(mathPara.data.section, sectionB);
     assert.ok(!(plainPara.data && 'section' in plainPara.data), '原节点没有分节信息时不凭空补一个');
 });
+
+// ============================================================
+// data.grid（docx 表格：合并单元格与单元格内多段）
+// ============================================================
+
+const REAL_BACKEND_TIMEOUT_MS = 90000;
+/** 出图的合理量级：比单行小表大得多即可，不锁死具体像素 */
+const MIN_GRID_IMAGE = { width: 200, height: 60 };
+
+/** 带 data.grid 的表格节点：两行三列，含横向与纵向合并、一个两段单元格与一个上标 */
+function mergedGridTable() {
+    const cell = (paragraphs, extra = {}) => ({ colspan: 1, rowspan: 1, header: false, paragraphs, ...extra });
+    const line = (value) => [createText(value)];
+    return {
+        ...createTable(null, [createTableRow([createTableCell('降级用')])]),
+        data: {
+            grid: {
+                rows: [
+                    { header: false, cells: [
+                        cell([line('横跨两列的表头')], { colspan: 2 }),
+                        cell([line('纵跨两行')], { rowspan: 2 }),
+                    ] },
+                    { header: false, cells: [
+                        cell([line('第一段文字'), [createText('第二段 m'), { type: 'superscript', children: [createText('3')] }]]),
+                        cell([line('普通单元格')]),
+                    ] },
+                ],
+            },
+        },
+    };
+}
+
+test('grid 表格：片段页按 grid 出跨度与多段，仍不引用任何 http(s) 资源', async () => {
+    // Arrange
+    const doc = createDocument({ ir: createRoot([mergedGridTable()]) });
+    const calls = stubBackend();
+
+    // Act
+    await rasterizeNodes(doc, { kinds: ['table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert
+    const html = calls[0].htmls[0];
+    assert.ok(html.includes('<td colspan="2"><p>横跨两列的表头</p></td>'), html);
+    assert.ok(html.includes('<td rowspan="2"><p>纵跨两行</p></td>'), html);
+    assert.ok(html.includes('<td><p>第一段文字</p><p>第二段 m<sup>3</sup></p></td>'), html);
+    assert.ok(!/<thead>/.test(html), '没有表头行时不出 thead，首行不被强制加粗');
+    assert.ok(!/https?:\/\//.test(html), '片段页不得引用任何 http(s) 资源');
+});
+
+test('grid 表格：后端不可用时仍按 mdast 的行列降级为逐行文本（grid 只供出图）', async () => {
+    // Arrange
+    const doc = createDocument({ ir: createRoot([mergedGridTable()]) });
+    backend._setDeps({ electronPath: null });
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert
+    assert.equal(result.rasterized, 0);
+    assert.equal(result.doc.ir.children[0].type, 'paragraph');
+    assert.equal(result.doc.ir.children[0].children[0].value, '降级用');
+});
+
+test('真实 electron 出图：含合并单元格与多段单元格的 grid 表格成图且非空白', { timeout: REAL_BACKEND_TIMEOUT_MS }, async (t) => {
+    // Arrange
+    const detected = await backend.detect();
+    if (!detected.available) {
+        t.skip(`本机无可用栅格后端：${detected.hint}`);
+        return;
+    }
+    const doc = createDocument({ ir: createRoot([mergedGridTable()]) });
+
+    // Act
+    let result;
+    try {
+        result = await rasterizeNodes(doc, { kinds: ['table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+    } catch (err) {
+        t.skip(`当前环境无法 spawn Electron：${err.message}`);
+        return;
+    }
+    if (result.rasterized === 0) {
+        t.skip(`当前环境出图失败：${result.warnings.join('；')}`);
+        return;
+    }
+
+    // Assert
+    const image = result.doc.ir.children[0];
+    assert.equal(image.type, 'image');
+    assert.ok(image.data.width >= MIN_GRID_IMAGE.width, `宽度应为正常量级，实际 ${image.data.width}`);
+    assert.ok(image.data.height >= MIN_GRID_IMAGE.height, `高度应含两行与多段，实际 ${image.data.height}`);
+    const { Jimp } = await loadJimp();
+    const rendered = await Jimp.read(result.doc.assets[0].buffer);
+    assert.ok(hasInk(rendered), '表格图不应是整幅空白');
+});
+
+/** 是否有明显墨迹：任一像素的 RGB 最小值低于阈值 */
+function hasInk(image) {
+    const { data } = image.bitmap;
+    for (let offset = 0; offset < data.length; offset += 4) {
+        if (Math.min(data[offset], data[offset + 1], data[offset + 2]) < 200) return true;
+    }
+    return false;
+}

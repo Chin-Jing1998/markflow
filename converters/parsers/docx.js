@@ -5,11 +5,13 @@
  *       → prepareLayout（首行缩进、制表符、题注换成标记 run，图片 alt 前写序号并记下显示尺寸）
  *       → markSections（多分节且页眉有文字时，每节起点插入一个哨兵段）
  *       → mammoth（docx → HTML，图片经 convertImage 截获为 Buffer，下划线经 styleMap 'u => u' 保留）
+ *       → collectTableGrids（顶层表格另存为结构化 grid，首个单元格注入表格标记）
  *       → turndown('word')（HTML → Markdown）→ remark-parse + remark-gfm（Markdown → mdast）
  *       → restoreMath（哨兵换回 math 节点）→ liftInlineHtml（<u> 等 → 节点）
  *       → applyImageData（显示尺寸与图片角色写回图片）
  *       → restoreMarkers（标记 → data.indent / data.role / \t）→ markCaptions（大图拆段、图注定角色）
  *       → applySections（消去哨兵段，顶层节点写 data.section）
+ *       → restoreTableGrids（表格标记 → table.data.grid，残留标记兜底清除）
  *
  * 契约：
  *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, data, assets, warnings, meta }
@@ -29,6 +31,8 @@
  *   - 段落文本本身不带全角缩进（由 md 渲染器按 data.indent 插入），专利 XML 等下游不受影响
  *   - 文档至少有两个 Word 分节且至少一节的页眉有文字时，每个顶层节点带 data.section = { index, header }
  *     （分节序号 1 起、该节生效页眉的纯文本，见 parsers/docx-sections）；否则不写该键，IR 与此前逐字节一致
+ *   - 表格节点带 table.data.grid：合并单元格、单元格内多段与行内格式的结构化留存（见 parsers/docx-tables）。
+ *     patent profile 的表格出图据此重建片段页；md / html / docx 渲染器不读该键，其产物与引入该键之前逐字节一致
  */
 const path = require('path');
 const fsp = require('fs/promises');
@@ -48,6 +52,7 @@ const { extractMath, restoreMath } = require('./docx-math');
 const { prepareLayout, parseImageMarker } = require('./docx-layout');
 const { CHEMISTRY_ROLE, resolveImageRole } = require('./docx-chemistry');
 const { markSections, applySections } = require('./docx-sections');
+const { collectTableGrids, restoreTableGrids } = require('./docx-tables');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
@@ -109,14 +114,21 @@ async function parse(input, ctx = {}) {
     notify(ctx, 'parsing', PROGRESS_ASSETS);
 
     const title = titleText(html) || stripExt(sourceName);
-    const markdown = cleanupMarkdown(createTurndownService('word').turndown(html));
+    // 表格结构（合并单元格、单元格内多段与行内格式）在此另存：turndown 转 GFM 只留单元格纯文本。
+    // 标记只随 turndown 这一路走，标题仍取未注入标记的 HTML
+    const tables = collectTableGrids(html);
+    warnings.push(...tables.warnings);
+    const markdown = cleanupMarkdown(createTurndownService('word').turndown(tables.html));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
     const parsed = unified().use(remarkParse).use(remarkGfm).parse(markdown);
     const restored = restoreMath(parsed, formulas);
     warnings.push(...restored.warnings);
     const lifted = applyImageData(liftInlineHtml(restored.ir, { source: 'docx' }), { displayByAsset, roleByAsset });
-    const ir = applySections(markCaptions(restoreMarkers(lifted)), sectioned.sections);
+    const blocks = applySections(markCaptions(restoreMarkers(lifted)), sectioned.sections);
+    const grids = restoreTableGrids(blocks, tables.grids);
+    warnings.push(...grids.warnings);
+    const ir = grids.ir;
     notify(ctx, 'parsing', PROGRESS_IR);
 
     const author = await readCoreCreator(original);

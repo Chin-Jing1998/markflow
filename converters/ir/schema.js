@@ -37,6 +37,16 @@
  *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
  *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入
  *   paragraph.data.role   = 'caption' | 'image_footnote'   图注 / 图片脚注；与图片靠「紧随其后」对应，不存图片名
+ *   table.data.grid      = { rows: [ { header, cells: [ { colspan, rowspan, header, paragraphs } ] } ] }
+ *                          docx 表格的结构化留存（parsers/docx-tables 写入）。GFM 表格表达不了合并单元格，
+ *                          单元格内多段与行内格式也在 turndown 取 textContent 时一并丢失，故在解析层另存一份：
+ *                          colspan / rowspan 为 ≥ 1 的整数，header 表示表头行 / 表头单元格，
+ *                          paragraphs 为 [[行内节点…], …]（每段一个数组），行内节点只用 raster/fragment.js 的
+ *                          nodeHtml 认得的类型（text / strong / emphasis / delete / underline / superscript /
+ *                          subscript / break / inlineCode），不含任何 HTML 字符串。
+ *                          目前只有 patent profile 的表格出图（raster/fragment.js 的 buildTableFragment）读该键；
+ *                          md / html / docx / xml 渲染器不读它，表格照旧按 tableRow / tableCell 输出。
+ *                          非 docx 来源的表格没有该键，出图走原先的 GFM 路径（首行为表头）
  *   <顶层节点>.data.section = { index, header }   docx 的 Word 分节序号（1 起）与该节生效页眉的纯文本；仅当文档
  *                          至少两节且至少一节页眉有文字时写入（parsers/docx-sections），patent profile 据此按页眉识别五书
  *

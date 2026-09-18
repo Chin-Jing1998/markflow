@@ -1,7 +1,9 @@
 /**
  * converters/raster/fragment.js 片段页单元测试（不出图，只看 HTML）
  * 覆盖：公式片段页按 data.fontSizePt 出图与标定系数、字号缺失 / 越界时的回落、
- *       表格单元格内的上标 / 下标 / 下划线节点渲染
+ *       表格单元格内的上标 / 下标 / 下划线节点渲染、
+ *       table.data.grid 路径（colspan / rowspan 写法、首行不强制加粗、单元格内多段的 <p> 与段间距、
+ *       文本转义、跨度脏数据回落与结构不符时回落到 GFM 路径）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -90,4 +92,95 @@ test('表格片段：上下标可嵌套其它行内节点，未知节点仍按�
 
     // Assert
     assert.ok(html.includes('<td><sup><b>n</b></sup><sub></sub>兜底</td>'), html.match(/<td>[\s\S]*?<\/td>/));
+});
+
+// ============================================================
+// data.grid 路径（docx 表格：合并单元格、单元格内多段与行内格式）
+// ============================================================
+
+/** 最小 grid 单元格；不写的项按 buildTableFragment 的默认值处理 */
+const gridCell = (paragraphs, extra = {}) => ({ colspan: 1, rowspan: 1, header: false, paragraphs, ...extra });
+const gridTable = (rows) => ({ ...createTable(null, [createTableRow([createTableCell('忽略')])]), data: { grid: { rows } } });
+const bodyOf = (html) => {
+    const matched = html.match(/<table>([\s\S]*)<\/table>/);
+    assert.ok(matched, `片段页应含表格：${html.slice(0, 200)}`);
+    return matched[1];
+};
+
+test('表格片段：有 grid 时按 grid 重建，跨度为 1 的不写 colspan / rowspan', () => {
+    // Arrange
+    const table = gridTable([
+        { header: false, cells: [gridCell([[createText('横')]], { colspan: 2 }), gridCell([[createText('纵')]], { rowspan: 3 })] },
+        { header: false, cells: [gridCell([[createText('普通')]])] },
+    ]);
+
+    // Act
+    const body = bodyOf(buildTableFragment(table));
+
+    // Assert
+    assert.equal(body, '<tbody><tr><td colspan="2"><p>横</p></td><td rowspan="3"><p>纵</p></td></tr>'
+        + '<tr><td><p>普通</p></td></tr></tbody>');
+});
+
+test('表格片段：有 grid 时首行不再强制加粗，只有 header 单元格用 th', () => {
+    // Arrange
+    const withoutHeader = gridTable([{ header: false, cells: [gridCell([[createText('首行')]])] }]);
+    const withHeader = gridTable([
+        { header: true, cells: [gridCell([[createText('表头')]], { header: true })] },
+        { header: false, cells: [gridCell([[createText('正文')]])] },
+    ]);
+
+    // Act
+    const plain = bodyOf(buildTableFragment(withoutHeader));
+    const headed = bodyOf(buildTableFragment(withHeader));
+
+    // Assert
+    assert.equal(plain, '<tbody><tr><td><p>首行</p></td></tr></tbody>', '首行是普通行时全为 td');
+    assert.equal(headed, '<thead><tr><th><p>表头</p></th></tr></thead><tbody><tr><td><p>正文</p></td></tr></tbody>');
+});
+
+test('表格片段：单元格内每段一个 <p>，段落外边距归零并给出小段间距', () => {
+    // Arrange
+    const table = gridTable([{ header: false, cells: [gridCell([[createText('一')], [createText('二')], [createText('三')]])] }]);
+
+    // Act
+    const html = buildTableFragment(table);
+
+    // Assert
+    assert.ok(bodyOf(html).includes('<td><p>一</p><p>二</p><p>三</p></td>'), bodyOf(html));
+    assert.match(html, /th>p,td>p\{margin:0\}/);
+    assert.match(html, /th>p\+p,td>p\+p\{margin-top:\dpt\}/);
+});
+
+test('表格片段：grid 里的文本一律转义，不把来源标记带进片段页', () => {
+    // Arrange
+    const injected = '<script>x</script>&"\'<td>';
+    const table = gridTable([{ header: false, cells: [gridCell([[createText(injected), { type: 'strong', children: [createText('<b>')] }]])] }]);
+
+    // Act
+    const html = buildTableFragment(table);
+
+    // Assert
+    assert.ok(!html.includes('<script'), '片段页不得出现来源的 script 标签');
+    assert.ok(html.includes('&lt;script&gt;x&lt;/script&gt;&amp;&quot;&#39;&lt;td&gt;'), bodyOf(html));
+    assert.ok(html.includes('<b>&lt;b&gt;</b>'), '行内容器由节点类型重建，内容仍转义');
+    assert.match(html, /Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"/);
+});
+
+test('表格片段：grid 里的跨度为脏数据时回落到 1，结构不符时回落到 GFM 路径', () => {
+    // Arrange
+    const dirty = gridTable([{ header: false, cells: [
+        gridCell([[createText('甲')]], { colspan: 0, rowspan: -2 }),
+        gridCell([[createText('乙')]], { colspan: '3', rowspan: 2.5 }),
+        gridCell([[createText('丙')]], { colspan: 99999 }),
+    ] }]);
+    const broken = { ...createTable(null, [createTableRow([createTableCell('甲')])]), data: { grid: { rows: [] } } };
+
+    // Act
+    const dirtyBody = bodyOf(buildTableFragment(dirty));
+    const brokenHtml = buildTableFragment(broken);
+
+    // Assert
+    assert.equal(dirtyBody, '<tbody><tr><td><p>甲</p></td><td><p>乙</p></td><td><p>丙</p></td></tr></tbody>');
+    assert.equal(brokenHtml, buildTableFragment(createTable(null, [createTableRow([createTableCell('甲')])])), 'rows 为空时与无 grid 的输出一致');
 });
