@@ -8,7 +8,7 @@
  * 分三组：
  *   排版   主题、字体、字号、行高、栏宽、段距、纸张、横向（改动只需重渲染）
  *   XML    方言、缩进、段号起止与位数、五书子集、分节识别、表格 / 公式栅格、图片密度
- *   解析   图片格式、JPEG 分辨率、文档公式、PDF 解析后端
+ *   解析   图片格式、JPEG 分辨率、文档公式、PDF 解析后端、五书 XML 反向导入的段号
  * 带「需重新解析」标记的字段改动后，主进程会在同一会话内重新 parseDocument（见 preview-session.REPARSE_KEYS），
  * 面板在该组标题上给出提示。
  *
@@ -28,7 +28,8 @@ const GROUPS = Object.freeze([
 
 /**
  * path 为 describeOptions() 描述树中的路径（对象层用 fields 下钻）；
- * targets / types 限定该字段对哪些目标与输入类型有意义；profile 限定只在该 xml profile 下出现。
+ * targets / types 限定该字段对哪些目标与输入类型有意义；profile 限定只在该 xml profile 下出现；
+ * hint 给出时替代描述树里的 description 作为该字段的悬停说明。
  */
 const FIELDS = Object.freeze([
     { key: 'theme', label: '主题', group: 'layout', targets: ['html', 'pdf'], path: ['html', 'theme'] },
@@ -57,6 +58,12 @@ const FIELDS = Object.freeze([
     { key: 'jpegPpi', label: 'JPG 分辨率（PPI）', group: 'parse', targets: ALL_TARGETS, path: ['jpegPpi'], reparse: true },
     { key: 'math', label: '文档公式', group: 'parse', targets: ALL_TARGETS, path: ['math'], types: ['docx'], reparse: true },
     { key: 'pdfBackend', label: 'PDF 解析后端', group: 'parse', targets: ALL_TARGETS, path: ['pdfBackend'], types: ['pdf'], reparse: true },
+    // 专利五书 XML 反向导入：只对 xml / zip 输入有意义，作用于解析阶段，故与目标无关且需重新解析
+    {
+        key: 'xmlImportParagraphNumbers', label: '段号写进正文', group: 'parse', targets: ALL_TARGETS,
+        path: ['xmlImport', 'paragraphNumbers'], types: ['xml', 'zip'], reparse: true,
+        hint: '把五书 XML 的段号写进 Word 正文（[0001]），便于对照审查意见里的段号；代价是段号留在正文里会妨碍增删段落。不勾选时段号不写入，转回 XML 时按顺序重编',
+    },
 ]);
 
 const ENUM_LABELS = Object.freeze({
@@ -150,7 +157,7 @@ class MfFormatPanel extends HTMLElement {
     renderField(field) {
         const node = pick(this.tree, field.path);
         const name = escapeAttr(field.key);
-        const title = escapeAttr(node.description || '');
+        const title = escapeAttr(field.hint || node.description || '');
         if (node.type === 'enum') {
             return `<label class="field" title="${title}"><span>${escapeHtml(field.label)}</span>
                 <select class="select select-slim" data-key="${name}">${node.values.map((value) => `<option value="${escapeAttr(value)}">${escapeHtml(labelOf(value))}</option>`).join('')}</select></label>`;

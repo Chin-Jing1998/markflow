@@ -5,7 +5,7 @@
  *       文件库 upsert 与 libraryId 回传、取消跳过未开始任务；testMineru 的鉴权失败 / 网络 / 正常三态且回包不含令牌；
  *       阶段 5 桩通道与文件库未就绪的中文错误；主题切换回调。
  */
-const { test, after } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -24,6 +24,26 @@ after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 const SAMPLE_MD = path.join(__dirname, 'fixtures', 'sample.md');
 const TOKEN = 'secret-token-xyz-987';
+
+/** 专利五书反向导入的三种输入 + 一个普通目录（内含无关的 .zip / .xml），内容为程序化合成的虚构五书 */
+const PATENT = {
+    xml: path.join(root, '一份说明书.xml'),
+    zip: path.join(root, '专利案卷.zip'),
+    bundleDir: path.join(root, '五书目录'),
+    plainDir: path.join(root, '普通目录'),
+};
+
+before(async () => {
+    const { buildOfficialBundle, writeFiles, zipFiles } = require('./fixtures/patent/roundtrip/build-roundtrip-fixtures');
+    const { files } = await buildOfficialBundle();
+    await writeFiles(PATENT.bundleDir, files);
+    fs.writeFileSync(PATENT.zip, await zipFiles(files));
+    fs.copyFileSync(path.join(PATENT.bundleDir, '100002', '100002.xml'), PATENT.xml);
+    fs.mkdirSync(PATENT.plainDir, { recursive: true });
+    fs.writeFileSync(path.join(PATENT.plainDir, '普通文档.docx'), 'docx');
+    fs.copyFileSync(PATENT.zip, path.join(PATENT.plainDir, '无关.zip'));
+    fs.writeFileSync(path.join(PATENT.plainDir, '无关.xml'), '<foo/>');
+});
 
 const fakeSafeStorage = {
     isEncryptionAvailable: () => true,
@@ -77,6 +97,9 @@ const REJECTS = [
     ['mf:convert:run', { items: [{ path: '/a.md' }], options: { unknown: 1 } }, '未知选项'],
     ['mf:convert:run', { items: [{ path: '/a.md' }], options: { validate: 'yes' } }, 'validate 非布尔'],
     ['mf:preview:render', { sessionId: 's1', options: { validate: 1 } }, '预览 validate 非布尔'],
+    ['mf:convert:run', { items: [{ path: '/a.xml' }], options: { xmlImportParagraphNumbers: 'yes' } }, '导入段号开关非布尔'],
+    ['mf:convert:run', { items: [{ path: '/a.xml' }], options: { xmlImport: { paragraphNumbers: true } } }, '渲染层只收扁平键，不收嵌套段'],
+    ['mf:preview:render', { sessionId: 's1', options: { xmlImportParagraphNumbers: 1 } }, '预览导入段号开关非布尔'],
     ['mf:convert:run', { items: [{ path: '/a.md' }], outputDir: '' }, '空输出目录'],
     ['mf:convert:cancel', {}, '缺 runId'],
     ['mf:convert:cancel', { runId: 5 }, 'runId 非字符串'],
@@ -154,6 +177,9 @@ test('schema 放行合法入参并原样返回', () => {
     // validate：专利 XML 的 DTD 校验开关，转换与预览两条通道共用同一套扁平选项
     assert.deepEqual(validatePayload('mf:convert:run', { items: [{ path: '/a.docx', target: 'xml' }], options: { xmlProfile: 'patent', validate: true } }).options, { xmlProfile: 'patent', validate: true });
     assert.deepEqual(validatePayload('mf:preview:render', { sessionId: 's1', options: { validate: false } }).options, { validate: false });
+    // xmlImportParagraphNumbers：专利五书 XML 反向导入的唯一选项，转换与预览两条通道共用
+    assert.deepEqual(validatePayload('mf:convert:run', { items: [{ path: '/案卷.zip' }], options: { xmlImportParagraphNumbers: true } }).options, { xmlImportParagraphNumbers: true });
+    assert.deepEqual(validatePayload('mf:preview:render', { sessionId: 's1', options: { xmlImportParagraphNumbers: false } }).options, { xmlImportParagraphNumbers: false });
     // Markdown 编辑：只收 sessionId（与文本、force），写入路径一律由主进程按会话取
     assert.deepEqual(validatePayload('mf:md:render', { sessionId: 'reader-1' }), { sessionId: 'reader-1' });
     assert.deepEqual(validatePayload('mf:md:render', { sessionId: 'reader-1', text: '# 标题\n' }), { sessionId: 'reader-1', text: '# 标题\n' });
@@ -178,13 +204,46 @@ test('validate 经 service.buildOptions 映射到 xml.validate', () => {
     assert.equal(realService.buildOptions({}).xml.validate, false, '默认不做 DTD 校验');
 });
 
+test('xmlImportParagraphNumbers 经 service.buildOptions 映射到 xmlImport.paragraphNumbers，且不受本批目标影响', () => {
+    assert.equal(realService.buildOptions({ xmlImportParagraphNumbers: true }).xmlImport.paragraphNumbers, true);
+    assert.equal(realService.buildOptions({ xmlImportParagraphNumbers: false }).xmlImport.paragraphNumbers, false);
+    assert.equal(realService.buildOptions({}).xmlImport.paragraphNumbers, false, '默认不把段号写进正文');
+    // xmlImport 作用于解析阶段、与目标无关，故任何一批目标下都照常写入（对比：xml 段只在本批含 xml 目标时校验）
+    for (const target of ['docx', 'html', 'xml']) {
+        assert.equal(realService.buildOptions({ xmlImportParagraphNumbers: true }, { targets: [target] }).xmlImport.paragraphNumbers, true, target);
+    }
+    // FlatOptionsSchema 只认这一个导入键，渲染层不可能提交别的
+    const importKeys = Object.keys(ipc.FlatOptionsSchema.shape).filter((key) => key.toLowerCase().includes('import'));
+    assert.deepEqual(importKeys, ['xmlImportParagraphNumbers']);
+});
+
 test('pickTarget 与 stripToken', () => {
     assert.equal(pickTarget('docx', 'html', {}), 'html', '显式目标优先');
     assert.equal(pickTarget('docx', undefined, { office: 'xml' }), 'xml');
     assert.equal(pickTarget('docx', undefined, { office: 'docx' }), 'bundle', '不兼容的设置回退默认');
     assert.equal(pickTarget('md', undefined, {}), 'docx');
+    // 专利五书输入（.xml / 案卷 .zip / 五书目录，后者的类型同为 xml）：缺省目标 docx，与 md 同属 markup 类别
+    assert.equal(pickTarget('xml', undefined, {}), 'docx');
+    assert.equal(pickTarget('zip', undefined, {}), 'docx');
+    assert.equal(pickTarget('xml', 'html', {}), 'html', '显式目标优先');
+    // bundle 不接受 markup 输入：设置里存的是 bundle 也要回退到 docx，不让用户落到一个必然失败的目标
+    for (const type of ['xml', 'zip', 'md']) {
+        assert.equal(pickTarget(type, undefined, { markup: 'bundle' }), 'docx', type);
+    }
     assert.deepEqual(stripToken({ imageFormat: 'jpg', mineru: { token: 'x', model: 'vlm' } }), { imageFormat: 'jpg', mineru: { model: 'vlm' } });
     assert.deepEqual(stripToken(null), {});
+});
+
+test('能力矩阵里 markup 目标不含 bundle：界面按输入类别取目标，故五书输入选不到必然失败的 bundle', () => {
+    const { listTargets, INPUT_CLASS: KERNEL_INPUT_CLASS } = require('../converters/targets');
+    const targets = listTargets({ pdfBackend: 'chromium' });
+    assert.equal(KERNEL_INPUT_CLASS.xml, 'markup');
+    assert.equal(KERNEL_INPUT_CLASS.zip, 'markup');
+    assert.ok(!targets.markup.includes('bundle'), 'markup 类别不得出现 bundle');
+    assert.deepEqual(targets.markup, ['docx', 'pdf', 'html', 'xml']);
+    // 主进程侧也拒绝：即便渲染层硬提交 bundle，planTasks 仍以中文错误挡下
+    assert.throws(() => realService.planTasks(['/案卷.zip'], 'bundle', '/'), /目标 bundle 不接受 zip 输入/);
+    assert.throws(() => realService.planTasks(['/说明书.xml'], 'bundle', '/'), /目标 bundle 不接受 xml 输入/);
 });
 
 // ============================================================
@@ -529,6 +588,51 @@ test('paths:expand 的 scope 透传到 scan：browse 另列 html / xml / json，
     assert.deepEqual(calls[2], [['/in']]);
 });
 
+test('paths:expand 的转档作用域受理专利五书：显式 .xml / .zip 不再记为不支持，五书目录整项收为 kind bundle', async () => {
+    const h = makeHarness();
+    const { files, unsupported } = await h.call('mf:paths:expand', { paths: [PATENT.xml, PATENT.zip, PATENT.bundleDir, PATENT.plainDir] });
+    assert.deepEqual(files.map((entry) => [path.basename(entry.path), entry.type, entry.kind]).sort(), [
+        ['一份说明书.xml', 'xml', 'file'], ['专利案卷.zip', 'zip', 'file'], ['五书目录', 'xml', 'bundle'], ['普通文档.docx', 'docx', 'file'],
+    ].sort());
+    assert.deepEqual(unsupported, [], '.xml / .zip 显式给出即受理');
+    assert.ok(!files.some((entry) => entry.path.startsWith(PATENT.plainDir) && /\.(zip|xml)$/i.test(entry.path)), '普通目录里的 .zip / .xml 不随目录带入');
+    // 文件库仓库树（browse）不受影响：仍不列 .zip
+    const browsed = await h.call('mf:paths:expand', { paths: [PATENT.plainDir], scope: 'browse' });
+    assert.ok(!browsed.files.some((entry) => entry.path.endsWith('.zip')), 'browse 作用域仍不列 .zip');
+});
+
+test('convert:run：三种五书输入的缺省目标均为 docx，五书目录以目录形态交 planTasks，导入选项透传到内核', async () => {
+    const h = makeHarness();
+    const { event, finished } = makeEvent();
+    const res = await h.call('mf:convert:run', {
+        items: [{ id: 'x', path: PATENT.xml }, { id: 'z', path: PATENT.zip }, { id: 'd', path: PATENT.bundleDir }],
+        options: { xmlImportParagraphNumbers: true },
+    }, event);
+    assert.deepEqual(res.tasks, [
+        { taskId: 'x', input: PATENT.xml, target: 'docx', type: 'xml', name: '一份说明书.xml' },
+        { taskId: 'z', input: PATENT.zip, target: 'docx', type: 'zip', name: '专利案卷.zip' },
+        { taskId: 'd', input: PATENT.bundleDir, target: 'docx', type: 'xml', name: '五书目录' },
+    ], '五书目录没有扩展名，类型由目录签名判定为 xml');
+    const last = await finished;
+    assert.deepEqual(last.summary, { total: 3, succeeded: 3, failed: 0, cancelled: 0 });
+    assert.deepEqual(h.seenTasks.map((task) => task.input), [{ path: PATENT.xml }, { path: PATENT.zip }, { path: PATENT.bundleDir }]);
+    assert.ok(h.seenOptions.every((options) => options.xmlImport.paragraphNumbers === true), '导入选项落到 options.xmlImport.paragraphNumbers');
+});
+
+test('convert:run：不给导入选项时段号不写进正文；普通目录里的 .zip 即便被硬提交也按普通 zip 交内核判定', async () => {
+    const h = makeHarness();
+    const { event, finished } = makeEvent();
+    await h.call('mf:convert:run', { items: [{ id: 'x', path: PATENT.xml }] }, event);
+    await finished;
+    assert.equal(h.seenOptions[0].xmlImport.paragraphNumbers, false, '缺省关');
+    // 目录签名只认显式给出的目录本身：普通目录被显式提交时仍按普通输入走，planTasks 据扩展名报错
+    await assert.rejects(
+        h.call('mf:convert:run', { items: [{ path: PATENT.plainDir }] }, makeEvent().event),
+        /不支持的输入格式/,
+        '非五书目录不能作为一项输入提交',
+    );
+});
+
 test('dialog:pickFiles：purpose read 为单选「选择要打开的文件」与可阅读文档过滤器；缺省仍是转换对话框', async () => {
     const dialogs = [];
     const dialog = { showOpenDialog: async (win, options) => { dialogs.push(options); return { canceled: false, filePaths: ['/a.md', '/b.json'] }; } };
@@ -605,7 +709,8 @@ test('file:action：open 前校验扩展名白名单（LOW-2 纵深防御），�
         fs.writeFileSync(p, 'x');
         return p;
     };
-    const blockedPaths = { command: makeFile('run.command'), app: makeFile('Foo.app'), sh: makeFile('run.sh') };
+    // .zip 自专利案卷反向导入起可作转换输入，但仍不得进「用默认应用打开」的白名单（BROWSE_EXTENSIONS 是其来源）
+    const blockedPaths = { command: makeFile('run.command'), app: makeFile('Foo.app'), sh: makeFile('run.sh'), zip: makeFile('案卷.zip') };
     const allowedPaths = { docxUpper: makeFile('Report.DOCX'), md: makeFile('note.md') };
     const otherPath = makeFile('note.txt');
     const reader = {
@@ -613,6 +718,7 @@ test('file:action：open 前校验扩展名白名单（LOW-2 纵深防御），�
             ['command', { path: blockedPaths.command }],
             ['app', { path: blockedPaths.app }],
             ['sh', { path: blockedPaths.sh }],
+            ['zip', { path: blockedPaths.zip }],
             ['docxUpper', { path: allowedPaths.docxUpper }],
             ['md', { path: allowedPaths.md }],
             ['other', { path: otherPath }],
@@ -622,7 +728,7 @@ test('file:action：open 前校验扩展名白名单（LOW-2 纵深防御），�
     const { handlers } = createIpcHandlers({ electron, settings, service: realService, scan, reader, log: () => undefined });
     const call = (payload) => handlers['mf:file:action']({}, validatePayload('mf:file:action', payload));
 
-    for (const id of ['command', 'app', 'sh']) {
+    for (const id of ['command', 'app', 'sh', 'zip']) {
         await assert.rejects(call({ sessionId: id, action: 'open' }), /只能用默认应用打开文档类文件/, `${id} 应拒绝 open`);
     }
     assert.deepEqual(opened, [], '白名单外的扩展名不应调用 shell.openPath');

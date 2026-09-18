@@ -6,7 +6,7 @@ import { api, pathForFile, isDesktop } from '../api.js';
 import { icon } from '../icons.js';
 import { notify } from './mf-toast.js';
 
-const SUPPORTED_TEXT = '支持 .docx / .xlsx / .pptx / .pdf / .md，可拖入文件夹';
+const SUPPORTED_TEXT = '支持 .docx / .xlsx / .pptx / .pdf / .md，可拖入文件夹；专利五书另收 .xml、案卷 .zip 与五书目录';
 
 class MfDropzone extends HTMLElement {
     connectedCallback() {

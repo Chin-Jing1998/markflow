@@ -250,6 +250,10 @@ test('REPARSE_KEYS 覆盖解析管线相关项，changedReparseKeys 逐项判定
     for (const key of ['imageFormat', 'math', 'pdfBackend', 'patentParts', 'rasterizeTables', 'rasterizeFormulas', 'imageDpi', 'sectionDetection', 'xmlProfile', 'jpegQuality', 'jpegPpi']) {
         assert.ok(REPARSE_KEYS.includes(key), `REPARSE_KEYS 缺少 ${key}`);
     }
+    // 五书 XML 反向导入的段号开关作用于 parsers/xml，改动后须重新解析，否则预览里改它不生效
+    assert.ok(REPARSE_KEYS.includes('xmlImportParagraphNumbers'), 'REPARSE_KEYS 缺少 xmlImportParagraphNumbers');
+    assert.deepEqual(changedReparseKeys({ xmlImportParagraphNumbers: false }, { xmlImportParagraphNumbers: true }), ['xmlImportParagraphNumbers']);
+    assert.deepEqual(changedReparseKeys({ xmlImportParagraphNumbers: true }, { xmlImportParagraphNumbers: true }), []);
     assert.ok(!REPARSE_KEYS.includes('theme') && !REPARSE_KEYS.includes('fontSize'), '排版类选项不应触发重解析');
     assert.deepEqual(changedReparseKeys({ math: 'image' }, { math: 'image' }), []);
     assert.deepEqual(changedReparseKeys({ math: 'image' }, { math: 'text' }), ['math']);

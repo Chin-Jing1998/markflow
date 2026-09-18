@@ -181,6 +181,41 @@ async function loadDomModule() {
     return import(`data:text/javascript;charset=utf-8,${encodeURIComponent(src)}`);
 }
 
+test('专利五书反向导入的界面接线：拖放区说明、转换页底栏开关与格式面板字段各就各位', () => {
+    const dropzone = readComponent('mf-dropzone.js');
+    assert.match(dropzone, /\.xml[\s\S]{0,40}\.zip[\s\S]{0,40}五书目录/, '拖放区应说明新受理的三种输入');
+
+    const convertPage = readComponent('mf-convert-page.js');
+    assert.match(convertPage, /data-role="import-numbers-field"[\s\S]*?data-field="xmlImportParagraphNumbers"/, '底栏应有导入段号开关');
+    assert.match(convertPage, /title="[^"]*审查意见[^"]*增删段落[^"]*"/, '开关文案须同时说明用途与代价');
+    assert.match(convertPage, /IMPORT_TYPES = new Set\(\['xml', 'zip'\]\)/, '只对五书输入露出该开关');
+    assert.ok(!convertPage.includes('data-field="validate"]\').checked'), '底栏开关统一由 footerOptions 收集');
+
+    const panel = readComponent('mf-format-panel.js');
+    assert.match(panel, /key: 'xmlImportParagraphNumbers'[\s\S]*?types: \['xml', 'zip'\][\s\S]*?reparse: true/, '格式面板字段限定输入类型且标记需重新解析');
+    assert.match(panel, /hint: '[^']*审查意见[^']*增删段落[^']*'/, '面板文案须同时说明用途与代价');
+});
+
+test('渲染层的 INPUT_CLASS 副本与内核 converters/targets 逐键一致（两份表不得漂移）', async () => {
+    const { INPUT_CLASS } = require('../converters/targets');
+    const dom = await loadDomModule();
+    assert.deepEqual(dom.INPUT_CLASS, { ...INPUT_CLASS }, '渲染层按类别取可选目标，漏一个输入类型就会让该输入选不到目标');
+    // 专利五书反向导入的三种输入都归 markup：五书目录没有扩展名，主进程按目录签名判定后同样以 xml 下发
+    assert.equal(dom.INPUT_CLASS.xml, 'markup');
+    assert.equal(dom.INPUT_CLASS.zip, 'markup');
+    assert.equal(dom.classOf('zip'), 'markup');
+    assert.equal(dom.classOf('未知类型'), null);
+});
+
+test('渲染层类型标签：xml / zip 有中文标签，kind 为 bundle 时显示「专利五书目录」', async () => {
+    const dom = await loadDomModule();
+    assert.equal(dom.typeLabel('xml'), '专利 XML');
+    assert.equal(dom.typeLabel('zip'), '专利案卷');
+    assert.equal(dom.typeLabel('xml', 'bundle'), '专利五书目录', 'kind 优先于 type');
+    assert.equal(dom.typeLabel('docx', 'file'), 'Word', '普通文件的 kind 不改标签');
+    assert.equal(dom.typeLabel('docx'), 'Word', '既有调用只传一个参数，行为不变');
+});
+
 test('视图帧外观：adaptive 注入深色覆盖样式，paper 与缺省不注入，src 帧（PDF）不注入', async () => {
     const dom = await loadDomModule();
     const page = '<!DOCTYPE html><html><head><title>t</title></head><body><p>x</p></body></html>';

@@ -13,7 +13,7 @@
  *   render({ sessionId, target, options })
  *     → { sessionId, target, options, product, warnings, reparsed, changedKeys, sourceView? }
  *     仅当 REPARSE_KEYS 里的项发生变化时才重新解析（imageFormat / jpegQuality / jpegPpi / math / pdfBackend /
- *     xml profile 与 patent 子项 / mineru 各项 / raster 各项——它们都作用在解析管线上），
+ *     xml profile 与 patent 子项 / 五书 XML 反向导入的段号 / mineru 各项 / raster 各项——它们都作用在解析管线上），
  *     此时连同来源栏一起重建；其余选项只重渲染，界面据此做 300 ms 防抖实时预览。
  *   export({ sessionId, outputDir? })
  *     → { outputPath, outputs, extras, warnings, libraryId, name, title, managed }
@@ -72,10 +72,11 @@ const PRIMARY_XML_BOOK = 'description';
 const MAX_SESSIONS = 3;
 /** 来源栏用「结构视图」呈现（无原始版式可直转）的输入类型 */
 const STRUCTURED_SOURCE_TYPES = Object.freeze(['xlsx', 'pptx', 'url']);
-/** 改这些扁平选项须重新解析：它们作用在 parseDocument 的管线（图片归一、栅格化、PDF 后端）上 */
+/** 改这些扁平选项须重新解析：它们作用在 parseDocument 的管线（图片归一、栅格化、PDF 后端、五书 XML 反向导入）上 */
 const REPARSE_KEYS = Object.freeze([
     'imageFormat', 'jpegQuality', 'jpegPpi', 'math', 'pdfBackend',
     'xmlProfile', 'patentParts', 'rasterizeTables', 'rasterizeFormulas', 'imageDpi', 'sectionDetection',
+    'xmlImportParagraphNumbers',
     'mineruModel', 'mineruOcr', 'mineruFormula', 'mineruTable', 'mineruLang', 'mineruTimeout', 'pageRanges',
     'rasterScale', 'rasterMaxWidth',
 ]);

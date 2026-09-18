@@ -1,7 +1,9 @@
 /**
- * <mf-convert-page>：转换页 = 拖放区 + 任务列表 + 底栏（输出目录、DTD 校验、开始 / 取消 / 清空）。
+ * <mf-convert-page>：转换页 = 拖放区 + 任务列表 + 底栏（输出目录、转换开关、开始 / 取消 / 清空）。
  * 任务状态存于全局 store.tasks；进度事件（mf:convert:event）在此消费并写回 store。
- * 底栏的「DTD 校验」只在队列里有 xml 目标的待转任务时出现，勾选后随本批 options 一起提交。
+ * 底栏的两个开关只在与本批相关时出现，勾选后随本批 options 一起提交（未露出的项不参与本批）：
+ *   「DTD 校验」        队列里有 xml 目标的待转任务时；
+ *   「段号写进正文」    队列里有专利五书输入（.xml、案卷 .zip、五书目录）的待转任务时。
  */
 import { store, addTasks, updateTask, removeTask, clearTasks } from '../store.js';
 import { api, onConvertEvent } from '../api.js';
@@ -16,6 +18,8 @@ import { hostOf } from '../url-lines.mjs';
 const PENDING = new Set(['idle', 'failed', 'cancelled']);
 const FINISHED = new Set(['done', 'failed', 'cancelled']);
 const URL_TARGET_HINT = '网页链接只能转为 bundle、html 或 xml';
+/** 走专利五书 XML 反向导入的输入类型；五书目录的类型同样是 xml（整个目录一项输入） */
+const IMPORT_TYPES = new Set(['xml', 'zip']);
 
 class MfConvertPage extends HTMLElement {
     connectedCallback() {
@@ -39,6 +43,9 @@ class MfConvertPage extends HTMLElement {
                 <div class="footer-actions">
                     <label class="field-check footer-option" data-role="validate-field" hidden title="渲染后用官方 DTD 校验五书，结果写入 precheck.json 与转换提示">
                         <input type="checkbox" data-field="validate"><span>DTD 校验</span>
+                    </label>
+                    <label class="field-check footer-option" data-role="import-numbers-field" hidden title="把五书 XML 的段号写进 Word 正文（[0001]），便于对照审查意见里的段号；代价是段号留在正文里会妨碍增删段落。不勾选时段号不写入，转回 XML 时按顺序重编">
+                        <input type="checkbox" data-field="xmlImportParagraphNumbers"><span>段号写进正文</span>
                     </label>
                     <button class="btn btn-secondary" type="button" data-action="clear">清空已完成</button>
                     <button class="btn btn-secondary" type="button" data-action="cancel" hidden>${icon('x')}取消</button>
@@ -95,7 +102,8 @@ class MfConvertPage extends HTMLElement {
         const settings = state.settings && state.settings.settings;
         const outputDir = state.run ? state.run.outputDir : (settings ? (settings.library.mode === 'managed' ? `${settings.library.root}（托管）` : settings.outputDir) : '…');
         this.querySelector('.output-dir').textContent = outputDir;
-        const pending = state.tasks.filter((task) => PENDING.has(task.status)).length;
+        const pendingTasks = state.tasks.filter((task) => PENDING.has(task.status));
+        const pending = pendingTasks.length;
         const done = state.tasks.filter((task) => task.status === 'done').length;
         const failed = state.tasks.filter((task) => task.status === 'failed').length;
         const summary = state.tasks.length === 0 ? '' : `${state.tasks.length} 个任务 · 待转换 ${pending} · 完成 ${done}${failed ? ` · 失败 ${failed}` : ''}`;
@@ -108,7 +116,9 @@ class MfConvertPage extends HTMLElement {
         this.querySelector('[data-action="cancel"]').hidden = !running;
         this.querySelector('[data-action="clear"]').disabled = state.tasks.every((task) => !FINISHED.has(task.status));
         // DTD 校验只对 xml 目标有意义，故只在队列里有 xml 任务时露出
-        this.querySelector('[data-role="validate-field"]').hidden = !state.tasks.some((task) => task.target === 'xml' && PENDING.has(task.status));
+        this.querySelector('[data-role="validate-field"]').hidden = !pendingTasks.some((task) => task.target === 'xml');
+        // 段号写进正文只对专利五书输入有意义（.xml、案卷 .zip、五书目录）
+        this.querySelector('[data-role="import-numbers-field"]').hidden = !pendingTasks.some((task) => IMPORT_TYPES.has(task.type));
     }
 
     async enqueue(paths) {
@@ -141,8 +151,18 @@ class MfConvertPage extends HTMLElement {
 
     addEntries(files) {
         addTasks((files || []).map((file) => ({
-            id: nextId('task'), path: file.path, name: file.name, type: file.type, size: file.size, target: this.defaultTarget(file.type),
+            id: nextId('task'), path: file.path, name: file.name, type: file.type, kind: file.kind, size: file.size, target: this.defaultTarget(file.type),
         })));
+    }
+
+    /** 底栏开关 → 本批扁平选项：只收当前露出且已勾选的项，两项默认均为关 */
+    footerOptions() {
+        const options = {};
+        for (const input of this.querySelectorAll('.page-footer .footer-option input[data-field]')) {
+            if (input.closest('.footer-option').hidden || !input.checked) continue;
+            options[input.dataset.field] = true;
+        }
+        return options;
     }
 
     async start() {
@@ -156,10 +176,9 @@ class MfConvertPage extends HTMLElement {
             ...(task.url ? { url: task.url } : { path: task.path }),
             ...(task.target ? { target: task.target } : {}),
         }));
-        const validate = this.querySelector('[data-field="validate"]');
-        const options = validate && !validate.closest('[data-role="validate-field"]').hidden && validate.checked ? { validate: true } : undefined;
+        const options = this.footerOptions();
         try {
-            const res = await api.convertRun(options ? { items, options } : { items });
+            const res = await api.convertRun(Object.keys(options).length > 0 ? { items, options } : { items });
             store.set({ run: { runId: res.runId, outputDir: res.outputDir } });
             for (const task of res.tasks) updateTask(task.taskId, { status: 'queued', runId: res.runId, target: task.target, error: '', pct: 0, phase: '' });
         } catch (err) {

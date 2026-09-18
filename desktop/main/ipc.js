@@ -12,6 +12,7 @@
  *   mf:dialog:pickFiles { directory?, purpose? } → 原生对话框；purpose 'read' 为「选择要打开的文件」（单选、可阅读文档过滤器）
  *   mf:dialog:pickDirectory                  → 原生对话框
  *   mf:paths:expand { paths, scope? }        → { files, unsupported, truncated }；scope 缺省 / 'convert' 按转档白名单，
+ *       另受理显式给出的 .xml / .zip 与专利五书目录（后者整项收为 files 里 kind 为 'bundle' 的一条，见 convert-inputs.js），
  *       'browse'（文件库仓库树）另列 .html .htm .xml .json
  *   mf:convert:run { items, outputDir?, options? } → { runId, outputDir, tasks }；进度经 mf:convert:event 推送
  *       事件形状：{ runId, taskId, status: 'queued'|'running'|'done'|'failed'|'cancelled', phase, pct, result?, libraryId?, error? }
@@ -39,11 +40,12 @@ const path = require('path');
 const fsp = require('fs').promises;
 const { z } = require('zod');
 
-const { TARGETS, INPUT_CLASS, DEFAULT_TARGETS, SUPPORTED_EXTENSIONS, assertTargetAllowed, detectInputType } = require('../../converters/targets');
+const { TARGETS, INPUT_CLASS, DEFAULT_TARGETS, SUPPORTED_EXTENSIONS, BUNDLE_DIR_TYPE, assertTargetAllowed, detectInputType } = require('../../converters/targets');
 const { OPTION_ENUMS, describeOptions } = require('../../converters/options');
 const { errText, statOrNull, hostnameOf } = require('../../converters/util');
 const { THEMES, LIBRARY_MODES, SettingsPatchSchema } = require('./settings');
 const { BROWSE_EXTENSIONS, READER_EXTENSIONS, IMAGE_IMPORT_EXTENSIONS, MAX_TEXT_BYTES } = require('./file-kinds');
+const { expandConvertPaths, resolveBundleInputs } = require('./convert-inputs');
 const { ADDIN_CHANNELS, ADDIN_SCHEMAS, createAddinHandlers } = require('./addin/ipc');
 
 const CONVERT_CONCURRENCY = 2;
@@ -146,6 +148,8 @@ const FlatOptionsSchema = z.object({
     sectionDetection: z.enum([...OPTION_ENUMS.sectionDetection]),
     rasterScale: z.number().min(1).max(4),
     rasterMaxWidth: z.number().int().min(200).max(10000),
+    // 专利五书 XML 反向导入的唯一选项：把段号写进 Word 正文（作用于解析阶段，与目标无关）
+    xmlImportParagraphNumbers: z.boolean(),
 }).partial().strict();
 
 const ConvertItemSchema = z.object({
@@ -356,10 +360,13 @@ function createIpcHandlers(deps = {}) {
         return { canceled: Boolean(result.canceled) || result.filePaths.length === 0, path: result.canceled ? null : (result.filePaths[0] || null) };
     }
 
-    /** 转档入口（缺省 / convert）仍按转档白名单展开；文件库仓库树（browse）另列 html / htm / xml / json */
+    /**
+     * 转档入口（缺省 / convert）：目录展开仍按转档白名单，另受理显式给出的 .xml / .zip 与专利五书目录；
+     * 文件库仓库树（browse）另列 html / htm / xml / json，其目录遍历不变
+     */
     const pathsExpand = (event, payload) => (payload.scope === 'browse'
         ? scan.scanPaths(payload.paths, { exts: BROWSE_EXTENSIONS })
-        : scan.scanPaths(payload.paths));
+        : expandConvertPaths(payload.paths, { scanPaths: scan.scanPaths }));
 
     // ---------- 转换 ----------
 
@@ -376,10 +383,12 @@ function createIpcHandlers(deps = {}) {
         const flat = { ...current.defaults, ...options };
         const token = settings.getMineruToken();
         if (token) flat.mineruToken = token;
+        // 专利五书目录没有扩展名可辨，须读盘按签名判定；判定结果同时决定输入类型与 planTasks 的 hints.bundles
+        const { bundles, isBundle } = await resolveBundleInputs(items.map((item) => item.path).filter(Boolean));
         const tasks = items.map((item, index) => {
             const raw = item.path || item.url;
-            const type = detectInputType(raw);
-            const [task] = service.planTasks([raw], pickTarget(type, item.target, current.defaultTargets), process.cwd());
+            const type = isBundle(raw) ? BUNDLE_DIR_TYPE : detectInputType(raw);
+            const [task] = service.planTasks([raw], pickTarget(type, item.target, current.defaultTargets), process.cwd(), { bundles });
             return { ...task, taskId: item.id || `task-${index + 1}`, type, name: item.path ? path.basename(item.path) : hostnameOf(raw) || raw };
         });
         // 扁平选项按本批目标校验：只作用于其它目标的段，取值越界时跳过写入而不是让整批失败

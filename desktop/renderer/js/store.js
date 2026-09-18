@@ -7,7 +7,8 @@
  *   isDark           主进程 nativeTheme.shouldUseDarkColors
  *   formats          mf:formats:describe 的回包（targets / capabilities / options / inProcess）
  *   settings         mf:settings:get 的回包（settings / mineruTokenConfigured / encryptionAvailable / paths）
- *   tasks            转换页任务列表 [{ id, path|url, name, type, size, target, status, phase, pct, error, result, libraryId, runId }]
+ *   tasks            转换页任务列表 [{ id, path|url, name, type, kind, size, target, status, phase, pct, error, result, libraryId, runId }]
+ *                    kind 取 mf:paths:expand 回包里的同名字段：'file' 为普通文件，'bundle' 为整项收入的专利五书目录
  *   run              进行中的批次 { runId, outputDir } | null
  *   libraryVersion   文件库变更计数（转换完成后 +1，文件库页据此刷新）
  *   librarySidebarCollapsed  文件库左边栏折叠状态（按钮在顶部状态栏，文件库页据此收起/展开侧栏）

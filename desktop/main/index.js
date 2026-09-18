@@ -23,6 +23,7 @@ const { createChromiumJobs } = require('./chromium-jobs');
 const { createIpcHandlers, registerIpc, CHANNELS } = require('./ipc');
 const { createUpdateChecker } = require('./update-check');
 const { scanPaths } = require('./scan');
+const { expandConvertPaths } = require('./convert-inputs');
 const { createReader, isReaderPath, READER_EXTENSIONS } = require('./reader');
 const { createPreviewSessions } = require('./preview-session');
 const { createWordAddin } = require('./addin/controller');
@@ -239,7 +240,7 @@ function bootstrap(electron) {
 
     /**
      * 「打开文件…」：md / html / xml / pdf 交阅读模式直接打开（只取第一个，阅读模式一次显示一份），
-     * 其余扩展名照旧进转换队列；两类都选中时各走各的通道。
+     * 其余扩展名照旧进转换队列（含专利案卷 .zip）；两类都选中时各走各的通道。
      */
     async function openFilesFromMenu() {
         const win = state.mainWindow;
@@ -257,7 +258,7 @@ function bootstrap(electron) {
         const readable = result.filePaths.filter((item) => isReaderPath(item));
         const convertible = result.filePaths.filter((item) => !isReaderPath(item));
         if (convertible.length > 0) {
-            const { files, unsupported } = await scanPaths(convertible);
+            const { files, unsupported } = await expandConvertPaths(convertible);
             win.webContents.send(CHANNELS.convertEvent, { runId: null, type: 'enqueue', files, unsupported });
         }
         if (readable.length > 0 && !win.isDestroyed()) {
