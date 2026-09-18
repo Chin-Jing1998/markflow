@@ -20,14 +20,11 @@
  *   [11] EMF，只有 4 字节的截断文件                                     → 不命中且不抛错
  * 序号按 docx-layout 的收集次序分配：先全部 DrawingML（1–11），再全部 VML（12–13）。
  *
- * 两处 mammoth 行为决定了 CHEMISTRY_EXPECTED 只列 12 张图（源文档共 13 张）：
- *   - w:fldSimple 整体被 mammoth 忽略（warnings 里有 unrecognised element），故 [7] 的图不进 IR；
- *     判据 c 的简单域分支由 collectChemistryRanges 的单元测试直接覆盖。
- *   - VML 图片的序号标记写在 o:title 上，而 mammoth 的命名空间表不含
- *     urn:schemas-microsoft-com:office:office，该属性在它那里的键名是 Clark 记法，读不出来，
- *     故 [12][13] 的 altText 为 undefined、序号丢失，判据 a 到不了 IR（同一原因也让 OLE 预览图拿不到显示尺寸）。
- *     这是既有的标记传递缺口，不在本夹具的修复范围内；判据 a 由 prepareLayout 的 roles 与
- *     collectChemistryRanges 两级单元测试覆盖。
+ * CHEMISTRY_EXPECTED 只列 12 张图（源文档共 13 张）：w:fldSimple 整体被 mammoth 忽略
+ * （warnings 里有 unrecognised element），故 [7] 的图不进 IR；判据 c 的简单域分支由
+ * collectChemistryRanges 的单元测试直接覆盖。
+ * [12][13] 两张 VML 预览图的序号标记由 docx-layout 改写成 DrawingML 后经 wp:docPr@descr 传递
+ * （详见该模块与 test/docx-vml-layout.test.js），判据 a 因此对 [12] 生效。
  *
  * 图片本体：PNG 为 8×8 单色，三张 EMF 按最小必要结构拼（EMF 头 + 一条注释记录 + EOF），
  * 只为让判据有字节可扫，不要求能被任何渲染器画出来。
@@ -147,7 +144,7 @@ const CHEMISTRY_EXPECTED = Object.freeze({
         Object.freeze({ name: 'images/image_3.png', role: 'formula', alt: '公式甲', note: '角色标记，带分号余文' }),
         Object.freeze({ name: 'images/image_4.png', role: 'table', alt: '', note: '角色标记，无余文' }),
         Object.freeze({ name: 'images/image_5.png', role: null, alt: 'markflow:role=chemistryX', note: '角色标记不匹配，alt 原样' }),
-        Object.freeze({ name: 'images/image_6.png', role: null, alt: '', note: 'ChemDraw 预览图；VML 序号标记到不了 mammoth' }),
+        Object.freeze({ name: 'images/image_6.png', role: 'chemistry', alt: '', note: '判据 a：ChemDraw 预览图（VML）' }),
         Object.freeze({ name: 'images/image_7.png', role: null, alt: '', note: 'Equation 预览图，不命中' }),
         Object.freeze({ name: 'images/image_8.png', role: 'chemistry', alt: '', note: '判据 c：复合域 KingDrawObject.Document' }),
         Object.freeze({ name: 'images/image_9.png', role: null, alt: '', note: '复合域 Equation.DSMT4，不命中' }),
