@@ -3,10 +3,12 @@
  *
  * 流程：读入 buffer → inspectOoxml（OOXML 预检信息）→ extractMath（OMML 换成哨兵 run）
  *       → prepareLayout（首行缩进、制表符、题注换成标记 run，图片 alt 前写序号并记下显示尺寸）
+ *       → markSections（多分节且页眉有文字时，每节起点插入一个哨兵段）
  *       → mammoth（docx → HTML，图片经 convertImage 截获为 Buffer，下划线经 styleMap 'u => u' 保留）
  *       → turndown('word')（HTML → Markdown）→ remark-parse + remark-gfm（Markdown → mdast）
  *       → restoreMath（哨兵换回 math 节点）→ liftInlineHtml（<u> 等 → 节点）→ applyDisplay（显示尺寸写回图片）
  *       → restoreMarkers（标记 → data.indent / data.role / \t）→ markCaptions（大图拆段、图注定角色）
+ *       → applySections（消去哨兵段，顶层节点写 data.section）
  *
  * 契约：
  *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, data, assets, warnings, meta }
@@ -21,6 +23,8 @@
  *     为空、缺失或是占位名时不设该键，front matter 随之不写 author 行
  *   - 公式一律进 IR 的 math 节点；options.math='text' 的降级由渲染器负责，解析层不降级
  *   - 段落文本本身不带全角缩进（由 md 渲染器按 data.indent 插入），专利 XML 等下游不受影响
+ *   - 文档至少有两个 Word 分节且至少一节的页眉有文字时，每个顶层节点带 data.section = { index, header }
+ *     （分节序号 1 起、该节生效页眉的纯文本，见 parsers/docx-sections）；否则不写该键，IR 与此前逐字节一致
  */
 const path = require('path');
 const fsp = require('fs/promises');
@@ -38,6 +42,7 @@ const { notify, errText } = require('../util');
 const { inspectOoxml } = require('./docx-ooxml');
 const { extractMath, restoreMath } = require('./docx-math');
 const { prepareLayout, parseImageMarker } = require('./docx-layout');
+const { markSections, applySections } = require('./docx-sections');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
@@ -88,9 +93,10 @@ async function parse(input, ctx = {}) {
     const ooxml = await inspectSafely(original, warnings);
     const { buffer, formulas } = await extractSafely(original, warnings);
     const layout = await layoutSafely(buffer, warnings);
+    const sectioned = await sectionsSafely(layout.buffer, warnings);
 
     const displayByAsset = new Map();
-    const rawHtml = await convertWithMammoth({ buffer: layout.buffer }, { assets, warnings, displays: layout.displays, displayByAsset });
+    const rawHtml = await convertWithMammoth({ buffer: sectioned.buffer }, { assets, warnings, displays: layout.displays, displayByAsset });
     const html = collectInlineBase64Images(rawHtml, assets, warnings);
     notify(ctx, 'parsing', PROGRESS_ASSETS);
 
@@ -102,7 +108,7 @@ async function parse(input, ctx = {}) {
     const restored = restoreMath(parsed, formulas);
     warnings.push(...restored.warnings);
     const lifted = applyDisplay(liftInlineHtml(restored.ir, { source: 'docx' }), displayByAsset);
-    const ir = markCaptions(restoreMarkers(lifted));
+    const ir = applySections(markCaptions(restoreMarkers(lifted)), sectioned.sections);
     notify(ctx, 'parsing', PROGRESS_IR);
 
     const author = await readCoreCreator(original);
@@ -158,6 +164,16 @@ async function layoutSafely(buffer, warnings) {
     } catch (err) {
         warnings.push(`版面信息（缩进、制表符、题注、图片尺寸）读取失败，已按原样转换（${errText(err)}）`);
         return { buffer, displays: new Map() };
+    }
+}
+
+// 分节与页眉读取失败时按无分节继续：顶层节点不带 data.section，下游回落到既有的标题段与位置推定
+async function sectionsSafely(buffer, warnings) {
+    try {
+        return await markSections(buffer);
+    } catch (err) {
+        warnings.push(`分节与页眉读取失败，已按无分节处理（${errText(err)}）`);
+        return { buffer, sections: [] };
     }
 }
 

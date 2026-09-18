@@ -30,6 +30,8 @@
  *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
  *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入
  *   paragraph.data.role   = 'caption' | 'image_footnote'   图注 / 图片脚注；与图片靠「紧随其后」对应，不存图片名
+ *   <顶层节点>.data.section = { index, header }   docx 的 Word 分节序号（1 起）与该节生效页眉的纯文本；仅当文档
+ *                          至少两节且至少一节页眉有文字时写入（parsers/docx-sections），patent profile 据此按页眉识别五书
  *
  * 顶层包装结构（MarkFlowDocument）：
  * {
