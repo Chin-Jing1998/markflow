@@ -52,7 +52,7 @@ npm ci
 
 - **electron** 位于 `devDependencies`，用作 PDF 出图与栅格化（表格、公式转图片）的渲染引擎，同时是桌面应用的运行时。命令行用户必须执行完整的 `npm ci`：加 `--omit=dev` 会同时失去 PDF 输出与栅格化能力，此时 `markflow formats` 会把两个后端标为不可用。
 - **libxml2-wasm** 位于 `optionalDependencies`，仅 `--validate` 的 DTD 校验用到。未安装时校验步骤跳过并记入 warnings，转换本身不受影响。
-- **LibreOffice** 非必需，仅在两处作为兜底：PDF 出图的第三级后端，以及 `patent` profile 下 EMF/WMF 图元的栅格化。未安装时对应路径降级并告警。
+- **LibreOffice** 非必需，只作 PDF 出图的第三级后端，未安装时该级降级并告警。`patent` profile 下的 EMF 图元改由内置图元渲染器出图，不再需要它。
 
 ## 桌面应用
 
@@ -140,7 +140,7 @@ markflow mcp
 | `--pdf-backend <后端>` | `auto` \| `mineru` \| `local` | `auto` | PDF 解析后端：`auto` 有令牌走云端否则本地，`mineru` 强制云端，`local` 强制本地 |
 | `--image-format <格式>` | `jpg` \| `keep` | `jpg` | 图片归一格式：`jpg` 把位图统一转为 JPEG，`keep` 保持原格式 |
 | `--jpeg-quality <n>` | 整数 60–100 | `90` | JPEG 压缩质量 |
-| `--jpeg-ppi <n>` | 整数 72–600 | `330` | JPEG 分辨率（PPI） |
+| `--jpeg-ppi <n>` | 整数 72–600 | `330` | JPEG 分辨率（PPI）；`--xml-profile patent` 且未显式指定时取 `300` |
 | `--math <方式>` | `image` \| `text` | `image` | docx 公式：`image` 栅格为图片，`text` 降级为线性化文本 |
 | `--mineru-model <模型>` | `pipeline` \| `vlm` | `pipeline` | MinerU 解析模型 |
 | `--mineru-ocr` | 布尔开关 | `false` | 强制 OCR |
@@ -353,13 +353,19 @@ JSON 产物结构为 `{ schemaVersion, kind, ir, data, meta }`，其中 `ir` 为
   precheck.json         预检问题清单与校验记录，不入 zip
 ```
 
-命名约定：图片名为 `<表格代码>_<序号>.<扩展名>`，序号自 1 起、不补零，各书独立计数，同一书内的全部图片共用一个计数器（官方样稿的说明书内只有公式图，几类图片混排时是否分别计数尚无样本，此为推定）；`img/@file` 只写裸文件名；尚未栅格化的非 JPG 图片（如 EMF）保留原扩展名并告警。官方产出没有 `List.xml`，本工具同样不生成。`--clean` 重跑时一并清理书目目录内上一轮的文件与旧版的平铺产物（`claims.xml`、`drawing-N.jpg` 等），目录内的其它文件保留。
+命名约定：图片名为 `<表格代码>_<序号>.<扩展名>`，序号自 1 起、不补零，各书独立计数，同一书内的全部图片共用一个计数器（官方样稿的说明书内只有公式图，几类图片混排时是否分别计数尚无样本，此为推定）；`img/@file` 只写裸文件名；未能转为 JPG 的图片保留原扩展名并告警，本 profile 下即 WMF、SVG 与栅格化失败的 EMF。官方产出没有 `List.xml`，本工具同样不生成。`--clean` 重跑时一并清理书目目录内上一轮的文件与旧版的平铺产物（`claims.xml`、`drawing-N.jpg` 等），目录内的其它文件保留。
 
 字节级形态同样对齐官方：UTF-8 BOM、换行统一为 CRLF、空元素写作 `<img … />`；官方产出中不规则的空行与缩进不模仿。generic profile 不受影响，仍为无 BOM、LF、`<hr/>`。
 
-结构约定：每份文件头三行固定为 XML 声明、`<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd"[]>` 与 `showxml.xsl` 样式处理指令，根元素为 `<cn-application-body lang="zh" country="CN">`。说明书段号四位补零连续编排（段首已有 `[0001]` 者剥离并复用，与预期不一致时记「段号跳变」告警）；权项 id 形如 `cl001`，`根据权利要求 N 所述` 自动解析为 `<claim-ref>`；附图 id 形如 `f0001`、图片 id 形如 `i0001`，`wi`/`he` 由像素与 JPEG 密度换算为毫米。表格与公式在本 profile 下一律栅格为 JPG，栅格化后端不可用时降级为逐行文本或线性化文本并告警。权利要求内的图片输出为 `claim-text` 内的 `img`；标注为化学式的图片输出为 `<chemistry id="chem0001" num="0001">` 内的 `img`，不写 `chem` 元素（官方转换器从不输出它）。
+结构约定：每份文件头三行固定为 XML 声明、`<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd"[]>` 与 `showxml.xsl` 样式处理指令，根元素为 `<cn-application-body lang="zh" country="CN">`。说明书段号四位补零连续编排（段首已有 `[0001]` 者剥离并复用，与预期不一致时记「段号跳变」告警）；权项 id 形如 `cl001`，「根据权利要求 N 所述」与「如图 N 所示」一律保留为纯文本——官方真实产出不生成 `claim-ref` 与 `figref`，本工具同样不生成；附图 id 形如 `f0001`，图片 id 按所在位置取三种前缀——说明书附图内 `if0001`、摘要附图内 `iaf0001`、权利要求书与说明书及摘要正文内 `idf0001`；`wi`/`he` 为毫米整数，优先取解析层记下的源 Word 显示尺寸，取不到时按「像素 × 25.4 ÷ JFIF 密度」换算（读不出密度时取 `--patent-image-dpi`，默认 300），两条路径一律向下取整、最小为 1。表格与公式在本 profile 下一律栅格为 JPG，栅格化后端不可用时降级为逐行文本或线性化文本并告警。权利要求内的图片输出为 `claim-text` 内的 `img`；标注为化学式的图片输出为 `<chemistry id="chem0001" num="0001">` 内的 `img`，不写 `chem` 元素（官方转换器从不输出它）。
 
-转档前预检覆盖：GB18030 之外的字符、图片格式与密度（官方只受理 JPG/TIF、72–300 DPI）、浮动对象与文本框、OLE 对象、Word 自动编号、修订痕迹、文档保护、批注、非常规中文字体、公式后标点、缺节。问题项分 `blocking`（官方工具会拒绝转换）与 `warning` 两级，全部写入 `precheck.json` 并进入结果的 `warnings`。因此，patent profile 提交前应使用 `--jpeg-ppi 72–300`；通用 JPG 默认值仍为 330 PPI。
+书目的识别：依次按三类依据把正文归入五书。其一，Word 分节页眉——官方五书模板的书目名只写在各节页眉里，页眉认得出书目的分节整节归入该书；该模板里由 Cnipr 字体渲染的私用区标记（U+E205 段落起始、U+E206 权项起始、U+E208 包裹编号或图号、U+E209 包裹发明名称、U+E20A 包裹小标题）按码位识别，用后从产物中剥离。其二，书目标题段——标题，或 `--section-detection auto` 时的整段加粗段与不超过 12 字的纯文本短段，文字为「权利要求书」「说明书」「说明书附图」「说明书摘要」「摘要附图」之一（允许字间空白）。其三，前两类都没有时按位置推定：自首个「N.」「N、」编号段起、至首个五部分标题之前为权利要求书；其前不超过 3 段、无编号、无图表的前导正文为摘要，否则并入说明书并告警；文末只由图片段与图号段组成的尾部为说明书附图；摘要区域内独立成段的图片为摘要附图，与摘要文字同在一个 Word 段落里的图片留在段内。位置推定得出的书目合并为一条「分节：」提示，列出各书的段落区间。发明名称依次取「发明名称：X」字段、说明书首个标题段、文首的文档标题、权利要求 1 的主题、文档属性里的标题，后两者附告警；都取不到时告警且不输出发明名称。
+
+化学结构式的归类：解析层按四条判据给 docx 里的图片打上化学式角色——OLE 对象的 ProgID 命中化学白名单（ChemDraw、Chem3D、KingDraw 等，容忍版本后缀）、域代码为 `EMBED <白名单 ProgID>`、替换文字以 `<SIPOChemFile` 开头（官方编辑器把 CML 存在这里，命中即清空该替换文字，不让它流进任何产物）、EMF 字节内带 ChemDraw 的原生 CDX 数据。命中者在权利要求书、说明书与摘要正文里包成 `chemistry > img`；同一幅图落在说明书附图或摘要附图里时仍按 `figure > img` 输出，因为 DTD 的 `figure` 只容纳 `img`。本工具只做归类与栅格化，不还原分子结构（CML／MOL）：官方转换器自身也从不产出结构文件，而官方样式表在 `chem` 存在时反会隐藏图片。
+
+表格图的保真：docx 表格在解析层另存一份结构化的行列数据，出表格图时据此重建，合并单元格（`colspan`／`rowspan`）、单元格内的多个段落与粗体、斜体、下划线、上下标均予保留；表头只认源文档标记的标题行，首行不再强制加粗。已知限制三项：对齐与列宽取不到（解析库 mammoth 不输出 `w:jc` 与 `w:tblGrid`）；单元格内的图片以替换文字占位并告警；嵌套表格按纯文本展开并告警。
+
+转档前预检覆盖：GB18030 之外的字符、图片格式与密度（官方只受理 JPG/TIF、72–300 DPI）、浮动对象与文本框、OLE 对象、Word 自动编号、修订痕迹、文档保护、批注、非常规中文字体、公式后标点、缺节。问题项分 `blocking`（官方工具会拒绝转换）与 `warning` 两级，全部写入 `precheck.json` 并进入结果的 `warnings`。`patent` profile 下 `--jpeg-ppi` 缺省即取 300，无须另行指定；显式给出时应落在 72–300 之内，否则预检逐图告警。通用 JPG 默认值仍为 330 PPI。
 
 加 `--validate` 后，随包分发的官方 DTD 会逐份校验五书。交叉核对可用 `xmllint`，在仓库根目录执行：
 
@@ -369,7 +375,7 @@ xmllint --nonet --noout --dtdvalid converters/renderers/xml/dtd/cn-application-b
 
 两点须知：`xmllint` 把 `--dtdvalid` 的参数当 URI 处理，含中文的绝对路径会报 `Could not parse DTD`，故须用上面的相对路径；stderr 中的 `failed to load external entity "/dtdandxsl/…"` 属预期（文档内的 SYSTEM 标识符指向官方部署路径，本地不存在），说明书附图（`100003/100003.xml`）的 `Content model of cn-drawings is not deterministic` 是官方 DTD 自身的缺陷，两者都不影响校验结论。
 
-与官方编辑器的差异——本工具跨平台运行、不依赖 Office 或 WPS、不要求套用五书模板、公式按目标 DPI 放大后再栅格、转档前即给出预检清单。本期不覆盖：化学式识别、一键提交到客户端草稿箱。
+与官方编辑器的差异——本工具跨平台运行、不依赖 Office 或 WPS、不要求套用五书模板、公式按目标 DPI 放大后再栅格、EMF 图元由内置渲染器出图而不借道 Windows GDI、转档前即给出预检清单。本期不覆盖：还原化学结构（CML／MOL）、一键提交到客户端草稿箱。
 
 完整的政策背景、官方编辑器内部结构、DTD 解读与映射决策见 [docs/patent-xml-research.md](docs/patent-xml-research.md)。
 
@@ -445,11 +451,15 @@ MinerU 结果包按文档名改名后与主产物平铺在同一目录：`*_cont
 
 ## 图片与公式处理
 
-图片默认统一为 JPG：png、bmp、tiff、webp 与静态 gif 解码后铺白合成，以 `--jpeg-quality`（默认 90）控制压缩质量，并以 `--jpeg-ppi`（默认 330 PPI）写入 JFIF 密度；已是 JPEG 的只补写密度、不重编码。svg、emf、wmf 与动图 gif 保持原格式并告警。`--image-format keep` 关闭整条归一链路。
+图片默认统一为 JPG：png、bmp、tiff、webp 与静态 gif 解码后铺白合成，以 `--jpeg-quality`（默认 90）控制压缩质量，并以 `--jpeg-ppi`（默认 330 PPI）写入 JFIF 密度；已是 JPEG 的只补写密度、不重编码。svg、wmf 与动图 gif 保持原格式并告警；emf 只在 `patent` profile 下转为 JPG（见本节的「EMF 图元转 JPG」），其余 profile 同样保持原格式并告警。`--image-format keep` 关闭整条归一链路。
 
-`bundle` 目标例外：`images/` 存与原件逐字节一致的原图（不转码、不改 JFIF 密度），归一与上述选项只作用于 html、xml 等其它目标；tiff、emf、wmf 原样保留并告警「多数 Markdown 查看器无法显示」。Markdown 中的图片取得到原文档或原网页的显示尺寸时写成 `<img src="images/image_N.ext" width="W" alt="…">`（docx 取 `wp:extent`、pptx 取形状 `a:ext`、网页取 width 属性或样式、MinerU 取 `bbox`），段首缩进写为全角空格，图注为紧随图片的独立段落。
+`bundle` 目标例外：`images/` 存与原件逐字节一致的原图（不转码、不改 JFIF 密度），归一与上述选项只作用于 html、xml 等其它目标；tiff、emf、wmf 原样保留并告警「多数 Markdown 查看器无法显示」。Markdown 中的图片取得到原文档或原网页的显示尺寸时写成 `<img src="images/image_N.ext" width="W" alt="…">`（docx 取 `wp:extent`；以 VML 承载的图片——典型如 OLE 对象的预览图——取所属 `v:shape` 的 `style` 尺寸，其替换文字与化学式角色一并取回；pptx 取形状 `a:ext`、网页取 width 属性或样式、MinerU 取 `bbox`），段首缩进写为全角空格，图注为紧随图片的独立段落。
 
-护栏与降级：默认按 `raster.maxWidth`（1600 px）等比缩小，`patent` profile 下禁用缩放以保留原始像素；像素数超过 8000 万或字节数超过 200 MB 的图片保留原图并告警；多页 TIFF 取首页；单张失败只降级为告警，不影响整份转换。`patent` profile 下的 EMF/WMF 先试栅格化后端，再试 LibreOffice，两者皆不可用时告警。
+护栏与降级：默认按 `raster.maxWidth`（1600 px）等比缩小；`patent` profile 不设该上限，改按每幅图在 Word 中的显示尺寸重采样——目标像素为「显示毫米 ÷ 25.4 × `--jpeg-ppi`」，该 profile 的 `--jpeg-ppi` 缺省取 300 而非通用的 330，故重采样结果与官方工具的出图像素一致；取不到显示尺寸，或目标像素超过 4000 万、单边超过 20000 px 时，保留嵌入像素并告警。像素数超过 8000 万或字节数超过 200 MB 的图片保留原图并告警；多页 TIFF 取首页；单张失败只降级为告警，不影响整份转换。
+
+EMF 图元转 JPG（仅 `patent` profile）：docx 内嵌的 EMF——含 EMF+ 与 EMF+ Dual 两种记录形态——先由内置的纯 Node 图元渲染器（`converters/metafile/`，零新增依赖）回放为 SVG，再交现有的栅格后端出图并转 JPG。目标像素同样按 Word 显示尺寸算出，取不到时退回图元自身的幅面并告警；同一份转换内字节与目标像素都相同的图元只出一次图。WMF 不支持，其余 profile 的图元一律保持原格式。
+
+出图后逐张核验：像素须与目标一致；扫描显示含绘图记录而出图全白即判失败；EMF+ Dual 的图元另按 EMF+ 与经典两条记录流各出一张互校非白像素数，EMF+ 一侧不足经典流的 90% 时改用经典流出图并告警。遇到内置渲染器尚未支持的绘图记录（弧与扇形、基数样条、位图、渐变填充、Symbol 字符集文字等，清单以 `converters/metafile/` 的实现为准）时照常出图，但给出「可能缺失内容，提交前必须对照原稿核对」的强告警。单个图元的任何失败只让该图保持原格式并告警，不影响整份转换。
 
 docx 中的 OMML 公式默认栅格为图片（`--math image`）：先转 MathML，再由 Chromium 内的 MathJax 渲染后截图。出图字号取源稿该公式的 `w:sz`（公式内没有时取所在段落的段落属性，两处都取不到时按 14pt），并乘一个标定系数以抵消 MathJax 字形与 Word 数学字体的大小差异。`patent` profile 下公式图另按墨迹紧裁——取墨迹外接矩形后四周各补 4 px 白边，使幅面贴近官方工具的公式出图（官方按 Word 的公式版面盒出图，字形不同，故不追求逐像素相等）；表格图与其它 profile 不做紧裁。`--math text` 降级为线性化文本。旧版 Equation 3.0 公式（OLE + WMF）按图片处理并告警。
 
@@ -491,7 +501,8 @@ converters/
     html-themes/           六款 HTML 主题
     xml/                   generic 与 patent 两套方言、预检、DTD 校验与随包 DTD
   ir/                      中间表示的结构、工具与表格清洗
-  assets/                  Markdown 图片解析与 JPG 归一
+  assets/                  Markdown 图片解析、JPG 归一与 EMF 图元转 JPG
+  metafile/                内置图元渲染器：EMF 记录回放为 SVG（纯 Node，零新增依赖）
   math/                    OMML → MathML
   raster/                  栅格化后端与节点栅格化
   chromium/                Electron 子进程派生
@@ -537,8 +548,8 @@ npm run build:all    # 两个平台一并打包
 - Excel 不提取内嵌图片；PowerPoint 只提取幻灯片正文中的图片，不含背景图与母版图，也不处理表格、SmartArt 与动画；Excel 不处理合并单元格，公式取结果值。Excel 解析依赖 exceljs，其不识别以命名空间前缀书写的工作簿部件（如 `<x:workbook>`，见于部分 Open XML SDK 系工具生成的文件），此类文件会报「Cannot read properties of undefined (reading 'sheets')」，用 Excel 或 WPS 另存一次即可。
 - `.doc`、`.xls`、`.ppt` 三种旧二进制格式不再受理，请先另存为对应的 Open XML 格式。
 - `bundle` 只接受 Office、PDF 与网页输入；`docx` 与 `pdf` 只接受 Markdown 与专利五书 XML 输入。
-- `patent` profile 不识别化学式，不生成案卷包，不支持一键提交。
-- 专利五书 XML 反向导入只受理 `patent` 方言（根元素 `cn-application-body`），不受理 `generic` profile 的 XML；公式、表格与化学式导入后仍是图片；桌面端的转档入口尚未接入 `.xml` 与 `.zip`（命令行与 MCP 可用）；其余必丢项见「专利五书 XML 反向导入」。
+- `patent` profile 的化学式只做归类与栅格化：判为化学式的图片转成 JPG 并包进 `chemistry` 元素，不还原分子结构（CML／MOL），也不写 `chem` 元素。不支持一键提交到客户端草稿箱。
+- 专利五书 XML 反向导入只受理 `patent` 方言（根元素 `cn-application-body`），不受理 `generic` profile 的 XML；公式、表格与化学式导入后仍是图片；其余必丢项见「专利五书 XML 反向导入」。
 - `--validate` 需要可选依赖 libxml2-wasm；未安装时跳过校验并在 warnings 中说明。
 - Readability 的可读性阈值已按中文段落长度下调（中文段落多在 50 至 150 字，默认阈值会把多数中文文章判为不可读）；判定失误时由字符数下限双重兜底，回退通用提取。
 

@@ -47,7 +47,7 @@ const EXTRACT_OPTIONAL_META = Object.freeze(['author', 'publishedAt', 'siteName'
 const VALIDATOR_PROBE_XML = '<probe/>';
 const VALIDATOR_NAME = 'libxml2-wasm';
 const LIBREOFFICE_NAME = 'soffice';
-const LIBREOFFICE_ROLE = '非必需，仅作 PDF 出图的第三级后端与 patent profile 下 EMF/WMF 栅格化的兜底';
+const LIBREOFFICE_ROLE = '非必需，仅作 PDF 出图的第三级后端';
 
 // ============================================================
 // 能力探测
