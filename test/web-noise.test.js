@@ -211,3 +211,113 @@ test('规范化归一 CRLF，且对空输入返回空串', () => {
     assert.equal(normalizeMarkdown(''), '');
     assert.equal(normalizeMarkdown(null), '');
 });
+
+// ============================================================
+// 行尾空白清理的耗时与语义等价：normalizeMarkdown 须线性于文本长度
+// ============================================================
+
+const { ZERO_WIDTH_CODE_POINTS, NBSP_CODE_POINTS } = require('../converters/web/normalize');
+
+// 行终止符四个：LF 与 CR 写作转义序列，其余两个以码点生成
+const LINE_SEPARATOR = String.fromCharCode(0x2028);
+const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
+
+// 耗时用例的输入规模：256 个不换行空格后缀一个零宽字符，重复 400 次。零宽字符使这段空白在
+// web/whitespace 的入口截断（上限 256、按 \s 计段）里分属 400 段、逐段放行；规范化先删零宽、
+// 再把不换行空格归一为普通空格，于是在本函数内并成 102400 个普通空格的一段，且不在行尾
+const TRAILING_STRESS_RUNS = 400;
+const TRAILING_STRESS_RUN_LENGTH = 256;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。
+// 1500 ms 使两侧余量都不小于 5 倍——线性化之前的 /[ \t]+$/gm 在这一规模上实测 9365.7 ms
+// （同法实测 k=100 为 594.7 ms、k=200 为 2415 ms，耗时随段长平方增长），是它的 6.2 倍；
+// 线性化之后实测数毫秒、不足它的百分之一，故慢机以及 node --test 多文件并行抢占 CPU 时都不会误报
+const TRAILING_STRESS_BUDGET_MS = 1500;
+
+const elapsedMsSince = (started) => Number(process.hrtime.bigint() - started) / 1e6;
+
+// 码点列表 → 匹配其中任一字符的全局正则（与被测模块同一写法，供参照实现复用）
+const charClassRegExp = (codePoints) => new RegExp(`[${codePoints.map((cp) => String.fromCharCode(cp)).join('')}]`, 'g');
+
+const LEGACY_ZERO_WIDTH_RE = charClassRegExp(ZERO_WIDTH_CODE_POINTS);
+const LEGACY_NBSP_RE = charClassRegExp(NBSP_CODE_POINTS);
+const LEGACY_TRAILING_SPACE_RE = /[ \t]+$/gm;
+
+// 线性化之前的 normalizeMarkdown，仅作短输入的差分参照：其行尾一步的量词加行尾锚在不处于
+// 行尾的长空白串上逐位回溯，不可用于耗时用例的输入规模
+const legacyNormalizeMarkdown = (markdown) => String(markdown == null ? '' : markdown)
+    .replace(/\r\n/g, '\n')
+    .replace(LEGACY_ZERO_WIDTH_RE, '')
+    .replace(LEGACY_NBSP_RE, ' ')
+    .replace(LEGACY_TRAILING_SPACE_RE, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+// 字母表上长度 0 到 maxLength 的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    let level = [''];
+    const all = [...level];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((character) => prefix + character));
+        all.push(...level);
+    }
+    return all;
+}
+
+test('规范化：不在行尾的 10 万个空白不触发回溯，耗时在绝对上限内且输出逐字正确', () => {
+    // Arrange：每次新构造字符串——V8 对「同一字符串对象 + 同一全局正则」的 replace 结果有缓存
+    const run = NBSP.repeat(TRAILING_STRESS_RUN_LENGTH) + ZERO_WIDTH;
+    const input = `甲${run.repeat(TRAILING_STRESS_RUNS)}乙`;
+
+    // Act
+    const started = process.hrtime.bigint();
+    const result = normalizeMarkdown(input);
+    const elapsedMs = elapsedMsSince(started);
+
+    // Assert：先验输出正确，以免「快」来自少做了事——该段夹在两个可见字符之间，须逐字保留
+    assert.equal(result, `甲${' '.repeat(TRAILING_STRESS_RUN_LENGTH * TRAILING_STRESS_RUNS)}乙`);
+    assert.ok(
+        elapsedMs < TRAILING_STRESS_BUDGET_MS,
+        `规范化实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${TRAILING_STRESS_BUDGET_MS} ms`,
+    );
+});
+
+test('规范化与线性化之前的实现逐字等价：{空格, 制表符, LF, CR, 行分隔符, 段分隔符, 可见字符, 不换行空格, 零宽空格} 上长度不超过 5 的全部字符串', () => {
+    // Arrange：9 个字符的字母表上长度 0 到 5 的全部字符串共 66430 个。字母表须含全部四个行终止符，
+    // 行尾判定正是按它们取舍；不换行空格与零宽空格用于覆盖「前两步改写之后才并成一段」的情形
+    const alphabet = [' ', '\t', '\n', '\r', LINE_SEPARATOR, PARAGRAPH_SEPARATOR, '甲', NBSP, ZERO_WIDTH];
+    const samples = everyStringUpTo(5, alphabet);
+    assert.equal(samples.length, 66430);
+
+    // Act & Assert
+    for (const text of samples) {
+        assert.equal(normalizeMarkdown(text), legacyNormalizeMarkdown(text), JSON.stringify(text));
+    }
+});
+
+test('规范化：空白段紧邻四种行终止符之前或位于串尾时删除，其余位置逐字保留', () => {
+    // Arrange：[用例说明, 输入, 期望输出]。两端一律加可见字符，以免末尾 trim 掩盖行尾一步的效果
+    const cases = [
+        ['LF 之前的空白段删除', '甲  \n乙', '甲\n乙'],
+        ['孤立 CR 之前的空白段删除', '甲  \r乙', '甲\r乙'],
+        ['行分隔符之前的空白段删除', `甲  ${LINE_SEPARATOR}乙`, `甲${LINE_SEPARATOR}乙`],
+        ['段分隔符之前的空白段删除', `甲  ${PARAGRAPH_SEPARATOR}乙`, `甲${PARAGRAPH_SEPARATOR}乙`],
+        // 串尾一段同时落在行尾清理与末尾 trim 的覆盖范围内，两者结果一致，此处只断言最终形态
+        ['串尾的空白段删除', '甲  ', '甲'],
+        ['行中的空白段逐字保留', '甲  乙', '甲  乙'],
+        ['行尾的制表符与空格混合段删除', '甲 \t \t\n乙', '甲\n乙'],
+        ['行中的制表符与空格混合段逐字保留', '甲 \t 乙', '甲 \t 乙'],
+        ['只含空格的整行清空', '甲\n   \n乙', '甲\n\n乙'],
+        ['只含制表符的连续空行清空后并入空行折叠', '甲\n\t\n\t\n乙', '甲\n\n乙'],
+        ['同一行内两段：前段保留、行尾段删除', '甲  乙  \n丙', '甲  乙\n丙'],
+        ['相邻行分隔符之间的空白段删除，行分隔符不参与空行折叠', `甲  ${LINE_SEPARATOR}  ${LINE_SEPARATOR}乙`, `甲${LINE_SEPARATOR}${LINE_SEPARATOR}乙`],
+        // 删零宽、归一不换行空格之后才并成一段：位于行尾则整段删除
+        ['零宽与不换行空格拼成的行尾段删除', `甲 ${NBSP} ${ZERO_WIDTH} \n乙`, '甲\n乙'],
+        // 同样并成一段，但位于行中：归一后的三个普通空格逐字保留
+        ['零宽与不换行空格拼成的行中段保留', `甲 ${NBSP}${ZERO_WIDTH} 乙`, '甲   乙'],
+    ];
+
+    // Act & Assert
+    for (const [name, input, expected] of cases) {
+        assert.equal(normalizeMarkdown(input), expected, name);
+    }
+});
