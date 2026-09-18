@@ -37,6 +37,10 @@
  *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
  *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入
  *   paragraph.data.role   = 'caption' | 'image_footnote'   图注 / 图片脚注；与图片靠「紧随其后」对应，不存图片名
+ *   paragraph.data.splitGroup = <正整数>   ir/captions 的大图拆段把一个原段落拆成多块时，给各块写同一个分组号
+ *                          （同组同值、按文档顺序递增，未被拆的段落不写该键）。patent profile 的渲染层据此在权利要求书、
+ *                          说明书、摘要三本书里把相邻的同组块并回一个段落（renderers/xml/blocks 的 mergeSplitGroups），
+ *                          使一个 Word 段落只出一个 p、段号不顺延；说明书附图与摘要附图不并。其余渲染器不读该键
  *   table.data.grid      = { rows: [ { header, cells: [ { colspan, rowspan, header, paragraphs } ] } ] }
  *                          docx 表格的结构化留存（parsers/docx-tables 写入）。GFM 表格表达不了合并单元格，
  *                          单元格内多段与行内格式也在 turndown 取 textContent 时一并丢失，故在解析层另存一份：
