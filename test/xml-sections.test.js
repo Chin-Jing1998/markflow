@@ -14,6 +14,7 @@ const path = require('node:path');
 const { load } = require('cheerio');
 
 const xmlRenderer = require('../converters/renderers/xml');
+const { FILE_NAMES } = require('../converters/renderers/xml/patent');
 const { validateXml } = require('../converters/renderers/xml/validate');
 const { ISSUE_CODES } = require('../converters/renderers/xml/precheck');
 const { normalizeOptions } = require('../converters/options');
@@ -33,7 +34,8 @@ const MARK = Object.freeze({
 });
 const PUA_RESIDUE_RE = new RegExp(`[${fromCode(0xE200)}-${fromCode(0xE20F)}${fromCode(0xEF00)}-${fromCode(0xEF1F)}]`);
 const IDEOGRAPHIC_SPACE = fromCode(0x3000);
-const XML_FILES = ['claims.xml', 'description.xml', 'drawings.xml', 'abstract.xml', 'abstract-figure.xml'];
+// 五书的相对路径随官方案卷结构（100001/100001.xml 等），一律取自渲染器的 FILE_NAMES
+const XML_FILES = Object.values(FILE_NAMES);
 const SECTION_FALLBACK_CODES = [ISSUE_CODES.SECTION_INFERRED, ISSUE_CODES.SECTION_UNCLASSIFIED, ISSUE_CODES.SECTION_MISSING];
 
 // ============================================================
@@ -126,13 +128,13 @@ describe('patent profile：Word 分节页眉定书目', () => {
         assert.deepEqual(Object.keys(result.files).sort(), [...XML_FILES, '{name}.zip', 'precheck.json'].sort());
         for (const code of SECTION_FALLBACK_CODES) assert.ok(!codesOf(result).includes(code), `不应出现 ${code}：${JSON.stringify(result.warnings)}`);
         assert.deepEqual(result.warnings.filter((item) => item.startsWith('分节：')), []);
-        const claims = $of(result.files['claims.xml']);
+        const claims = $of(result.files[FILE_NAMES.claims]);
         assert.deepEqual(claims('claim').toArray().map((node) => [node.attribs.num, claims(node).find('claim-text').length]), [['1', 3], ['2', 1]]);
         assert.equal(claims('claim-text').first().text(), '一种夹持装置，其特征在于，包括：', '权 1 不含编号');
-        assert.deepEqual(textsOf(result.files['abstract.xml'], 'cn-abstract > p'), ['本申请公开了一种夹持装置，包括底座与夹爪。'], '只含码位的空壳段不成段');
-        assert.equal($of(result.files['abstract-figure.xml'])('cn-abst-figure > figure > img').length, 1);
+        assert.deepEqual(textsOf(result.files[FILE_NAMES.abstract], 'cn-abstract > p'), ['本申请公开了一种夹持装置，包括底座与夹爪。'], '只含码位的空壳段不成段');
+        assert.equal($of(result.files[FILE_NAMES.abstractFigure])('cn-abst-figure > figure > img').length, 1);
         assert.ok(!codesOf(result).includes(ISSUE_CODES.FIGURE_INLINE_IMAGE), '摘要附图不再当作正文内图片');
-        assert.deepEqual($of(result.files['drawings.xml'])('figure').toArray().map((node) => node.attribs['figure-labels']), ['图1', '图2']);
+        assert.deepEqual($of(result.files[FILE_NAMES.drawings])('figure').toArray().map((node) => node.attribs['figure-labels']), ['图1', '图2']);
         assertNoResidue(result.files);
         await assertAllValid(result.files);
     });
@@ -145,7 +147,7 @@ describe('patent profile：Word 分节页眉定书目', () => {
 
         assert.deepEqual(Object.keys(result.files).sort(), [...XML_FILES, '{name}.zip', 'precheck.json'].sort());
         assert.deepEqual(result.warnings.filter((item) => item.startsWith('分节：')), []);
-        assert.equal($of(result.files['claims.xml'])('claim').length, 2);
+        assert.equal($of(result.files[FILE_NAMES.claims])('claim').length, 2);
     });
 
     test('页眉认不出书目（事务所抬头、空页眉）时回落到标题段与位置推定，产物与无分节信息时逐字一致', async () => {
@@ -160,7 +162,7 @@ describe('patent profile：Word 分节页眉定书目', () => {
 
         for (const name of XML_FILES.filter((file) => file in without.files)) assert.equal(withSections.files[name], without.files[name], name);
         assert.deepEqual(withSections.warnings, without.warnings);
-        assert.equal(textsOf(withSections.files['description.xml'], 'description > p').length, 2, '分节边界不切断标题段区域');
+        assert.equal(textsOf(withSections.files[FILE_NAMES.description], 'description > p').length, 2, '分节边界不切断标题段区域');
     });
 
     test('页眉区域之后的无书目分节另起区域回落位置推定，不被前一书目吞并', async () => {
@@ -174,9 +176,9 @@ describe('patent profile：Word 分节页眉定书目', () => {
 
         const result = await renderPatent(children);
 
-        assert.deepEqual(textsOf(result.files['abstract.xml'], 'cn-abstract > p'), ['本发明公开了一种装置。']);
-        assert.equal($of(result.files['claims.xml'])('claim').length, 2);
-        assert.equal($of(result.files['description.xml'])('invention-title').text(), '一种装置');
+        assert.deepEqual(textsOf(result.files[FILE_NAMES.abstract], 'cn-abstract > p'), ['本发明公开了一种装置。']);
+        assert.equal($of(result.files[FILE_NAMES.claims])('claim').length, 2);
+        assert.equal($of(result.files[FILE_NAMES.description])('invention-title').text(), '一种装置');
         const inferred = result.warnings.find((item) => item.startsWith('分节：未发现书目标题，按位置推定：'));
         assert.ok(inferred && inferred.includes('权利要求书=') && inferred.includes('说明书='), JSON.stringify(result.warnings));
         assert.ok(!inferred.includes('说明书摘要='), '页眉定下的书目不列入按位置推定');
@@ -194,11 +196,11 @@ describe('patent profile：Word 分节页眉定书目', () => {
 
         const result = await renderPatent(children, { assets: [asset('images/image_1.jpg'), asset('images/table-1.jpg')] });
 
-        const desc = $of(result.files['description.xml']);
+        const desc = $of(result.files[FILE_NAMES.description]);
         assert.deepEqual(desc('description > p').toArray().map((node) => desc(node).text().trim()), ['本发明涉及装置。', '', '表后的一段。']);
         assert.equal(desc('description > p > tables > img').length, 1, '栅格化表格随前一块留在说明书');
-        assert.equal($of(result.files['drawings.xml'])('figure').attr('figure-labels'), '图1');
-        assert.deepEqual(textsOf(result.files['abstract.xml'], 'cn-abstract > p'), ['本发明公开了一种装置。']);
+        assert.equal($of(result.files[FILE_NAMES.drawings])('figure').attr('figure-labels'), '图1');
+        assert.deepEqual(textsOf(result.files[FILE_NAMES.abstract], 'cn-abstract > p'), ['本发明公开了一种装置。']);
         assert.deepEqual(result.warnings.filter((item) => item.startsWith('分节：')), []);
         await assertAllValid(result.files);
     });
@@ -221,7 +223,7 @@ describe('patent profile：官方标记码位', () => {
 
         const result = await renderPatent(children);
 
-        const desc = $of(result.files['description.xml']);
+        const desc = $of(result.files[FILE_NAMES.description]);
         assert.equal(desc('invention-title').text(), '用于试样装夹的装置，及其使用方法', '带标点、不以「一种」起头也认');
         assert.equal(result.title, '用于试样装夹的装置，及其使用方法');
         assert.deepEqual(desc('heading').toArray().map((node) => desc(node).text()), ['技术领域', '有益效果']);
@@ -245,10 +247,10 @@ describe('patent profile：官方标记码位', () => {
 
         const result = await renderPatent(children, { assets: [asset('images/image_1.jpg')] });
 
-        const claims = $of(result.files['claims.xml']);
+        const claims = $of(result.files[FILE_NAMES.claims]);
         assert.deepEqual(claims('claim').toArray().map((node) => [node.attribs.id, node.attribs.num]), [['cl001', '1'], ['cl002', '2']]);
         assert.deepEqual(claims('claim').first().find('claim-text').toArray().map((node) => claims(node).text()), ['一种装置，其特征在于，包括：', '底座；']);
-        const figure = $of(result.files['drawings.xml'])('figure');
+        const figure = $of(result.files[FILE_NAMES.drawings])('figure');
         assert.equal(figure.attr('figure-labels'), '图13');
         assert.equal(figure.attr('num'), '0013');
         assertNoResidue(result.files);
@@ -264,10 +266,10 @@ describe('patent profile：官方标记码位', () => {
 
         const result = await renderPatent(children);
 
-        assert.equal($of(result.files['claims.xml'])('claim').length, 2);
+        assert.equal($of(result.files[FILE_NAMES.claims])('claim').length, 2);
         assert.ok(codesOf(result).includes(ISSUE_CODES.CLAIM_NONE), '无编号时由权项模块按段落顺序编号');
-        assert.deepEqual(textsOf(result.files['abstract.xml'], 'cn-abstract > p'), ['本申请公开了一种装置。']);
-        assert.deepEqual(textsOf(result.files['description.xml'], 'description > p'), ['本申请涉及装置。']);
+        assert.deepEqual(textsOf(result.files[FILE_NAMES.abstract], 'cn-abstract > p'), ['本申请公开了一种装置。']);
+        assert.deepEqual(textsOf(result.files[FILE_NAMES.description], 'description > p'), ['本申请涉及装置。']);
         assertNoResidue(result.files);
     });
 
@@ -280,8 +282,8 @@ describe('patent profile：官方标记码位', () => {
         const official = await renderPatent(body(marked));
         const legacy = await renderPatent(body(p));
 
-        assert.deepEqual(textsOf(official.files['description.xml'], 'description > p'), ['本发明涉及装置。', literal]);
-        assert.deepEqual(textsOf(legacy.files['description.xml'], 'description > p'), ['本发明涉及装置。', literal.slice(1, -1)], '无码位文稿沿用既有字面规则');
+        assert.deepEqual(textsOf(official.files[FILE_NAMES.description], 'description > p'), ['本发明涉及装置。', literal]);
+        assert.deepEqual(textsOf(legacy.files[FILE_NAMES.description], 'description > p'), ['本发明涉及装置。', literal.slice(1, -1)], '无码位文稿沿用既有字面规则');
     });
 });
 

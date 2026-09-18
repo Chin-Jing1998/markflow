@@ -31,7 +31,7 @@
 | `pdf` | 单文件 | `{名称}.pdf` |
 | `html` | 目录 | `{名称}/{名称}.html` + `images/` |
 | `xml`（`generic`） | 目录 | `{名称}/{名称}.xml` + `images/` |
-| `xml`（`patent`） | 目录 | `{名称}/` 下五书 XML + 平铺的 JPG + `{名称}.zip` + `precheck.json` |
+| `xml`（`patent`） | 目录 | `{名称}/` 下按表格代码分目录的五书 XML 与图片（`100001/100001.xml`、`100003/100003_1.jpg` 等）+ `{名称}.zip` + `precheck.json` |
 
 `pdf` 目标只在 PDF 出图后端可用时列出；后端状态见 `markflow formats`。
 
@@ -222,7 +222,7 @@ markflow config unset mineru-token         # 从配置文件移除；其它来�
 
 字段说明：`options` 为本次生效的完整选项（`mineru.token` 一律置 `null`）；`extras` 为已落盘附属文件在产物目录内的相对路径（MinerU 产物即在此列）；`backends` 记录实际生效的 PDF 解析后端与栅格化后端；`--validate` 时信封另有 `validate: true`。告警不单列字段，逐项写在各结果的 `warnings` 中；`--json` 模式不输出进度。
 
-`outputs` 的键由产物文件名派生（规则的唯一定义处为 `converters/output.js`）：主产物 `{名称}.<扩展名>` 取扩展名（`md`、`json`、`html`、`xml`、`docx`、`pdf`、`zip`）；以 `{名称}_` 开头的旁路文件取其后主干的 camelCase，非 `.json` 的再接扩展名；其余文件取去扩展名的文件名转 camelCase（`claims.xml` → `claims`、`abstract-figure.xml` → `abstractFigure`）；写入了 `images/` 则另有 `imagesDir`。因此 `bundle` 目标恒有 `md`、`json`、`contentList`，有图片时有 `imagesDir`；PDF 走 MinerU 时另有 `contentListV2`、`model`、`layout`、`originPdf`。
+`outputs` 的键由产物文件名派生（规则的唯一定义处为 `converters/output.js`）：主产物 `{名称}.<扩展名>` 取扩展名（`md`、`json`、`html`、`xml`、`docx`、`pdf`、`zip`）；以 `{名称}_` 开头的旁路文件取其后主干的 camelCase，非 `.json` 的再接扩展名；patent profile 的五书按表格代码显式映射为固定键（`100001/100001.xml` → `claims`、`100002/100002.xml` → `description`、`100003/100003.xml` → `drawings`、`100004/100004.xml` → `abstract`、`100005/100005.xml` → `abstractFigure`，另有 `zip` 与 `precheck`），键名是对外契约，不随文件名变化；其余文件取去扩展名的文件名转 camelCase（`precheck.json` → `precheck`）；写入了 `images/` 则另有 `imagesDir`。因此 `bundle` 目标恒有 `md`、`json`、`contentList`，有图片时有 `imagesDir`；PDF 走 MinerU 时另有 `contentListV2`、`model`、`layout`、`originPdf`。
 
 ## MCP 服务
 
@@ -305,23 +305,33 @@ JSON 产物结构为 `{ schemaVersion, kind, ir, data, meta }`，其中 `ir` 为
 
 自 2026-01-01 起，中国专利电子申请一律以 XML 格式提交。本 profile 直接对齐官方「WORD 转 ACXML 编辑器」的输出结构，把 docx 底稿转为可提交的五书 XML。
 
-产物落在 `{名称}/` 目录下：
+产物落在 `{名称}/` 目录下，目录结构、文件命名与官方「WORD 转 ACXML 编辑器」的真实产出一致：每书一个以表格代码命名的目录，图片与所属 XML 同目录。
 
 ```
 {名称}/
-  claims.xml            权利要求书  <cn-claims>
-  description.xml       说明书      <description>
-  drawings.xml          说明书附图  <cn-drawings>
-  abstract.xml          说明书摘要  <cn-abstract>
-  abstract-figure.xml   摘要附图    仅识别到时生成
-  drawing-1.jpg         图片以裸文件名平铺在目录根下，不建 images/
-  table-1.jpg           表格栅格化产物
-  omath-14-1.jpg        公式栅格化产物，命名为 omath-<段号>-<序号>.jpg
-  {名称}.zip            五书 XML 与全部图片的同一平铺集合
+  100001/
+    100001.xml          权利要求书  <cn-claims>
+    100001_1.jpg        权利要求内的图片（化学结构式、公式图），有则生成
+  100002/
+    100002.xml          说明书      <description>
+    100002_1.jpg        说明书内的公式、表格、化学式与段内图片，按出现顺序统一编号
+  100003/
+    100003.xml          说明书附图  <cn-drawings>
+    100003_1.jpg        附图，按出现顺序编号
+  100004/
+    100004.xml          说明书摘要  <cn-abstract>
+  100005/
+    100005.xml          摘要附图    仅识别到时生成
+    100005_1.jpg
+  {名称}.zip            上述各目录的同一集合：条目名即相对路径（100001/100001.xml …），无外层文件夹、无目录条目
   precheck.json         预检问题清单与校验记录，不入 zip
 ```
 
-结构约定：每份文件头三行固定为 XML 声明、`<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd">` 与 `showxml.xsl` 样式处理指令，根元素为 `<cn-application-body lang="zh" country="CN">`。说明书段号四位补零连续编排（段首已有 `[0001]` 者剥离并复用，与预期不一致时记「段号跳变」告警）；权项 id 形如 `cl001`，`根据权利要求 N 所述` 自动解析为 `<claim-ref>`；附图 id 形如 `f0001`、图片 id 形如 `i0001`，`wi`/`he` 由像素与 JPEG 密度换算为毫米。表格与公式在本 profile 下一律栅格为 JPG，栅格化后端不可用时降级为逐行文本或线性化文本并告警。
+命名约定：图片名为 `<表格代码>_<序号>.<扩展名>`，序号自 1 起、不补零，各书独立计数，同一书内的全部图片共用一个计数器（官方样稿的说明书内只有公式图，几类图片混排时是否分别计数尚无样本，此为推定）；`img/@file` 只写裸文件名；尚未栅格化的非 JPG 图片（如 EMF）保留原扩展名并告警。官方产出没有 `List.xml`，本工具同样不生成。`--clean` 重跑时一并清理书目目录内上一轮的文件与旧版的平铺产物（`claims.xml`、`drawing-N.jpg` 等），目录内的其它文件保留。
+
+字节级形态同样对齐官方：UTF-8 BOM、换行统一为 CRLF、空元素写作 `<img … />`；官方产出中不规则的空行与缩进不模仿。generic profile 不受影响，仍为无 BOM、LF、`<hr/>`。
+
+结构约定：每份文件头三行固定为 XML 声明、`<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd"[]>` 与 `showxml.xsl` 样式处理指令，根元素为 `<cn-application-body lang="zh" country="CN">`。说明书段号四位补零连续编排（段首已有 `[0001]` 者剥离并复用，与预期不一致时记「段号跳变」告警）；权项 id 形如 `cl001`，`根据权利要求 N 所述` 自动解析为 `<claim-ref>`；附图 id 形如 `f0001`、图片 id 形如 `i0001`，`wi`/`he` 由像素与 JPEG 密度换算为毫米。表格与公式在本 profile 下一律栅格为 JPG，栅格化后端不可用时降级为逐行文本或线性化文本并告警。权利要求内的图片输出为 `claim-text` 内的 `img`；标注为化学式的图片输出为 `<chemistry id="chem0001" num="0001">` 内的 `img`，不写 `chem` 元素（官方转换器从不输出它）。
 
 转档前预检覆盖：GB18030 之外的字符、图片格式与密度（官方只受理 JPG/TIF、72–300 DPI）、浮动对象与文本框、OLE 对象、Word 自动编号、修订痕迹、文档保护、批注、非常规中文字体、公式后标点、缺节。问题项分 `blocking`（官方工具会拒绝转换）与 `warning` 两级，全部写入 `precheck.json` 并进入结果的 `warnings`。因此，patent profile 提交前应使用 `--jpeg-ppi 72–300`；通用 JPG 默认值仍为 330 PPI。
 
@@ -331,9 +341,9 @@ JSON 产物结构为 `{ schemaVersion, kind, ir, data, meta }`，其中 `ir` 为
 xmllint --nonet --noout --dtdvalid converters/renderers/xml/dtd/cn-application-body-20080416.dtd <file.xml>
 ```
 
-两点须知：`xmllint` 把 `--dtdvalid` 的参数当 URI 处理，含中文的绝对路径会报 `Could not parse DTD`，故须用上面的相对路径；stderr 中的 `failed to load external entity "/dtdandxsl/…"` 属预期（文档内的 SYSTEM 标识符指向官方部署路径，本地不存在），`drawings.xml` 的 `Content model of cn-drawings is not deterministic` 是官方 DTD 自身的缺陷，两者都不影响校验结论。
+两点须知：`xmllint` 把 `--dtdvalid` 的参数当 URI 处理，含中文的绝对路径会报 `Could not parse DTD`，故须用上面的相对路径；stderr 中的 `failed to load external entity "/dtdandxsl/…"` 属预期（文档内的 SYSTEM 标识符指向官方部署路径，本地不存在），说明书附图（`100003/100003.xml`）的 `Content model of cn-drawings is not deterministic` 是官方 DTD 自身的缺陷，两者都不影响校验结论。
 
-与官方编辑器的差异——本工具跨平台运行、不依赖 Office 或 WPS、不要求套用五书模板、公式按目标 DPI 放大后再栅格、转档前即给出预检清单。本期不覆盖：案卷包（表格代码目录 100001–100005 与 `List.xml`）、化学式识别、XML 反向导入、一键提交到客户端草稿箱。
+与官方编辑器的差异——本工具跨平台运行、不依赖 Office 或 WPS、不要求套用五书模板、公式按目标 DPI 放大后再栅格、转档前即给出预检清单。本期不覆盖：化学式识别、XML 反向导入、一键提交到客户端草稿箱。
 
 完整的政策背景、官方编辑器内部结构、DTD 解读与映射决策见 [docs/patent-xml-research.md](docs/patent-xml-research.md)。
 

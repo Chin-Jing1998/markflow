@@ -10,9 +10,13 @@
  *   formatXml(text, { indent })         → { xml, ok, error }   合法则按缩进重排，非法则原样回吐
  *   detectProfile(root)                 → 'patent' | 'generic' | null
  *       patent：根元素 cn-application-body（国知局五书）；generic：根为 urn:markflow:document:1 的 document
- *   buildXmlView(text, { assetBase?, indent?, label? }) → { kind: 'xml', xml, structuredHtml, profile, warnings, error }
+ *   buildXmlView(text, { assetBase?, indent?, label? })
+ *       → { kind: 'xml', xml, structuredHtml, profile, profileLabel, book, bookLabel, warnings, error }
  *       structuredHtml 为自包含的 HTML 文档（供 <iframe sandbox srcdoc> 直接承载），未知 profile 或
  *       解析失败时为 null，此时界面只显示美化原文。
+ *       book / bookLabel：patent 文件所属的书目，按内容判定（根下首个元素：cn-claims / description / cn-drawings /
+ *       cn-abstract，cn-abstract 内只有 cn-abst-figure 时为 cn-abst-figure），与文件名无关——官方案卷结构下五书
+ *       名为 100001.xml–100005.xml，调用方据此给出可读标签并选定主视图；非 patent 或无法判定时为 null / ''。
  *
  * patent 结构视图按官方 showxml.xsl 观感：段号 @num 红色粗体前置、权项分条编号、
  * img 按 @wi/@he（毫米）定尺寸、maths/tables/chemistry 内的图按 inline 决定行内或独立成块。
@@ -255,7 +259,7 @@ function buildXmlView(input, { assetBase = null, indent = DEFAULT_INDENT, label 
     const parsed = parseXml(raw);
     if (!parsed.ok) {
         return {
-            kind: 'xml', xml: raw, structuredHtml: null, profile: null, profileLabel: '',
+            kind: 'xml', xml: raw, structuredHtml: null, profile: null, profileLabel: '', book: null, bookLabel: '',
             warnings: [`XML 解析失败，只能显示原文：${parsed.error}`], error: parsed.error,
         };
     }
@@ -266,7 +270,11 @@ function buildXmlView(input, { assetBase = null, indent = DEFAULT_INDENT, label 
     const warnings = [];
     if (!profile) warnings.push('未识别的 XML 结构，只显示美化原文');
     if (ctx.missingAssets > 0) warnings.push(`有 ${ctx.missingAssets} 处图片地址不可用，已只保留替代文字`);
-    return { kind: 'xml', xml: formatted.xml, structuredHtml, profile, profileLabel: profile ? PROFILE_LABELS[profile] : '', warnings, error: null };
+    const book = profile === PROFILES.patent ? patentBookOf(parsed.root) : null;
+    return {
+        kind: 'xml', xml: formatted.xml, structuredHtml, profile, profileLabel: profile ? PROFILE_LABELS[profile] : '',
+        book, bookLabel: book ? PATENT_BOOK_LABELS[book] : '', warnings, error: null,
+    };
 }
 
 const bodyFor = (profile, root, ctx) => (profile === PROFILES.patent ? patentBody(root, ctx) : genericBody(root, ctx));
@@ -277,6 +285,15 @@ const PATENT_BOOK_LABELS = Object.freeze({
     'cn-claims': '权利要求书', description: '说明书', 'cn-drawings': '说明书附图',
     'cn-abstract': '说明书摘要', 'cn-abst-figure': '摘要附图',
 });
+
+/** 书目按内容判定：根下首个元素；摘要附图的文件是 cn-abstract 内只含 cn-abst-figure */
+function patentBookOf(root) {
+    const book = root.children.find((child) => child.type === 'element');
+    if (!book || !Object.hasOwn(PATENT_BOOK_LABELS, book.name)) return null;
+    const inner = book.children.filter((child) => child.type === 'element');
+    const isFigureOnly = book.name === 'cn-abstract' && inner.length > 0 && inner.every((child) => child.name === 'cn-abst-figure');
+    return isFigureOnly ? 'cn-abst-figure' : book.name;
+}
 
 function patentBody(root, ctx) {
     const books = root.children.filter((child) => child.type === 'element');

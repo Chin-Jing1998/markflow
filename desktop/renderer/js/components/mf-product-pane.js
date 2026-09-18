@@ -4,7 +4,8 @@
  * 用法：pane.sessionId = 预览会话 id；pane.product = mf:preview:open / render 回包里的 product。
  *   html   → { kind:'html', html }                 渲染与源码两个页签
  *   xml    → { kind:'xml', xml, structuredHtml, parts, precheck, profile }
- *            结构视图 / 原文两个页签 + 分文件切换 + 预检清单（patent profile 的 precheck.json 与
+ *            结构视图 / 原文两个页签 + 分文件切换（下拉项显示 part.label：patent 五书按官方案卷结构命名为
+ *            100001/100001.xml 一类，label 冠以书目名；缺 label 时退回 part.name）+ 预检清单（patent profile 的 precheck.json 与
  *            带「预检：」「分节：」「发明名称：」「权项：」「段号：」「附图：」「栅格化：」「DTD 校验：」前缀的 warnings）
  *   md     → { kind:'md', html, raw }              bundle 目标：渲染 / Markdown 原文 / 编辑 三个页签
  *   pdf    → { kind:'pdf', url }                   临时 PDF 交 Chromium 内置阅读器（该帧不带 sandbox）
@@ -161,7 +162,7 @@ class MfProductPane extends HTMLElement {
         select.hidden = list.length < 2;
         if (list.length < 2) return;
         if (this.partIndex >= list.length) this.partIndex = 0;
-        select.innerHTML = list.map((part, index) => `<option value="${index}"${index === this.partIndex ? ' selected' : ''}>${escapeHtml(part.name)}</option>`).join('');
+        select.innerHTML = list.map((part, index) => `<option value="${index}"${index === this.partIndex ? ' selected' : ''}>${escapeHtml(part.label || part.name)}</option>`).join('');
     }
 
     /** 编辑页签：首次进入时建常驻编辑器并载入产物 md 原文；之后切页签只改 hidden */

@@ -9,7 +9,7 @@
  *   cn-drawing-p，故本模块不再输出该元素。figure/@num 为四位补零的图号，缺图号按顺序补号；图号不
  *   连续记「附图：」问题项。ctx.labels 为 false（摘要附图，官方 cn-abst-figure 下的 figure 无
  *   figure-labels）时不写图注属性；附图区域内非图号段的杂散文本无处安放，丢弃并记问题项。
- *   图片资源经 ctx.assets.use(名, { kind: 'drawing' }) 取平铺文件名，img 的 id 前缀取 ctx.imgPrefix。
+ *   图片资源经 ctx.assets.use(名) 取该书的裸文件名（<表格代码>_<序号>.<扩展名>，见 assets.js），img 的 id 前缀取 ctx.imgPrefix。
  * buildImg(ctx, { asset, file, node, prefix, inline })
  *   → <img id file wi he top left img-content img-format orientation inline/>（属性顺序与官方逐字一致）
  *   wi/he 为毫米：优先取解析层写入的源 Word 显示尺寸 data.displayWidthMm / data.displayHeightMm，
@@ -52,7 +52,7 @@ function buildFigures(blocks, ctx) {
                 `附图部分的文字“${preview(entry.text)}”不是图号段，官方 cn-drawings 只容纳 figure，已丢弃`));
             continue;
         }
-        const resolved = ctx.assets.use(assetNameOf(entry.node), { kind: 'drawing' });
+        const resolved = ctx.assets.use(assetNameOf(entry.node));
         if (!resolved) {
             ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_MISSING_ASSET, `图${entry.num} 的图片（${assetNameOf(entry.node) || '无地址'}）没有本地文件，已跳过`));
             continue;

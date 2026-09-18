@@ -5,6 +5,7 @@
  *   工具清单与入参 schema（含转换选项、2020-12 方言、无 $ref、描述与取值范围、中文校验文案）、
  *   工具 annotations 与服务 instructions、list_formats 能力矩阵（含 DTD 校验器、LibreOffice 与受理扩展名）、
  *   convert_document 的成功/选项透传/入参错误/运行期失败、validate 标记、ignoredArguments、
+ *   patent profile 的 outputs 契约（键名不变、值为官方案卷结构 100001/100001.xml 一类的新路径）、
  *   缺失输入不预检、returnContent（contentTruncated、非 bundle 告警、紧凑 JSON）、进度通知、
  *   extract_article 的只读提取（结构、截断语义、零落盘）。
  * 客户端在 listTools() 后会用 outputSchema 校验 structuredContent，因此这些用例同时验证了
@@ -32,6 +33,7 @@ const SERVER = path.join(ROOT, 'mcp', 'server.js');
 const PRELOAD = path.join(ROOT, 'test', 'fixtures', 'allow-private-network.js');
 const SAMPLE_MD = path.join(ROOT, 'test', 'fixtures', 'sample.md');
 const SAMPLE_PDF = path.join(ROOT, 'test', 'fixtures', 'sample.pdf');
+const SAMPLE_PATENT = path.join(ROOT, 'test', 'fixtures', 'patent', 'sample-patent.docx');
 const PKG_VERSION = require('../package.json').version;
 
 let client;
@@ -232,6 +234,37 @@ test('convert_document 以 target=html 转换 Markdown，产出目录含 html �
     assert.equal(item.outputs.html, path.join(outputDir, 'sample', 'sample.html'));
     assert.ok(fs.existsSync(item.outputs.html));
     assert.ok(fs.existsSync(item.outputs.imagesDir));
+});
+
+test('convert_document 的 patent profile：outputs 键名不变，值为官方案卷结构下的新路径，图片与所属 XML 同目录', async () => {
+    // Arrange：关闭栅格化以免依赖 Electron
+    const outputDir = makeOutDir('patent-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: {
+            paths: [SAMPLE_PATENT], target: 'xml', outputDir, xmlProfile: 'patent', math: 'text', validate: true,
+            xml: { rasterizeTables: false, rasterizeFormulas: false },
+        },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const [item] = result.structuredContent.results;
+    const dir = path.join(outputDir, 'sample-patent');
+    assert.deepEqual(item.outputs, {
+        claims: path.join(dir, '100001', '100001.xml'),
+        description: path.join(dir, '100002', '100002.xml'),
+        drawings: path.join(dir, '100003', '100003.xml'),
+        abstract: path.join(dir, '100004', '100004.xml'),
+        abstractFigure: path.join(dir, '100005', '100005.xml'),
+        zip: path.join(dir, 'sample-patent.zip'),
+        precheck: path.join(dir, 'precheck.json'),
+    });
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['100001', '100002', '100003', '100004', '100005', 'precheck.json', 'sample-patent.zip'].sort());
+    assert.ok(fs.existsSync(path.join(dir, '100003', '100003_1.jpg')), '附图应与 100003.xml 同目录');
+    assert.deepEqual(item.warnings.filter((text) => text.startsWith('DTD 校验：')), []);
 });
 
 test('convert_document 透传转换选项：扁平键与嵌套段都进入结果 options', async () => {

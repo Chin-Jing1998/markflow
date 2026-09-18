@@ -40,7 +40,7 @@
  *   | { files: { '<posix 相对路径>': string|Buffer }, assets?, extras?, warnings?, omitDocAssets?, title? }
  *   string/Buffer 视为主产物 {name}.<ext>（ext 取自 targets.js 的规则表，string 按 utf8）；files 的键可用 {name} 占位符；
  *   warnings（string[]）并入 convert 结果的 warnings；omitDocAssets 为 true 时不再合并 doc.assets，落盘的图片
- *   只取渲染器返回的 assets（patent profile 把图片改名后平铺到产物目录根下即依赖此项）；title 为非空字符串时
+ *   只取渲染器返回的 assets（patent profile 把图片改名为 <表格代码>_<序号> 并放进各书目录即依赖此项）；title 为非空字符串时
  *   覆盖结果信封的 title（patent profile 给出发明名称），parseDocument 的标题解析不受影响。
  *   layout 'single' 的目标只允许一个文件，经 output.writeSingle 落盘为 {outputDir}/{name}.<ext>；
  *   layout 'folder' 的经 output.writeFolder 落盘到 {outputDir}/{name}/，outputs 形状见 output.js。
@@ -161,7 +161,7 @@ function assertBooleanParam(value, key) {
 }
 
 // 主产物：folder 布局为 {outputDir}/{name}/{name}.{ext}，single 布局为 {outputDir}/{name}.{ext}；ext 取自规则表，
-// 唯 xml 的 patent profile 不产出 {name}.xml，以五书与图片的同一平铺集合 {name}.zip 为主产物。
+// 唯 xml 的 patent profile 不产出 {name}.xml，以五书与图片打成的 {name}.zip 为主产物。
 // outputsKey 与落盘路径一致：single 布局取目标名（见 writeDocument），folder 布局取扩展名（见 output.js）
 function mainProductOf({ outputDir, target, name, options }) {
     const { layout, ext: ruleExt } = getTargetRule(target);
@@ -341,7 +341,7 @@ async function renderDocument(doc, target, rawOptions, { imageMode } = {}) {
     const docExtras = rendered.omitDocExtras ? [] : finalizeMineruExtras(asArray(doc.extras), doc);
     return {
         files: rendered.files,
-        // 渲染器声明 omitDocAssets（如 patent profile 把图片改名平铺）时，文档资产以其返回的 assets 为准
+        // 渲染器声明 omitDocAssets（如 patent profile 把图片改名后放进各书目录）时，文档资产以其返回的 assets 为准
         assets: [...(rendered.omitDocAssets ? [] : asArray(doc.assets)), ...asArray(rendered.assets)],
         extras: [...docExtras, ...asArray(rendered.extras)],
         warnings: asArray(rendered.warnings),

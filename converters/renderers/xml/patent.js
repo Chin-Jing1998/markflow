@@ -3,11 +3,19 @@
  *
  * analyze(doc, options) → { books, inventionTitle, issues, assignments, annotatedIr }   纯分类，供桌面端预览复用
  * render(doc, options)  → { files, assets, extras: [], warnings, omitDocAssets: true, issues, analysis, title? }
- *   files：五书分文件（FILE_NAMES，parts 为 auto 时只输出识别到的部分）+ {name}.zip（五书 + 图片的同一平铺集合）
- *          + precheck.json（问题项清单与 validation 记录 { requested, engine, files }，不入 zip）；
+ *   产物结构与官方「WORD 转 XML 编辑器」的真实产出一致：每书一个以表格代码命名的目录（BOOK_CODES），目录内为
+ *   <代码>.xml 与该书的图片 <代码>_<序号>.<扩展名>（序号规则见 assets.js）；没有 List.xml，也没有其它文件。
+ *   files：五书分文件（FILE_NAMES，键形如 '100001/100001.xml'；parts 为 auto 时只输出识别到的部分）
+ *          + {name}.zip（条目与落盘的五书、图片相对路径逐一相同：无外层文件夹、无目录条目、正斜杠、DEFLATE）
+ *          + precheck.json（问题项清单与 validation 记录 { requested, engine, files: [{ file, valid, errors, warnings }] }，
+ *          file 即 FILE_NAMES 的相对路径；precheck.json 与 zip 留在 {name}/ 根下，均不入 zip）；
  *   title：发明名称文本，调度器据此覆盖结果信封的 title；
- *   assets：图片一律改为裸文件名平铺在 {name}/ 根下（FILE_REF_STYLE 'bare'，官方案卷包内 XML 与图片同目录、
- *          无任何子目录，见研究报告 §4.4），故 omitDocAssets 为 true，调度器不再合并 doc.assets。
+ *   assets：[{ name: '100003/100003_1.jpg', buffer, mime }]，只含已输出各书的图片；img/@file 写裸文件名
+ *          （FILE_REF_STYLE 'bare'，图片与所属 XML 同目录），故 omitDocAssets 为 true，调度器不再合并 doc.assets。
+ *   outputs 的键（claims / description / drawings / abstract / abstractFigure）由 converters/output.js 按表格代码
+ *   显式映射，须与 BOOK_CODES 一致（test/output.test.js 锁定）。
+ * 字节级形态同样对齐官方：UTF-8 BOM、换行统一为 CRLF（不留裸 LF）、空元素写作 `<img … />`（XML_STYLE）；
+ *   官方产出中不规则的空行与缩进不模仿。
  * 元素与属性约定以官方「WORD 转 XML 编辑器」的真实产出为准：UTF-8 BOM + 文件头三行（DOCTYPE 带空内部
  *   子集 []）+ <cn-application-body lang="zh" country="CN">；heading id="h0001" level="2"；
  *   p id="p0001" num="0001" Italic="0"；临时段 id="l0001" num="XXXX"；claim id="cl001" num="1"；
@@ -18,8 +26,12 @@
  *   inline="yes" 而说明书正文内的图 inline="no"，id 前缀按用途分 if / iaf / idf 三种并各自独立编号；
  *   官方不生成 claim-ref 与 figref，权项引用与正文图号一律保留为纯文本；
  *   容器元素不写 id；不用 technical-field 等语义分节元素，统一 (heading*, p+)+。
- * 表格 / 公式：栅格化后的 image 节点（data.role 'table' | 'formula'）→ <tables>/<maths> 内仅含 img；
- *   仍为 table / math 节点的（栅格化未就绪或已关闭）降级为逐行文本 / 线性化文本并记「栅格化：」问题项。
+ * 表格 / 公式 / 化学式：带角色的 image 节点（data.role 'table' | 'formula' | 'chemistry'，ROLE_WRAPPERS）→
+ *   <tables> / <maths> / <chemistry> 内仅含 img；chemistry 不写 chem 元素（官方转换器从不输出它，官方样式表在
+ *   chem 存在时会隐藏图片）。仍为 table / math 节点的（栅格化未就绪或已关闭）降级为逐行文本 / 线性化文本并记
+ *   「栅格化：」问题项。
+ * 权利要求内的图片（化学结构式、公式图）：只含图片的段输出为 claim-text 内的 img，与说明书正文内图片同一规则
+ *   （id 前缀 idf、inline="no"），不报问题项；说明书与摘要里只含图片的段按段内图片输出，并提示其可能是误放的附图。
  * options.xml.validate 为 true 时逐份调 validateXml，错误以「DTD 校验：」问题项进 warnings 与 precheck.json。
  */
 const JSZip = require('jszip');
@@ -35,11 +47,25 @@ const { validateXml, describeValidation } = require('./validate');
 const { emitRuns, isWholeMark, withoutMark, textRun } = require('./inline');
 const { mathToText } = require('../../ir/schema');
 
-const FILE_NAMES = Object.freeze({
-    claims: 'claims.xml', description: 'description.xml', drawings: 'drawings.xml',
-    abstract: 'abstract.xml', abstractFigure: 'abstract-figure.xml',
+// ---------- 产物布局：官方「WORD 转 XML 编辑器」的真实产出 ----------
+// 表格代码 ↔ 书目：每书一个以表格代码命名的目录，目录内为 <代码>.xml 与该书的图片（命名见 assets.js）
+const BOOK_CODES = Object.freeze({
+    claims: '100001', description: '100002', drawings: '100003', abstract: '100004', abstractFigure: '100005',
 });
+const XML_EXT = '.xml';
+const bookXmlPath = (code) => `${code}/${code}${XML_EXT}`;
+// 五书相对产物目录的 posix 路径，同时是 zip 条目名与 validation 记录的 file
+const FILE_NAMES = Object.freeze(Object.fromEntries(Object.entries(BOOK_CODES).map(([key, code]) => [key, bookXmlPath(code)])));
+// img/@file 只写裸文件名：图片与所属 XML 同目录
 const FILE_REF_STYLE = 'bare';
+// zip 条目规则：条目名即落盘相对路径（正斜杠、无外层文件夹）；官方 zip 只有文件条目，故不自动补目录条目；
+// 每书先 XML 后图片；precheck.json 不入 zip，官方产出没有 List.xml
+const ZIP_ENTRY_OPTIONS = Object.freeze({ createFolders: false });
+const ZIP_OPTIONS = Object.freeze({ type: 'nodebuffer', compression: 'DEFLATE' });
+// 官方 XML 的换行为 CRLF，空元素写作 `<img … />`
+const XML_STYLE = Object.freeze({ newline: '\r\n', emptyTagSpace: true });
+
+// ---------- 元素、属性与 id 约定 ----------
 const ELEMENT_NAMES = Object.freeze({
     root: 'cn-application-body', claims: 'cn-claims', claim: 'claim', claimText: 'claim-text',
     description: 'description', inventionTitle: 'invention-title', heading: 'heading', paragraph: 'p', lineBreak: 'br',
@@ -50,6 +76,12 @@ const ELEMENT_NAMES = Object.freeze({
 const ID_PREFIXES = Object.freeze({
     heading: 'h', figure: 'f', drawingImg: 'if', abstractImg: 'iaf', bodyImg: 'idf',
     tables: 'tabl', maths: 'math', chemistry: 'chem', claim: 'cl',
+});
+// 带角色的图片 → 包裹元素与 id 前缀（内部仅含 img；@num 四位补零）
+const ROLE_WRAPPERS = Object.freeze({
+    table: Object.freeze({ element: ELEMENT_NAMES.tables, prefix: ID_PREFIXES.tables }),
+    formula: Object.freeze({ element: ELEMENT_NAMES.maths, prefix: ID_PREFIXES.maths }),
+    chemistry: Object.freeze({ element: ELEMENT_NAMES.chemistry, prefix: ID_PREFIXES.chemistry }),
 });
 // 官方 DOCTYPE 带空内部子集；BOM 为官方产出的文件头首三字节
 const DOCTYPE = Object.freeze({ name: ELEMENT_NAMES.root, systemId: '/dtdandxsl/cn-application-body-20080416.dtd', internalSubset: '' });
@@ -86,7 +118,8 @@ async function render(doc, options) {
     }
     const validation = options.xml.validate ? await validateAll(selected, issues) : { requested: false, engine: null, files: [] };
 
-    const assets = registry.list();
+    // 只落盘已输出各书的图片：未输出的书不留下只有图片、没有 XML 的目录
+    const assets = registry.list(selected.map(([key]) => BOOK_CODES[key]));
     const files = Object.fromEntries(selected.map(([key, xml]) => [FILE_NAMES[key], xml]));
     files[`${NAME_TOKEN}.zip`] = await buildZip(selected, assets);
     files[PRECHECK_FILE] = JSON.stringify(precheckReport(doc, issues, validation), null, 2);
@@ -101,29 +134,30 @@ async function render(doc, options) {
 // 五书组装
 // ============================================================
 
-// 附图先于其它部分输出，使 drawing-N 的序号与附图顺序一致（各文件的 id 计数器相互独立）
+// 各书的 id 计数器与图片序号计数器相互独立，输出的先后只决定问题项的排列顺序（沿用既有顺序：附图在前）
 function emitBooks(analysis, deps) {
     const { books, inventionTitle } = analysis;
     const out = {};
-    out.drawings = emitDrawings(books.drawings, createFileContext(deps));
-    out.abstractFigure = emitAbstractFigure(books.abstractFigure, createFileContext(deps));
-    out.claims = emitClaims(books.claims, createFileContext(deps));
-    out.description = emitDescription(books.description, createFileContext(deps), inventionTitle);
-    out.abstract = emitAbstract(books.abstract, createFileContext(deps));
+    out.drawings = emitDrawings(books.drawings, createFileContext(deps, 'drawings'));
+    out.abstractFigure = emitAbstractFigure(books.abstractFigure, createFileContext(deps, 'abstractFigure'));
+    out.claims = emitClaims(books.claims, createFileContext(deps, 'claims'));
+    out.description = emitDescription(books.description, createFileContext(deps, 'description'), inventionTitle);
+    out.abstract = emitAbstract(books.abstract, createFileContext(deps, 'abstract'));
     return Object.fromEntries(BOOK_KEYS.map((key) => [key, out[key] ? wrapDocument(out[key], deps.options) : null]));
 }
 
-function createFileContext({ options, registry, issues }) {
+// assets 为该书专属的图片登记视图：文件名 <表格代码>_<序号>.<扩展名>，序号在书内独立计数
+function createFileContext({ options, registry, issues }, key) {
     const ids = createIdFactory();
     return {
-        el, ids, issues, temp: createTempNumbering(ids), assets: registry,
+        el, ids, issues, temp: createTempNumbering(ids), assets: registry.forBook(BOOK_CODES[key]),
         dpi: options.xml.patent.imageDpi, numbering: options.xml.numbering,
     };
 }
 
 function wrapDocument(bookNode, options) {
     const root = el(ELEMENT_NAMES.root, ROOT_ATTRS, [bookNode]);
-    return BOM + serializeDocument({ root, doctype: DOCTYPE, instructions: [STYLESHEET], indent: options.xml.indent });
+    return BOM + serializeDocument({ root, doctype: DOCTYPE, instructions: [STYLESHEET], indent: options.xml.indent, ...XML_STYLE });
 }
 
 function selectParts(emitted, parts, issues) {
@@ -155,14 +189,15 @@ function emitClaims(blocks, ctx) {
     return el(ELEMENT_NAMES.claims, {}, children);
 }
 
-// 官方不生成 claim-ref：「根据权利要求1所述的…」原样留在 claim-text 内
+// 官方不生成 claim-ref：「根据权利要求1所述的…」原样留在 claim-text 内。
+// 只含图片的段（化学结构式、公式图）→ 一个 claim-text，内含各图的 img（DTD 的 claim-text 允许 img / chemistry /
+// maths / tables）；未栅格化的表格 / 块级公式降级为逐行文本
 function emitClaimPart(part, ctx) {
-    if (part.runs) {
-        const kids = emitInline(part.runs, ctx);
-        return kids.length > 0 ? [el(ELEMENT_NAMES.claimText, {}, kids)] : [];
-    }
-    return degradedRuns(part.block, ctx).map((runs) => el(ELEMENT_NAMES.claimText, {}, emitInline(runs, ctx))).filter((node) => node.children.length > 0);
+    const runsList = part.runs ? [part.runs] : claimBlockRuns(part.block, ctx);
+    return runsList.map((runs) => el(ELEMENT_NAMES.claimText, {}, emitInline(runs, ctx))).filter((node) => node.children.length > 0);
 }
+
+const claimBlockRuns = (block, ctx) => (block.kind === 'image' ? [imageRuns(block)] : degradedRuns(block, ctx));
 
 // ---------- 说明书 ----------
 
@@ -174,7 +209,7 @@ function emitDescription(blocks, ctx, inventionTitle) {
             children.push(el(ELEMENT_NAMES.heading, { id: ctx.ids.next(ID_PREFIXES.heading).id, level: HEADING_LEVEL }, [block.headingText || block.text]));
             continue;
         }
-        children.push(...emitBlock(block, ctx, { numbering, stripNumbers: true }));
+        children.push(...emitBlock(block, ctx, { numbering, stripNumbers: true, imageNotice: PART_LABELS.description }));
     }
     return children.some((node) => node.name === ELEMENT_NAMES.paragraph) ? el(ELEMENT_NAMES.description, {}, children) : null;
 }
@@ -184,7 +219,7 @@ function emitDescription(blocks, ctx, inventionTitle) {
 // 摘要内的图片段已由分节模块移入摘要附图；此处只剩文本段（段号独立从 1 计，预览不显示）
 function emitAbstract(blocks, ctx) {
     const numbering = createParagraphNumbering({ width: ctx.numbering.width, issues: ctx.issues });
-    const children = blocks.flatMap((block) => emitBlock(block, ctx, { numbering, stripNumbers: true }));
+    const children = blocks.flatMap((block) => emitBlock(block, ctx, { numbering, stripNumbers: true, imageNotice: PART_LABELS.abstract }));
     return children.length > 0 ? el(ELEMENT_NAMES.abstract, {}, children) : null;
 }
 
@@ -209,20 +244,29 @@ function emitDrawings(blocks, ctx) {
 // 段落与行内
 // ============================================================
 
-// 块 → p 节点数组：表格 / 块级公式（未栅格化）降级为若干文本段；段内图片按 img 输出
+// 块 → p 节点数组：表格 / 块级公式（未栅格化）降级为若干文本段；只含图片的段按段内 img 输出。
+// settings.imageNotice 为所在书目的名称时，对只含图片的段逐图提示（说明书、摘要里它可能是误放的附图）；
+// 缺省不提示（权利要求书里的图片属正常内容）。带角色的图片不会形成 image 块，故化学式、公式、表格图不在提示之列
 function emitBlock(block, ctx, settings) {
     if (block.kind === 'paragraph') {
         const node = emitParagraph(block.runs, ctx, settings);
         return node ? [node] : [];
     }
     if (block.kind === 'image') {
-        block.images.forEach((image) => ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_INLINE_IMAGE,
-            `正文含图片 ${assetNameOf(image) || '（无地址）'}，已作为段内图片输出；附图请置于说明书附图部分`)));
-        const runs = block.images.map((image) => ({ kind: 'image', node: image }));
-        const node = emitParagraph(runs, ctx, { ...settings, stripNumbers: false });
+        if (settings.imageNotice) noticeBodyImages(block, ctx, settings.imageNotice);
+        const node = emitParagraph(imageRuns(block), ctx, { ...settings, stripNumbers: false });
         return node ? [node] : [];
     }
     return degradedRuns(block, ctx).map((runs) => emitParagraph(runs, ctx, settings)).filter(Boolean);
+}
+
+const imageRuns = (block) => block.images.map((image) => ({ kind: 'image', node: image }));
+
+function noticeBodyImages(block, ctx, bookLabel) {
+    for (const image of block.images) {
+        ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_INLINE_IMAGE,
+            `${bookLabel}正文含图片 ${assetNameOf(image) || '（无地址）'}，已作为段内图片输出；如为附图，请移至说明书附图部分`));
+    }
 }
 
 // 未栅格化的表格 / 块级公式 → 文本 runs（每行一段）
@@ -264,25 +308,20 @@ function emitInline(runs, ctx) {
     });
 }
 
-// 栅格化产物按角色包成 tables / maths（仅含 img）；其余图片为段内 img。
-// 说明书正文内的图（含行内公式）官方一律写 inline="no"，id 前缀为 idf。
+// 带角色的图片按 ROLE_WRAPPERS 包成 tables / maths / chemistry（仅含 img，不写 chem）；其余图片为段内 img。
+// 说明书正文与权利要求内的图（含行内公式）官方一律写 inline="no"，id 前缀为 idf。
 function emitImage(node, ctx) {
-    const role = node.data && node.data.role;
-    const resolved = ctx.assets.use(assetNameOf(node), { kind: 'inline' });
+    const resolved = ctx.assets.use(assetNameOf(node));
     if (!resolved) {
         ctx.issues.push(createIssue(ISSUE_CODES.FIGURE_MISSING_ASSET, `图片 ${assetNameOf(node) || '（无地址）'} 没有本地文件，已略过`));
         return null;
     }
     const img = buildImg(ctx, { ...resolved, node, prefix: ID_PREFIXES.bodyImg, inline: false });
-    if (role === 'table') {
-        const seq = ctx.ids.next(ID_PREFIXES.tables);
-        return el(ELEMENT_NAMES.tables, { id: seq.id, num: padNumber(seq.index, NUM_WIDTH) }, [img]);
-    }
-    if (role === 'formula') {
-        const seq = ctx.ids.next(ID_PREFIXES.maths);
-        return el(ELEMENT_NAMES.maths, { id: seq.id, num: padNumber(seq.index, NUM_WIDTH) }, [img]);
-    }
-    return img;
+    const role = node.data && node.data.role;
+    const wrapper = typeof role === 'string' && Object.hasOwn(ROLE_WRAPPERS, role) ? ROLE_WRAPPERS[role] : null;
+    if (!wrapper) return img;
+    const seq = ctx.ids.next(wrapper.prefix);
+    return el(wrapper.element, { id: seq.id, num: padNumber(seq.index, NUM_WIDTH) }, [img]);
 }
 
 function degradeInlineMath(node, ctx) {
@@ -297,13 +336,14 @@ const preview = (text) => (text.length > FORMULA_PREVIEW ? `${text.slice(0, FORM
 // 校验、打包与报告
 // ============================================================
 
-// 逐份校验；返回 precheck.json 的 validation 记录（校验器不可用时 engine 为 null、files 为空）
+// 逐份校验；返回 precheck.json 的 validation 记录（校验器不可用时 engine 为 null、files 为空）。
+// 记录里的 file 为相对路径（100001/100001.xml）；问题项文案另冠书目名，免得只见表格代码不知是哪一书
 async function validateAll(selected, issues) {
     const files = [];
     for (const [key, xml] of selected) {
         const file = FILE_NAMES[key];
         const result = await validateXml(xml);
-        issues.push(...describeValidation(file, result, { requireDtd: true }));
+        issues.push(...describeValidation(`${PART_LABELS[key]} ${file}`, result, { requireDtd: true }));
         if (!result.available) return { requested: true, engine: null, files: [] };
         files.push({
             file, valid: result.valid,
@@ -314,11 +354,15 @@ async function validateAll(selected, issues) {
     return { requested: true, engine: VALIDATION_ENGINE, files };
 }
 
+// 条目与落盘的相对路径逐一相同；每书先 XML 后图片（条目规则见 ZIP_ENTRY_OPTIONS）
 async function buildZip(selected, assets) {
     const zip = new JSZip();
-    for (const [key, xml] of selected) zip.file(FILE_NAMES[key], xml);
-    for (const asset of assets) zip.file(asset.name, asset.buffer);
-    return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    for (const [key, xml] of selected) {
+        zip.file(FILE_NAMES[key], xml, ZIP_ENTRY_OPTIONS);
+        const dirPrefix = `${BOOK_CODES[key]}/`;
+        for (const asset of assets.filter((item) => item.name.startsWith(dirPrefix))) zip.file(asset.name, asset.buffer, ZIP_ENTRY_OPTIONS);
+    }
+    return zip.generateAsync(ZIP_OPTIONS);
 }
 
 function precheckReport(doc, issues, validation) {
@@ -343,5 +387,5 @@ function annotate(ir, assignments) {
 }
 
 module.exports = {
-    render, analyze, FILE_NAMES, FILE_REF_STYLE, ELEMENT_NAMES, ID_PREFIXES, DOCTYPE, STYLESHEET, ROOT_ATTRS, PRECHECK_FILE,
+    render, analyze, BOOK_CODES, FILE_NAMES, FILE_REF_STYLE, ELEMENT_NAMES, ID_PREFIXES, DOCTYPE, STYLESHEET, ROOT_ATTRS, PRECHECK_FILE,
 };

@@ -7,7 +7,8 @@
  *       参数解析（中文报错、--no-<开关>、布尔开关误带取值、--concurrency 非法值告警）、
  *       extract 子命令（本机 HTTP 服务、stdout 为正文、零落盘）、
  *       config 子命令（set/get/unset 与文件权限）、参数错误（1）、失败项（2）、
- *       输出目录解析（--out / MARKFLOW_OUTPUT_DIR）、人类模式与 --json 模式的输出分流。
+ *       输出目录解析（--out / MARKFLOW_OUTPUT_DIR）、人类模式与 --json 模式的输出分流、
+ *       patent profile 的 --json 契约（outputs 键不变、值为官方案卷结构下的新路径）与 --clean 对旧版平铺产物的清理。
  * 临时产物与隔离的配置目录一律写入 os.tmpdir()。extract 的成功路径以 --require 预加载
  * allow-private-network.js，为子进程内的 SSRF 守卫放行 127.0.0.1（守卫本体不变）。
  */
@@ -25,6 +26,7 @@ const CLI = path.join(ROOT, 'bin', 'markflow.js');
 const PRELOAD = path.join(ROOT, 'test', 'fixtures', 'allow-private-network.js');
 const SAMPLE_MD = path.join(ROOT, 'test', 'fixtures', 'sample.md');
 const SAMPLE_PDF = path.join(ROOT, 'test', 'fixtures', 'sample.pdf');
+const SAMPLE_PATENT = path.join(ROOT, 'test', 'fixtures', 'patent', 'sample-patent.docx');
 const PKG_VERSION = require('../package.json').version;
 // parseArgs 的英文原文：CLI 已按错误码中文化，任何一句都不应再出现在 stderr 中
 const ENGLISH_PARSE_ERROR_RE = /Unknown option|argument missing|does not take an argument|ambiguous|Unexpected argument/;
@@ -1076,6 +1078,44 @@ test('--clean：重转前清理旧产物，用户放入的其它文件保留', a
     assert.equal(fs.existsSync(stale), false, '旧的 MarkFlow 产物应被清理');
     assert.equal(fs.readFileSync(mine, 'utf8'), '保留我', '用户放入的文件应保留');
     assert.ok(fs.existsSync(path.join(dir, 'sample.html')), '本次产物应照常写出');
+});
+
+test('patent profile：--json 的 outputs 键不变、值为官方案卷结构的新路径；--clean 清掉旧版平铺产物与上一轮多余的图片', async () => {
+    // Arrange：关闭栅格化以免依赖 Electron；预置旧版平铺产物、书目目录内上一轮多出的图片与一份用户文件
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'patent-'));
+    const dir = path.join(outDir, 'sample-patent');
+    fs.mkdirSync(path.join(dir, '100003'), { recursive: true });
+    const stale = ['claims.xml', 'abstract-figure.xml', 'drawing-1.jpg', 'omath-3-1.jpg', path.join('100003', '100003_99.jpg')];
+    for (const rel of stale) fs.writeFileSync(path.join(dir, rel), '旧产物');
+    fs.writeFileSync(path.join(dir, '100003', '批注.txt'), '保留我');
+    const args = ['convert', SAMPLE_PATENT, '--to', 'xml', '--xml-profile', 'patent', '--math', 'text',
+        '--no-rasterize-tables', '--no-rasterize-formulas', '--validate', '--clean', '--out', outDir, '--json'];
+
+    // Act
+    const { code, stdout, stderr } = await runCli(args);
+
+    // Assert：键名是对外契约
+    assert.equal(code, 0, stderr);
+    const envelope = parseSingleLineJson(stdout);
+    assert.deepEqual([envelope.ok, envelope.errors.length, envelope.results.length], [true, 0, 1]);
+    const result = envelope.results[0];
+    assert.deepEqual(result.outputs, {
+        claims: path.join(dir, '100001', '100001.xml'),
+        description: path.join(dir, '100002', '100002.xml'),
+        drawings: path.join(dir, '100003', '100003.xml'),
+        abstract: path.join(dir, '100004', '100004.xml'),
+        abstractFigure: path.join(dir, '100005', '100005.xml'),
+        zip: path.join(dir, 'sample-patent.zip'),
+        precheck: path.join(dir, 'precheck.json'),
+    });
+    for (const file of Object.values(result.outputs)) assert.ok(fs.statSync(file).isFile(), file);
+    assert.deepEqual(result.warnings.filter((item) => item.startsWith('DTD 校验：')), []);
+    // Assert：产物根下只有五个书目目录、zip 与预检；图片与所属 XML 同目录
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['100001', '100002', '100003', '100004', '100005', 'precheck.json', 'sample-patent.zip'].sort());
+    const drawings = fs.readdirSync(path.join(dir, '100003'));
+    assert.ok(drawings.includes('100003.xml') && drawings.includes('100003_1.jpg'), drawings.join('、'));
+    assert.equal(drawings.includes('100003_99.jpg'), false, '上一轮多出的图片应被清理');
+    assert.equal(fs.readFileSync(path.join(dir, '100003', '批注.txt'), 'utf8'), '保留我', '书目目录内的用户文件应保留');
 });
 
 test('SIGINT 中止批次：进行中的任务跑完，未开始的记为已取消，退出码 2', async (t) => {

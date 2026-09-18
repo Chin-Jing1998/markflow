@@ -5,7 +5,8 @@
  *
  * 覆盖：open 只解析一次并同时给出来源栏与产物栏；render 复用缓存只重渲染；
  *       命中 REPARSE_KEYS 的选项变更被标出并触发重新解析（连同来源栏重建）；
- *       xml 产物的五书分文件、precheck 与结构化视图；export 落盘后写入文件库记录；
+ *       xml 产物的五书分文件、precheck 与结构化视图（官方案卷结构下按书目目录取图、按内容选主视图）；
+ *       真实转换内核下专利预览的图片地址逐一可经 mf-asset 协议解析；export 落盘后写入文件库记录；
  *       close 撤销 mf-asset 授权并删除会话临时目录；
  *       网页来源 open/render 走通且全程不经路径展开；
  *       MinerU 令牌注入 buildOptions 却不出现在任何回包与会话选项里。
@@ -16,7 +17,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { createPreviewSessions, changedReparseKeys, REPARSE_KEYS } = require('../desktop/main/preview-session');
-const { createAssetGrants } = require('../desktop/main/asset-protocol');
+const { createAssetGrants, resolveAssetRequest } = require('../desktop/main/asset-protocol');
 const service = require('../converters/service');
 const { redactOptions } = require('../converters/options');
 
@@ -40,14 +41,19 @@ const PRECHECK = {
     blocking: [], warnings: ['段号：段号跳变'],
     items: [{ code: 'NUMBERING_JUMP', level: 'warning', category: 'numbering', message: '段号：段号跳变' }],
 };
+// 与 patent 渲染器的真实产出同形：UTF-8 BOM、CRLF、空元素 " />"，五书按表格代码分目录、图片与所属 XML 同目录
 const PATENT_DESCRIPTION = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
+    '\ufeff<?xml version="1.0" encoding="UTF-8"?>',
     '<cn-application-body lang="zh" country="CN"><description>',
     '<invention-title>一种测试装置</invention-title>',
-    '<p id="p0001" num="0001" Italic="0">正文<tables num="1"><img id="i1" he="20" wi="60" file="table-1.jpg" inline="no"/></tables></p>',
+    '<p id="p0001" num="0001" Italic="0">正文<tables id="tabl0001" num="0001"><img id="idf0001" file="100002_1.jpg" wi="60" he="20" inline="no" /></tables></p>',
     '</description></cn-application-body>',
-].join('');
+    '',
+].join('\r\n');
 const PATENT_CLAIMS = '<cn-application-body><cn-claims><claim id="cl001" num="1"><claim-text>一种测试装置。</claim-text></claim></cn-claims></cn-application-body>';
+const PATENT_DESCRIPTION_FILE = '100002/100002.xml';
+const PATENT_CLAIMS_FILE = '100001/100001.xml';
+const PATENT_TABLE_IMAGE = '100002/100002_1.jpg';
 
 // ============================================================
 // 桩
@@ -82,12 +88,12 @@ function makeCore() {
             if (target === 'xml') {
                 return {
                     files: {
-                        'description.xml': PATENT_DESCRIPTION,
-                        'claims.xml': PATENT_CLAIMS,
+                        [PATENT_CLAIMS_FILE]: PATENT_CLAIMS,
+                        [PATENT_DESCRIPTION_FILE]: PATENT_DESCRIPTION,
                         '{name}.zip': Buffer.from('zip'),
                         'precheck.json': JSON.stringify(PRECHECK),
                     },
-                    assets: [{ name: 'table-1.jpg', buffer: Buffer.from('table') }],
+                    assets: [{ name: PATENT_TABLE_IMAGE, buffer: Buffer.from('table') }],
                     extras: [], warnings: ['段号：段号跳变'], title: '一种测试装置', layout: 'folder',
                 };
             }
@@ -259,16 +265,59 @@ test('render 可切换目标：xml 产物给出五书分文件、结构化视图
 
     assert.equal(rendered.target, 'xml');
     assert.equal(rendered.product.view.kind, 'xml');
-    assert.deepEqual(rendered.product.view.parts.map((part) => part.name), ['description.xml', 'claims.xml']);
-    assert.equal(rendered.product.view.parts[0].profile, 'patent');
-    assert.ok(rendered.product.view.structuredHtml.includes('<span class="pnum">[0001]</span>'), '段号未进结构视图');
-    assert.deepEqual(rendered.product.view.precheck, PRECHECK);
-    assert.deepEqual(rendered.product.files.sort(), ['claims.xml', 'description.xml', 'precheck.json', '样例文档.zip'].sort());
+    const { view } = rendered.product;
+    assert.deepEqual(view.parts.map((part) => part.name), [PATENT_CLAIMS_FILE, PATENT_DESCRIPTION_FILE]);
+    assert.deepEqual(view.parts.map((part) => part.label), ['权利要求书（100001/100001.xml）', '说明书（100002/100002.xml）'], '表格代码文件名须配书目名才可读');
+    assert.deepEqual(view.parts.map((part) => part.book), ['cn-claims', 'description']);
+    assert.equal(view.parts[0].profile, 'patent');
+    assert.equal(view.primary, 1, '主视图按内容认定为说明书，与文件名和排列顺序无关');
+    assert.equal(view.structuredHtml, view.parts[1].structuredHtml);
+    assert.ok(view.structuredHtml.includes('<span class="pnum">[0001]</span>'), '段号未进结构视图');
+    assert.deepEqual(view.precheck, PRECHECK);
+    assert.deepEqual(rendered.product.files.sort(), [PATENT_CLAIMS_FILE, PATENT_DESCRIPTION_FILE, 'precheck.json', '样例文档.zip'].sort());
 
+    // 图片与所属 XML 同目录：img/@file 为裸文件名，取图基址须落在该书的表格代码目录内
     const session = h.preview.sessions.get(opened.sessionId);
-    assert.ok(rendered.product.view.structuredHtml.includes(`mf-asset://${session.sid}/product/table-1.jpg`), '表格图未走 mf-asset');
-    assert.ok(fs.existsSync(path.join(session.tempDir, 'product', 'table-1.jpg')), '裸文件名资产应平铺在产物目录根下');
+    assert.ok(view.structuredHtml.includes(`src="mf-asset://${session.sid}/product/${PATENT_TABLE_IMAGE}"`), `表格图未按书目目录寻址：${view.structuredHtml}`);
+    assert.ok(!view.structuredHtml.includes('class="img-missing"'), '结构视图不应有取不到的图片');
+    assert.ok(fs.existsSync(path.join(session.tempDir, 'product', '100002', '100002_1.jpg')), '资产应落在产物目录的书目子目录内');
     assert.ok(!fs.existsSync(path.join(session.tempDir, 'product', 'images')), '切换目标时产物目录须先清空');
+});
+
+test('真实转换内核下的专利预览：各书结构视图里的图片地址都落在该书的表格代码目录内，经 mf-asset 协议逐一可解析', async () => {
+    // Arrange：不注入内核桩（core 省略即懒加载真实的 converters）；关闭栅格化以免依赖 Electron
+    const grants = createAssetGrants();
+    const settings = { get: () => ({ defaults: {}, outputDir: path.join(root, 'real-out') }), getMineruToken: () => null };
+    const preview = createPreviewSessions({ grants, settings, library: null, mammoth: mammothStub, log: () => undefined });
+    harnesses.push({ preview });
+    const samplePatent = path.join(__dirname, 'fixtures', 'patent', 'sample-patent.docx');
+
+    // Act
+    const opened = await preview.open({
+        path: samplePatent, type: 'docx', target: 'xml',
+        options: { xmlProfile: 'patent', math: 'text', rasterizeTables: false, rasterizeFormulas: false },
+    });
+
+    // Assert：五书齐备、主视图为说明书
+    const { view } = opened.product;
+    assert.deepEqual(view.parts.map((part) => part.name), ['100001/100001.xml', '100002/100002.xml', '100003/100003.xml', '100004/100004.xml', '100005/100005.xml']);
+    assert.deepEqual(view.parts.map((part) => part.book), ['cn-claims', 'description', 'cn-drawings', 'cn-abstract', 'cn-abst-figure']);
+    assert.equal(view.parts[view.primary].book, 'description');
+    // Assert：每份结构视图里的图片地址都在该书目录下，且授权表能把它解析到会话临时目录内的真实文件
+    const session = preview.sessions.get(opened.sessionId);
+    let images = 0;
+    for (const part of view.parts) {
+        const code = part.name.split('/')[0];
+        assert.ok(!part.structuredHtml.includes('class="img-missing"'), `${part.name} 有取不到的图片`);
+        for (const [, url] of part.structuredHtml.matchAll(/<img class="[^"]*" src="([^"]+)"/g)) {
+            images += 1;
+            assert.ok(url.startsWith(`mf-asset://${session.sid}/product/${code}/${code}_`), `${part.name} 的图片地址不在书目目录内：${url}`);
+            const resolved = await resolveAssetRequest({ grants: grants.grants, url });
+            assert.equal(resolved.status, 200, `${url} → ${JSON.stringify(resolved)}`);
+            assert.equal(fs.realpathSync(path.dirname(resolved.filePath)), fs.realpathSync(path.join(session.tempDir, 'product', code)));
+        }
+    }
+    assert.ok(images >= 2, `夹具稿的附图与摘要附图都应出现在结构视图里，实际 ${images} 处`);
 });
 
 test('bundle 产物给出 md 渲染与原文，pdf 产物落临时文件经 mf-asset 展示', async () => {
