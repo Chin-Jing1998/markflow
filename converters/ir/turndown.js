@@ -3,22 +3,26 @@
  *
  * profile 取值与行为来源：
  *   'basic' — 通用 HTML：基础选项 + 移除 script/style/noscript（源自 ir/util.js:78）
- *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img + 保留 <u>/<sup>/<sub> + 转义「~」
+ *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img + 保留 <u>/<sup>/<sub>
  *             （<u> 由 mammoth 经 styleMap 'u => u' 产出，<sup>/<sub> 由 w:vertAlign 默认产出；
  *             三者均由 ir/inline-html 提升为 underline / superscript / subscript 节点）
- *   'url'   — 网页正文：基础选项 + 内联样式识别 + figure/figcaption + section 块级
+ *   'url'   — 网页正文：基础选项 + 内联样式识别 + figure/figcaption + section 块级 + 保留 <sup>/<sub>
  *             + 移除 script/style/noscript/iframe/nav/footer/aside（源自 旧版 url.js:239）
  *             + 表格转 GFM（turndown 核心不含表格支持，缺失时网页表格退化为逐行纯文本，IR 得不到 table 节点）
  *
- * word profile 的输出约定（与 ir/inline-html 配套）：
- *   - 文本中的「~」一律转义为 \~：Word 正文里的「~」多为区间号（化学专利的「C1~C30的烷基」），
- *     而 remark-gfm 默认 singleTilde，成对的单个「~」会被解析成 delete 节点、波浪号连同区间含义一起丢失。
- *     只在本 profile 转义，Markdown 输入的 ~删除线~ 语义不受影响
+ * 各 profile 共同的输出约定：
+ *   - 文本中的「~」一律转义为 \~：HTML 文本里的「~」恒为字面量，多为区间号（化学专利的「C1~C30的烷基」、
+ *     网页的「疗程3~5天」），而 remark-gfm 默认 singleTilde，成对的单个「~」会被解析成 delete 节点、
+ *     波浪号连同区间含义一起丢失。转义只发生在 HTML → Markdown 这一侧，Markdown 输入的 ~删除线~ 语义不受影响。
+ *     例外：不经 service.escape 的文本通道不在此列——表格单元格（cellText 取 textContent）与图片 alt，
+ *     其中成对的「~」仍会被解析成删除线
  *
  * url profile 的输出约定（与 ir/markers、ir/inline-html 配套）：
  *   - 粗体、斜体、删除线一律输出 <strong>/<em>/<del> HTML 而非 ** / * / ~~：CommonMark 的 flanking 规则在中文
  *     标点旁失效（如「依据**《词典》**的」），字面星号会被 md 渲染器转义成 \*\*；HTML 标签由 ir/inline-html
  *     在 remark 解析后还原为 strong/emphasis/delete 节点，与标点无关
+ *   - <sup>/<sub> 原样输出：Markdown 没有对应语法，网页的化学式（「C<sub>1</sub>的烷基」）与脚注标号
+ *     （「<sup>[1]</sup>」）不加标签就会塌成同级文本，由 ir/inline-html 提升为 superscript / subscript 节点
  *   - <section> 按块级输出（\n\n…\n\n）：微信正文全由 section 构成，透传会使整篇塌成一段
  *   - <br> 输出 BR 标记，由 parsers/url 的 collapseBreakMarkers 折叠：双 BR 分段、单 BR 转硬换行
  *   - 图注（figcaption、微信小字图注）输出 CAPTION 标记开头的独立段落，由 ir/markers 还原为 data.role
@@ -66,6 +70,7 @@ function createTurndownService(profile = 'basic') {
     }
     const service = new TurndownService(BASE_OPTIONS);
     configure(service);
+    escapeTildesIn(service);
     return service;
 }
 
@@ -161,6 +166,10 @@ function configureWord(service) {
             return content ? `<${tag}>${content}</${tag}>` : '';
         },
     });
+}
+
+/** 在实例的转义链末端补上「~」的转义（各 profile 共用，故挂在工厂层而非某个 configure 内） */
+function escapeTildesIn(service) {
     const escapeMarkdown = service.escape.bind(service);
     service.escape = (text) => escapeTildes(escapeMarkdown(text));
 }
@@ -173,8 +182,11 @@ function escapeTildes(text) {
     return text.replace(TILDE_RE, (matched, slashes) => (slashes.length % 2 === 1 ? matched : `${slashes}\\~`));
 }
 
-// [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整
+// [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整。
+// 上下标排在表首、优先级最低：带 line-through 等样式的 <sup>/<sub> 仍归后面的样式规则接管
 const URL_WRAP_RULES = [
+    ['supTag', ['sup'], '<sup>', '</sup>'],
+    ['subTag', ['sub'], '<sub>', '</sub>'],
     ['inlineBold', (node) => ['SPAN', 'P', 'SECTION'].includes(node.nodeName) && BOLD_STYLE_RE.test(styleOf(node)), '<strong>', '</strong>'],
     ['inlineItalic', (node) => node.nodeName === 'SPAN' && ITALIC_STYLE_RE.test(styleOf(node)), '<em>', '</em>'],
     ['inlineStrikethrough', (node) => STRIKE_STYLE_RE.test(styleOf(node)), '<del>', '</del>'],

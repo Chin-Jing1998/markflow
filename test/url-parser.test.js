@@ -110,6 +110,18 @@ const DATA_URL_PAGE = `<!doctype html>
 </article>
 </body></html>`;
 
+// 区间号与上下标：成对的单「~」曾被 remark-gfm 吞成删除线，<sup>/<sub> 曾被 turndown 剥成纯文本
+const RANGE_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><title>区间写法</title></head><body>
+<article>
+<h1>区间写法</h1>
+<p>C1~C30的烷基、C1~C30的烷氧基</p>
+<p>疗程3~5天，有效率10~20%</p>
+<p>R<sup>2</sup>、C<sub>1</sub>的烷基</p>
+<p>原价<del>3~5元</del>，现价<s>作废</s>两元</p>
+</article>
+</body></html>`;
+
 // ------------------------------------------------------------
 // 提取质量对比夹具
 // ------------------------------------------------------------
@@ -180,6 +192,10 @@ function startServer() {
             case '/data-url':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(DATA_URL_PAGE);
+                return;
+            case '/range':
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(RANGE_PAGE);
                 return;
             case '/sidebar':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -609,4 +625,34 @@ test('微信夹具转 Markdown：无 \\* 与字符引用，<img width> 独占一
     assert.ok(lines.includes(`${IDEO}${IDEO}首行缩进两字的段落，来自 text-indent。`), markdown);
     assert.ok(lines.includes(`${IDEO}${IDEO}四个不换行空格起首的段落。`), markdown);
     assert.ok(lines.includes('单个换行之前\\'), markdown);
+});
+
+test('区间号页面：「~」逐字进入 IR，delete 只来自 <del>/<s>，<sup>/<sub> 成节点，Markdown 不把区间号变成删除线', async (t) => {
+    // Arrange
+    const server = await startServer();
+    t.after(() => server.close());
+
+    // Act
+    const doc = await parse({ url: `${server.base}/range` }, { allowPrivateNetwork: true });
+    const paragraphs = doc.ir.children.filter((n) => n.type === 'paragraph');
+    const markdown = await mdRenderer.render(doc);
+
+    // Assert：四段正文逐字保留，波浪号不被吞
+    assert.deepEqual(paragraphs.map(plainText), [
+        'C1~C30的烷基、C1~C30的烷氧基',
+        '疗程3~5天，有效率10~20%',
+        'R2、C1的烷基',
+        '原价3~5元，现价作废两元',
+    ]);
+
+    // Assert：delete 节点只来自真正的删除线标签
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete').map(plainText), ['3~5元', '作废']);
+
+    // Assert：上下标进入 IR
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'superscript').map(plainText), ['2']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'subscript').map(plainText), ['1']);
+
+    // Assert：md 产物中区间号不再是删除线，上下标以 HTML 标签落地
+    assert.ok(!markdown.includes('~~C30'), markdown);
+    assert.ok(markdown.includes('<sup>2</sup>') && markdown.includes('<sub>1</sub>'), markdown);
 });
