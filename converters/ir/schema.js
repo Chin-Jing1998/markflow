@@ -48,7 +48,11 @@
  *                          md / html / docx / xml 渲染器不读它，表格照旧按 tableRow / tableCell 输出。
  *                          非 docx 来源的表格没有该键，出图走原先的 GFM 路径（首行为表头）
  *   <顶层节点>.data.section = { index, header }   docx 的 Word 分节序号（1 起）与该节生效页眉的纯文本；仅当文档
- *                          至少两节且至少一节页眉有文字时写入（parsers/docx-sections），patent profile 据此按页眉识别五书
+ *                          至少两节且至少一节页眉有文字时写入（parsers/docx-sections），patent profile 据此按页眉识别五书。
+ *                          专利五书 XML 反向导入（parsers/xml）同样写该键：index 为书目序号，header 为书目名，
+ *                          docx 渲染器据此产出真实的 Word 分节与页眉，xml 目标据此直接归书
+ *   heading.data.role     = 'section-title'   反向导入时每本书开头的书目标题节点（parsers/xml/patent）。html 等目标靠它
+ *                          分隔五书；docx 渲染器在文档确有两节及以上时略去它（书目名已由页眉承载），只有一节时保留
  *
  * 顶层包装结构（MarkFlowDocument）：
  * {
