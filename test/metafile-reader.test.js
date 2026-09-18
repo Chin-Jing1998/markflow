@@ -188,7 +188,9 @@ test('inspectMetafile：Dual 文件报出 present、dual 与 logicalDpi', () => 
     assert.deepEqual(info.plus, { present: true, dual: true, logicalDpi: [144, 144] });
 });
 
-test('本批 auto 遇到 EMF+ 时按经典记录回放，并在诊断里注明', () => {
+// W1 原用例断言的是「auto 暂按经典记录回放」这一过渡行为；W2 实现 EMF+ 回放后，
+// 同一夹具的正确行为是 auto 抑制经典绘图、classic 照常回放，断言据此改写并加严。
+test('auto 按 [MS-EMFPLUS] 1.3.1 以 EMF+ 记录为准，classic 流仍只回放经典记录', () => {
     const buffer = B.buildEmf([
         B.emfPlusComment([B.plusHeader({ dual: false, logicalDpi: [96, 96] })]),
         B.polyline16([[0, 0], [10, 10]]),
@@ -196,11 +198,15 @@ test('本批 auto 遇到 EMF+ 时按经典记录回放，并在诊断里注明',
     const auto = metafileToSvg(buffer);
     assert.deepEqual(auto.plus, { present: true, dual: false });
     assert.equal(auto.diagnostics.plusRecords, 1);
-    assert.ok(auto.diagnostics.notes.some((note) => note.includes('EMF+ 回放尚未实现')));
-    assert.match(auto.svg, /<polyline /);
+    assert.equal(auto.diagnostics.classicSuppressed, 1);
+    assert.equal(auto.diagnostics.classicDrawn, 0);
+    assert.ok(auto.diagnostics.notes.some((note) => note.includes('以 EMF+ 记录为准回放')));
+    assert.doesNotMatch(auto.svg, /<polyline /);
 
     const classic = metafileToSvg(buffer, { stream: 'classic' });
-    assert.equal(classic.svg, auto.svg, 'W1 的 auto 与 classic 输出应当一致');
+    assert.match(classic.svg, /<polyline /);
+    assert.notEqual(classic.svg, auto.svg);
+    assert.equal(classic.diagnostics.plusRecords, 1);
     assert.ok(classic.diagnostics.notes.some((note) => note.includes('只回放经典 EMR 记录')));
 });
 

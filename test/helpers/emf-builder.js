@@ -291,7 +291,178 @@ function emfPlusComment(plusRecords) {
     return record(70, Buffer.concat([uint32(body.length + 4), uint32(EMF_PLUS_SIGNATURE), body]));
 }
 
+// ---------------- EMF+ 对象（W2 追加） ----------------
+
+/** GDI+ 1.1 的对象版本号；各对象数据段的首个字段 */
+const PLUS_VERSION = 0xDBC01002;
+/** EmfPlusObject 的 Flags 布局：id 在低 8 位，对象类型在第 8–14 位，C 位表示续接 */
+const objectFlags = (objectType, id, continued) => ((id & 0xFF) | ((objectType & 0x7F) << 8) | (continued ? 0x8000 : 0));
+/** 绘图记录的点编码位：C 为 16 位整数点，P 为 7／15 位相对点 */
+const pointFlags = ({ compressed = false, relative = false } = {}) => ((compressed ? 0x4000 : 0) | (relative ? 0x0800 : 0));
+/** S 位：画刷字段按 ARGB 内联而非对象 id */
+const brushFlag = (options) => (options.inlineBrush === false ? 0 : 0x8000);
+
+/** 7 位相对整数；超出 [-64, 64) 时改用 15 位形式 */
+function relativeInt(value) {
+    if (value >= -64 && value < 64) return Buffer.from([value & 0x7F]);
+    const raw = value & 0x7FFF;
+    return Buffer.from([0x80 | ((raw >> 8) & 0x7F), raw & 0xFF]);
+}
+/** 点数组：浮点、16 位整数、相对三种编码 */
+function plusPoints(points, options = {}) {
+    if (options.relative) {
+        const parts = [];
+        let prior = [0, 0];
+        for (const point of points) {
+            parts.push(relativeInt(Math.trunc(point[0] - prior[0])), relativeInt(Math.trunc(point[1] - prior[1])));
+            prior = point;
+        }
+        return Buffer.concat(parts);
+    }
+    return options.compressed ? int16(...points.flat()) : float32(...points.flat());
+}
+/** 矩形数组：[x, y, w, h] 逐个 */
+const plusRects = (rects, compressed) => (compressed
+    ? int16(...rects.flat())
+    : float32(...rects.flat()));
+
+/** 一条 EmfPlusObject 记录；continued 为真时数据段前置 4 字节 TotalObjectSize */
+function plusObject(objectType, id, data, { continued = false, totalSize = null } = {}) {
+    const payload = continued
+        ? Buffer.concat([uint32(totalSize === null ? data.length : totalSize), data])
+        : data;
+    return plusRecord(0x4008, objectFlags(objectType, id, continued), payload);
+}
+/** 把一个对象载荷切成若干条带 C 位的续接记录（末条凑齐 TotalObjectSize） */
+function plusObjectChunks(objectType, id, data, chunkSize, { totalSize = null } = {}) {
+    const out = [];
+    for (let at = 0; at < data.length; at += chunkSize) {
+        out.push(plusObject(objectType, id, data.subarray(at, Math.min(at + chunkSize, data.length)), {
+            continued: true,
+            totalSize: totalSize === null ? data.length : totalSize,
+        }));
+    }
+    return out;
+}
+
+/** EmfPlusBrush：实心色 */
+const plusBrushData = (argb = 0xFF000000) => Buffer.concat([uint32(PLUS_VERSION), uint32(0), uint32(argb)]);
+/** EmfPlusPen：可选字段由调用方按 dataFlags 自行拼在 optional 里，末尾内嵌画刷 */
+const plusPenData = ({ argb = 0xFF000000, width = 1, unit = 0, dataFlags = 0, optional = Buffer.alloc(0) } = {}) => Buffer.concat([
+    uint32(PLUS_VERSION), uint32(0), uint32(dataFlags), uint32(unit), float32(width), optional, plusBrushData(argb),
+]);
+/** EmfPlusPath：点数组 + 类型数组（0 起点、1 直线、3 贝塞尔，0x80 为闭合位） */
+const plusPathData = (points, types, options = {}) => Buffer.concat([
+    uint32(PLUS_VERSION), uint32(points.length), uint32(pointFlags(options)),
+    plusPoints(points, options), Buffer.from(types),
+]);
+/** EmfPlusRegion：四种节点 */
+const plusRegionRectData = (box) => Buffer.concat([uint32(PLUS_VERSION), uint32(0), uint32(0x10000000), float32(...box)]);
+const plusRegionPathData = (pathData) => Buffer.concat([uint32(PLUS_VERSION), uint32(0), uint32(0x10000001), uint32(pathData.length), pathData]);
+const plusRegionEmptyData = () => Buffer.concat([uint32(PLUS_VERSION), uint32(0), uint32(0x10000002)]);
+const plusRegionInfiniteData = () => Buffer.concat([uint32(PLUS_VERSION), uint32(0), uint32(0x10000003)]);
+/** EmfPlusImage：内嵌图元（MetafileDataType 4 即 EmfPlusOnly） */
+const plusImageMetafileData = (metafile, { metafileType = 4 } = {}) => Buffer.concat([
+    uint32(PLUS_VERSION), uint32(2), uint32(metafileType), uint32(metafile.length), metafile,
+]);
+/** EmfPlusImage：位图（本批不绘制，只用于断言诊断项） */
+const plusImageBitmapData = () => Buffer.concat([uint32(PLUS_VERSION), uint32(1), uint32(0)]);
+/** EmfPlusFont：EmSize 以 SizeUnit 计，样式位 1 粗体、2 斜体 */
+const plusFontData = ({ em = 100, unit = 2, style = 0, face = 'Arial' } = {}) => Buffer.concat([
+    uint32(PLUS_VERSION), float32(em), uint32(unit), uint32(style), uint32(0),
+    uint32(String(face).length), Buffer.from(String(face), 'utf16le'),
+]);
+/** EmfPlusStringFormat：对齐与左右留白（LeadingMargin 在偏移 36） */
+function plusStringFormatData({ align = 0, lineAlign = 0, leadingMargin = 0, trailingMargin = 0, tracking = 1, formatFlags = 0 } = {}) {
+    const out = Buffer.alloc(60);
+    out.writeUInt32LE(PLUS_VERSION, 0);
+    out.writeUInt32LE(formatFlags, 4);
+    out.writeUInt32LE(align, 12);
+    out.writeUInt32LE(lineAlign, 16);
+    out.writeFloatLE(leadingMargin, 36);
+    out.writeFloatLE(trailingMargin, 40);
+    out.writeFloatLE(tracking, 44);
+    return out;
+}
+/** 内嵌图元对象：一条或（给定 chunkSize 时）多条续接记录 */
+function nestedMetafile(inner, { id = 1, chunkSize = 0, metafileType = 4, totalSize = null } = {}) {
+    const data = plusImageMetafileData(inner, { metafileType });
+    if (!chunkSize) return [plusObject(5, id, data)];
+    return plusObjectChunks(5, id, data, chunkSize, { totalSize });
+}
+
+// ---------------- EMF+ 记录（W2 追加） ----------------
+
+const plusEndOfFile = () => plusRecord(0x4002, 0);
+const plusComment = (payload) => plusRecord(0x4003, 0, Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload), 'latin1'));
+const plusGetDc = () => plusRecord(0x4004, 0);
+const plusDrawLines = (penId, points, options = {}) => plusRecord(
+    0x400D, (penId & 0xFF) | (options.closed ? 0x2000 : 0) | pointFlags(options),
+    Buffer.concat([uint32(points.length), plusPoints(points, options)]),
+);
+const plusFillPolygon = (brush, points, options = {}) => plusRecord(
+    0x400C, brushFlag(options) | pointFlags(options),
+    Buffer.concat([uint32(brush >>> 0), uint32(points.length), plusPoints(points, options)]),
+);
+const plusFillRects = (brush, rects, options = {}) => plusRecord(
+    0x400A, brushFlag(options) | pointFlags(options),
+    Buffer.concat([uint32(brush >>> 0), uint32(rects.length), plusRects(rects, options.compressed)]),
+);
+const plusDrawRects = (penId, rects, options = {}) => plusRecord(
+    0x400B, (penId & 0xFF) | pointFlags(options),
+    Buffer.concat([uint32(rects.length), plusRects(rects, options.compressed)]),
+);
+const plusFillEllipse = (brush, box, options = {}) => plusRecord(
+    0x400E, brushFlag(options) | pointFlags(options),
+    Buffer.concat([uint32(brush >>> 0), plusRects([box], options.compressed)]),
+);
+const plusDrawEllipse = (penId, box, options = {}) => plusRecord(
+    0x400F, (penId & 0xFF) | pointFlags(options), plusRects([box], options.compressed),
+);
+const plusFillPath = (pathId, brush, options = {}) => plusRecord(
+    0x4014, (pathId & 0xFF) | brushFlag(options), uint32(brush >>> 0),
+);
+const plusDrawPath = (pathId, penId) => plusRecord(0x4015, pathId & 0xFF, uint32(penId >>> 0));
+const plusDrawString = ({
+    fontId = 0, brush = 0xFF000000, formatId = 0, text = '', x = 0, y = 0, width = 0, height = 0, inlineBrush = true,
+}) => plusRecord(
+    0x401C, (fontId & 0xFF) | (inlineBrush ? 0x8000 : 0),
+    Buffer.concat([
+        uint32(brush >>> 0), uint32(formatId), uint32(String(text).length),
+        float32(x, y, width, height), Buffer.from(String(text), 'utf16le'),
+    ]),
+);
+const plusDrawImage = (imageId, srcRect, destRect, options = {}) => plusRecord(
+    0x401A, (imageId & 0xFF) | pointFlags(options),
+    Buffer.concat([uint32(0), uint32(options.srcUnit === undefined ? 2 : options.srcUnit),
+        float32(...srcRect), plusRects([destRect], options.compressed)]),
+);
+const plusDrawImagePoints = (imageId, srcRect, points, options = {}) => plusRecord(
+    0x401B, (imageId & 0xFF) | pointFlags(options),
+    Buffer.concat([uint32(0), uint32(options.srcUnit === undefined ? 2 : options.srcUnit),
+        float32(...srcRect), uint32(points.length), plusPoints(points, options)]),
+);
+const plusSave = (index = 0) => plusRecord(0x4025, 0, uint32(index));
+const plusRestore = (index = 0) => plusRecord(0x4026, 0, uint32(index));
+const plusBeginContainerNoParams = (index = 0) => plusRecord(0x4028, 0, uint32(index));
+const plusEndContainer = (index = 0) => plusRecord(0x4029, 0, uint32(index));
+const plusSetWorldTransform = (matrix) => plusRecord(0x402A, 0, float32(...matrix));
+const plusResetWorldTransform = () => plusRecord(0x402B, 0);
+const plusMultiplyWorldTransform = (matrix, post = false) => plusRecord(0x402C, post ? 0x2000 : 0, float32(...matrix));
+const plusTranslateWorldTransform = (dx, dy, post = false) => plusRecord(0x402D, post ? 0x2000 : 0, float32(dx, dy));
+const plusScaleWorldTransform = (sx, sy, post = false) => plusRecord(0x402E, post ? 0x2000 : 0, float32(sx, sy));
+const plusRotateWorldTransform = (degrees, post = false) => plusRecord(0x402F, post ? 0x2000 : 0, float32(degrees));
+const plusSetPageTransform = (scale, unit = 2) => plusRecord(0x4030, unit & 0xFF, float32(scale));
+const plusResetClip = () => plusRecord(0x4031, 0);
+const plusSetClipRect = (box, mode = 0) => plusRecord(0x4032, (mode & 0xF) << 8, float32(...box));
+const plusSetClipPath = (pathId, mode = 0) => plusRecord(0x4033, (pathId & 0xFF) | ((mode & 0xF) << 8));
+const plusSetClipRegion = (regionId, mode = 0) => plusRecord(0x4034, (regionId & 0xFF) | ((mode & 0xF) << 8));
+
 module.exports = {
+    uint32,
+    int32,
+    float32,
+    int16,
     rgb,
     record,
     emfHeader,
@@ -355,4 +526,48 @@ module.exports = {
     plusRecord,
     plusHeader,
     emfPlusComment,
+    plusObject,
+    plusObjectChunks,
+    plusPoints,
+    plusBrushData,
+    plusPenData,
+    plusPathData,
+    plusRegionRectData,
+    plusRegionPathData,
+    plusRegionEmptyData,
+    plusRegionInfiniteData,
+    plusImageMetafileData,
+    plusImageBitmapData,
+    plusFontData,
+    plusStringFormatData,
+    nestedMetafile,
+    plusEndOfFile,
+    plusComment,
+    plusGetDc,
+    plusDrawLines,
+    plusFillPolygon,
+    plusFillRects,
+    plusDrawRects,
+    plusFillEllipse,
+    plusDrawEllipse,
+    plusFillPath,
+    plusDrawPath,
+    plusDrawString,
+    plusDrawImage,
+    plusDrawImagePoints,
+    plusSave,
+    plusRestore,
+    plusBeginContainerNoParams,
+    plusEndContainer,
+    plusSetWorldTransform,
+    plusResetWorldTransform,
+    plusMultiplyWorldTransform,
+    plusTranslateWorldTransform,
+    plusScaleWorldTransform,
+    plusRotateWorldTransform,
+    plusSetPageTransform,
+    plusResetClip,
+    plusSetClipRect,
+    plusSetClipPath,
+    plusSetClipRegion,
 };
