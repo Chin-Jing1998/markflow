@@ -15,6 +15,22 @@
  *   - 未知节点降级为纯文本段落，绝不静默丢弃。
  * 渲染器只向 doc.warnings 推入字符串，不打印 stdout；纯文本收集统一用 ir/util 的 collectText。
  */
+// docx 包内打包的 util-deprecate 垫片在加载期读取 globalThis.localStorage；Node 25 起该访问器在未传
+// --localstorage-file 时会向 stderr 打印 ExperimentalWarning，破坏 CLI「--json 模式 stderr 为空」的约定。
+// 加载期间临时用值为 undefined 的自有属性遮住访问器，加载完即还原，不改变全局对象的最终形态。
+function requireDocx() {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    const shadowed = Boolean(descriptor && typeof descriptor.get === 'function' && descriptor.configurable);
+    if (shadowed) {
+        Object.defineProperty(globalThis, 'localStorage', { value: undefined, configurable: true, writable: true, enumerable: false });
+    }
+    try {
+        return require('docx');
+    } finally {
+        if (shadowed) Object.defineProperty(globalThis, 'localStorage', descriptor);
+    }
+}
+
 const {
     Document,
     Packer,
@@ -31,7 +47,7 @@ const {
     BorderStyle,
     ShadingType,
     Tab,
-} = require('docx');
+} = requireDocx();
 const { imageSize } = require('image-size');
 const { stripHtml, collectText } = require('../ir/util');
 const { toBuffer } = require('../util');
