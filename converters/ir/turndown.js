@@ -49,8 +49,11 @@ const BASIC_REMOVED_TAGS = ['script', 'style', 'noscript'];
 const URL_REMOVED_TAGS = ['script', 'style', 'noscript', 'iframe', 'nav', 'footer', 'aside'];
 // word profile 输出为行内 HTML 的标签：Markdown 没有对应语法，由 ir/inline-html 提升为 IR 节点
 const WORD_INLINE_TAGS = ['u', 'sup', 'sub'];
-// 「~」及其前导反斜杠（判定是否已被 turndown 自身转义）
-const TILDE_RE = /(\\*)~/g;
+// 「~」及其前导反斜杠（判定是否已被 turndown 自身转义），按「一串反斜杠（可后接一个 ~）」或「单个 ~」分词。
+// 不写成 /(\\*)~/g：前导的 \\* 在不含「~」的超长反斜杠串上逐位回溯，耗时随长度平方增长
+//（1 万个反斜杠 40 毫秒、4 万个 777 毫秒、16 万个 13.7 秒），而网页正文属不可信输入。
+// 本式的 ~? 可选，极大反斜杠串一次匹配即成功，不存在失败后的逐位回溯，耗时线性于文本长度
+const TILDE_RE = /\\+~?|~/g;
 // 图片 alt 的分行符。不写成 /\s*[\r\n]+\s*/ 一步替换：前导的 \s* 在不含换行的超长空白串上逐位回溯，
 // 耗时随长度平方增长（16 万个空格约 9 秒），而网页的 alt 属不可信输入
 const LINE_BREAK_RE = /[\r\n]+/;
@@ -212,9 +215,15 @@ function escapeTildesIn(service) {
 /**
  * 在 turndown 自身的转义结果上补转义「~」。turndown 的转义表只处理行首的 ~~~，且会把文本中的字面
  * 反斜杠加倍，因此按前导反斜杠的奇偶判定：奇数个表示该「~」已被转义，原样保留；偶数个（含 0 个）补一个。
+ * TILDE_RE 的记号只有两形：不以「~」结尾的即纯反斜杠串，与「~」无关，原样返回；以「~」结尾的其
+ * 前导反斜杠个数即记号长度减 1，该串恒为该「~」之前极大的连续反斜杠串。
  */
 function escapeTildes(text) {
-    return text.replace(TILDE_RE, (matched, slashes) => (slashes.length % 2 === 1 ? matched : `${slashes}\\~`));
+    return text.replace(TILDE_RE, (matched) => {
+        if (!matched.endsWith('~')) return matched;
+        const slashCount = matched.length - 1;
+        return slashCount % 2 === 1 ? matched : `${matched.slice(0, slashCount)}\\~`;
+    });
 }
 
 // [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整。
