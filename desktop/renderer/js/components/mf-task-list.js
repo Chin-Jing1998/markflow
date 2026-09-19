@@ -1,13 +1,16 @@
 /**
  * <mf-task-list>：转换任务列表（键控增量渲染，进度更新不重建整行）。
  * 属性（JS property）：tasks（store.tasks）、targets（formats.targets：{ office, markup, url }）、libraryReady（布尔）。
+ * 任务的 kind 为 'bundle' 时该项是专利五书目录（整个目录一项输入），以文件夹图标与「专利五书目录」标签呈现。
  * 事件（冒泡）：mf-task-change { id, target }、mf-task-remove { id }、mf-task-action { id, action: 'reveal'|'open' }。
  */
 import { escapeHtml, escapeAttr, formatSize, targetLabel, typeLabel, classOf, STATUS_LABELS, PHASE_LABELS } from '../dom.js';
 import { icon } from '../icons.js';
 import './mf-progress.js';
 
-const TYPE_ICONS = Object.freeze({ docx: 'file', xlsx: 'file', pptx: 'file', pdf: 'file', md: 'file', url: 'link' });
+const TYPE_ICONS = Object.freeze({ docx: 'file', xlsx: 'file', pptx: 'file', pdf: 'file', md: 'file', xml: 'file', zip: 'file', url: 'link' });
+/** 专利五书目录整体为一项输入，以文件夹图标与其余输入区分 */
+const BUNDLE_ICON = 'folder';
 const REMOVABLE = new Set(['idle', 'done', 'failed', 'cancelled']);
 const EDITABLE = new Set(['idle', 'failed', 'cancelled']);
 
@@ -82,7 +85,7 @@ class MfTaskList extends HTMLElement {
 
     rowTemplate(task) {
         return `
-            <div class="task-icon">${icon(TYPE_ICONS[task.type] || 'file')}</div>
+            <div class="task-icon">${icon(task.kind === 'bundle' ? BUNDLE_ICON : (TYPE_ICONS[task.type] || 'file'))}</div>
             <div class="task-main">
                 <div class="task-title">
                     <span class="task-name"></span>
@@ -104,7 +107,7 @@ class MfTaskList extends HTMLElement {
     updateRow(row, task) {
         row.dataset.status = task.status;
         row.querySelector('.task-name').textContent = task.name || task.path || task.url || '';
-        row.querySelector('.task-type').textContent = typeLabel(task.type);
+        row.querySelector('.task-type').textContent = typeLabel(task.type, task.kind);
         row.querySelector('.task-size').textContent = task.size ? formatSize(task.size) : '';
         const pathEl = row.querySelector('.task-path');
         pathEl.textContent = task.path || task.url || '';

@@ -9,6 +9,7 @@
  */
 const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
+const { imageSize } = require('image-size');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -183,7 +184,11 @@ test('动图 GIF / SVG / EMF 均保持原样并记中文 warning', async () => {
     assert.equal(result.warnings.length, 3);
     assert.match(result.warnings[0], /images\/image_1\.gif 保持原格式：动图 GIF/);
     assert.match(result.warnings[1], /images\/image_2\.svg 保持原格式：矢量图 SVG/);
-    assert.match(result.warnings[2], /images\/image_3\.emf 保持原格式：EMF\/WMF 图元/);
+    // 图元只在 patent profile 下栅格化（详见 test/metafile-normalize.test.js），此处的 generic profile 一律保持原样
+    assert.equal(
+        result.warnings[2],
+        '图片 images/image_3.emf 保持原格式：EMF/WMF 图元只在专利（patent）profile 下栅格化为 JPG',
+    );
 });
 
 test('像素数超阈值的图片保持原样：文件头声明 12000×8000 即被拦下，4000×3000 照常转码', async () => {
@@ -408,6 +413,170 @@ test('宽度超过 raster.maxWidth 时等比缩小；patent profile 下不缩放
     // Assert
     assert.deepEqual(await readSize(scaled.doc.assets[0].buffer), { width: 200, height: 40 });
     assert.deepEqual(await readSize(patent.doc.assets[0].buffer), { width: 300, height: 60 });
+});
+
+// ============================================================
+// patent profile：按 Word 显示尺寸在 jpegPpi 下重采样
+// ============================================================
+
+// 官方样例实测值：wp:extent 5272405×2597785 EMU = 146.4557×72.1607 mm，300 DPI 下官方输出 1730×852
+const OFFICIAL_MM = { width: 146.45572, height: 72.16072 };
+const OFFICIAL_PX = { width: 1730, height: 852 };
+
+const docxDoc = (assets, children) => ({ ...makeDoc(assets, children), meta: { title: 'T', sourceType: 'docx' } });
+
+test('patent profile：按 displayWidthMm/displayHeightMm 在 300 DPI 下重采样，像素与官方一致且 JFIF 密度同为 300', async () => {
+    // Arrange：嵌入像素远小于显示尺寸，正是官方样例的形态（981×569 的 PNG 显示成 146×72 mm）
+    const png = await makeImage('image/png', { width: 981, height: 569 });
+    const doc = docxDoc(
+        [{ name: 'images/image_1.png', buffer: png, mime: 'image/png' }],
+        [imageNode('images/image_1.png', { displayWidthMm: OFFICIAL_MM.width, displayHeightMm: OFFICIAL_MM.height })],
+    );
+
+    // Act
+    const result = await normalizeImages(doc, jpgOptions({ xml: { profile: 'patent' } }));
+
+    // Assert
+    assert.deepEqual(result.warnings, []);
+    assert.deepEqual(await readSize(result.doc.assets[0].buffer), OFFICIAL_PX);
+    assert.deepEqual(readJfifDensity(result.doc.assets[0].buffer), { units: 1, x: 300, y: 300 });
+});
+
+test('重采样只在 patent profile 生效：generic profile 下像素与嵌入原图一致', async () => {
+    // Arrange
+    const png = await makeImage('image/png', { width: 100, height: 50 });
+    const assetOf = () => [{ name: 'images/image_1.png', buffer: png, mime: 'image/png' }];
+    const childrenOf = () => [imageNode('images/image_1.png', { displayWidthMm: OFFICIAL_MM.width, displayHeightMm: OFFICIAL_MM.height })];
+
+    // Act
+    const generic = await normalizeImages(docxDoc(assetOf(), childrenOf()), jpgOptions());
+    const patent = await normalizeImages(docxDoc(assetOf(), childrenOf()), jpgOptions({ xml: { profile: 'patent' } }));
+
+    // Assert
+    assert.deepEqual(await readSize(generic.doc.assets[0].buffer), { width: 100, height: 50 });
+    assert.deepEqual(await readSize(patent.doc.assets[0].buffer), OFFICIAL_PX);
+});
+
+// 把 JPEG 文件头 SOF 段声明的宽高改写为指定值：只动文件头，供体量护栏类用例伪造超大图
+function declareJpegSize(buffer, width, height) {
+    const out = Buffer.from(buffer);
+    let offset = 2;
+    while (offset + 9 < out.length && out[offset] === 0xff) {
+        const marker = out[offset + 1];
+        if (marker >= 0xc0 && marker <= 0xc2) {
+            out.writeUInt16BE(height, offset + 5);
+            out.writeUInt16BE(width, offset + 7);
+            return out;
+        }
+        offset += 2 + out.readUInt16BE(offset + 2);
+    }
+    throw new Error('未找到 SOF 段');
+}
+
+test('patent profile：体量超护栏的 JPEG 不解码不重采样，但仍补写 300 DPI 密度并告警', async () => {
+    // Arrange：文件头声明 12000×8000（9600 万像素）越过体量护栏；显示尺寸齐备，本应触发重采样
+    const jpeg = declareJpegSize(await makeImage('image/jpeg', { width: 8, height: 8 }), 12000, 8000);
+    const doc = docxDoc(
+        [{ name: 'images/image_1.jpg', buffer: jpeg, mime: 'image/jpeg' }],
+        [imageNode('images/image_1.jpg', { displayWidthMm: OFFICIAL_MM.width, displayHeightMm: OFFICIAL_MM.height })],
+    );
+
+    // Act
+    const result = await normalizeImages(doc, jpgOptions({ xml: { profile: 'patent' } }));
+
+    // Assert：像素原样（文件头仍声明 12000×8000），密度补为 300，且给出一条跳过重采样的告警
+    // 只读文件头取尺寸：readSize 会整图解码，对声明 9600 万像素的伪造图必然超出解码器内存上限
+    const header = imageSize(result.doc.assets[0].buffer);
+    assert.deepEqual({ width: header.width, height: header.height }, { width: 12000, height: 8000 });
+    assert.deepEqual(readJfifDensity(result.doc.assets[0].buffer), { units: 1, x: 300, y: 300 });
+    assert.equal(result.warnings.length, 1);
+    assert.match(result.warnings[0], /images\/image_1\.jpg/);
+    assert.match(result.warnings[0], /12000×8000/);
+});
+
+test('重采样目标像素随 jpegPpi 走：显式 150 PPI 得一半像素，且 JFIF 密度同为 150', async () => {
+    // Arrange
+    const png = await makeImage('image/png', { width: 40, height: 20 });
+    const doc = docxDoc(
+        [{ name: 'images/image_1.png', buffer: png, mime: 'image/png' }],
+        [imageNode('images/image_1.png', { displayWidthMm: 25.4, displayHeightMm: 12.7 })],
+    );
+
+    // Act
+    const result = await normalizeImages(doc, jpgOptions({ jpegPpi: 150, xml: { profile: 'patent' } }));
+
+    // Assert：25.4 mm = 1 英寸，150 PPI 即 150 px
+    assert.deepEqual(await readSize(result.doc.assets[0].buffer), { width: 150, height: 75 });
+    assert.deepEqual(readJfifDensity(result.doc.assets[0].buffer), { units: 1, x: 150, y: 150 });
+});
+
+test('已是 JPEG 的资产同样按显示尺寸重采样，但仍按「格式未变」计入 kept', async () => {
+    // Arrange
+    const jpeg = await makeImage('image/jpeg', { width: 60, height: 30 });
+    const doc = docxDoc(
+        [{ name: 'images/image_1.jpg', buffer: jpeg, mime: 'image/jpeg' }],
+        [imageNode('images/image_1.jpg', { displayWidthMm: 25.4, displayHeightMm: 12.7 })],
+    );
+
+    // Act
+    const result = await normalizeImages(doc, jpgOptions({ xml: { profile: 'patent' } }));
+
+    // Assert
+    assert.equal(result.converted, 0);
+    assert.equal(result.kept, 1);
+    assert.deepEqual(await readSize(result.doc.assets[0].buffer), { width: 300, height: 150 });
+});
+
+test('docx 来源取不到显示尺寸时保留嵌入像素并告警；md 等本就不记尺寸的来源不告警', async () => {
+    // Arrange
+    const png = await makeImage('image/png', { width: 80, height: 40 });
+    const assetOf = () => [{ name: 'images/image_1.png', buffer: png, mime: 'image/png' }];
+    const childrenOf = () => [imageNode('images/image_1.png', { display: { width: 80, unit: 'px' } })];
+    const patentOptions = jpgOptions({ xml: { profile: 'patent' } });
+
+    // Act
+    const fromDocx = await normalizeImages(docxDoc(assetOf(), childrenOf()), patentOptions);
+    const fromMd = await normalizeImages(
+        { ...makeDoc(assetOf(), childrenOf()), meta: { title: 'T', sourceType: 'md' } },
+        patentOptions,
+    );
+
+    // Assert
+    assert.deepEqual(fromDocx.warnings, ['图片 images/image_1.png 未按 Word 显示尺寸重采样：源文档中未记录该图的显示尺寸，已按嵌入像素输出']);
+    assert.deepEqual(fromMd.warnings, []);
+    assert.deepEqual(await readSize(fromDocx.doc.assets[0].buffer), { width: 80, height: 40 });
+    assert.deepEqual(await readSize(fromMd.doc.assets[0].buffer), { width: 80, height: 40 });
+});
+
+test('重采样护栏：目标单边超过 20000 px 时保留嵌入像素并告警，仍照常转为 JPEG', async () => {
+    // Arrange：2000 mm 在 300 DPI 下约 23622 px，越过单边上限
+    const png = await makeImage('image/png', { width: 40, height: 20 });
+    const doc = docxDoc(
+        [{ name: 'images/image_1.png', buffer: png, mime: 'image/png' }],
+        [imageNode('images/image_1.png', { displayWidthMm: 2000, displayHeightMm: 1000 })],
+    );
+
+    // Act
+    const result = await normalizeImages(doc, jpgOptions({ xml: { profile: 'patent' } }));
+
+    // Assert
+    assert.equal(result.converted, 1);
+    assert.equal(result.doc.assets[0].name, 'images/image_1.jpg');
+    assert.deepEqual(await readSize(result.doc.assets[0].buffer), { width: 40, height: 20 });
+    assert.match(result.warnings[0], /^图片 images\/image_1\.png 未按 Word 显示尺寸重采样：目标 23622×11811 的单边超过 20000 px 上限，已按嵌入像素输出$/);
+});
+
+test('IR 上没有 image 节点引用的资产不参与重采样，也不告警', async () => {
+    // Arrange
+    const png = await makeImage('image/png', { width: 40, height: 20 });
+    const doc = docxDoc([{ name: 'images/image_1.png', buffer: png, mime: 'image/png' }], []);
+
+    // Act
+    const result = await normalizeImages(doc, jpgOptions({ xml: { profile: 'patent' } }));
+
+    // Assert
+    assert.deepEqual(result.warnings, []);
+    assert.deepEqual(await readSize(result.doc.assets[0].buffer), { width: 40, height: 20 });
 });
 
 test('jpegQuality 生效：质量 60 的产物显著小于质量 100', async () => {

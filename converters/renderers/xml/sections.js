@@ -6,8 +6,23 @@
  *     inventionTitle: { text, source } | null, issues: Issue[], assignments: Map<顶层节点, { book, role }> }
  *
  * 规则（方案 §3.4.2、研究报告 §5.2、交接简报 §4）：
- *   1. 官方显式标记先剥离：私用区标记码位（U+E200–U+E20F）一律删除；「名…名」→ 发明名称，「题…题」→ 标题，
- *      「段号[0001]号…」→ 保留 [0001] 交段号模块复用，「条号1.号…」→ 保留 1. 交权项模块，「号图1号」→ 图1。
+ *   0. Word 分节页眉（官方五书模板的书目名只写在各节页眉里，正文没有书目标题段）：解析层给顶层节点写的
+ *      data.section = { index, header }（见 parsers/docx-sections）经 block.origin 读出；页眉文字整体、其次逐行
+ *      经 normalizeTitle 与书目正则比对，认得出书目的分节整节直接归入该书，视同显式书目，不报「按位置推定」
+ *      与「无法归类」；认不出的分节（事务所抬头、空页眉）不切分区域，仅在紧随页眉区域时另起一个无书目区域，
+ *      回落到规则 2–3。同一分节内仍出现书目标题段时，标题段照旧生效（自该段起改归标题所指书目，至下一
+ *      分节或下一标题段为止）。不带分节信息的块（栅格化替换出的图片节点等）沿用前一块所在的分节。
+ *   1. 官方显式标记按码位识别、用后剥离。Cnipr 字体把私用区码位渲染成「段号／条号／号／名／题」字形，
+ *      文档里存的是码位而非这些汉字：U+E209 成对包裹发明名称 → hint 'invention-title'；U+E20A 成对包裹
+ *      小标题 → hint 'heading'；U+E206 权项起始 → hint 'claim-start'；U+E208 成对包裹编号或图号 → 去壳保留
+ *      内层文字（「1. 」交权项模块，「图13」交图号判定）；U+E205 段落起始 → hint 'paragraph'：撰稿人已标明
+ *      这是正文段，不再按文字猜成小标题、发明名称或权项起始（官方转换器同样只认 U+E20A 为小标题，
+ *      正文里的「实施例」「1、……」照常输出为 p）。一段含多种码位时按 名称 > 小标题 > 权项起始 > 段落 取其一。
+ *      识别之后 U+E200–U+E20F 一律从段落文字与表格单元格中删除，产物不留残留。
+ *      字面汉字规则（「名…名」→ 发明名称，「题…题」→ 标题，「段号[0001]号…」→ 保留 [0001] 交段号模块复用，
+ *      「条号1.号…」→ 保留 1. 交权项模块，「号图1号」→ 图1）源自对手册截图的推定，真实 docx 中不出现；
+ *      「名…名」「题…题」两条对普通正文有误伤风险（首尾同为该字的短段会被削去首尾并改判角色），故仅在
+ *      全文不含任何上述结构码位时才启用——官方模板稿一律走码位，不受其影响；未见码位的文稿行为与此前一致。
  *   2. 候选标题 = heading 节点，或（sectionDetection 为 auto 时）整段加粗 / 纯文本 ≤ 12 字的段落；
  *      候选标题命中书目正则（允许字间空白）即为分节标题：权利要求书 / 说明书 / 说明书附图|附图 /
  *      说明书摘要|摘要 / 摘要附图；sectionDetection 为 headings 时只认 heading 节点。
@@ -24,6 +39,7 @@ const { runsText, trimRuns, stripPrefix, textRun } = require('./inline');
 const { ISSUE_CODES, createIssue } = require('./precheck');
 const { CLAIM_START_RE } = require('./claims');
 const { isPureLabel } = require('./figures');
+const { mergeSplitGroups, splitGroupOf } = require('./blocks');
 
 const BOOK_RULES = Object.freeze([
     ['abstractFigure', /^摘\s*要\s*附\s*图$/],
@@ -43,7 +59,21 @@ const SUBJECT_PREFIX_RE = /^一种/;
 const BRACKET_RE = /^[(（\[［【〖〔《{｛]+|[)）\]］】〗〕》}｝]+$/g;
 const ENUM_PREFIX_RE = /^(?:[一二三四五六七八九十]+|\d+)\s*[、.．]\s*/;
 const TRAILING_COLON_RE = /[:：]$/;
-const OFFICIAL_PUA_RE = /[-]/g;
+// 官方标记码位（不可见字符一律以码点声明、运行时生成，源码里不出现看不见的字面量）
+const fromCode = (code) => String.fromCharCode(code);
+const OFFICIAL_MARKS = Object.freeze({
+    PARAGRAPH: fromCode(0xE205), CLAIM: fromCode(0xE206), NUMBER: fromCode(0xE208),
+    TITLE: fromCode(0xE209), HEADING: fromCode(0xE20A),
+});
+const OFFICIAL_PUA_CLASS = `[${fromCode(0xE200)}-${fromCode(0xE20F)}]`;
+const OFFICIAL_PUA_RE = new RegExp(OFFICIAL_PUA_CLASS, 'g');
+const HAS_OFFICIAL_PUA_RE = new RegExp(OFFICIAL_PUA_CLASS);
+const STRUCTURAL_MARK_RE = new RegExp(`[${Object.values(OFFICIAL_MARKS).join('')}]`);
+// 码位 → hint，按先后取首个命中者：发明名称 > 小标题 > 权项起始 > 段落
+const HINT_BY_MARK = Object.freeze([
+    [OFFICIAL_MARKS.TITLE, 'invention-title'], [OFFICIAL_MARKS.HEADING, 'heading'],
+    [OFFICIAL_MARKS.CLAIM, 'claim-start'], [OFFICIAL_MARKS.PARAGRAPH, 'paragraph'],
+]);
 const MARK_TITLE_RE = /^名(.+)名$/;
 const MARK_HEADING_RE = /^题(.+)题$/;
 const MARK_PARA_RE = /^段号(?=[\[［]\d+[\]］])/;
@@ -59,7 +89,8 @@ function detectSections(blocks, { sectionDetection = 'auto', meta = {} } = {}) {
     const issues = [];
     const assignments = new Map();
     // index 为块在全文块序列中的 1 起序号，供「按位置推定」的段落区间提示使用
-    const normalized = blocks.map((block, position) => ({ ...normalizeOfficialMarks(block), index: position + 1 }));
+    const useLiteralMarks = !blocks.some(hasStructuralMark);
+    const normalized = blocks.map((block, position) => ({ ...normalizeOfficialMarks(block, useLiteralMarks), index: position + 1 }));
     const titleField = extractTitleField(normalized);
     const remaining = titleField ? normalized.filter((block) => block !== titleField.block) : normalized;
     if (titleField) assignments.set(titleField.block.origin, { book: 'description', role: 'invention-title' });
@@ -88,12 +119,15 @@ function detectSections(blocks, { sectionDetection = 'auto', meta = {} } = {}) {
 
 const emptyBooks = () => Object.fromEntries(BOOK_KEYS.map((key) => [key, []]));
 
-// 无「摘要附图」标题时，摘要区域内的图片段推定为摘要附图
+// 无「摘要附图」标题时，摘要区域内独立成段的图片推定为摘要附图。与摘要文字同属一个 Word 段落的图片
+// （大图拆段拆出来的、与某个文字块同组的图片块）是段内图片——多为结构式或公式——留在摘要里，由渲染器并回原段
 function moveAbstractImages(books, inferred) {
     if (books.abstractFigure.length > 0) return;
-    const images = books.abstract.filter((block) => block.kind === 'image');
+    const textGroups = new Set(books.abstract.filter((block) => block.kind === 'paragraph').map(splitGroupOf).filter((group) => group !== null));
+    const isStandaloneImage = (block) => block.kind === 'image' && !textGroups.has(splitGroupOf(block));
+    const images = books.abstract.filter(isStandaloneImage);
     if (images.length === 0) return;
-    books.abstract = books.abstract.filter((block) => block.kind !== 'image');
+    books.abstract = books.abstract.filter((block) => !isStandaloneImage(block));
     books.abstractFigure.push(...images);
     inferred.push({ key: 'abstractFigure', blocks: images });
 }
@@ -121,17 +155,35 @@ function rangeOf(blocks, total) {
 // 官方标记
 // ============================================================
 
-function normalizeOfficialMarks(block) {
-    if (block.kind !== 'paragraph' && block.kind !== 'heading') return block;
+const hasTextRuns = (block) => block.kind === 'paragraph' || block.kind === 'heading';
+
+const hasStructuralMark = (block) => hasTextRuns(block) && STRUCTURAL_MARK_RE.test(runsText(block.runs));
+
+const hintOfMarks = (text) => {
+    const hit = HINT_BY_MARK.find(([mark]) => text.includes(mark));
+    return hit ? hit[1] : null;
+};
+
+// useLiteralMarks：全文不含结构码位时才按字面汉字规则识别（见文件头规则 1）
+function normalizeOfficialMarks(block, useLiteralMarks) {
+    if (block.kind === 'table') return stripTableMarks(block);
+    if (!hasTextRuns(block)) return block;
+    let hint = hintOfMarks(runsText(block.runs));
     let runs = trimRuns(block.runs.map((run) => (run.kind === 'text' ? textRun(run.text.replace(OFFICIAL_PUA_RE, ''), run.marks) : run)));
-    let hint = null;
     const text = runsText(runs).trim();
+    if (!useLiteralMarks) return { ...block, runs, text, hint };
     if (MARK_TITLE_RE.test(text)) { runs = stripEdges(runs, /^名/, /名$/); hint = 'invention-title'; }
     else if (MARK_HEADING_RE.test(text)) { runs = stripEdges(runs, /^题/, /题$/); hint = 'heading'; }
     else if (MARK_FIGURE_RE.test(text)) { runs = stripEdges(runs, /^号/, /号$/); }
     else if (MARK_PARA_RE.test(text)) { runs = stripMarkedNumber(runs, MARK_PARA_RE, MARK_PARA_TAIL_RE); }
     else if (MARK_CLAIM_RE.test(text)) { runs = stripMarkedNumber(runs, MARK_CLAIM_RE, MARK_CLAIM_TAIL_RE); }
     return { ...block, runs, text: runsText(runs).trim(), hint };
+}
+
+// 未栅格化的表格降级为逐行文本输出，单元格里的官方码位同样不得进入产物；无码位时返回原块
+function stripTableMarks(block) {
+    if (!block.rows.some((row) => row.some((cell) => HAS_OFFICIAL_PUA_RE.test(cell)))) return block;
+    return { ...block, rows: block.rows.map((row) => row.map((cell) => cell.replace(OFFICIAL_PUA_RE, ''))) };
 }
 
 function stripEdges(runs, headRe, tailRe) {
@@ -175,20 +227,35 @@ function bookOf(block, sectionDetection) {
     return hit ? hit[0] : null;
 }
 
+// 官方「段落起始」码位标明的正文段不参与按文字的角色推断
+const isMarkedBody = (block) => block.hint === 'paragraph';
+
 const isPartHeading = (block, sectionDetection) => block.hint === 'heading'
-    || (isTitleCandidate(block, sectionDetection) && PART_HEADING_RE.test(normalizeTitle(block.text)));
+    || (!isMarkedBody(block) && isTitleCandidate(block, sectionDetection) && PART_HEADING_RE.test(normalizeTitle(block.text)));
+
+// 权项起始段：带官方「权项起始」码位，或文字以权项编号开头（标明为正文段的除外）
+const isClaimStartBlock = (block) => block.hint === 'claim-start' || (!isMarkedBody(block) && CLAIM_START_RE.test(block.text));
 
 // 标题样段：heading 节点，或无终结标点、不带编号的短段——加粗，或以「一种」起头的普通段
 function isTitleLike(block) {
     if (block.hint === 'invention-title') return true;
+    if (isMarkedBody(block)) return false;
     if (block.kind === 'heading') return block.text.length > 0 && block.text.length <= MAX_INVENTION_TITLE;
     if (block.kind !== 'paragraph' || !block.text || block.text.length > MAX_INVENTION_TITLE) return false;
-    return !TERMINAL_PUNCT_RE.test(block.text) && !CLAIM_START_RE.test(block.text) && (block.isBold || SUBJECT_PREFIX_RE.test(block.text));
+    return !TERMINAL_PUNCT_RE.test(block.text) && !isClaimStartBlock(block) && (block.isBold || SUBJECT_PREFIX_RE.test(block.text));
 }
 
+// 区域切分：页眉认得出书目的分节与书目标题段各起一个显式区域，其余块并入当前区域（见文件头规则 0、2）
 function splitRegions(blocks, sectionDetection, assignments) {
     const regions = [{ book: null, blocks: [] }];
+    let section = null;
     for (const block of blocks) {
+        const entered = sectionOf(block);
+        if (entered && (!section || entered.index !== section.index)) {
+            const headerBook = bookOfHeader(entered.header);
+            if (headerBook || (section && section.book)) regions.push({ book: headerBook, blocks: [] });
+            section = { index: entered.index, book: headerBook };
+        }
         const book = bookOf(block, sectionDetection);
         if (book) {
             assignments.set(block.origin, { book, role: 'title' });
@@ -198,6 +265,23 @@ function splitRegions(blocks, sectionDetection, assignments) {
         regions[regions.length - 1].blocks.push(block);
     }
     return regions.filter((region) => region.book || region.blocks.length > 0);
+}
+
+// 块所属的 Word 分节（解析层写在顶层节点上）；没有分节信息时为 null，由调用方沿用前一块的分节
+function sectionOf(block) {
+    const section = block.origin && block.origin.data && block.origin.data.section;
+    return section && Number.isInteger(section.index) ? section : null;
+}
+
+// 页眉 → 书目：先整体比对，再逐行比对（事务所页眉常见「案号一行、书目名一行」）
+function bookOfHeader(header) {
+    const lines = String(header == null ? '' : header).split('\n');
+    for (const candidate of [lines.join(''), ...lines]) {
+        const title = normalizeTitle(candidate);
+        const hit = BOOK_RULES.find(([, re]) => re.test(title));
+        if (hit) return hit[0];
+    }
+    return null;
 }
 
 function extractTitleField(blocks) {
@@ -223,7 +307,7 @@ function inferPreamble(blocks, { books, issues, titles, explicit, last, sectionD
     const partIndex = list.findIndex((block, index) => index < drawingsStart && isPartHeading(block, sectionDetection));
     const bodyEnd = partIndex >= 0 ? partIndex : drawingsStart;
     const claimsStart = explicit.has('claims') ? -1
-        : list.findIndex((block, index) => index < bodyEnd && block.kind === 'paragraph' && CLAIM_START_RE.test(block.text));
+        : list.findIndex((block, index) => index < bodyEnd && block.kind === 'paragraph' && isClaimStartBlock(block));
 
     let claimsEnd = bodyEnd;
     if (claimsStart >= 0 && partIndex > claimsStart + 1 && isTitleLike(list[partIndex - 1])) claimsEnd = partIndex - 1;
@@ -251,13 +335,16 @@ function trailingDrawingsStart(list) {
     return list.slice(start).some((block) => block.kind === 'image') ? start : list.length;
 }
 
-// 权利要求块（或首个五部分标题）之前的无标题前导正文：≤ 3 段、无编号、无图表 → 摘要；否则并入说明书
+// 权利要求块（或首个五部分标题）之前的无标题前导正文：≤ 3 段、无编号、无图表 → 摘要；否则并入说明书。
+// 段数与「无图表」按 Word 段落计：解析层的大图拆段会把「文字 + 段尾大图」拆成文字块与图片块（同一 splitGroup），
+// 判定前先并回，否则摘要段只因图片够大就落入「无法归类」；归书的仍是未并回的原块，由 patent 渲染器统一并回
 function classifyLeading(leading, { books, issues, explicit, inferred, hasBodyAfter }) {
     if (leading.length === 0) return;
-    const paragraphs = leading.filter((block) => block.kind === 'paragraph');
+    const units = mergeSplitGroups(leading);
+    const paragraphs = units.filter((block) => block.kind === 'paragraph');
     const isAbstractLike = hasBodyAfter && !explicit.has('abstract') && books.abstract.length === 0
-        && paragraphs.length === leading.length && paragraphs.length <= MAX_ABSTRACT_PREAMBLE
-        && paragraphs.every((block) => !CLAIM_START_RE.test(block.text));
+        && paragraphs.length === units.length && paragraphs.length <= MAX_ABSTRACT_PREAMBLE
+        && paragraphs.every((block) => !isClaimStartBlock(block));
     if (isAbstractLike) {
         books.abstract.push(...leading);
         inferred.push({ key: 'abstract', blocks: leading });

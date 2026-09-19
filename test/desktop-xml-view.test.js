@@ -5,6 +5,8 @@
  *       patent 结构视图（段号红色粗体、权项分条与 claim-ref、img 按 wi/he 毫米定尺寸、行内与独立公式表格）；
  *       generic 结构视图（meta、标题层级、列表、表格、代码、图片、外链 noopener）；
  *       test/fixtures/patent/reference/*.xml 五份官方风格样例全部可解析且识别为 patent；
+ *       patent 书目按内容判定（book / bookLabel，与文件名无关）；patent 渲染器真实产出的字节形态
+ *       （BOM、CRLF、空元素 " />"）可解析，裸文件名的图片按所在书目目录的 assetBase 寻址；
  *       非本应用 XML 只给美化原文；畸形 XML 返回错误文案而不抛出；
  *       图片地址越界 / 非白名单扩展名 / 缺 assetBase 时只留替代文字。
  */
@@ -187,6 +189,48 @@ test('官方风格样例五份全部可解析且识别为 patent', () => {
     const description = buildXmlView(fs.readFileSync(path.join(REFERENCE_DIR, 'description.xml'), 'utf8'), { assetBase: ASSET_BASE });
     assert.ok(description.structuredHtml.includes('<span class="pnum">[0011]</span>'), '官方样例的段号未渲染');
     assert.ok(description.structuredHtml.includes(`${ASSET_BASE}table-1.jpg`), '官方样例的表格图未寻址');
+});
+
+test('patent 书目按内容判定：五书各得 book 与 bookLabel，摘要附图与摘要按 cn-abst-figure 区分；非 patent 为 null', () => {
+    const wrap = (inner) => `<cn-application-body lang="zh" country="CN">${inner}</cn-application-body>`;
+    const cases = [
+        ['<cn-claims><claim id="cl001" num="1"><claim-text>一种装置。</claim-text></claim></cn-claims>', 'cn-claims', '权利要求书'],
+        ['<description><p id="p0001" num="0001" Italic="0">正文。</p></description>', 'description', '说明书'],
+        ['<cn-drawings><figure id="f0001" num="0001"><img file="100003_1.jpg" /></figure></cn-drawings>', 'cn-drawings', '说明书附图'],
+        ['<cn-abstract><p id="p0001" num="0001" Italic="0">摘要。</p></cn-abstract>', 'cn-abstract', '说明书摘要'],
+        ['<cn-abstract><cn-abst-figure><figure id="f0001" num="0001"><img file="100005_1.jpg" /></figure></cn-abst-figure></cn-abstract>', 'cn-abst-figure', '摘要附图'],
+        ['<cn-unknown/>', null, ''],
+    ];
+    for (const [inner, book, bookLabel] of cases) {
+        const view = buildXmlView(wrap(inner), { assetBase: ASSET_BASE, label: '100001/100001.xml' });
+        assert.deepEqual([view.profile, view.book, view.bookLabel], [PROFILES.patent, book, bookLabel], inner);
+    }
+    const generic = buildXmlView(GENERIC, { assetBase: ASSET_BASE });
+    assert.deepEqual([generic.book, generic.bookLabel], [null, '']);
+    const broken = buildXmlView('<cn-application-body><description>', { assetBase: ASSET_BASE });
+    assert.deepEqual([broken.book, broken.bookLabel], [null, '']);
+});
+
+test('patent 渲染器的真实字节形态（BOM、CRLF、空元素 " />"）可解析；裸文件名的图片按书目目录的 assetBase 寻址', () => {
+    const xml = [
+        '\ufeff<?xml version="1.0" encoding="UTF-8"?>',
+        '<!DOCTYPE cn-application-body SYSTEM "/dtdandxsl/cn-application-body-20080416.dtd"[]>',
+        '<?xml-stylesheet type="text/xsl" href="/dtdandxsl/showxml.xsl"?>',
+        '<cn-application-body lang="zh" country="CN">',
+        '  <cn-drawings>',
+        '    <figure id="f0001" num="0001" figure-labels="图1">',
+        '      <img id="if0001" file="100003_1.jpg" wi="146" he="72" top="0" left="0" img-content="drawing" img-format="jpg" orientation="portrait" inline="yes" />',
+        '    </figure>',
+        '  </cn-drawings>',
+        '</cn-application-body>',
+        '',
+    ].join('\r\n');
+    const view = buildXmlView(xml, { assetBase: `${ASSET_BASE}product/100003/` });
+    assert.equal(view.error, null);
+    assert.deepEqual([view.profile, view.book], [PROFILES.patent, 'cn-drawings']);
+    assert.ok(view.structuredHtml.includes(`src="${ASSET_BASE}product/100003/100003_1.jpg"`), view.structuredHtml);
+    assert.ok(view.structuredHtml.includes('style="width:146mm;height:72mm"'));
+    assert.deepEqual(view.warnings, []);
 });
 
 // ============================================================

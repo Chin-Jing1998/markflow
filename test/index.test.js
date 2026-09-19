@@ -3,7 +3,8 @@
  * 覆盖：导出与懒加载、detectInputType、listTargets（规则派生）、convert 参数校验与非法选项、
  *       md → docx 与 md → html 真实端到端、三段式 API 独立调用、bundle/pdf/html/xml 经桩 parser/renderer
  *       的编排逻辑（字符串产物与 files 对象落盘、options 透传、extras 落盘与穿越拒绝、管线桩调用、渲染器缺失）、
- *       重跑策略 skipExisting / clean
+ *       重跑策略 skipExisting / clean、
+ *       专利五书 XML 输入的 docx 中文字体缺省（未显式给出取宋体，三种显式写法照用，其它输入仍取微软雅黑）
  */
 const { test, describe, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -49,7 +50,7 @@ describe('模块导出与懒加载', () => {
         assert.equal(runBatch, require('../converters/batch').runBatch);
         assert.ok(Array.isArray(SUPPORTED_EXTENSIONS));
         assert.ok(Object.isFrozen(SUPPORTED_EXTENSIONS));
-        for (const ext of ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']) {
+        for (const ext of ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown', '.xml', '.zip']) {
             assert.ok(SUPPORTED_EXTENSIONS.includes(ext), ext);
         }
         for (const ext of ['.doc', '.xls', '.ppt']) {
@@ -76,6 +77,8 @@ describe('detectInputType', () => {
             'x.md': 'md',
             'x.markdown': 'md',
             '/路径/中文 文件.Md': 'md',
+            '/案卷/100002.xml': 'xml',
+            '案卷.ZIP': 'zip',
         };
         for (const [input, expected] of Object.entries(cases)) {
             assert.equal(detectInputType(input), expected, input);
@@ -104,7 +107,7 @@ describe('listTargets', () => {
             office: ['bundle', 'html', 'xml'],
             markup: ['docx', 'html', 'xml'],
             url: ['bundle', 'html', 'xml'],
-            inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', url: 'url' },
+            inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', xml: 'markup', zip: 'markup', url: 'url' },
             capabilities: { pdfBackend: null },
         });
     });
@@ -112,7 +115,7 @@ describe('listTargets', () => {
     test('inputs 不含 markdown 键（.markdown 已由 detectInputType 归入 md），也不含旧二进制格式', () => {
         const { inputs } = listTargets();
         assert.equal('markdown' in inputs, false);
-        assert.deepEqual(Object.keys(inputs), ['docx', 'xlsx', 'pptx', 'pdf', 'md', 'url']);
+        assert.deepEqual(Object.keys(inputs), ['docx', 'xlsx', 'pptx', 'pdf', 'md', 'xml', 'zip', 'url']);
     });
 
     test('pdfBackend 存在时 markup 含 pdf 且顺序固定；与 targets.js 同一实现', () => {
@@ -1449,5 +1452,95 @@ describe('convert：重跑策略 skipExisting / clean（桩 parser 与 renderer�
         assert.equal('clean' in res.options, false);
         assert.equal('skipExisting' in res.options, false);
         assert.equal('skipped' in res, false);
+    });
+});
+
+// ============================================================
+// 专利五书 XML 输入的 docx 中文字体缺省
+// ============================================================
+
+describe('专利五书 XML 输入：docx 的中文字体缺省取宋体', () => {
+    const JSZip = require('jszip');
+    const service = require('../converters/service');
+    const { buildOfficialBundle, writeFiles, zipFiles } = require('./fixtures/patent/roundtrip/build-roundtrip-fixtures');
+
+    // 专利预检只接受宋体、黑体、楷体、仿宋；通用默认为微软雅黑
+    const PATENT_FONT = '宋体';
+    const GENERIC_FONT = '微软雅黑';
+    const FONT_ISSUE = '常规字体之外的中文字体';
+    const SINGLE_BOOK_XML = '<?xml version="1.0" encoding="UTF-8"?><cn-application-body lang="zh" country="CN"><description>'
+        + '<invention-title>一种测试装置</invention-title><heading level="2">技术领域</heading>'
+        + '<p num="0001">本发明涉及测试装置。</p></description></cn-application-body>';
+
+    let bundle;
+    before(async () => {
+        _reset();
+        bundle = await buildOfficialBundle();
+    });
+
+    let fontSeq = 0;
+    const newDir = (label) => {
+        fontSeq += 1;
+        const dir = path.join(root, `font-${label}-${fontSeq}`);
+        fs.mkdirSync(dir, { recursive: true });
+        return dir;
+    };
+    const writeSingleBook = () => {
+        const file = path.join(newDir('single'), 'description.xml');
+        fs.writeFileSync(file, Buffer.from(SINGLE_BOOK_XML, 'utf8'));
+        return file;
+    };
+    const toDocx = (input, options) => convert({ input: { path: input }, target: 'docx', outputDir: newDir('out'), options });
+
+    /** docx 的文档默认中文字体（word/styles.xml 的 w:eastAsia） */
+    async function eastAsiaOf(docxPath) {
+        const zip = await JSZip.loadAsync(fs.readFileSync(docxPath));
+        const styles = await zip.file('word/styles.xml').async('string');
+        const hit = /w:eastAsia="([^"]+)"/.exec(styles);
+        return hit ? hit[1] : null;
+    }
+
+    test('三种输入形态（单书 xml、案卷 zip、五书目录）未指定字体时取宋体，结果回显同此', async () => {
+        const dir = writeFiles(newDir('bundle'), bundle.files);
+        const zipPath = path.join(newDir('zip'), '案卷.zip');
+        fs.writeFileSync(zipPath, await zipFiles(bundle.files));
+
+        for (const input of [writeSingleBook(), zipPath, dir]) {
+            const res = await toDocx(input);
+            assert.equal(await eastAsiaOf(res.outputPath), PATENT_FONT, input);
+            assert.equal(res.options.docx.fontFamily.eastAsia, PATENT_FONT, '结果信封的 options 与产物一致');
+        }
+    });
+
+    test('显式给出的字体照用：嵌套写法、CLI 的 fontEastAsia、MCP 的 docx.fontEastAsia 三种各一例', async () => {
+        const input = writeSingleBook();
+        const cases = [
+            ['嵌套写法', { docx: { fontFamily: { eastAsia: '黑体' } } }, '黑体'],
+            ['CLI', service.buildOptions({ fontEastAsia: '楷体' }, { targets: ['docx'] }), '楷体'],
+            ['MCP', service.buildOptions({ docx: { fontEastAsia: GENERIC_FONT } }, { targets: ['docx'] }), GENERIC_FONT],
+        ];
+        for (const [label, options, expected] of cases) {
+            const res = await toDocx(input, options);
+            assert.equal(await eastAsiaOf(res.outputPath), expected, label);
+        }
+    });
+
+    test('其它输入类型的缺省值不变：md 输入的产物与 docx 输入的归一结果都仍是微软雅黑', async () => {
+        const res = await toDocx(SAMPLE_MD);
+        assert.equal(await eastAsiaOf(res.outputPath), GENERIC_FONT);
+
+        const parsed = await parseDocument({ input: { path: path.join(FIXTURES, 'patent', 'sample-patent.docx') } });
+        assert.equal(parsed.options.docx.fontFamily.eastAsia, GENERIC_FONT);
+    });
+
+    test('往返告警：五书 XML → Word → 再转 XML 不再自招字体预检告警；显式指定微软雅黑时照旧告警', async () => {
+        const input = writeSingleBook();
+        const toXml = (docxPath) => convert({ input: { path: docxPath }, target: 'xml', outputDir: newDir('xml'), options: { xml: { profile: 'patent' } } });
+
+        const back = await toXml((await toDocx(input)).outputPath);
+        assert.equal(back.warnings.some((item) => item.includes(FONT_ISSUE)), false, JSON.stringify(back.warnings));
+
+        const explicit = await toXml((await toDocx(input, { docx: { fontFamily: { eastAsia: GENERIC_FONT } } })).outputPath);
+        assert.ok(explicit.warnings.some((item) => item.includes(FONT_ISSUE)), '显式给出的字体照用，预检照旧告警');
     });
 });

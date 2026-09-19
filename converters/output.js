@@ -5,14 +5,17 @@
  *   → { outputPath, outputs }
  *   目录 {outputDir}/{name}/。files 为 { '<posix 相对路径>': string | Buffer }（字符串按 utf8 写入），
  *   键中的 {name} 占位符（NAME_TOKEN）替换为产物名；assets 按 assets[].name 写入（形如 images/image_1.png，
- *   仅当某个资产名以 images/ 开头才创建 images/ 并报告 imagesDir；裸文件名的资产平铺在目录根下）；
+ *   仅当某个资产名以 images/ 开头才创建 images/ 并报告 imagesDir；裸文件名的资产平铺在目录根下，带其它目录
+ *   前缀的——patent profile 的 100003/100003_1.jpg——写入相应子目录）；
  *   extras 为 [{ name, buffer }] 的附属文件（sidecar），name 中的 {name} 同样替换为产物名后写入。
  *   outputs 的键（方案 §3.3.3）：主产物（键为 {name}.<ext>）取 ext（md / json / html / xml / zip）；
  *   以 {name}_ 开头的文件（files 或根目录 extras）取 {name}_ 之后主干的 camelCase，非 json 再接上扩展名
  *   （{name}_content_list.json → contentList，{name}_content_list_v2.json → contentListV2，
- *   {name}_origin.pdf → originPdf）；其余文件取去扩展名的文件名并转 camelCase（claims.xml → claims，
- *   abstract-figure.xml → abstractFigure）；写入了 images/ 则有 imagesDir；extras 的每个顶层目录记为
- *   <目录名>Dir（mineru/full.md → mineruDir）；根目录下不以 {name}_ 开头的 extras 不进 outputs。
+ *   {name}_origin.pdf → originPdf）；patent profile 的目录化五书 <表格代码>/<表格代码>.xml 按 PATENT_BOOK_KEYS
+ *   显式映射（100001/100001.xml → claims、100002 → description、100003 → drawings、100004 → abstract、
+ *   100005 → abstractFigure），键名是对外契约，不随文件名变化；其余文件取去扩展名的文件名并转 camelCase
+ *   （precheck.json → precheck，abstract-figure.xml → abstractFigure）；写入了 images/ 则有 imagesDir；
+ *   extras 的每个顶层目录记为 <目录名>Dir（mineru/full.md → mineruDir）；根目录下不以 {name}_ 开头的 extras 不进 outputs。
  *   clean 为 true 时，全部路径与内容校验通过之后、写入之前，先清理产物目录中 MarkFlow 会生成的旧文件（范围见下）；
  *   缺省不清理。
  * writeBundle({ outputDir, name, md, json, assets })
@@ -24,12 +27,15 @@
  * 全部路径与内容先校验再统一写盘，避免半途失败留下部分产物。
  * 均覆盖写、全部使用 fs.promises；除 writeFolder 的 clean 之外不删除任何既有文件。
  *
- * clean 的清理范围只限产物目录 {outputDir}/{name}/ 本层（名称区分大小写，{name} 为产物名）：
+ * clean 的清理范围只限产物目录 {outputDir}/{name}/ 本层与 patent profile 的书目目录（名称区分大小写，{name} 为产物名）：
  *   目录 images/（整体删除；为符号链接时只删链接本身，不触及链接目标）；
  *   文件 {name}.md、{name}.json、{name}.html、{name}.xml、{name}.zip、{name}_content_list*.json、{name}_model.json、
- *   {name}_layout.json、{name}_origin.pdf，专利五书 claims.xml、description.xml、drawings.xml、abstract.xml、
- *   abstract-figure.xml 与 precheck.json，patent profile 平铺在根下的图片 drawing-N、table-N、omath-N-N、image_N
- *   （可带 -K 冲突后缀）。与上述文件同名的子目录、其余文件与子目录（用户放入的笔记等）一律保留，
+ *   {name}_layout.json、{name}_origin.pdf 与 precheck.json；
+ *   patent profile 现行的目录化产物：书目目录 100001–100005 内的 <代码>.xml 与 <代码>_<序号>.<扩展名>，删后目录
+ *   为空则一并移除，目录内的其它文件保留；书目目录为符号链接时只删链接本身；
+ *   patent profile 旧版的平铺产物：claims.xml、description.xml、drawings.xml、abstract.xml、abstract-figure.xml，
+ *   以及平铺在根下的图片 drawing-N、table-N、omath-N-N、image_N（可带 -K 冲突后缀）——用户目录里可能还留着上一版文件。
+ *   与上述文件同名的子目录、其余文件与子目录（用户放入的笔记等）一律保留，
  *   产物目录之外的任何文件都不触碰；产物目录不存在时不做任何事；产物目录本身是符号链接时拒绝清理并抛中文错误，
  *   以免删到链接目标中的文件。
  */
@@ -44,15 +50,25 @@ const NAME_TOKEN = '{name}';
 const SIDECAR_PREFIX = `${NAME_TOKEN}_`;
 const WINDOWS_DRIVE_RE = /^[A-Za-z]:/;
 // clean 按原名删除的产物文件（{name} 为产物名占位符）
+// 末行为 patent profile 旧版平铺产物的五书文件名（现行产物在书目目录内，见 PATENT_BOOK_KEYS）
 const CLEAN_FILES = Object.freeze([
     `${NAME_TOKEN}.md`, `${NAME_TOKEN}.json`, `${NAME_TOKEN}.html`, `${NAME_TOKEN}.xml`, `${NAME_TOKEN}.zip`,
-    `${NAME_TOKEN}_model.json`, `${NAME_TOKEN}_layout.json`, `${NAME_TOKEN}_origin.pdf`,
-    'claims.xml', 'description.xml', 'drawings.xml', 'abstract.xml', 'abstract-figure.xml', 'precheck.json',
+    `${NAME_TOKEN}_model.json`, `${NAME_TOKEN}_layout.json`, `${NAME_TOKEN}_origin.pdf`, 'precheck.json',
+    'claims.xml', 'description.xml', 'drawings.xml', 'abstract.xml', 'abstract-figure.xml',
 ]);
 // clean 按前缀删除的旁路 JSON：{name}_content_list.json、{name}_content_list_v2.json 等
 const CLEAN_CONTENT_LIST_PREFIX = `${NAME_TOKEN}_content_list`;
-// patent profile 平铺在产物目录根下的图片：附图 drawing-N、栅格化的 table-N 与 omath-段-序、段内图片 image_N，冲突时带 -K
+// patent profile 旧版平铺在产物目录根下的图片：附图 drawing-N、栅格化的 table-N 与 omath-段-序、段内图片 image_N，冲突时带 -K
 const PATENT_FLAT_IMAGE_RE = /^(?:drawing-\d+|table-\d+|omath-\d+-\d+|image_\d+)(?:-\d+)?\.[A-Za-z0-9]+$/;
+// patent profile 现行的目录化产物（官方「WORD 转 XML 编辑器」的案卷结构）：表格代码 → outputs 键。
+// 须与 renderers/xml/patent.js 的 BOOK_CODES 一致（本文件经调度器顶层加载，不得 require 渲染器；test/output.test.js 锁定两表）
+const PATENT_BOOK_KEYS = Object.freeze({
+    100001: 'claims', 100002: 'description', 100003: 'drawings', 100004: 'abstract', 100005: 'abstractFigure',
+});
+// 五书的相对路径：<表格代码>/<表格代码>.xml
+const PATENT_BOOK_XML_RE = /^(\d{6})\/\1\.xml$/;
+// 书目目录内由本工具生成的文件：<代码>.xml 与图片 <代码>_<序号>.<扩展名>
+const patentBookFileRe = (code) => new RegExp(`^${code}(?:\\.xml|_\\d+\\.[A-Za-z0-9]+)$`);
 
 async function writeFolder({ outputDir, name, files, assets = [], extras = [], clean = false } = {}) {
     const baseDir = resolveOutputDir(outputDir);
@@ -72,7 +88,8 @@ async function writeFolder({ outputDir, name, files, assets = [], extras = [], c
     return { outputPath: dir, outputs };
 }
 
-// 只有资产名以 images/ 开头才涉及 images/ 目录；裸文件名的资产（patent profile 平铺的图片）直接落在目录根下
+// 只有资产名以 images/ 开头才涉及 images/ 目录；裸文件名的资产直接落在目录根下，
+// 带其它目录前缀的（patent profile 的 100003/100003_1.jpg）由 writeJobs 写入相应子目录
 const hasImagesDir = (assetJobs) => assetJobs.some((job) => job.rel.startsWith(`${IMAGES_DIRNAME}/`));
 
 async function writeBundle({ outputDir, name, md, json, assets = [] } = {}) {
@@ -161,6 +178,23 @@ async function cleanFolder(dir, name) {
     const doomed = entries.filter((entry) => isCleanTarget(entry, exactNames, contentListPrefix));
     // images 为目录时整体删除；为符号链接时 fs.rm 只删链接本身（按 lstat 判定，不跟随链接）
     await Promise.all(doomed.map((entry) => fsp.rm(path.join(dir, entry.name), { recursive: entry.name === IMAGES_DIRNAME, force: true })));
+    const bookDirs = entries.filter((entry) => Object.hasOwn(PATENT_BOOK_KEYS, entry.name));
+    await Promise.all(bookDirs.map((entry) => cleanPatentBookDir(path.join(dir, entry.name), entry)));
+}
+
+// patent profile 的书目目录：只删本工具生成的 <代码>.xml 与 <代码>_<序号>.<扩展名>，删后为空则移除目录，
+// 其余文件（用户放入的）保留；目录为符号链接时只删链接本身，随后的写入会在原位新建真实目录
+async function cleanPatentBookDir(bookDir, entry) {
+    if (entry.isSymbolicLink()) {
+        await fsp.rm(bookDir, { force: true });
+        return;
+    }
+    if (!entry.isDirectory()) return;
+    const pattern = patentBookFileRe(entry.name);
+    const children = await fsp.readdir(bookDir, { withFileTypes: true });
+    const doomed = children.filter((child) => (child.isFile() || child.isSymbolicLink()) && pattern.test(child.name));
+    await Promise.all(doomed.map((child) => fsp.rm(path.join(bookDir, child.name), { force: true })));
+    if (doomed.length === children.length) await fsp.rmdir(bookDir);
 }
 
 // Dirent 按 lstat 语义给出类型：images 须为目录或符号链接，其余须为文件或符号链接，同名的子目录一律保留
@@ -202,8 +236,11 @@ function buildOutputs(dir, { fileJobs, assetJobs, extraJobs }) {
 }
 
 // {name}.md → md；{name}_content_list.json → contentList；{name}_origin.pdf → originPdf；
-// claims.xml → claims；abstract-figure.xml → abstractFigure
+// 100001/100001.xml → claims（patent profile 的五书按表格代码显式映射，不从文件名派生）；
+// precheck.json → precheck；abstract-figure.xml → abstractFigure
 function outputKeyFor(key) {
+    const bookXml = PATENT_BOOK_XML_RE.exec(normalizeSlashes(key));
+    if (bookXml && Object.hasOwn(PATENT_BOOK_KEYS, bookXml[1])) return PATENT_BOOK_KEYS[bookXml[1]];
     const base = path.posix.basename(normalizeSlashes(key));
     const ext = path.posix.extname(base);
     const stem = ext ? base.slice(0, -ext.length) : base;
@@ -269,4 +306,4 @@ function isPlainObject(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value) && !Buffer.isBuffer(value);
 }
 
-module.exports = { writeFolder, writeBundle, writeSingle, outputKeyFor, NAME_TOKEN };
+module.exports = { writeFolder, writeBundle, writeSingle, outputKeyFor, NAME_TOKEN, PATENT_BOOK_KEYS };

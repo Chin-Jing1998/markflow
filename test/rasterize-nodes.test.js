@@ -2,7 +2,9 @@
  * converters/raster/rasterize-nodes.js 与 raster/fragment.js 单元测试（桩后端）
  * 覆盖：table → image 节点与 JPG 资源（JFIF 密度 330、白底）、omath-<段>-<序> 命名与行内 inline 标记、
  *       patent 不缩放 / 非 patent 按 scale 与 maxWidth、后端不可用与单任务 / 整批失败的降级 + warning、
- *       入参不变与未触及节点保持引用、无命中不触碰后端、资源名冲突、片段页内容与无 http(s) 引用
+ *       入参不变与未触及节点保持引用、无命中不触碰后端、资源名冲突、片段页内容与无 http(s) 引用、
+ *       patent 下公式图按墨迹紧裁（四周定量留白、全白不裁）与 data.section 继承、
+ *       table.data.grid 表格的片段页跨度与多段、降级仍走 mdast 行列、真实 electron 出图非空白（无后端时跳过）
  */
 const { test, before, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -19,18 +21,40 @@ const {
 
 const MML = '<math><mfrac><mi>a</mi><mi>b</mi></mfrac></math>';
 const RED = 0xff0000ff;
+const WHITE = 0xffffffff;
 const TRANSPARENT = 0x00000000;
 const PNG_MIME = 'image/png';
+
+/** 紧裁留白：与 rasterize-nodes.js 的 MATH_MARGIN_PX 一致 */
+const MATH_MARGIN_PX = 4;
+/** 墨迹块尺寸与其在画布中的位置：画布远大于墨迹，才能看出是否真的裁掉了周边留白 */
+const INK = { canvas: { w: 240, h: 160 }, rect: { x: 70, y: 45, w: 60, h: 30 } };
 
 let Jimp;
 let PNG_RED;
 let PNG_TRANSPARENT;
+let PNG_INK;
+let PNG_BLANK;
 
 before(async () => {
     ({ Jimp } = await loadJimp());
     PNG_RED = await new Jimp({ width: 400, height: 40, color: RED }).getBuffer(PNG_MIME);
     PNG_TRANSPARENT = await new Jimp({ width: 40, height: 20, color: TRANSPARENT }).getBuffer(PNG_MIME);
+    PNG_INK = await inkCanvas().getBuffer(PNG_MIME);
+    PNG_BLANK = await new Jimp({ width: INK.canvas.w, height: INK.canvas.h, color: WHITE }).getBuffer(PNG_MIME);
 });
+
+/** 白底画布上画一块黑色墨迹矩形 */
+function inkCanvas() {
+    const image = new Jimp({ width: INK.canvas.w, height: INK.canvas.h, color: WHITE });
+    const { x, y, w, h } = INK.rect;
+    for (let row = y; row < y + h; row += 1) {
+        for (let col = x; col < x + w; col += 1) {
+            image.bitmap.data.set([0, 0, 0, 255], (row * INK.canvas.w + col) * 4);
+        }
+    }
+    return image;
+}
 
 afterEach(() => {
     backend._reset();
@@ -93,11 +117,31 @@ function assertNoRemote(html) {
 
 const dims = (node) => ({ width: node.data.width, height: node.data.height, dpi: node.data.dpi });
 
+/** 以新对象方式给节点补 data 字段（顶层块的 data.section 由 parsers/docx-sections 写入） */
+const withData = (node, extra) => ({ ...node, data: { ...(node.data || {}), ...extra } });
+
+function collectImages(node, out = []) {
+    if (!node || typeof node !== 'object') return out;
+    if (node.type === 'image') out.push(node);
+    if (Array.isArray(node.children)) node.children.forEach((child) => collectImages(child, out));
+    return out;
+}
+
+/** 距图像边框 inset 像素的那一圈上，所有像素的最小灰度 */
+function minLuma(image, inset) {
+    const { data, width, height } = image.bitmap;
+    const at = (x, y) => Math.min(data[(y * width + x) * 4], data[(y * width + x) * 4 + 1], data[(y * width + x) * 4 + 2]);
+    let min = 255;
+    for (let x = inset; x < width - inset; x += 1) min = Math.min(min, at(x, inset), at(x, height - 1 - inset));
+    for (let y = inset; y < height - inset; y += 1) min = Math.min(min, at(inset, y), at(width - 1 - inset, y));
+    return min;
+}
+
 // ============================================================
 // rasterizeNodes
 // ============================================================
 
-test('table → image 节点与 JPG 资源：命名 table-<序>、role table、JFIF 密度 330、math 节点不受影响', async () => {
+test('table → image 节点与 JPG 资源：命名 table-<序>、role table、JFIF 密度取 patent 默认的 300、math 节点不受影响', async () => {
     // Arrange
     const calls = stubBackend();
     const doc = sampleDoc();
@@ -117,7 +161,8 @@ test('table → image 节点与 JPG 资源：命名 table-<序>、role table、J
     assert.equal(children[1].type, 'image');
     assert.equal(children[1].url, 'images/table-1.jpg');
     assert.equal(children[1].alt, '表格 1');
-    assert.deepEqual(children[1].data, { assetName: 'images/table-1.jpg', role: 'table', inline: false, width: 400, height: 40, dpi: 330 });
+    // patent profile 未显式给 jpegPpi 时取 300（converters/options.js 的 profile 默认值）
+    assert.deepEqual(children[1].data, { assetName: 'images/table-1.jpg', role: 'table', inline: false, width: 400, height: 40, dpi: 300 });
     assert.equal(children[5].url, 'images/table-2.jpg');
     assert.equal(children[0], doc.ir.children[0], '未命中的段落沿用原引用');
 
@@ -126,7 +171,7 @@ test('table → image 节点与 JPG 资源：命名 table-<序>、role table、J
     const asset = result.doc.assets[1];
     assert.equal(asset.name, 'images/table-1.jpg');
     assert.equal(asset.mime, 'image/jpeg');
-    assert.deepEqual(readJfif(asset.buffer), { units: 1, x: 330, y: 330 });
+    assert.deepEqual(readJfif(asset.buffer), { units: 1, x: 300, y: 300 });
     assert.equal(result.doc.assets[2].name, 'images/table-2.jpg');
 });
 
@@ -177,10 +222,10 @@ test('patent profile 按 imageDpi 出图且不缩放；JPEG 统一写入 jpegPpi
     const limited = await run({ raster: { scale: 1, maxWidth: 200 } });
     const scaled = await run({ raster: { scale: 3 } });
 
-    // Assert
+    // Assert：patent profile 未显式给 jpegPpi，密度取 profile 默认的 300；出图 DPI 仍由 imageDpi 决定
     assert.equal(patent.dpi, 150);
-    assert.deepEqual(dims(patent.node), { width: 400, height: 40, dpi: 330 });
-    assert.deepEqual(readJfif(patent.asset.buffer), { units: 1, x: 330, y: 330 });
+    assert.deepEqual(dims(patent.node), { width: 400, height: 40, dpi: 300 });
+    assert.deepEqual(readJfif(patent.asset.buffer), { units: 1, x: 300, y: 300 });
 
     assert.equal(limited.dpi, 96);
     assert.deepEqual(dims(limited.node), { width: 200, height: 20, dpi: 330 });
@@ -388,3 +433,226 @@ test('公式片段：本地 MathJax 脚本与字体路径、display 归一、就
     assert.ok(!unsafe.includes('<script>alert'));
     assertNoRemote(fallback);
 });
+
+// ============================================================
+// 公式图紧裁（patent profile）
+// ============================================================
+
+test('patent：公式图按墨迹紧裁，四周各留 MATH_MARGIN_PX；同一批的表格图不裁', async () => {
+    // Arrange：后端对所有任务返回同一张「大画布 + 小墨迹」的图
+    stubBackend((jobs) => new Map(jobs.map((job) => [job.id, PNG_INK])));
+    const doc = sampleDoc();
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['math', 'table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert：公式图 = 墨迹 + 两侧留白
+    const expected = { width: INK.rect.w + 2 * MATH_MARGIN_PX, height: INK.rect.h + 2 * MATH_MARGIN_PX, dpi: 300 };
+    const formulas = collectImages(result.doc.ir).filter((node) => node.data.role === 'formula');
+    assert.equal(formulas.length, 4);
+    for (const node of formulas) assert.deepEqual(dims(node), expected);
+
+    // Assert：表格图沿用片段页原始幅面
+    const tables = collectImages(result.doc.ir).filter((node) => node.data.role === 'table');
+    assert.equal(tables.length, 2);
+    for (const node of tables) assert.deepEqual(dims(node), { width: INK.canvas.w, height: INK.canvas.h, dpi: 300 });
+});
+
+test('patent：紧裁后的公式图四周确为纯白留白，墨迹一像素不丢', async () => {
+    // Arrange
+    stubBackend((jobs) => new Map(jobs.map((job) => [job.id, PNG_INK])));
+    const doc = createDocument({ ir: createRoot([createMath({ mathml: MML, text: 'a/b', display: true })]), meta: {} });
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['math'], options: normalizeOptions({ xml: { profile: 'patent' }, jpegQuality: 100 }) });
+    const image = await Jimp.read(result.doc.assets[0].buffer);
+
+    // Assert：外圈 MATH_MARGIN_PX 全白，紧贴留白的那一圈全是墨迹
+    assert.equal(image.width, INK.rect.w + 2 * MATH_MARGIN_PX);
+    assert.equal(image.height, INK.rect.h + 2 * MATH_MARGIN_PX);
+    assert.equal(minLuma(image, MATH_MARGIN_PX - 1), 255, '最外侧留白应为纯白');
+    assert.ok(minLuma(image, MATH_MARGIN_PX) < 128, '留白之内紧接着就是墨迹');
+});
+
+test('patent：整幅无墨迹的公式图原样返回，不裁成 0×0', async () => {
+    // Arrange
+    stubBackend((jobs) => new Map(jobs.map((job) => [job.id, PNG_BLANK])));
+    const doc = createDocument({ ir: createRoot([createMath({ text: ' ', display: true })]), meta: {} });
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['math'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert
+    assert.deepEqual(dims(result.doc.ir.children[0]), { width: INK.canvas.w, height: INK.canvas.h, dpi: 300 });
+});
+
+test('非 patent profile：公式图不紧裁，沿用既有的 scale 与 maxWidth 行为', async () => {
+    // Arrange
+    stubBackend((jobs) => new Map(jobs.map((job) => [job.id, PNG_INK])));
+    const doc = createDocument({ ir: createRoot([createMath({ mathml: MML, text: 'a/b', display: true })]), meta: {} });
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['math'], options: normalizeOptions({}) });
+
+    // Assert
+    assert.deepEqual(dims(result.doc.ir.children[0]), { width: INK.canvas.w, height: INK.canvas.h, dpi: 330 });
+});
+
+// ============================================================
+// 分节信息继承
+// ============================================================
+
+test('替换成 image 节点时继承原节点的 data.section，原节点没有则不写该字段', async () => {
+    // Arrange：表格与块级公式各自带分节信息，另有一个不带的公式
+    stubBackend();
+    const sectionA = { index: 2, header: '说明书' };
+    const sectionB = { index: 3, header: '说明书附图' };
+    const doc = createDocument({
+        ir: createRoot([
+            withData(table([['甲']]), { section: sectionA }),
+            withData(createMath({ mathml: MML, text: 'a/b', display: true }), { section: sectionB }),
+            createMath({ text: 'x', display: true }),
+        ]),
+        meta: {},
+    });
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['math', 'table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert
+    const [tableImage, mathImage, plainImage] = result.doc.ir.children;
+    assert.deepEqual(tableImage.data.section, sectionA);
+    assert.deepEqual(mathImage.data.section, sectionB);
+    assert.ok(!('section' in plainImage.data), '原节点没有分节信息时不凭空补一个');
+    assert.deepEqual(doc.ir.children[0].data.section, sectionA, '入参不被修改');
+});
+
+
+test('后端不可用而降级时，顶层表格与块级公式的降级段落同样继承 data.section', async () => {
+    // Arrange
+    backend._setDeps({ electronPath: null });
+    const sectionA = { index: 2, header: '说明书' };
+    const sectionB = { index: 3, header: '说明书附图' };
+    const doc = createDocument({
+        ir: createRoot([
+            withData(table([['甲', '乙'], ['1', '2']]), { section: sectionA }),
+            withData(createMath({ mathml: MML, text: 'a/b', display: true }), { section: sectionB }),
+            createMath({ text: 'x', display: true }),
+        ]),
+        meta: {},
+    });
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['math', 'table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert
+    const [rowA, rowB, mathPara, plainPara] = result.doc.ir.children;
+    assert.equal(result.backend, null);
+    assert.deepEqual(rowA.data.section, sectionA);
+    assert.deepEqual(rowB.data.section, sectionA);
+    assert.deepEqual(mathPara.data.section, sectionB);
+    assert.ok(!(plainPara.data && 'section' in plainPara.data), '原节点没有分节信息时不凭空补一个');
+});
+
+// ============================================================
+// data.grid（docx 表格：合并单元格与单元格内多段）
+// ============================================================
+
+const REAL_BACKEND_TIMEOUT_MS = 90000;
+/** 出图的合理量级：比单行小表大得多即可，不锁死具体像素 */
+const MIN_GRID_IMAGE = { width: 200, height: 60 };
+
+/** 带 data.grid 的表格节点：两行三列，含横向与纵向合并、一个两段单元格与一个上标 */
+function mergedGridTable() {
+    const cell = (paragraphs, extra = {}) => ({ colspan: 1, rowspan: 1, header: false, paragraphs, ...extra });
+    const line = (value) => [createText(value)];
+    return {
+        ...createTable(null, [createTableRow([createTableCell('降级用')])]),
+        data: {
+            grid: {
+                rows: [
+                    { header: false, cells: [
+                        cell([line('横跨两列的表头')], { colspan: 2 }),
+                        cell([line('纵跨两行')], { rowspan: 2 }),
+                    ] },
+                    { header: false, cells: [
+                        cell([line('第一段文字'), [createText('第二段 m'), { type: 'superscript', children: [createText('3')] }]]),
+                        cell([line('普通单元格')]),
+                    ] },
+                ],
+            },
+        },
+    };
+}
+
+test('grid 表格：片段页按 grid 出跨度与多段，仍不引用任何 http(s) 资源', async () => {
+    // Arrange
+    const doc = createDocument({ ir: createRoot([mergedGridTable()]) });
+    const calls = stubBackend();
+
+    // Act
+    await rasterizeNodes(doc, { kinds: ['table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert
+    const html = calls[0].htmls[0];
+    assert.ok(html.includes('<td colspan="2"><p>横跨两列的表头</p></td>'), html);
+    assert.ok(html.includes('<td rowspan="2"><p>纵跨两行</p></td>'), html);
+    assert.ok(html.includes('<td><p>第一段文字</p><p>第二段 m<sup>3</sup></p></td>'), html);
+    assert.ok(!/<thead>/.test(html), '没有表头行时不出 thead，首行不被强制加粗');
+    assert.ok(!/https?:\/\//.test(html), '片段页不得引用任何 http(s) 资源');
+});
+
+test('grid 表格：后端不可用时仍按 mdast 的行列降级为逐行文本（grid 只供出图）', async () => {
+    // Arrange
+    const doc = createDocument({ ir: createRoot([mergedGridTable()]) });
+    backend._setDeps({ electronPath: null });
+
+    // Act
+    const result = await rasterizeNodes(doc, { kinds: ['table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+
+    // Assert
+    assert.equal(result.rasterized, 0);
+    assert.equal(result.doc.ir.children[0].type, 'paragraph');
+    assert.equal(result.doc.ir.children[0].children[0].value, '降级用');
+});
+
+test('真实 electron 出图：含合并单元格与多段单元格的 grid 表格成图且非空白', { timeout: REAL_BACKEND_TIMEOUT_MS }, async (t) => {
+    // Arrange
+    const detected = await backend.detect();
+    if (!detected.available) {
+        t.skip(`本机无可用栅格后端：${detected.hint}`);
+        return;
+    }
+    const doc = createDocument({ ir: createRoot([mergedGridTable()]) });
+
+    // Act
+    let result;
+    try {
+        result = await rasterizeNodes(doc, { kinds: ['table'], options: normalizeOptions({ xml: { profile: 'patent' } }) });
+    } catch (err) {
+        t.skip(`当前环境无法 spawn Electron：${err.message}`);
+        return;
+    }
+    if (result.rasterized === 0) {
+        t.skip(`当前环境出图失败：${result.warnings.join('；')}`);
+        return;
+    }
+
+    // Assert
+    const image = result.doc.ir.children[0];
+    assert.equal(image.type, 'image');
+    assert.ok(image.data.width >= MIN_GRID_IMAGE.width, `宽度应为正常量级，实际 ${image.data.width}`);
+    assert.ok(image.data.height >= MIN_GRID_IMAGE.height, `高度应含两行与多段，实际 ${image.data.height}`);
+    const { Jimp } = await loadJimp();
+    const rendered = await Jimp.read(result.doc.assets[0].buffer);
+    assert.ok(hasInk(rendered), '表格图不应是整幅空白');
+});
+
+/** 是否有明显墨迹：任一像素的 RGB 最小值低于阈值 */
+function hasInk(image) {
+    const { data } = image.bitmap;
+    for (let offset = 0; offset < data.length; offset += 4) {
+        if (Math.min(data[offset], data[offset + 1], data[offset + 2]) < 200) return true;
+    }
+    return false;
+}

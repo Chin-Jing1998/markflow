@@ -1,13 +1,15 @@
 /**
  * converters/renderers/md.js 与 json.js 对 math / safeTable 节点的处理
  * 覆盖：math 降级为线性化文本并套 TeX 定界符（行内 $…$、块级 $$…$$ 独立成段）、
- *       text 缺省时由 MathML 兜底、safeTable 的 html 节点原样输出、json 原样序列化且不抛错
+ *       text 缺省时由 MathML 兜底、safeTable 的 html 节点原样输出、json 原样序列化且不抛错、
+ *       underline / superscript / subscript 输出行内 HTML 且可往返
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const mdRenderer = require('../converters/renderers/md');
 const jsonRenderer = require('../converters/renderers/json');
+const { loadUnified } = require('../converters/ir/unified-loader');
 const { createDocument, createRoot, createParagraph, createText, createMath } = require('../converters/ir/schema');
 
 const SAFE_TABLE = '<table><tr><td>甲</td><td>乙</td></tr></table>';
@@ -78,4 +80,32 @@ test('json：math 与 safeTable 节点原样序列化，二进制被略过', asy
     assert.equal(html.data.safeTable, true);
     assert.equal(html.value, SAFE_TABLE);
     assert.equal(imageParagraph.children[0].data.asset.buffer, undefined, '二进制不应进入 JSON');
+});
+
+test('md：underline / superscript / subscript 输出行内 HTML，再解析可回到同样的节点', async () => {
+    // Arrange
+    const doc = makeDoc([createParagraph([
+        createText('C'), { type: 'subscript', children: [createText('1')] },
+        createText('~C'), { type: 'subscript', children: [createText('30')] },
+        createText('，R'), { type: 'superscript', children: [createText('2')] },
+        createText('，'), { type: 'underline', children: [createText('注')] },
+    ])]);
+
+    // Act
+    const md = await mdRenderer.render(doc);
+
+    // Assert：行内 HTML 形态与 <u> 一致
+    assert.ok(md.includes('C<sub>1</sub>'), md);
+    assert.ok(md.includes('C<sub>30</sub>'), md);
+    assert.ok(md.includes('R<sup>2</sup>'), md);
+    assert.ok(md.includes('<u>注</u>'), md);
+
+    // Assert：md → 再解析 → 提升，回到同样的节点序列
+    const { unified, remarkParse, remarkGfm } = await loadUnified();
+    const { liftInlineHtml } = require('../converters/ir/inline-html');
+    const reparsed = liftInlineHtml(unified().use(remarkParse).use(remarkGfm).parse(md));
+    assert.deepEqual(
+        reparsed.children[0].children.map((n) => n.type),
+        ['text', 'subscript', 'text', 'subscript', 'text', 'superscript', 'text', 'underline'],
+    );
 });

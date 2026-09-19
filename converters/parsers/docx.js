@@ -3,16 +3,25 @@
  *
  * 流程：读入 buffer → inspectOoxml（OOXML 预检信息）→ extractMath（OMML 换成哨兵 run）
  *       → prepareLayout（首行缩进、制表符、题注换成标记 run，图片 alt 前写序号并记下显示尺寸）
+ *       → markSections（多分节且页眉有文字时，每节起点插入一个哨兵段）
  *       → mammoth（docx → HTML，图片经 convertImage 截获为 Buffer，下划线经 styleMap 'u => u' 保留）
+ *       → collectTableGrids（顶层表格另存为结构化 grid，首个单元格注入表格标记）
  *       → turndown('word')（HTML → Markdown）→ remark-parse + remark-gfm（Markdown → mdast）
- *       → restoreMath（哨兵换回 math 节点）→ liftInlineHtml（<u> 等 → 节点）→ applyDisplay（显示尺寸写回图片）
+ *       → restoreMath（哨兵换回 math 节点）→ liftInlineHtml（<u> 等 → 节点）
+ *       → applyImageData（显示尺寸与图片角色写回图片）
  *       → restoreMarkers（标记 → data.indent / data.role / \t）→ markCaptions（大图拆段、图注定角色）
+ *       → applySections（消去哨兵段，顶层节点写 data.section）
+ *       → restoreTableGrids（表格标记 → table.data.grid，残留标记兜底清除）
  *
  * 契约：
  *   - async parse({ path } | { buffer }, ctx) → MarkFlowDocument{ ir, data, assets, warnings, meta }
  *   - 不写盘、不打印：mammoth 警告、图片读取失败、预检与公式抽取异常一律推入 warnings
  *   - 图片按出现顺序编号为 images/image_N.ext（N 从 1 起），IR 中 image 节点 url 与 assets 一一对应；
- *     取得到 wp:extent / VML 尺寸的图片带 data.display（px），浮动图另带 data.floating
+ *     取得到 wp:extent / VML 尺寸的图片带 data.display（px）与 data.displayWidthMm / displayHeightMm
+ *     （Word 中的物理显示尺寸，毫米浮点不取整），浮动图另带 data.floating
+ *   - 图片角色写入 data.role（见 parsers/docx-chemistry）：化学结构式按四条判据判为 'chemistry'，
+ *     替换文字带 markflow:role= 前缀的按标记取 'formula' | 'table' | 'chemistry'；两者都不命中即不写该键。
+ *     `<SIPOChemFile` 判据命中后 alt 清空，角色标记前缀连同其后的一个 `;` 从 alt 中剥离
  *   - 标题取首个有文字的 Title 样式段（不带编号的在正文中仍为普通段落，带编号的与同一编号定义下的普通段同为列表项），
  *     其次首个 <h1> 文本，否则取去扩展名的文件名
  *   - data.ooxml 为 OOXML 预检信息（采集失败时为 null），meta.sourcePath 为源文件绝对路径
@@ -20,6 +29,10 @@
  *     为空、缺失或是占位名时不设该键，front matter 随之不写 author 行
  *   - 公式一律进 IR 的 math 节点；options.math='text' 的降级由渲染器负责，解析层不降级
  *   - 段落文本本身不带全角缩进（由 md 渲染器按 data.indent 插入），专利 XML 等下游不受影响
+ *   - 文档至少有两个 Word 分节且至少一节的页眉有文字时，每个顶层节点带 data.section = { index, header }
+ *     （分节序号 1 起、该节生效页眉的纯文本，见 parsers/docx-sections）；否则不写该键，IR 与此前逐字节一致
+ *   - 表格节点带 table.data.grid：合并单元格、单元格内多段与行内格式的结构化留存（见 parsers/docx-tables）。
+ *     patent profile 的表格出图据此重建片段页；md / html / docx 渲染器不读该键，其产物与引入该键之前逐字节一致
  */
 const path = require('path');
 const fsp = require('fs/promises');
@@ -37,6 +50,9 @@ const { notify, errText } = require('../util');
 const { inspectOoxml } = require('./docx-ooxml');
 const { extractMath, restoreMath } = require('./docx-math');
 const { prepareLayout, parseImageMarker } = require('./docx-layout');
+const { CHEMISTRY_ROLE, resolveImageRole } = require('./docx-chemistry');
+const { markSections, applySections } = require('./docx-sections');
+const { collectTableGrids, restoreTableGrids } = require('./docx-tables');
 
 const DEFAULT_SOURCE_NAME = '未命名.docx';
 const DEFAULT_IMAGE_MIME = 'image/png';
@@ -87,21 +103,32 @@ async function parse(input, ctx = {}) {
     const ooxml = await inspectSafely(original, warnings);
     const { buffer, formulas } = await extractSafely(original, warnings);
     const layout = await layoutSafely(buffer, warnings);
+    const sectioned = await sectionsSafely(layout.buffer, warnings);
 
     const displayByAsset = new Map();
-    const rawHtml = await convertWithMammoth({ buffer: layout.buffer }, { assets, warnings, displays: layout.displays, displayByAsset });
+    const roleByAsset = new Map();
+    const rawHtml = await convertWithMammoth({ buffer: sectioned.buffer }, {
+        assets, warnings, displays: layout.displays, roles: layout.roles, displayByAsset, roleByAsset,
+    });
     const html = collectInlineBase64Images(rawHtml, assets, warnings);
     notify(ctx, 'parsing', PROGRESS_ASSETS);
 
     const title = titleText(html) || stripExt(sourceName);
-    const markdown = cleanupMarkdown(createTurndownService('word').turndown(html));
+    // 表格结构（合并单元格、单元格内多段与行内格式）在此另存：turndown 转 GFM 只留单元格纯文本。
+    // 标记只随 turndown 这一路走，标题仍取未注入标记的 HTML
+    const tables = collectTableGrids(html);
+    warnings.push(...tables.warnings);
+    const markdown = cleanupMarkdown(createTurndownService('word').turndown(tables.html));
 
     const { unified, remarkParse, remarkGfm } = await loadUnified();
     const parsed = unified().use(remarkParse).use(remarkGfm).parse(markdown);
     const restored = restoreMath(parsed, formulas);
     warnings.push(...restored.warnings);
-    const lifted = applyDisplay(liftInlineHtml(restored.ir, { source: 'docx' }), displayByAsset);
-    const ir = markCaptions(restoreMarkers(lifted));
+    const lifted = applyImageData(liftInlineHtml(restored.ir, { source: 'docx' }), { displayByAsset, roleByAsset });
+    const blocks = applySections(markCaptions(restoreMarkers(lifted)), sectioned.sections);
+    const grids = restoreTableGrids(blocks, tables.grids);
+    warnings.push(...grids.warnings);
+    const ir = grids.ir;
     notify(ctx, 'parsing', PROGRESS_IR);
 
     const author = await readCoreCreator(original);
@@ -156,7 +183,17 @@ async function layoutSafely(buffer, warnings) {
         return await prepareLayout(buffer);
     } catch (err) {
         warnings.push(`版面信息（缩进、制表符、题注、图片尺寸）读取失败，已按原样转换（${errText(err)}）`);
-        return { buffer, displays: new Map() };
+        return { buffer, displays: new Map(), roles: new Map() };
+    }
+}
+
+// 分节与页眉读取失败时按无分节继续：顶层节点不带 data.section，下游回落到既有的标题段与位置推定
+async function sectionsSafely(buffer, warnings) {
+    try {
+        return await markSections(buffer);
+    } catch (err) {
+        warnings.push(`分节与页眉读取失败，已按无分节处理（${errText(err)}）`);
+        return { buffer, sections: [] };
     }
 }
 
@@ -169,27 +206,38 @@ function resolveSource(input) {
 // ---------- mammoth 转换 ----------
 
 /**
- * 图片 alt 里的序号标记（docx-layout 写入）在此取出并还原原 alt，据此把显示尺寸登记到资产名上
+ * 图片 alt 里的序号标记（docx-layout 写入）在此取出并还原原 alt，据此把显示尺寸与 OOXML 侧的角色
+ * 登记到资产名上；另两条化学式判据（替换文字、EMF 字节）在此就地判定（见 parsers/docx-chemistry）
  */
-async function convertWithMammoth(source, { assets, warnings, displays, displayByAsset }) {
+async function convertWithMammoth(source, { assets, warnings, displays, roles, displayByAsset, roleByAsset }) {
     const options = {
         styleMap: [...STYLE_MAP],
         convertImage: mammoth.images.imgElement(async (image) => {
-            const { index, alt } = parseImageMarker(image.altText);
+            const { index, alt: rawAlt } = parseImageMarker(image.altText);
+            // 角色标记与 SIPOChemFile 前缀都写在替换文字里，先只按文本判一次：
+            // 图片读不出时也不让这些前缀（尤其是可长达数十 KB 的 CML）流进 alt
+            const textOnly = resolveImageRole({ alt: rawAlt });
             let buffer;
             try {
                 buffer = await image.readAsBuffer();
             } catch (err) {
                 warnings.push(`图片读取失败，已跳过（${errText(err)}）`);
-                return { src: '', alt };
+                return { src: '', alt: textOnly.alt };
             }
             if (!buffer || buffer.length === 0) {
                 warnings.push('遇到空图片，已跳过');
-                return { src: '', alt };
+                return { src: '', alt: textOnly.alt };
             }
             const name = pushAsset(assets, buffer, image.contentType);
             const display = index === null ? null : displays.get(index);
             if (display && display.width >= 1) displayByAsset.set(name, display);
+            const { role, alt } = resolveImageRole({
+                alt: rawAlt,
+                buffer,
+                mime: image.contentType,
+                ooxmlChemistry: index !== null && roles.get(index) === CHEMISTRY_ROLE,
+            });
+            if (role) roleByAsset.set(name, role);
             return { src: name, alt };
         }),
     };
@@ -216,23 +264,33 @@ function normalizeMime(contentType) {
 
 // ---------- IR 后处理 ----------
 
-// 资产名 → 显示尺寸，写回 image 节点的 data.display（px）；浮动图另记 data.floating。不改动入参
-function applyDisplay(node, displayByAsset) {
-    if (!node || typeof node !== 'object' || displayByAsset.size === 0) return node;
-    if (node.type === 'image') {
-        const size = displayByAsset.get(node.url);
-        if (!size) return node;
+// 资产名 → 显示尺寸与角色，写回 image 节点的 data.display（px）、data.displayWidthMm / displayHeightMm
+// （毫米，浮点不取整）与 data.role；浮动图另记 data.floating。各项取不到即不写该键。不改动入参
+function applyImageData(node, maps) {
+    if (!node || typeof node !== 'object' || (maps.displayByAsset.size === 0 && maps.roleByAsset.size === 0)) return node;
+    if (node.type === 'image') return withImageData(node, maps);
+    if (!Array.isArray(node.children)) return node;
+    const children = node.children.map((child) => applyImageData(child, maps));
+    return children.some((child, i) => child !== node.children[i]) ? { ...node, children } : node;
+}
+
+function withImageData(node, { displayByAsset, roleByAsset }) {
+    const size = displayByAsset.get(node.url);
+    const role = roleByAsset.get(node.url);
+    if (!size && !role) return node;
+    const data = { ...(node.data || {}) };
+    if (size) {
         const display = { width: size.width };
         if (size.height >= 1) display.height = size.height;
         display.unit = 'px';
         display.source = 'docx';
-        const data = { ...(node.data || {}), display };
+        data.display = display;
         if (size.floating) data.floating = true;
-        return { ...node, data };
+        if (size.widthMm > 0) data.displayWidthMm = size.widthMm;
+        if (size.heightMm > 0) data.displayHeightMm = size.heightMm;
     }
-    if (!Array.isArray(node.children)) return node;
-    const children = node.children.map((child) => applyDisplay(child, displayByAsset));
-    return children.some((child, i) => child !== node.children[i]) ? { ...node, children } : node;
+    if (role) data.role = role;
+    return { ...node, data };
 }
 
 // ---------- HTML 后处理 ----------

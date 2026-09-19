@@ -5,8 +5,10 @@
  *   工具清单与入参 schema（含转换选项、2020-12 方言、无 $ref、描述与取值范围、中文校验文案）、
  *   工具 annotations 与服务 instructions、list_formats 能力矩阵（含 DTD 校验器、LibreOffice 与受理扩展名）、
  *   convert_document 的成功/选项透传/入参错误/运行期失败、validate 标记、ignoredArguments、
+ *   patent profile 的 outputs 契约（键名不变、值为官方案卷结构 100001/100001.xml 一类的新路径）、
  *   缺失输入不预检、returnContent（contentTruncated、非 bundle 告警、紧凑 JSON）、进度通知、
- *   extract_article 的只读提取（结构、截断语义、零落盘）。
+ *   extract_article 的只读提取（结构、截断语义、零落盘）、
+ *   专利五书 XML 反向导入（案卷 zip / 五书目录 / 单个 XML 三种输入、xmlImport 段、list_formats 列出新输入类型）。
  * 客户端在 listTools() 后会用 outputSchema 校验 structuredContent，因此这些用例同时验证了
  * 服务端返回结构与声明的 schema 一致。临时产物一律写入 os.tmpdir()。
  *
@@ -32,6 +34,7 @@ const SERVER = path.join(ROOT, 'mcp', 'server.js');
 const PRELOAD = path.join(ROOT, 'test', 'fixtures', 'allow-private-network.js');
 const SAMPLE_MD = path.join(ROOT, 'test', 'fixtures', 'sample.md');
 const SAMPLE_PDF = path.join(ROOT, 'test', 'fixtures', 'sample.pdf');
+const SAMPLE_PATENT = path.join(ROOT, 'test', 'fixtures', 'patent', 'sample-patent.docx');
 const PKG_VERSION = require('../package.json').version;
 
 let client;
@@ -112,7 +115,7 @@ test('convert_document 的 inputSchema 暴露全部转换选项，只有 outputD
     assert.deepEqual(Object.keys(properties).sort(), [
         'clean', 'docx', 'html', 'imageFormat', 'jpegPpi', 'jpegQuality', 'math', 'mineru', 'outputDir', 'paths',
         'patentParts', 'pdf', 'pdfBackend', 'raster', 'returnContent', 'skipExisting', 'target', 'theme', 'urls',
-        'validate', 'xml', 'xmlProfile',
+        'validate', 'xml', 'xmlImport', 'xmlProfile',
     ].sort());
     assert.equal(properties.validate.type, 'boolean');
     assert.deepEqual(tool.inputSchema.required, ['outputDir']);
@@ -163,7 +166,9 @@ test('list_formats 返回能力矩阵，office 目标含 bundle', async () => {
         assert.deepEqual(Object.keys(capabilities[key]).sort(), ['available', 'hint', 'name'], `${key} 的键`);
         assert.equal(capabilities[key].available, capabilities[key].name !== null);
     }
-    assert.deepEqual(result.structuredContent.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']);
+    assert.deepEqual(result.structuredContent.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown', '.xml', '.zip']);
+    assert.deepEqual(Object.keys(targets.inputs), ['docx', 'xlsx', 'pptx', 'pdf', 'md', 'xml', 'zip', 'url'], '专利五书 XML 与案卷 zip 列入输入类型');
+    assert.deepEqual([targets.inputs.xml, targets.inputs.zip], ['markup', 'markup']);
     assert.equal('sofficeAvailable' in capabilities, false);
     assert.equal(typeof capabilities.pdfBackend.available, 'boolean');
     assert.equal(typeof capabilities.pdfBackend.hint, 'string');
@@ -232,6 +237,37 @@ test('convert_document 以 target=html 转换 Markdown，产出目录含 html �
     assert.equal(item.outputs.html, path.join(outputDir, 'sample', 'sample.html'));
     assert.ok(fs.existsSync(item.outputs.html));
     assert.ok(fs.existsSync(item.outputs.imagesDir));
+});
+
+test('convert_document 的 patent profile：outputs 键名不变，值为官方案卷结构下的新路径，图片与所属 XML 同目录', async () => {
+    // Arrange：关闭栅格化以免依赖 Electron
+    const outputDir = makeOutDir('patent-');
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: {
+            paths: [SAMPLE_PATENT], target: 'xml', outputDir, xmlProfile: 'patent', math: 'text', validate: true,
+            xml: { rasterizeTables: false, rasterizeFormulas: false },
+        },
+    });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const [item] = result.structuredContent.results;
+    const dir = path.join(outputDir, 'sample-patent');
+    assert.deepEqual(item.outputs, {
+        claims: path.join(dir, '100001', '100001.xml'),
+        description: path.join(dir, '100002', '100002.xml'),
+        drawings: path.join(dir, '100003', '100003.xml'),
+        abstract: path.join(dir, '100004', '100004.xml'),
+        abstractFigure: path.join(dir, '100005', '100005.xml'),
+        zip: path.join(dir, 'sample-patent.zip'),
+        precheck: path.join(dir, 'precheck.json'),
+    });
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['100001', '100002', '100003', '100004', '100005', 'precheck.json', 'sample-patent.zip'].sort());
+    assert.ok(fs.existsSync(path.join(dir, '100003', '100003_1.jpg')), '附图应与 100003.xml 同目录');
+    assert.deepEqual(item.warnings.filter((text) => text.startsWith('DTD 校验：')), []);
 });
 
 test('convert_document 透传转换选项：扁平键与嵌套段都进入结果 options', async () => {
@@ -971,4 +1007,82 @@ test('createServer 返回未连接的 McpServer；console 标准输出通道已�
     assert.equal(console.log, console.error);
     assert.equal(console.info, console.error);
     assert.equal(console.debug, console.error);
+});
+
+// ============================================================
+// 专利五书 XML 反向导入
+// ============================================================
+
+const {
+    buildOfficialBundle, writeFiles, zipFiles, OFFICIAL_EXPECTED,
+} = require('./fixtures/patent/roundtrip/build-roundtrip-fixtures');
+
+test('convert_document 受理专利五书的三种输入：案卷 zip、五书目录与单个 XML，target 省略即 docx', async () => {
+    // Arrange
+    const work = makeOutDir('import-');
+    const bundle = await buildOfficialBundle();
+    const dir = writeFiles(path.join(work, '目录案卷'), bundle.files);
+    const zip = path.join(work, '压缩案卷.zip');
+    fs.writeFileSync(zip, await zipFiles(bundle.files));
+    const single = path.join(dir, '100001', '100001.xml');
+    const outputDir = makeOutDir('import-out-');
+
+    // Act
+    const result = await client.callTool({ name: 'convert_document', arguments: { paths: [zip, dir, single], outputDir } });
+
+    // Assert
+    assert.notEqual(result.isError, true, JSON.stringify(result.content));
+    const payload = result.structuredContent;
+    assert.equal(payload.ok, true, JSON.stringify(payload.errors));
+    assert.equal(payload.inputExpansion, undefined, '五书目录整体作为一项输入，不算目录展开');
+    assert.deepEqual(payload.results.map((item) => [item.input, item.target, item.sourceType, item.name]), [
+        [zip, 'docx', 'zip', '压缩案卷'], [dir, 'docx', 'xml', '目录案卷'], [single, 'docx', 'xml', '100001'],
+    ]);
+    assert.deepEqual(payload.results.map((item) => item.title), [OFFICIAL_EXPECTED.inventionTitle, OFFICIAL_EXPECTED.inventionTitle, '100001']);
+    for (const item of payload.results) {
+        assert.ok(fs.statSync(item.outputs.docx).size > 0);
+        assert.ok(item.warnings.every((warning) => warning.startsWith('导入：')), item.warnings.join('\n'));
+    }
+});
+
+test('convert_document 的 xmlImport 段：schema 只有 paragraphNumbers，取值透传，段内未知字段记入 ignoredArguments', async () => {
+    // Arrange
+    const { tools } = await client.listTools();
+    const { properties } = tools.find((item) => item.name === 'convert_document').inputSchema;
+    const work = makeOutDir('import-options-');
+    const zip = path.join(work, '案卷.zip');
+    fs.writeFileSync(zip, await zipFiles((await buildOfficialBundle()).files));
+
+    // Act
+    const result = await client.callTool({
+        name: 'convert_document',
+        arguments: { paths: [zip], outputDir: makeOutDir('import-options-out-'), target: 'html', xmlImport: { paragraphNumbers: true, images: 'link' } },
+    });
+
+    // Assert
+    assert.deepEqual(Object.keys(properties.xmlImport.properties), ['paragraphNumbers']);
+    assert.equal(properties.xmlImport.properties.paragraphNumbers.type, 'boolean');
+    assert.match(properties.xmlImport.properties.paragraphNumbers.description, /段号写回段首.*默认 false/);
+    assert.match(properties.paths.description, /案卷 \.zip，或整个五书目录/);
+    const payload = result.structuredContent;
+    assert.equal(payload.ok, true, JSON.stringify(payload.errors));
+    assert.deepEqual(payload.ignoredArguments, ['xmlImport.images']);
+    assert.equal(payload.results[0].options.xmlImport.paragraphNumbers, true);
+    assert.ok(fs.readFileSync(payload.results[0].outputs.html, 'utf8').includes('[0001]'));
+});
+
+test('convert_document：非专利 XML 与 bundle 目标的中文说明', async () => {
+    // Arrange
+    const work = makeOutDir('import-foreign-');
+    const foreign = path.join(writeFiles(work, { 'pom.xml': Buffer.from('<project/>') }), 'pom.xml');
+
+    // Act
+    const failed = await client.callTool({ name: 'convert_document', arguments: { paths: [foreign], outputDir: makeOutDir('import-foreign-out-') } });
+    const refused = await client.callTool({ name: 'convert_document', arguments: { paths: [foreign], target: 'bundle', outputDir: makeOutDir('import-refused-out-') } });
+
+    // Assert：运行期失败进 errors（isError 为 false）；目标不接受该输入属入参错误
+    assert.notEqual(failed.isError, true);
+    assert.deepEqual(failed.structuredContent.errors, [{ input: foreign, error: 'pom.xml 不是国知局专利五书 XML：根元素为 project，应为 cn-application-body' }]);
+    assert.equal(refused.isError, true);
+    assert.match(refused.content[0].text, /目标 bundle 不接受 xml 输入/);
 });

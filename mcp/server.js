@@ -22,7 +22,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const service = require('../converters/service');
 const { OPTION_ENUMS } = require('../converters/options');
-const { TARGETS, SUPPORTED_EXTENSIONS, resolveUserPath } = require('../converters/targets');
+const { TARGETS, DIRECTORY_SCAN_EXTENSIONS, resolveUserPath } = require('../converters/targets');
 const { expandInputs } = require('../converters/scan');
 const { errText, isDirectory } = require('../converters/util');
 const pkg = require('../package.json');
@@ -67,11 +67,13 @@ function fieldText(paths, { description, note } = {}) {
 const TARGET_DESCRIPTION = 'bundle=Markdown 知识库包（{名称}/{名称}.md + {名称}.json + {名称}_content_list.json + images/，'
     + 'PDF 走 MinerU 时另有 {名称}_content_list_v2.json、{名称}_model.json、{名称}_layout.json 与 {名称}_origin.pdf，'
     + '对应结果 outputs 中的 md、json、contentList、imagesDir、contentListV2、model、layout、originPdf）；'
-    + 'docx | pdf 仅接受 Markdown 输入；html | xml 接受全部输入；'
-    + '省略则按输入类型取默认目标（Office/PDF/网页 → bundle，Markdown → docx）';
+    + 'docx | pdf 仅接受 Markdown 与专利五书 XML（.xml、案卷 .zip、五书目录）输入；html | xml 接受全部输入；'
+    + '省略则按输入类型取默认目标（Office/PDF/网页 → bundle，Markdown 与专利五书 XML → docx）';
 const PATHS_DESCRIPTION = '本地文件或目录的路径列表：建议用绝对路径，也支持 ~ 与 file:// 写法，'
     + '相对路径按 MCP 服务进程的工作目录解析；目录展开为其下受支持的文件（产物平铺在同一 outputDir，'
-    + '不保留子目录层级，展开情况见结果的 inputExpansion）；'
+    + '不保留子目录层级，展开情况见结果的 inputExpansion；.xml 与 .zip 不随目录展开，须显式给出）；'
+    + '国知局专利五书可给单个 .xml、案卷 .zip，或整个五书目录（内含 10000N/10000N.xml 或五书 XML，整体作为一项输入），'
+    + '多书合并导入为一份文档；'
     + '服务端不预检文件是否存在，缺失项记入结果的 errors（isError 仍为 false），同批其余项照常转换';
 const OUTPUT_DIR_DESCRIPTION = '已存在的输出目录：服务端不会创建目录，不存在即返回 isError；'
     + '建议用绝对路径，相对路径按 MCP 服务进程的工作目录解析';
@@ -135,6 +137,9 @@ const CONVERT_INPUT_SHAPE = {
         rasterizeTables: bool('xml.rasterizeTables').describe(fieldText(['xml.patent.rasterizeTables'], { note: '仅 patent profile' })),
         rasterizeFormulas: bool('xml.rasterizeFormulas').describe(fieldText(['xml.patent.rasterizeFormulas'], { note: '仅 patent profile' })),
     }).optional().describe('xml 目标参数：缩进与说明书段号，以及 patent profile 的图片密度、分节识别与表格、公式栅格化'),
+    xmlImport: section('xmlImport', {
+        paragraphNumbers: bool('xmlImport.paragraphNumbers').describe(fieldText(['xmlImport.paragraphNumbers'])),
+    }).optional().describe('专利五书 XML 反向导入参数（仅 .xml、案卷 .zip 与五书目录输入生效）'),
     raster: section('raster', {
         scale: num('raster.scale').describe(fieldText(['raster.scale'])),
         maxWidth: int('raster.maxWidth').describe(fieldText(['raster.maxWidth'])),
@@ -157,11 +162,11 @@ const CONVERT_INPUT = z.object(CONVERT_INPUT_SHAPE, {
 // 入参中交给 service.buildOptions 的键；其余（paths/urls/target/outputDir/returnContent）由本文件自行处理
 const OPTION_ARG_KEYS = Object.freeze([
     'theme', 'xmlProfile', 'patentParts', 'pdfBackend', 'imageFormat', 'jpegQuality', 'jpegPpi', 'math',
-    'mineru', 'html', 'pdf', 'docx', 'xml', 'raster', 'validate',
+    'mineru', 'html', 'pdf', 'docx', 'xml', 'xmlImport', 'raster', 'validate',
 ]);
 // 本工具认得的入参键与各嵌套段认得的字段：其余一律记入 ignoredArguments
 const CONVERT_ARG_KEYS = Object.freeze(Object.keys(CONVERT_INPUT_SHAPE));
-const SECTION_KEYS = Object.freeze(['mineru', 'html', 'pdf', 'docx', 'xml', 'raster']);
+const SECTION_KEYS = Object.freeze(['mineru', 'html', 'pdf', 'docx', 'xml', 'xmlImport', 'raster']);
 const SECTION_FIELDS = Object.freeze(Object.fromEntries(
     SECTION_KEYS.map((key) => [key, Object.freeze(Object.keys(CONVERT_INPUT_SHAPE[key].unwrap().shape))]),
 ));
@@ -236,13 +241,13 @@ async function handleConvertDocument(args = {}, extra = {}) {
     // 目录就地展开为其下受支持的文件（产物平铺在同一 outputDir，不保留子目录层级）；未给目录时逐项与入参相同
     const expansion = await expandInputs(raws, { cwd: process.cwd() });
     if (expansion.inputs.length === 0) {
-        return failure(`输入目录中没有可转换的文件（受理扩展名：${SUPPORTED_EXTENSIONS.join(' ')}）`);
+        return failure(`输入目录中没有可转换的文件（目录展开受理：${DIRECTORY_SCAN_EXTENSIONS.join(' ')}；.xml 与 .zip 须显式给出）`);
     }
 
     // 选项按本批目标校验，故先规划任务
     let tasks;
     try {
-        tasks = service.planTasks(expansion.inputs, args.target, process.cwd());
+        tasks = service.planTasks(expansion.inputs, args.target, process.cwd(), { bundles: expansion.bundles });
     } catch (err) {
         return failure(errText(err));
     }
@@ -379,6 +384,8 @@ async function withContent(item, returnContent) {
 
 const SERVER_INSTRUCTIONS = [
     'MarkFlow 文档转换服务：把本地办公文档、PDF、Markdown 与网页转成 Markdown 知识库包、DOCX、PDF、HTML 或 XML。',
+    '国知局专利五书 XML 可反向导入为可再编辑的 Word：paths 给单个 .xml、案卷 .zip 或五书目录，target 省略即 docx；'
+        + '导入时丢失或改写的信息以「导入：」开头记入该项 warnings。',
     'convert_document 的 outputDir 必须是已存在的目录（服务端不创建目录）；paths 建议用绝对路径，'
         + '相对路径按服务进程的工作目录解析。输入文件不预检：缺失项记入结果的 errors，不会让整批失败。',
     'PDF 输入的 pdfBackend 缺省为 auto：本机取得 MinerU 令牌时走 MinerU 云端解析（按量计费，且会上传文件）；'
@@ -392,7 +399,7 @@ function createServer() {
     const server = new McpServer({ name: 'markflow', version: pkg.version }, { instructions: SERVER_INSTRUCTIONS });
     server.registerTool('convert_document', {
         title: '转换文档',
-        description: '把本地办公文档、PDF、Markdown 或网页转换为 Markdown 包（bundle）、DOCX、PDF、HTML 或 XML；'
+        description: '把本地办公文档、PDF、Markdown、国知局专利五书 XML（.xml、案卷 .zip、五书目录）或网页转换为 Markdown 包（bundle）、DOCX、PDF、HTML 或 XML；'
             + '可指定主题、XML profile、图片与公式处理方式以及 MinerU 解析参数，省略的选项取默认值。'
             + '产物写入 outputDir（同名产物覆盖），返回结构与命令行 markflow convert --json 一致。',
         inputSchema: CONVERT_INPUT,

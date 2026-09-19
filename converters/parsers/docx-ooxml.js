@@ -5,7 +5,7 @@
  * 汇总一份供 XML 专利渲染与递交前预检使用的事实清单（不做判定，只给计数与取值）。
  *
  * 契约：inspectOoxml(docxBuffer) → {
- *   floatingImages, textBoxes, oleObjects: [{ progId }], autoNumbering,
+ *   floatingImages, textBoxes, oleObjects: [{ progId, chemistry }], autoNumbering,
  *   revisions: { insertions, deletions, trackRevisions },
  *   protection: { enforced, type }, comments, fields,
  *   eastAsiaFonts: [string], headingStyleParagraphs, paragraphs
@@ -16,6 +16,7 @@
  */
 const JSZip = require('jszip');
 const cheerio = require('cheerio');
+const { isChemistryProgId } = require('./docx-chemistry');
 
 const NOT_DOCX = '文档已加密或不是 docx';
 const OLE_MAGIC = Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
@@ -91,11 +92,15 @@ function countTextBoxes($) {
     return all($, 'w:txbxContent').filter((node) => $(node).parents(sel('mc:Fallback')).length === 0).length;
 }
 
+// chemistry 表示 ProgID 命中化学白名单（见 docx-chemistry）：这类对象的预览图已按化学式图片输出，
+// 预检文案据此与其余 OLE 对象区分开
 function collectOleObjects($) {
-    const objects = all($, 'o:OLEObject').map((node) => ({ progId: attr($, node, 'ProgID') || '' }));
+    const objects = all($, 'o:OLEObject').map((node) => describeOle(attr($, node, 'ProgID') || ''));
     if (objects.length > 0) return objects;
-    return all($, 'w:object').map(() => ({ progId: '' }));
+    return all($, 'w:object').map(() => describeOle(''));
 }
+
+const describeOle = (progId) => ({ progId, chemistry: isChemistryProgId(progId) });
 
 function readProtection($) {
     const node = all($, 'w:documentProtection')[0];

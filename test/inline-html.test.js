@@ -201,6 +201,51 @@ test('链接与表格单元格内的行内 HTML 同样提升', async () => {
     assert.equal(cell.children[0].type, 'strong');
 });
 
+test('成对的 <sup>/<sub> 提升为 superscript / subscript，可与加粗、下划线互相嵌套', async () => {
+    // Act：化学式里的上下标（R²、C₁ 的烷基）与嵌套形态
+    const tree = await lift('R<sup>2</sup>、C<sub>1</sub>的烷基、<strong>甲<sub><u>乙</u></sub></strong>\n');
+    const children = tree.children[0].children;
+
+    // Assert：上下标各成节点，文字逐字保留
+    assert.deepEqual(children.map((n) => n.type), ['text', 'superscript', 'text', 'subscript', 'text', 'strong']);
+    assert.equal(children[1].children[0].value, '2');
+    assert.equal(children[3].children[0].value, '1');
+    assert.deepEqual(htmls(tree), []);
+
+    // Assert：<strong>甲<sub><u>乙</u></sub></strong> 的三层嵌套按原层次还原
+    const [, subscript] = children[5].children;
+    assert.equal(children[5].children[0].value, '甲');
+    assert.equal(subscript.type, 'subscript');
+    assert.equal(subscript.children[0].type, 'underline');
+    assert.equal(subscript.children[0].children[0].value, '乙');
+});
+
+test('Markdown 输入的 ~~删除线~~ 与 ~删除线~ 仍解析为 delete 节点（remark-gfm 的 singleTilde 未被改动）', async () => {
+    // Act
+    const doubled = await lift('~~双波浪~~\n');
+    const single = await lift('~单波浪~\n');
+
+    // Assert
+    for (const tree of [doubled, single]) {
+        const [deleted] = tree.children[0].children;
+        assert.equal(deleted.type, 'delete');
+    }
+    assert.equal(doubled.children[0].children[0].children[0].value, '双波浪');
+    assert.equal(single.children[0].children[0].children[0].value, '单波浪');
+});
+
+test('相邻的同类上下标合并；未配对的 <sup>/<sub> 删标签留文本', async () => {
+    // Act
+    const merged = await lift('X<sup>1</sup><sup>2</sup>\n');
+    const unpaired = await lift('前<sub>没有闭合的下标\n');
+
+    // Assert
+    const [, sup] = merged.children[0].children;
+    assert.equal(sup.type, 'superscript');
+    assert.deepEqual(sup.children, [{ type: 'text', value: '12' }]);
+    assert.deepEqual(unpaired.children[0].children, [{ type: 'text', value: '前没有闭合的下标' }]);
+});
+
 // ============================================================
 // 块级包裹
 // ============================================================

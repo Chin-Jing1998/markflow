@@ -6,9 +6,11 @@
  * mammoth；IR 建好后按哨兵切分文本节点，换回 math 节点。
  *
  * 契约：
- *   extractMath(docxBuffer) → { buffer, formulas: [{ id, omml, display }] }
- *     - buffer   公式已替换为哨兵的新 docx；无公式时原样返回入参 buffer
- *     - display  true 表示来自 m:oMathPara（块级），其内多个 m:oMath 合并为一个公式
+ *   extractMath(docxBuffer) → { buffer, formulas: [{ id, omml, display, fontSizePt }] }
+ *     - buffer      公式已替换为哨兵的新 docx；无公式时原样返回入参 buffer
+ *     - display     true 表示来自 m:oMathPara（块级），其内多个 m:oMath 合并为一个公式
+ *     - fontSizePt  源稿字号（磅）：取公式内出现最多的 w:sz（半磅），其次取所在段落 w:pPr/w:rPr 的
+ *                   w:sz；两处都没有时为 null，由下游按缺省字号出图
  *   restoreMath(ir, formulas, { mathml = true }) → { ir, warnings }
  *     - 不修改入参；mathml=false 时只回填 omml，不做 MathML 转换
  *
@@ -53,6 +55,7 @@ function replaceFormulas(xml) {
         id: index + 1,
         omml: xml.slice(block.start, block.end),
         display: block.display,
+        fontSizePt: readFontSizePt(xml, block),
     }));
 
     let out = xml;
@@ -63,6 +66,53 @@ function replaceFormulas(xml) {
         out = out.slice(0, block.start) + replacement + out.slice(block.end);
     }
     return { xml: out, formulas };
+}
+
+/** 半磅 → 磅：w:sz 以半磅计（w:sz w:val="28" 即 14pt） */
+const HALF_POINT = 2;
+/** 字号合法区间（磅）：Word 允许 1–1638pt，超出视为脏数据 */
+const MIN_FONT_SIZE_PT = 1;
+const MAX_FONT_SIZE_PT = 1638;
+/** <w:sz w:val="N"/>；后面紧跟空白才匹配，故不会命中 <w:szCs> */
+const FONT_SIZE_RE = /<w:sz\s+w:val="(\d+)"/g;
+const PARAGRAPH_PROPS_RE = /<w:pPr\b[\s\S]*?<\/w:pPr>/g;
+
+/**
+ * 公式的源稿字号（磅）：先取公式片段内出现次数最多的 w:sz（并列时取较大者，避免上下标压低整体字号），
+ * 公式内没有时退到所在段落的 w:pPr；都取不到返回 null。
+ */
+function readFontSizePt(xml, block) {
+    const inside = pickFontSizePt(xml.slice(block.start, block.end));
+    if (inside !== null) return inside;
+    const props = paragraphProps(xml, block.start);
+    return props === null ? null : pickFontSizePt(props);
+}
+
+function pickFontSizePt(fragment) {
+    const counts = new Map();
+    FONT_SIZE_RE.lastIndex = 0;
+    let match = FONT_SIZE_RE.exec(fragment);
+    while (match !== null) {
+        const pt = Number(match[1]) / HALF_POINT;
+        if (pt >= MIN_FONT_SIZE_PT && pt <= MAX_FONT_SIZE_PT) counts.set(pt, (counts.get(pt) || 0) + 1);
+        match = FONT_SIZE_RE.exec(fragment);
+    }
+    let best = null;
+    for (const [pt, count] of counts) {
+        if (best === null || count > best.count || (count === best.count && pt > best.pt)) best = { pt, count };
+    }
+    return best === null ? null : best.pt;
+}
+
+/** 公式所在段落的 w:pPr 源文；公式不在段落内、该段无 w:pPr，或其间已闭合段落时返回 null */
+function paragraphProps(xml, index) {
+    const open = Math.max(xml.lastIndexOf('<w:p>', index), xml.lastIndexOf('<w:p ', index));
+    if (open < 0) return null;
+    PARAGRAPH_PROPS_RE.lastIndex = open;
+    const match = PARAGRAPH_PROPS_RE.exec(xml);
+    if (match === null || match.index >= index) return null;
+    // w:pPr 必须与公式同属这一段：其间不得出现 </w:p>
+    return xml.indexOf('</w:p>', open) < match.index ? null : match[0];
 }
 
 // 返回同名元素的顶层（互不嵌套）区间 [start, end)
@@ -159,18 +209,24 @@ function restoreMath(ir, formulas, { mathml = true } = {}) {
 function buildMathNode(formula, withMathml, warnings) {
     const display = Boolean(formula.display);
     const omml = typeof formula.omml === 'string' ? formula.omml : '';
-    if (!withMathml) return createMath({ omml, display });
+    if (!withMathml) return withFontSize(createMath({ omml, display }), formula.fontSizePt);
     let converted;
     try {
         converted = ommlToMathml(omml, { display });
     } catch (err) {
         warnings.push(`公式 ${formula.id} 转 MathML 失败，已保留 OMML（${errText(err)}）`);
-        return createMath({ omml, display });
+        return withFontSize(createMath({ omml, display }), formula.fontSizePt);
     }
     if (converted.unsupported.length > 0) {
         warnings.push(`公式 ${formula.id} 含未支持的 OMML 元素，已降级为 mrow：${converted.unsupported.join('、')}`);
     }
-    return createMath({ omml, mathml: converted.mathml, text: converted.text, display });
+    const node = createMath({ omml, mathml: converted.mathml, text: converted.text, display });
+    return withFontSize(node, formula.fontSizePt);
+}
+
+/** 以新对象方式补 data.fontSizePt（ir/schema 的 math 节点不含该字段，故在此按需附加，不就地修改） */
+function withFontSize(node, fontSizePt) {
+    return Number.isFinite(fontSizePt) ? { ...node, data: { ...node.data, fontSizePt } } : node;
 }
 
 function transform(node, templates) {

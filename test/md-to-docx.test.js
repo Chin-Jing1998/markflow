@@ -2,7 +2,9 @@
  * converters/renderers/docx.js 单元测试
  * 覆盖：GFM 表格/删除线/任务列表、超链接、图片内嵌与降级、引用块、代码块、HTML 去标签、
  *       未知节点降级、CJK 默认字体、图片宽度缩放、空文档、
- *       options.docx 的纸张/页边距/字号/中西文字体透传、math 节点降级为线性化文本
+ *       options.docx 的纸张/页边距/字号/中西文字体透传、math 节点降级为线性化文本、
+ *       专利五书反向导入所需的三项：按 data.section 产出 Word 分节与页眉（多节时略去书目标题节点、单节时保留）、
+ *       带物理显示尺寸的图片按毫米写 wp:extent 且不受 600px 上限约束、带角色图片的 markflow:role 替换文字
  * IR 直接由 unified + remark-parse + remark-gfm 从内联 Markdown 构造，不依赖 parsers/md.js。
  */
 const { test } = require('node:test');
@@ -386,4 +388,130 @@ test('underline 输出下划线 run；带 display 的图片按显示宽度内嵌
     assert.ok(documentXml.includes(`cy="${150 * EMU_PER_PX}"`), '高度按像素宽高比补为 150px');
     assert.match(documentXml, /<w:u w:val="single"\/>/);
     assert.ok(documentXml.includes('<w:tab/>'), '制表符应为 w:tab');
+});
+
+test('superscript / subscript 输出 w:vertAlign 的上下标 run', async () => {
+    // Arrange：IR 经 ir/inline-html 提升（与 docx 解析器同一链路）
+    const { liftInlineHtml } = require('../converters/ir/inline-html');
+    const ir = liftInlineHtml(await parseMarkdown('C<sub>1</sub>的烷基、R<sup>2</sup>基团、<strong><sub>粗下标</sub></strong>\n'));
+
+    // Act
+    const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert
+    assert.match(documentXml, /<w:vertAlign w:val="subscript"\/>/);
+    assert.match(documentXml, /<w:vertAlign w:val="superscript"\/>/);
+    assert.ok(documentXml.includes('粗下标'), '嵌套在加粗内的下标文字不得丢失');
+    assert.equal((documentXml.match(/<w:vertAlign w:val="subscript"\/>/g) || []).length, 2, '两处下标各成一个 run');
+});
+
+// ============================================================
+// 专利五书反向导入：分节与页眉、毫米定尺寸、角色替换文字
+// ============================================================
+
+const EMU_PER_MM = 36000;
+const sectionOf = (index, header) => ({ section: { index, header } });
+const textParagraph = (value, data) => ({ type: 'paragraph', children: [{ type: 'text', value }], ...(data ? { data } : {}) });
+const sectionTitle = (value, data) => ({ type: 'heading', depth: 1, children: [{ type: 'text', value }], data: { role: 'section-title', ...data } });
+const imageNode = ({ alt = '', data = {} }) => ({
+    type: 'image', url: 'images/pic.jpg', alt, title: null,
+    data: { assetName: 'images/pic.jpg', asset: { buffer: makePng(8, 8), mime: 'image/png', width: 1730, height: 852 }, ...data },
+});
+
+async function unzipHeaders(buffer) {
+    const zip = await JSZip.loadAsync(buffer);
+    const names = Object.keys(zip.files).filter((name) => /^word\/header\d+\.xml$/.test(name)).sort();
+    return Promise.all(names.map((name) => zip.file(name).async('string')));
+}
+
+test('顶层节点带 data.section 时按分节序号产出多个 Word 分节，页眉写书目名；书目标题节点由页眉取代', async () => {
+    // Arrange：两书，各带一个书目标题节点（md / html 目标用它分隔五书）
+    const first = sectionOf(1, '权利要求书');
+    const second = sectionOf(2, '说明书');
+    const ir = {
+        type: 'root',
+        children: [
+            sectionTitle('权利要求书', first), textParagraph('1. 一种装置。', first),
+            sectionTitle('说明书', second), textParagraph('本申请涉及一种装置。', second), textParagraph('第二段。', second),
+        ],
+    };
+
+    // Act
+    const buffer = await docxRenderer.render(makeDoc(ir));
+    const { documentXml } = await unzipDocx(buffer);
+    const headers = await unzipHeaders(buffer);
+
+    // Assert
+    assert.equal((documentXml.match(/<w:sectPr/g) || []).length, 2, '两书两节');
+    assert.equal((documentXml.match(/<w:headerReference /g) || []).length, 2, '每节各引用自己的页眉');
+    assert.deepEqual(headers.map((xml) => (/<w:t[^>]*>([^<]*)<\/w:t>/.exec(xml) || [])[1]), ['权利要求书', '说明书']);
+    assert.ok(headers.every((xml) => xml.includes('<w:jc w:val="center"/>')), '页眉居中');
+    assert.ok(!documentXml.includes('>权利要求书<') && !documentXml.includes('>说明书<'), '正文里不留书目标题段');
+    assert.ok(documentXml.indexOf('一种装置') < documentXml.indexOf('本申请涉及'), '分节顺序即节点顺序');
+    assert.ok(documentXml.includes('第二段。'));
+});
+
+test('只有一节时保留书目标题节点：单节文档的页眉不足以让 docx 解析器认出书目', async () => {
+    const only = sectionOf(1, '说明书摘要');
+    const ir = { type: 'root', children: [sectionTitle('说明书摘要', only), textParagraph('本申请公开了一种装置。', only)] };
+
+    const buffer = await docxRenderer.render(makeDoc(ir));
+    const { documentXml } = await unzipDocx(buffer);
+
+    assert.equal((documentXml.match(/<w:sectPr/g) || []).length, 1);
+    assert.ok(documentXml.includes('>说明书摘要<'), '书目标题段保留在正文里');
+    assert.match(documentXml, /<w:pStyle w:val="Heading1"\/>/);
+    assert.deepEqual((await unzipHeaders(buffer)).length, 1, '页眉照写');
+});
+
+test('没有任何节点带 data.section 的文档仍只产出一节、不写页眉（既有行为不变）', async () => {
+    const buffer = await docxRenderer.render(makeDoc(await parseMarkdown('# 标题\n\n正文\n')));
+    const { documentXml } = await unzipDocx(buffer);
+    assert.equal((documentXml.match(/<w:sectPr/g) || []).length, 1);
+    assert.equal(documentXml.includes('<w:headerReference'), false);
+    assert.deepEqual(await unzipHeaders(buffer), []);
+});
+
+test('带物理显示尺寸的图片按毫米写 wp:extent（整数 EMU，1 像素 @300 DPI = 3048 EMU），不受 600px 上限约束', async () => {
+    // Arrange：1730×852 px @300 DPI = 146.47×72.14 mm（约 554×273 px @96 DPI）；另一幅故意超过 600px 上限
+    const exact = imageNode({ data: { displayWidthMm: (1730 * 3048) / EMU_PER_MM, displayHeightMm: (852 * 3048) / EMU_PER_MM } });
+    const wide = imageNode({ data: { displayWidthMm: 171.704, displayHeightMm: 84.1586 } });
+    const ir = { type: 'root', children: [{ type: 'paragraph', children: [exact] }, { type: 'paragraph', children: [wide] }] };
+
+    // Act
+    const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+    // Assert
+    assert.ok(documentXml.includes(`<wp:extent cx="${1730 * 3048}" cy="${852 * 3048}"/>`), '像素 × 3048 EMU 逐值写出');
+    assert.ok(documentXml.includes(`<wp:extent cx="${Math.round(171.704 * EMU_PER_MM)}" cy="${Math.round(84.1586 * EMU_PER_MM)}"/>`), '171.7 mm（约 649 px）不被压到 600 px');
+});
+
+test('物理显示尺寸缺项或不可信时退回按像素定尺寸与 600px 上限', async () => {
+    for (const data of [{ displayWidthMm: 120 }, { displayWidthMm: 0, displayHeightMm: 90 }, { displayWidthMm: 5000, displayHeightMm: 90 }, { displayWidthMm: 'x', displayHeightMm: 1 }]) {
+        const ir = { type: 'root', children: [{ type: 'paragraph', children: [imageNode({ data })] }] };
+        const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+        assert.ok(documentXml.includes(`cx="${600 * EMU_PER_PX}"`), JSON.stringify(data));
+    }
+});
+
+test('带角色的图片把替换文字写成 markflow:role=<角色>，原 alt 非空时以分号接在其后；无角色的图片不受影响', async () => {
+    // Arrange
+    const cases = [
+        [imageNode({ data: { role: 'formula' } }), 'markflow:role=formula'],
+        [imageNode({ alt: '表格 1', data: { role: 'table' } }), 'markflow:role=table;表格 1'],
+        [imageNode({ alt: '  ', data: { role: 'chemistry' } }), 'markflow:role=chemistry'],
+        [imageNode({ alt: '示意图', data: { role: 'caption' } }), '示意图'],
+        [imageNode({ alt: '' }), 'images/pic.jpg'],
+    ];
+
+    for (const [node, expected] of cases) {
+        // Act
+        const ir = { type: 'root', children: [{ type: 'paragraph', children: [node] }] };
+        const { documentXml } = await unzipDocx(await docxRenderer.render(makeDoc(ir)));
+
+        // Assert：docx 解析器（mammoth）先取 descr、再取 title 作 alt，两者须一致
+        const docPr = /<wp:docPr [^>]*>/.exec(documentXml)[0];
+        assert.ok(docPr.includes(`descr="${expected}"`), `${expected} ← ${docPr}`);
+        assert.ok(docPr.includes(`title="${expected}"`), `${expected} ← ${docPr}`);
+    }
 });

@@ -10,7 +10,8 @@
  * 版面与格式（与 ir/markers、ir/inline-html 配套）：
  *   - 残留私用区标记兜底剥除；paragraph.data.indent → 段首 n 个 U+3000；非代码文本中的 \t → 两个 U+3000
  *   - 带 data.display 的图片输出 <img src="…" width="W" alt="…">（只写宽度，属性值转义）；无 display 仍为 ![]()
- *   - underline → <u>…</u>
+ *   - underline / superscript / subscript → <u>…</u> / <sup>…</sup> / <sub>…</sub>（Markdown 无对应语法，
+ *     行内 HTML 经 ir/inline-html 再解析后仍是同一节点）
  *   - strong / emphasis / delete：定界符两侧按 CommonMark flanking 规则（标点含 \p{P}\p{S}）判定安全时写
  *     ** / * / ~~，否则回退 <strong> / <em> / <del>——中文标点旁的字面星号会被转义成 \*\*，默认处理器
  *     还会把相邻汉字写成 &#x…; 字符引用
@@ -129,17 +130,23 @@ function isDelimiterSafe(before, inner, after, markerChar) {
 const isWhitespace = (char) => WHITESPACE_RE.test(char);
 const isPunctuation = (char) => PUNCTUATION_RE.test(char);
 
-function underline(node, _parent, state, info) {
-    const inner = state.containerPhrasing(node, { ...info, before: '>', after: '<' });
-    return inner ? `<u>${inner}</u>` : '';
+/** Markdown 无对应语法的行内格式（下划线、上下标）：一律输出同名 HTML 标签，往返解析后仍是同一节点 */
+function htmlTag(tag) {
+    const handler = (node, _parent, state, info) => {
+        const inner = state.containerPhrasing(node, { ...info, before: '>', after: '<' });
+        return inner ? `<${tag}>${inner}</${tag}>` : '';
+    };
+    handler.peek = () => '<';
+    return handler;
 }
-underline.peek = () => '<';
 
 const HANDLERS = Object.freeze({
     strong: attention('**', 'strong', 'strong'),
     emphasis: attention('*', 'em', 'emphasis'),
     delete: attention('~~', 'del', 'strikethrough'),
-    underline,
+    underline: htmlTag('u'),
+    superscript: htmlTag('sup'),
+    subscript: htmlTag('sub'),
 });
 
 module.exports = { render, isDelimiterSafe };

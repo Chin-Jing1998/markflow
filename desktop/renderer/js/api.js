@@ -47,6 +47,11 @@ export const api = {
     mdInsertImage: (sessionId) => call('mdInsertImage', { sessionId }),
     /** 当前文件操作（action：reveal 在访达中显示 | open 用默认应用打开 | copyPath 复制路径）：路径由主进程按 sessionId 取 */
     fileAction: (sessionId, action) => call('fileAction', sessionId, action),
+    /** Word for Mac 加载项：状态、启停开关、安装 / 移除清单；四者都回同一份状态对象 */
+    addinStatus: () => call('addinStatus'),
+    addinSetEnabled: (enabled) => call('addinSetEnabled', enabled),
+    addinInstall: () => call('addinInstall'),
+    addinUninstall: () => call('addinUninstall'),
 };
 
 export function pathForFile(file) {

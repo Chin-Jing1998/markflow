@@ -7,12 +7,14 @@
  * expandPaths(paths, opts) → Promise<Entry[]>（scanPaths().files 的简写）
  *   Entry = { path, name, ext, type, size }，path 为绝对路径，type 取 converters/targets.detectInputType 的结果
  *   opts = { exts?: string[], maxDepth?: number, maxFiles?: number }
- * expandInputs(raws, opts) → Promise<{ inputs: Array, directories: [{ path, count }], skipped: string[], truncated: boolean }>
+ * expandInputs(raws, opts) → Promise<{ inputs: Array, directories: [{ path, count }], bundles: string[], skipped: string[], truncated: boolean }>
  *   CLI / MCP 的目录输入展开；opts = { cwd?: string, maxDepth?: number, maxFiles?: number }
+ * isPatentBundleDir(dir)   → Promise<boolean>：该目录是否为「专利五书目录」（见下文目录签名）
  *
  * scanPaths 规则（桌面端「添加文件 / 文件夹」与文件库浏览）：
  *   - 入参逐项 path.resolve；不存在的路径忽略。直接给出的文件不受隐藏项规则约束，但仍须命中扩展名白名单
- *     （默认 SUPPORTED_EXTENSIONS），未命中的记入 unsupported，供界面提示「已忽略 N 个不支持的文件」。
+ *     （默认 DIRECTORY_SCAN_EXTENSIONS，即 SUPPORTED_EXTENSIONS 去掉只在显式给出时受理的 .xml 与 .zip），
+ *     未命中的记入 unsupported，供界面提示「已忽略 N 个不支持的文件」。
  *   - 目录递归收集：跳过点开头的隐藏项（文件与目录）、node_modules 与 .git；深度上限 maxDepth（默认 8）；
  *     目录内的符号链接按其目标类型处理，目录以 realpath 去环。
  *   - 结果按绝对路径去重（同一文件多次给出，或既给文件又给其父目录，只出现一次），按路径码点顺序稳定排序。
@@ -22,7 +24,13 @@
  *   - 逐项判定：字符串经 trim、targets.resolveUserPath（~、file://）与 path.resolve(cwd，缺省 process.cwd())
  *     后为已存在的目录才展开；网址、文件、不存在的路径、无法转换的 file:// 地址与非字符串值一律原样留在原位，
  *     交由 planTasks 按原有规则归类或报错。
- *   - 目录项就地替换为其下转档受支持文件（SUPPORTED_EXTENSIONS）的绝对路径，同一目录内按路径码点序。
+ *   - 目录项就地替换为其下转档受支持文件（DIRECTORY_SCAN_EXTENSIONS）的绝对路径，同一目录内按路径码点序。
+ *     .xml 与 .zip 不随目录展开（须显式给出）：文档目录里的这两类文件绝大多数与专利无关。
+ *   - 专利五书目录（目录签名）：显式给出的目录若直接含 10000N/10000N.xml（N ∈ 1..5）或含根元素为
+ *     cn-application-body 的 .xml，整个目录原样留在 inputs 里作为一项输入（交 parsers/xml 合并导入），不再展开，
+ *     其绝对路径另记入 bundles，调用方据此告知 planTasks 这一项是目录而非文件。签名只看显式给出的目录本身，
+ *     不看展开途中遇到的子目录——本工具自己的五书产物常落在被展开的目录里，逐层识别会把它们再吃回去。
+ *     判定有界：至多 5 次 stat、一次 readdir 与 MAX_SIGNATURE_PROBES 次读文首（各 SIGNATURE_PROBE_BYTES 字节）。
  *   - 去重：同一真实目录只遍历一次（重复给出或嵌套给出时，后者展开为空）；目录内命中的文件若已作为显式输入
  *     给出则不再展开。显式输入本身从不去重、从不删除。
  *   - maxFiles 限定全部目录展开所得文件的总数（显式输入不计），命中上限即停止遍历并置 truncated。
@@ -35,12 +43,19 @@
 const path = require('path');
 const fsp = require('fs').promises;
 
-const { SUPPORTED_EXTENSIONS, REMOTE_URL_RE, detectInputType, resolveUserPath } = require('./targets');
+const { DIRECTORY_SCAN_EXTENSIONS, REMOTE_URL_RE, detectInputType, resolveUserPath } = require('./targets');
+const { sniffRootName } = require('./xml/dom');
 
 const DEFAULT_MAX_DEPTH = 8;
 const DEFAULT_MAX_FILES = 2000;
 const MAX_INPUT_PATHS = 2000;
 const SKIP_DIR_NAMES = new Set(['node_modules', '.git']);
+// 专利五书目录的签名（与 parsers/xml/source.js 的目录候选同一范围）
+const PATENT_ROOT = 'cn-application-body';
+const BOOK_CODES = Object.freeze(['100001', '100002', '100003', '100004', '100005']);
+const XML_EXT = '.xml';
+const MAX_SIGNATURE_PROBES = 16;
+const SIGNATURE_PROBE_BYTES = 8192;
 
 const isHidden = (name) => name.startsWith('.');
 const compareText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -54,12 +69,12 @@ async function statOrNull(target) {
     }
 }
 
-/** 扩展名过滤集：缺省或全为非法项时回退到 SUPPORTED_EXTENSIONS；元素可带或不带前导点 */
+/** 扩展名过滤集：缺省或全为非法项时回退到 DIRECTORY_SCAN_EXTENSIONS；元素可带或不带前导点 */
 function normalizeExts(exts) {
     const list = Array.isArray(exts)
         ? exts.filter((item) => typeof item === 'string' && item.trim()).map((item) => (item.startsWith('.') ? item : `.${item}`).toLowerCase())
         : [];
-    return new Set(list.length > 0 ? list : SUPPORTED_EXTENSIONS);
+    return new Set(list.length > 0 ? list : DIRECTORY_SCAN_EXTENSIONS);
 }
 
 function normalizeLimits({ maxDepth, maxFiles } = {}) {
@@ -168,7 +183,7 @@ async function expandInputs(raws, opts = {}) {
     // 显式给出的本地文件：目录展开时不再重复收入，也不计入 skipped
     const explicit = new Set(items.filter((item) => item.kind === 'file').map((item) => item.abs));
     const ctx = {
-        exts: new Set(SUPPORTED_EXTENSIONS),
+        exts: new Set(DIRECTORY_SCAN_EXTENSIONS),
         limits: normalizeLimits(options),
         found: new Map(),
         seenDirs: new Set(),
@@ -177,9 +192,16 @@ async function expandInputs(raws, opts = {}) {
     };
     const inputs = [];
     const directories = [];
+    const bundles = [];
     for (const item of items) {
         if (item.kind !== 'dir') {
             inputs.push(item.raw);
+            continue;
+        }
+        // 专利五书目录整体作为一项输入，不展开（同一目录重复给出时各留一项，与显式文件一致）
+        if (await isPatentBundleDir(item.abs)) {
+            inputs.push(item.raw);
+            if (!bundles.includes(item.abs)) bundles.push(item.abs);
             continue;
         }
         const before = ctx.found.size;
@@ -192,9 +214,56 @@ async function expandInputs(raws, opts = {}) {
     return {
         inputs,
         directories,
+        bundles,
         skipped: ctx.skipped.filter((file) => !explicit.has(file)).sort(compareText),
         truncated: ctx.truncated,
     };
+}
+
+// ============================================================
+// 专利五书目录的签名
+// ============================================================
+
+/** 目录下直接含 10000N/10000N.xml，或含根元素为 cn-application-body 的 .xml；任何读盘失败都按「不是」处理 */
+async function isPatentBundleDir(dir) {
+    if (typeof dir !== 'string' || !dir) return false;
+    for (const code of BOOK_CODES) {
+        if (await hasPatentRoot(path.join(dir, code, `${code}${XML_EXT}`))) return true;
+    }
+    let names = [];
+    try {
+        names = (await fsp.readdir(dir)).filter((name) => !isHidden(name) && path.extname(name).toLowerCase() === XML_EXT).sort(compareText);
+    } catch (err) {
+        return false;
+    }
+    for (const name of names.slice(0, MAX_SIGNATURE_PROBES)) {
+        if (await hasPatentRoot(path.join(dir, name))) return true;
+    }
+    return false;
+}
+
+// 只读文首 SIGNATURE_PROBE_BYTES 字节判根元素名：官方文件头约 250 字节，UTF-8 / UTF-16 之外的编码在此之前也都是 ASCII
+async function hasPatentRoot(filePath) {
+    const stat = await statOrNull(filePath);
+    if (!stat || !stat.isFile()) return false;
+    let handle = null;
+    try {
+        handle = await fsp.open(filePath, 'r');
+        const buffer = Buffer.alloc(Math.min(SIGNATURE_PROBE_BYTES, stat.size));
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        return sniffRootName(decodeHead(buffer.subarray(0, bytesRead))) === PATENT_ROOT;
+    } catch (err) {
+        return false;
+    } finally {
+        if (handle) await handle.close().catch(() => {});
+    }
+}
+
+// UTF-16 以 BOM 识别，其余按 UTF-8 读（根元素名是 ASCII，GBK 等编码下同样读得出来）
+function decodeHead(buffer) {
+    if (buffer.length >= 2 && buffer[0] === 0xFF && buffer[1] === 0xFE) return buffer.toString('utf16le', 2);
+    if (buffer.length >= 2 && buffer[0] === 0xFE && buffer[1] === 0xFF) return new TextDecoder('utf-16be').decode(buffer.subarray(2));
+    return buffer.toString('utf8');
 }
 
 // 单项判定：已存在的目录为 dir，已存在的文件为 file（供去重），其余为 other；均保留原始值 raw
@@ -214,4 +283,4 @@ async function classifyRaw(raw, cwd) {
     return { raw, kind: stat && stat.isFile() ? 'file' : 'other', abs };
 }
 
-module.exports = { scanPaths, expandPaths, expandInputs, normalizeExts, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FILES };
+module.exports = { scanPaths, expandPaths, expandInputs, isPatentBundleDir, normalizeExts, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FILES };

@@ -78,4 +78,10 @@ contextBridge.exposeInMainWorld('markflow', {
     openExternal: (url) => invoke('mf:shell:openExternal', { url }),
     // 当前文件操作：只传会话与动作，文件路径由主进程按 sessionId 取
     fileAction: (sessionId, action) => invoke('mf:file:action', { sessionId, action }),
+
+    // Word for Mac 加载项：渲染层只给一个布尔开关，端口、目录与清单内容都由主进程决定
+    addinStatus: () => invoke('mf:addin:status'),
+    addinSetEnabled: (enabled) => invoke('mf:addin:setEnabled', { enabled: Boolean(enabled) }),
+    addinInstall: () => invoke('mf:addin:install'),
+    addinUninstall: () => invoke('mf:addin:uninstall'),
 });

@@ -6,6 +6,17 @@
  *   - 渲染前先经 downgradeCustomNodes 把 slideBreak/sheetSection 降级为标准节点；
  *   - 图片按 node.data.asset 内嵌（png/jpg/gif/bmp，宽超 600px 按比例缩小），
  *     svg/webp/emf 或无 asset 的图片降级为斜体 alt 文本并记 warning；
+ *     带物理显示尺寸的图片（data.displayWidthMm / displayHeightMm，专利五书 XML 反向导入写入）按毫米定尺寸，
+ *     不受 600px 上限约束：毫米先换成整数 EMU（1 mm = 36000 EMU）再写 wp:extent，使正向链路从 wp:extent
+ *     换回的毫米与目标像素逐值复原（1 像素 @300 DPI 恰为 3048 EMU）；
+ *   - 图片角色的往返载体：data.role 为 formula / table / chemistry 的图片，替换文字写成 markflow:role=<角色>，
+ *     原 alt 非空时写成 markflow:role=<角色>;<原 alt>；docx 解析器据此还原 data.role，XML 渲染层再包回
+ *     maths / tables / chemistry；
+ *   - Word 分节与页眉：顶层节点带 data.section = { index, header }（约定见 ir/schema，parsers/docx-sections 与
+ *     parsers/xml 写入）时，按 index 把顶层节点分组，每组一个 Word 分节（下一页起），header 写进该节页眉；
+ *     确有两节及以上时，标了 data.role = 'section-title' 的书目标题节点略去——书目名已由页眉承载，官方五书模板
+ *     的正文里同样没有书目标题段；只有一节时保留它，因为单节文档的页眉不足以让 docx 解析器认出书目。
+ *     没有任何节点带 data.section 的文档仍只产出一节，行为与此前一致；
  *   - 链接输出真实超链接（ExternalHyperlink），任务列表以 ☐/☑ 前缀表达；
  *   - 引用块左缩进 + 左边线 + 灰色文字；代码块逐行拆分、等宽字体、浅灰底纹；
  *   - 表格带边框、表头加粗；HTML 节点去标签后作普通文本（含 data.safeTable 的 <table> 片段，
@@ -15,6 +26,22 @@
  *   - 未知节点降级为纯文本段落，绝不静默丢弃。
  * 渲染器只向 doc.warnings 推入字符串，不打印 stdout；纯文本收集统一用 ir/util 的 collectText。
  */
+// docx 包内打包的 util-deprecate 垫片在加载期读取 globalThis.localStorage；Node 25 起该访问器在未传
+// --localstorage-file 时会向 stderr 打印 ExperimentalWarning，破坏 CLI「--json 模式 stderr 为空」的约定。
+// 加载期间临时用值为 undefined 的自有属性遮住访问器，加载完即还原，不改变全局对象的最终形态。
+function requireDocx() {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    const shadowed = Boolean(descriptor && typeof descriptor.get === 'function' && descriptor.configurable);
+    if (shadowed) {
+        Object.defineProperty(globalThis, 'localStorage', { value: undefined, configurable: true, writable: true, enumerable: false });
+    }
+    try {
+        return require('docx');
+    } finally {
+        if (shadowed) Object.defineProperty(globalThis, 'localStorage', descriptor);
+    }
+}
+
 const {
     Document,
     Packer,
@@ -31,7 +58,8 @@ const {
     BorderStyle,
     ShadingType,
     Tab,
-} = require('docx');
+    Header,
+} = requireDocx();
 const { imageSize } = require('image-size');
 const { stripHtml, collectText } = require('../ir/util');
 const { toBuffer } = require('../util');
@@ -68,6 +96,16 @@ const INDENT_STEP_TWIP = 720; // 0.5 英寸
 const HANGING_TWIP = 360;
 const MAX_LIST_DEPTH = 5;
 const MAX_IMAGE_WIDTH_PX = 600;
+// 物理显示尺寸 → wp:extent：docx 包按「像素 × 9525」取整得 EMU，故把整数 EMU 折成（可带小数的）像素交给它
+const EMU_PER_MM = 36000;
+const EMU_PER_PX = 9525;
+// 超出此范围的毫米值不可信（Word 的页面上限约 558 mm），退回按像素定尺寸
+const MAX_PHYSICAL_MM = 2000;
+// 图片角色的往返载体（与 docx 解析器的读取侧逐字一致）
+const ROLE_ALT_PREFIX = 'markflow:role=';
+const ROLE_ALT_SEPARATOR = ';';
+const IMAGE_ROLES = new Set(['formula', 'table', 'chemistry']);
+const SECTION_TITLE_ROLE = 'section-title';
 const PERCENT_BASE = 100;
 const TASK_CHECKED_PREFIX = '☑ ';
 const TASK_UNCHECKED_PREFIX = '☐ ';
@@ -98,17 +136,55 @@ async function render(doc, options) {
     // 公式降级须在自定义节点降级之前完成：两者互不依赖，合起来把 IR 收敛为纯标准 mdast；残留标记兜底剥除
     const root = downgradeCustomNodes(degradeMath(stripMarkersTree(doc.ir || { type: 'root', children: [] })));
     const ctx = { warnings: doc.warnings, quoteDepth: 0, listDepth: 0 };
-    const blocks = blocksToDocx(root.children, ctx);
-    if (blocks.length === 0) blocks.push(emptyParagraph());
+    const sections = groupSections(root.children).map((group) => sectionToDocx(group, docxOptions, ctx));
 
     const document = new Document({
         creator: 'MarkFlow',
         title: String((doc.meta && doc.meta.title) || ''),
         styles: { default: { document: { run: runDefaults(docxOptions) } } },
-        sections: [{ properties: { page: pageProperties(docxOptions) }, children: blocks }],
+        sections,
     });
     return Packer.toBuffer(document);
 }
+
+// ---- 分节 ----
+
+/**
+ * 顶层节点 → [{ header: string | null, nodes }]。data.section.index 变化即另起一组；不带分节信息的节点
+ * （自定义节点降级出的标题等）并入当前组。全文没有分节信息时只有一组、header 为 null。
+ * 确有两组及以上时略去书目标题节点（见文件头）。
+ */
+function groupSections(nodes) {
+    const groups = [];
+    let currentIndex = null;
+    for (const node of nodes || []) {
+        const section = node && node.data && node.data.section;
+        const index = section && Number.isInteger(section.index) ? section.index : currentIndex;
+        if (groups.length === 0 || index !== currentIndex) {
+            groups.push({ header: section && typeof section.header === 'string' && section.header.trim() ? section.header.trim() : null, nodes: [] });
+            currentIndex = index;
+        }
+        groups[groups.length - 1].nodes.push(node);
+    }
+    if (groups.length === 0) return [{ header: null, nodes: [] }];
+    if (groups.length === 1) return groups;
+    return groups.map((group) => ({ ...group, nodes: group.nodes.filter((node) => !isSectionTitle(node)) }));
+}
+
+const isSectionTitle = (node) => Boolean(node && node.type === 'heading' && node.data && node.data.role === SECTION_TITLE_ROLE);
+
+function sectionToDocx(group, docxOptions, ctx) {
+    const children = blocksToDocx(group.nodes, ctx);
+    if (children.length === 0) children.push(emptyParagraph());
+    const section = { properties: { page: pageProperties(docxOptions) }, children };
+    if (group.header) section.headers = { default: headerOf(group.header) };
+    return section;
+}
+
+// 页眉多行（事务所抬头一行、书目名一行）逐行成段，居中
+const headerOf = (text) => new Header({
+    children: text.split('\n').map((line) => new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: line })] })),
+});
 
 /** 文档默认 run：西文字体同时用于 hAnsi 与 cs，中文走 eastAsia；字号由 pt 换算为半磅 */
 function runDefaults({ fontSize, fontFamily }) {
@@ -342,6 +418,11 @@ function inlineToRun(node, ctx, fmt) {
             return inlineToRuns(node.children, ctx, { ...fmt, strike: true });
         case 'underline':
             return inlineToRuns(node.children, ctx, { ...fmt, underline: {} });
+        // 上下标互斥（OOXML 的 w:vertAlign 只有一个取值），内层覆盖外层
+        case 'superscript':
+            return inlineToRuns(node.children, ctx, { ...fmt, subScript: false, superScript: true });
+        case 'subscript':
+            return inlineToRuns(node.children, ctx, { ...fmt, superScript: false, subScript: true });
         case 'inlineCode':
             return [makeRun({ ...fmt, text: String(node.value || ''), font: CODE_FONT }, ctx)];
         case 'break':
@@ -384,7 +465,7 @@ function linkToDocx(node, ctx, fmt) {
 // ---- 图片 ----
 
 function imageToDocx(node, ctx, fmt) {
-    const alt = String(node.alt || node.url || '图片');
+    const alt = altTextOf(node);
     const asset = node.data && node.data.asset;
     const data = toBuffer(asset && asset.buffer);
     const degrade = (reason) => {
@@ -395,7 +476,7 @@ function imageToDocx(node, ctx, fmt) {
     if (!asset || !data || data.length === 0) return degrade(`缺少可用的图片数据（${node.url || '无地址'}）`);
     const type = resolveImageType(asset.mime, data);
     if (!type) return degrade(`不支持的图片格式 ${asset.mime || '未知'}，仅支持 png/jpg/gif/bmp`);
-    const size = resolveImageSize(asset, data, node.data && node.data.display);
+    const size = physicalSize(node.data) || resolveImageSize(asset, data, node.data && node.data.display);
     if (!size) return degrade('无法解析图片尺寸');
 
     try {
@@ -408,6 +489,27 @@ function imageToDocx(node, ctx, fmt) {
     } catch (err) {
         return degrade(`docx 内嵌失败（${err && err.message ? err.message : err}）`);
     }
+}
+
+// 替换文字：带角色的图片写往返标记（原 alt 为空时只写标记，不拿地址充数）；其余沿用 alt → 地址 → 「图片」
+function altTextOf(node) {
+    const role = node.data && node.data.role;
+    if (typeof role !== 'string' || !IMAGE_ROLES.has(role)) return String(node.alt || node.url || '图片');
+    const original = typeof node.alt === 'string' ? node.alt.trim() : '';
+    return `${ROLE_ALT_PREFIX}${role}${original ? `${ROLE_ALT_SEPARATOR}${original}` : ''}`;
+}
+
+/**
+ * 物理显示尺寸（毫米）→ 交给 docx 包的像素值（可带小数）：先取整到 EMU 再除以 9525，docx 包乘回去取整后
+ * 即该整数 EMU。两维都须为正且在可信范围内，否则返回 null，走既有的按像素定尺寸与 600px 上限。
+ */
+function physicalSize(nodeData) {
+    const width = Number(nodeData && nodeData.displayWidthMm);
+    const height = Number(nodeData && nodeData.displayHeightMm);
+    const valid = (mm) => Number.isFinite(mm) && mm > 0 && mm <= MAX_PHYSICAL_MM;
+    if (!valid(width) || !valid(height)) return null;
+    const toPx = (mm) => Math.max(1, Math.round(mm * EMU_PER_MM)) / EMU_PER_PX;
+    return { width: toPx(width), height: toPx(height) };
 }
 
 /** 由 mime 判定 docx 图片类型；mime 未知时用 image-size 嗅探，已知但不支持（svg/webp/emf）返回 null */

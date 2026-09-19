@@ -6,7 +6,7 @@
  *   units=0 表示仅有纵横比、无物理密度 → dpi 为 null）；非 JPEG 返回 null。不解码像素数据。
  * readImageInfo(buffer, mime) → { width, height, dpi, format } | null
  *   JPEG 走 readJpegInfo；其它格式经 image-size 取尺寸（dpi 为 null）。format 为 'jpg' | 'tif' | 其它扩展名。
- * pixelsToMm(px, dpi) → 毫米整数（px × 25.4 / dpi，四舍五入，最小 1）
+ * pixelsToMm(px, dpi) → 毫米整数（px × 25.4 / dpi，向下取整，最小 1；官方对 wi/he 一律截尾取整）
  */
 const { imageSize } = require('image-size');
 
@@ -85,7 +85,7 @@ function readImageInfo(buffer, mime) {
 
 function pixelsToMm(px, dpi) {
     if (!Number.isFinite(px) || px <= 0 || !Number.isFinite(dpi) || dpi <= 0) return null;
-    return Math.max(1, Math.round((px * INCH_MM) / dpi));
+    return Math.max(1, Math.floor((px * INCH_MM) / dpi));
 }
 
 module.exports = { isJpeg, readJpegInfo, readImageInfo, pixelsToMm, FORMAT_BY_MIME };

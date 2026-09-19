@@ -13,6 +13,8 @@
  *   - requireDtd 为 false 时只做 well-formed 检查（generic profile 无 DTD）。
  *   - libxml2-wasm 仅有 ESM 出口，CommonJS 侧用动态 import()；解析成功后 dispose() 释放 wasm 内存。
  * describeValidation(fileName, result, { requireDtd }) → Issue[]（DTD_INVALID / DTD_UNAVAILABLE 问题项）
+ *   fileName 只用于问题项的文案与 location，由调用方决定写法：patent profile 传「书目名 + 相对路径」
+ *   （权利要求书 100001/100001.xml），免得只见表格代码不知是哪一书；generic profile 传主产物的文件名。
  */
 const fs = require('fs');
 const path = require('path');

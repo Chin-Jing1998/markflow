@@ -7,7 +7,10 @@
  *       参数解析（中文报错、--no-<开关>、布尔开关误带取值、--concurrency 非法值告警）、
  *       extract 子命令（本机 HTTP 服务、stdout 为正文、零落盘）、
  *       config 子命令（set/get/unset 与文件权限）、参数错误（1）、失败项（2）、
- *       输出目录解析（--out / MARKFLOW_OUTPUT_DIR）、人类模式与 --json 模式的输出分流。
+ *       输出目录解析（--out / MARKFLOW_OUTPUT_DIR）、人类模式与 --json 模式的输出分流、
+ *       patent profile 的 --json 契约（outputs 键不变、值为官方案卷结构下的新路径）与 --clean 对旧版平铺产物的清理；
+ *       专利五书 XML 反向导入：案卷 zip / 五书目录 / 单个 XML 三种输入、省略 --to 即 docx、--to html、bundle 目标被拒、
+ *       .xml 与 .zip 不随目录展开、--xml-import-paragraph-numbers、非专利 XML 记为失败项、--json 模式 stderr 为空。
  * 临时产物与隔离的配置目录一律写入 os.tmpdir()。extract 的成功路径以 --require 预加载
  * allow-private-network.js，为子进程内的 SSRF 守卫放行 127.0.0.1（守卫本体不变）。
  */
@@ -25,6 +28,7 @@ const CLI = path.join(ROOT, 'bin', 'markflow.js');
 const PRELOAD = path.join(ROOT, 'test', 'fixtures', 'allow-private-network.js');
 const SAMPLE_MD = path.join(ROOT, 'test', 'fixtures', 'sample.md');
 const SAMPLE_PDF = path.join(ROOT, 'test', 'fixtures', 'sample.pdf');
+const SAMPLE_PATENT = path.join(ROOT, 'test', 'fixtures', 'patent', 'sample-patent.docx');
 const PKG_VERSION = require('../package.json').version;
 // parseArgs 的英文原文：CLI 已按错误码中文化，任何一句都不应再出现在 stderr 中
 const ENGLISH_PARSE_ERROR_RE = /Unknown option|argument missing|does not take an argument|ambiguous|Unexpected argument/;
@@ -93,7 +97,7 @@ test('--help 的选项段由 options.js 的描述树生成，列出全部转换�
         '--content-width', '--spacing', '--inline-images', '--page-size', '--landscape', '--docx-font-size',
         '--font-ascii', '--font-east-asia', '--xml-indent', '--numbering-width', '--mineru-formula', '--mineru-table',
         '--mineru-timeout', '--patent-image-dpi', '--section-detection', '--rasterize-tables', '--rasterize-formulas',
-        '--raster-scale', '--raster-max-width'];
+        '--raster-scale', '--raster-max-width', '--xml-import-paragraph-numbers'];
     flags.forEach((flag) => assert.ok(stdout.includes(flag), `--help 应列出 ${flag}`));
     // 多路径旗标：取值相同则合并、默认值不同逐段列出（pdf 主题缺省为 print 而非 apple）；取值不同则逐段列出
     assert.match(stdout, /可选 apple \| apple-dark \| github \| academic \| reader \| print；html 默认 apple，pdf 默认 print/);
@@ -168,7 +172,8 @@ test('formats --json 输出单行 JSON，含 targets 与 capabilities', async ()
         assert.deepEqual(Object.keys(capabilities[key]).sort(), ['available', 'hint', 'name'], `${key} 的键`);
         assert.equal(capabilities[key].available, capabilities[key].name !== null);
     }
-    assert.deepEqual(payload.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']);
+    assert.deepEqual(payload.extensions, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown', '.xml', '.zip']);
+    assert.deepEqual(Object.keys(payload.targets.inputs), ['docx', 'xlsx', 'pptx', 'pdf', 'md', 'xml', 'zip', 'url'], '专利五书 XML 与案卷 zip 列入可用输入类型');
     assert.ok('pdfBackend' in payload.targets.capabilities);
 });
 
@@ -184,7 +189,9 @@ test('formats 人类模式输出可读文本到 stdout', async () => {
     assert.match(stdout, /apple、apple-dark、github、academic、reader、print/);
     assert.match(stdout, /generic、patent/);
     assert.match(stdout, /DTD 校验器 +→ /);
-    assert.match(stdout, /受理扩展名 +→ \.docx \.xlsx \.pptx \.pdf \.md \.markdown/);
+    assert.match(stdout, /受理扩展名 +→ \.docx \.xlsx \.pptx \.pdf \.md \.markdown \.xml \.zip/);
+    assert.match(stdout, /可用输入类型 +→ docx xlsx pptx pdf md xml zip url/);
+    assert.match(stdout, /Markdown\/专利XML → docx/);
     // LibreOffice 非必需：可用时报名称，不可用时写明仅作兜底
     assert.match(stdout, /LibreOffice +→ (soffice|不可用（非必需)/);
 });
@@ -724,9 +731,10 @@ test('同批混合目标：md 的 sample.docx 与 docx 的 sample/ 分属不同�
 // ============================================================
 
 test('人类模式：每项告警逐条写 stderr，汇总行追加告警条数；--json 模式 stderr 仍为空', async () => {
-    // Arrange：patent profile 下 330 DPI 的图片必出「预检：」告警
+    // Arrange：patent profile 的默认密度已改为官方受理的 300 DPI，须显式给 330 才会出「预检：」告警；
+    // 这条顺带兜住「显式 --jpeg-ppi 优先于 profile 默认值」
     const outDir = fs.mkdtempSync(path.join(tmpDir, 'warn-'));
-    const args = ['convert', SAMPLE_MD, '--to', 'xml', '--xml-profile', 'patent', '--out', outDir];
+    const args = ['convert', SAMPLE_MD, '--to', 'xml', '--xml-profile', 'patent', '--jpeg-ppi', '330', '--out', outDir];
 
     // Act
     const human = await runCli(args);
@@ -1077,6 +1085,44 @@ test('--clean：重转前清理旧产物，用户放入的其它文件保留', a
     assert.ok(fs.existsSync(path.join(dir, 'sample.html')), '本次产物应照常写出');
 });
 
+test('patent profile：--json 的 outputs 键不变、值为官方案卷结构的新路径；--clean 清掉旧版平铺产物与上一轮多余的图片', async () => {
+    // Arrange：关闭栅格化以免依赖 Electron；预置旧版平铺产物、书目目录内上一轮多出的图片与一份用户文件
+    const outDir = fs.mkdtempSync(path.join(tmpDir, 'patent-'));
+    const dir = path.join(outDir, 'sample-patent');
+    fs.mkdirSync(path.join(dir, '100003'), { recursive: true });
+    const stale = ['claims.xml', 'abstract-figure.xml', 'drawing-1.jpg', 'omath-3-1.jpg', path.join('100003', '100003_99.jpg')];
+    for (const rel of stale) fs.writeFileSync(path.join(dir, rel), '旧产物');
+    fs.writeFileSync(path.join(dir, '100003', '批注.txt'), '保留我');
+    const args = ['convert', SAMPLE_PATENT, '--to', 'xml', '--xml-profile', 'patent', '--math', 'text',
+        '--no-rasterize-tables', '--no-rasterize-formulas', '--validate', '--clean', '--out', outDir, '--json'];
+
+    // Act
+    const { code, stdout, stderr } = await runCli(args);
+
+    // Assert：键名是对外契约
+    assert.equal(code, 0, stderr);
+    const envelope = parseSingleLineJson(stdout);
+    assert.deepEqual([envelope.ok, envelope.errors.length, envelope.results.length], [true, 0, 1]);
+    const result = envelope.results[0];
+    assert.deepEqual(result.outputs, {
+        claims: path.join(dir, '100001', '100001.xml'),
+        description: path.join(dir, '100002', '100002.xml'),
+        drawings: path.join(dir, '100003', '100003.xml'),
+        abstract: path.join(dir, '100004', '100004.xml'),
+        abstractFigure: path.join(dir, '100005', '100005.xml'),
+        zip: path.join(dir, 'sample-patent.zip'),
+        precheck: path.join(dir, 'precheck.json'),
+    });
+    for (const file of Object.values(result.outputs)) assert.ok(fs.statSync(file).isFile(), file);
+    assert.deepEqual(result.warnings.filter((item) => item.startsWith('DTD 校验：')), []);
+    // Assert：产物根下只有五个书目目录、zip 与预检；图片与所属 XML 同目录
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['100001', '100002', '100003', '100004', '100005', 'precheck.json', 'sample-patent.zip'].sort());
+    const drawings = fs.readdirSync(path.join(dir, '100003'));
+    assert.ok(drawings.includes('100003.xml') && drawings.includes('100003_1.jpg'), drawings.join('、'));
+    assert.equal(drawings.includes('100003_99.jpg'), false, '上一轮多出的图片应被清理');
+    assert.equal(fs.readFileSync(path.join(dir, '100003', '批注.txt'), 'utf8'), '保留我', '书目目录内的用户文件应保留');
+});
+
 test('SIGINT 中止批次：进行中的任务跑完，未开始的记为已取消，退出码 2', async (t) => {
     // Windows 没有 POSIX 信号：child.kill('SIGINT') 不会把 SIGINT 投递给子进程，
     // libuv 对 SIGTERM/SIGINT/SIGKILL 一律退化为 TerminateProcess，进程内注册的
@@ -1131,4 +1177,141 @@ test('extract 参数错误以 1 退出，抓取失败以 2 退出，均给出中
     assert.equal(failed.code, 2);
     assert.equal(failed.stdout, '');
     assert.match(failed.stderr, /提取失败：.*[一-龥]/);
+});
+
+// ============================================================
+// 专利五书 XML 反向导入
+// ============================================================
+
+const JSZip = require('jszip');
+const {
+    buildOfficialBundle, writeFiles, zipFiles, OFFICIAL_EXPECTED,
+} = require('./fixtures/patent/roundtrip/build-roundtrip-fixtures');
+
+// 每个用例各自现造一份官方形态的案卷：目录、zip 与其中的单个 XML
+async function makeCase(label) {
+    const work = fs.mkdtempSync(path.join(tmpDir, `${label}-`));
+    const bundle = await buildOfficialBundle();
+    const dir = writeFiles(path.join(work, '晾衣架案卷'), bundle.files);
+    const zip = path.join(work, '晾衣架案卷.zip');
+    fs.writeFileSync(zip, await zipFiles(bundle.files));
+    return { work, dir, zip, outDir: fs.mkdtempSync(path.join(work, 'out-')) };
+}
+
+async function docxText(file) {
+    const zip = await JSZip.loadAsync(fs.readFileSync(file));
+    const xml = await zip.file('word/document.xml').async('string');
+    return [...xml.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)].map((matched) => matched[1]).join('');
+}
+
+test('案卷 zip 省略 --to 即转 docx：人类模式 stdout 只有产物路径，导入问题项以告警行走 stderr', async () => {
+    const { zip, outDir } = await makeCase('import-zip');
+
+    const { code, stdout, stderr } = await runCli(['convert', zip, '--out', outDir]);
+
+    assert.equal(code, 0, stderr);
+    const product = path.join(outDir, '晾衣架案卷.docx');
+    assert.equal(stdout.trim(), product);
+    assert.match(stderr, /开始：.*晾衣架案卷\.zip → docx/);
+    assert.match(stderr, /告警：导入：已读取 说明书摘要（1 段）、摘要附图（1 幅）、权利要求书（3 项）、说明书（7 段、5 个小标题）、说明书附图（2 幅）；内嵌图片 4 幅/);
+    const text = await docxText(product);
+    assert.ok(text.includes(OFFICIAL_EXPECTED.inventionTitle) && text.includes(`1. ${OFFICIAL_EXPECTED.claims[0][0]}`));
+    assert.equal(text.includes('[0001]'), false, '段号缺省不写进正文');
+});
+
+test('五书目录作为一项输入：--json 模式 stderr 为空，sourceType 为 xml，不计入目录展开', async () => {
+    const { dir, outDir } = await makeCase('import-dir');
+
+    const { code, stdout, stderr } = await runCli(['convert', dir, '--json', '--out', outDir]);
+
+    assert.equal(code, 0);
+    assert.equal(stderr, '');
+    const payload = parseSingleLineJson(stdout);
+    assert.equal(payload.ok, true);
+    assert.equal('inputExpansion' in payload, false, '五书目录不是目录展开');
+    const [item] = payload.results;
+    assert.deepEqual([item.input, item.target, item.name, item.sourceType, item.title],
+        [dir, 'docx', '晾衣架案卷', 'xml', OFFICIAL_EXPECTED.inventionTitle]);
+    assert.equal(item.outputs.docx, path.join(outDir, '晾衣架案卷.docx'));
+    assert.ok(item.warnings.every((warning) => warning.startsWith('导入：')));
+});
+
+test('单个 XML 转 html：产物为 {名称}/{名称}.html 与 images/，stderr 为空', async () => {
+    const { dir, outDir } = await makeCase('import-xml');
+
+    const { code, stdout, stderr } = await runCli(['convert', path.join(dir, '100002', '100002.xml'), '--to', 'html', '--json', '--out', outDir]);
+
+    assert.equal(code, 0);
+    assert.equal(stderr, '');
+    const [item] = parseSingleLineJson(stdout).results;
+    assert.deepEqual([item.target, item.sourceType, item.name, item.imagesCount], ['html', 'xml', '100002', 1]);
+    const html = fs.readFileSync(item.outputs.html, 'utf8');
+    assert.ok(html.includes(OFFICIAL_EXPECTED.inventionTitle) && html.includes('images/100002_1.jpg'));
+    assert.ok(fs.existsSync(path.join(item.outputs.imagesDir, '100002_1.jpg')));
+});
+
+test('--xml-import-paragraph-numbers 把段号写进 Word 段首；--no- 前缀可关闭', async () => {
+    const { zip, outDir } = await makeCase('import-numbers');
+
+    const on = await runCli(['convert', zip, '--xml-import-paragraph-numbers', '--json', '--out', outDir]);
+    assert.equal(on.code, 0, on.stderr);
+    assert.equal(parseSingleLineJson(on.stdout).results[0].options.xmlImport.paragraphNumbers, true);
+    assert.ok((await docxText(path.join(outDir, '晾衣架案卷.docx'))).includes(`[0003]  ${OFFICIAL_EXPECTED.paragraphs[2]}`));
+
+    const off = await runCli(['convert', zip, '--xml-import-paragraph-numbers', '--no-xml-import-paragraph-numbers', '--json', '--out', outDir]);
+    assert.equal(parseSingleLineJson(off.stdout).results[0].options.xmlImport.paragraphNumbers, false);
+    assert.equal((await docxText(path.join(outDir, '晾衣架案卷.docx'))).includes('[0003]'), false);
+});
+
+test('bundle 目标不接受专利五书 XML：参数错误（1），不启动转换', async () => {
+    const { zip, dir, outDir } = await makeCase('import-bundle');
+    for (const [input, type] of [[zip, 'zip'], [dir, 'xml']]) {
+        const { code, stdout, stderr } = await runCli(['convert', input, '--to', 'bundle', '--out', outDir]);
+        assert.equal(code, 1);
+        assert.equal(stdout, '');
+        assert.match(stderr, new RegExp(`目标 bundle 不接受 ${type} 输入：bundle 仅接受 Office、PDF 文件与网页输入`));
+    }
+    assert.deepEqual(fs.readdirSync(outDir), []);
+});
+
+test('.xml 与 .zip 不随普通目录展开：记入 skipped，其余文件照常转换；目录里只有它们时提示须显式给出', async () => {
+    const work = fs.mkdtempSync(path.join(tmpDir, 'import-mixed-'));
+    const outDir = fs.mkdtempSync(path.join(work, 'out-'));
+    const mixed = writeFiles(path.join(work, 'mixed'), { 'note.md': Buffer.from('# 标题\n\n正文\n'), 'pom.xml': Buffer.from('<project/>'), '归档.zip': Buffer.from('PK') });
+
+    const { code, stdout, stderr } = await runCli(['convert', mixed, '--to', 'html', '--json', '--out', outDir]);
+    assert.equal(code, 0, stderr);
+    const payload = parseSingleLineJson(stdout);
+    assert.deepEqual(payload.results.map((item) => path.basename(item.input)), ['note.md']);
+    assert.deepEqual(payload.inputExpansion.skipped.map((file) => path.basename(file)).sort(), ['pom.xml', '归档.zip'].sort());
+
+    const only = writeFiles(path.join(work, 'only'), { 'pom.xml': Buffer.from('<project/>') });
+    const refused = await runCli(['convert', only, '--out', outDir]);
+    assert.equal(refused.code, 1);
+    assert.match(refused.stderr, /输入目录中没有可转换的文件（目录展开受理：\.docx \.xlsx \.pptx \.pdf \.md \.markdown；\.xml 与 \.zip 须显式给出）/);
+});
+
+test('非专利 XML 与无关 zip 显式给出时记为失败项（2），同批的案卷照常转换', async () => {
+    const { zip, work, outDir } = await makeCase('import-foreign');
+    const foreign = writeFiles(path.join(work, 'foreign'), { 'pom.xml': Buffer.from('<project/>') });
+    const otherZip = path.join(work, '无关.zip');
+    fs.writeFileSync(otherZip, await zipFiles({ 'readme.txt': Buffer.from('x') }));
+
+    const { code, stdout, stderr } = await runCli(['convert', path.join(foreign, 'pom.xml'), zip, otherZip, '--json', '--out', outDir]);
+
+    assert.equal(code, 2);
+    assert.equal(stderr, '');
+    const payload = parseSingleLineJson(stdout);
+    assert.deepEqual(payload.results.map((item) => item.name), ['晾衣架案卷']);
+    assert.deepEqual(payload.errors.map((item) => [path.basename(item.input), item.error]), [
+        ['pom.xml', 'pom.xml 不是国知局专利五书 XML：根元素为 project，应为 cn-application-body'],
+        ['无关.zip', 'zip 内未找到国知局专利五书 XML（根元素 cn-application-body）；反向导入只受理专利案卷包'],
+    ]);
+});
+
+test('--help 与 formats 说明专利五书 XML 的三种输入', async () => {
+    const help = await runCli(['--help']);
+    assert.match(help.stdout, /专利五书目录（内含 10000N\/10000N\.xml 或五书 XML）整体作为一项输入/);
+    assert.match(help.stdout, /Markdown 与专利五书 XML（\.xml、案卷 \.zip、五书目录）→ docx/);
+    assert.match(help.stdout, /--xml-import-paragraph-numbers .*默认 false.*仅专利五书 XML 输入/);
 });

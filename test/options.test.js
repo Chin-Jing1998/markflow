@@ -1,13 +1,14 @@
 /**
  * converters/options.js 单元测试
  * 覆盖：默认值与深冻结、部分覆盖时的深合并、幂等、枚举/数值/布尔/字符串/parts 各类校验的中文错误、
- *       敏感项不回显、可空对象、未知键拒绝、枚举表、描述树、脱敏拷贝
+ *       敏感项不回显、可空对象、未知键拒绝、枚举表、描述树、脱敏拷贝、
+ *       applyPatentImportDefaults（专利五书 XML 输入的 docx 中文字体缺省）
  */
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-    normalizeOptions, describeOptions, redactOptions, OPTION_ENUMS, DEFAULT_OPTIONS,
+    normalizeOptions, applyPatentImportDefaults, describeOptions, redactOptions, OPTION_ENUMS, DEFAULT_OPTIONS,
 } = require('../converters/options');
 
 // ============================================================
@@ -42,6 +43,7 @@ describe('normalizeOptions', () => {
             profile: 'generic', validate: false, indent: 2, numbering: { start: 1, width: 4 },
             patent: { parts: 'auto', rasterizeTables: true, rasterizeFormulas: true, imageDpi: 300, sectionDetection: 'auto' },
         });
+        assert.deepEqual(opts.xmlImport, { paragraphNumbers: false });
         assert.deepEqual(opts.raster, { scale: 2, maxWidth: 1600 });
 
         // Assert：深冻结（Reflect.set 在冻结对象上返回 false，不依赖严格模式）
@@ -64,7 +66,8 @@ describe('normalizeOptions', () => {
         });
 
         assert.equal(opts.jpegQuality, 75);
-        assert.equal(opts.jpegPpi, 330);
+        // patent profile 下未显式给 jpegPpi，取 profile 默认的 300（官方只受理 72–300 DPI）
+        assert.equal(opts.jpegPpi, 300);
         assert.equal(opts.html.theme, 'github');
         assert.equal(opts.html.fontSize, 18);
         assert.equal(opts.html.lineHeight, 1.7);
@@ -73,6 +76,25 @@ describe('normalizeOptions', () => {
         assert.equal(opts.xml.patent.imageDpi, 300);
         assert.deepEqual(opts.xml.numbering, { start: 1, width: 4 });
         assert.equal(opts.pdf.theme, 'print');
+    });
+
+    test('jpegPpi 按 profile 取默认：patent 为 300、其余为 330，显式给出的值一律优先', () => {
+        // Act
+        const patent = normalizeOptions({ xml: { profile: 'patent' } });
+        const explicit = normalizeOptions({ jpegPpi: 420, xml: { profile: 'patent' } });
+        const generic = normalizeOptions({ xml: { profile: 'generic' } });
+
+        // Assert：官方只受理 72–300 DPI，通用默认 330 会被专利预检判为超范围
+        assert.equal(patent.jpegPpi, 300);
+        assert.equal(explicit.jpegPpi, 420);
+        assert.equal(generic.jpegPpi, 330);
+        assert.equal(normalizeOptions({}).jpegPpi, 330);
+
+        // Assert：补默认值发生在深冻结与幂等登记之前，两项性质都不受影响
+        assert.ok(Object.isFrozen(patent));
+        assert.equal(normalizeOptions(patent), patent);
+        // Assert：只改 jpegPpi，其余字段与通用默认值逐项一致
+        assert.deepEqual({ ...patent, jpegPpi: 330, xml: generic.xml }, { ...generic });
     });
 
     test('对已归一的结果重复归一返回同一引用；结构相同的普通对象则得到等值的新结果', () => {
@@ -106,6 +128,19 @@ describe('normalizeOptions', () => {
         assert.equal(normalizeOptions({ html: { lineHeight: 2.2 } }).html.lineHeight, 2.2);
         assert.equal(normalizeOptions({ jpegQuality: 60 }).jpegQuality, 60);
         assert.equal(normalizeOptions({ jpegQuality: 100 }).jpegQuality, 100);
+    });
+
+    test('xmlImport.paragraphNumbers 为布尔项，默认关闭；非布尔值与段内未知键拒绝；描述树带中文说明', () => {
+        assert.equal(normalizeOptions({ xmlImport: { paragraphNumbers: true } }).xmlImport.paragraphNumbers, true);
+        assert.equal(normalizeOptions({ xmlImport: {} }).xmlImport.paragraphNumbers, false);
+        assert.throws(() => normalizeOptions({ xmlImport: { paragraphNumbers: 'yes' } }), /选项 xmlImport\.paragraphNumbers 须为布尔值，实际："yes"/);
+        assert.throws(() => normalizeOptions({ xmlImport: { images: 'link' } }), /未知选项：xmlImport\.images（可用：paragraphNumbers）/);
+        assert.throws(() => normalizeOptions({ xmlImport: null }), /选项 xmlImport 不可为空/);
+        const spec = describeOptions().xmlImport;
+        assert.equal(spec.type, 'object');
+        assert.deepEqual(Object.keys(spec.fields), ['paragraphNumbers']);
+        assert.deepEqual([spec.fields.paragraphNumbers.type, spec.fields.paragraphNumbers.default], ['boolean', false]);
+        assert.match(spec.fields.paragraphNumbers.description, /段号写回段首/);
     });
 
     test('xml.validate 为布尔项，默认关闭，非布尔值拒绝', () => {
@@ -206,9 +241,17 @@ describe('OPTION_ENUMS、describeOptions 与 redactOptions', () => {
         assert.deepEqual(desc.jpegQuality, {
             type: 'number', description: 'JPEG 质量', min: 60, max: 100, integer: true, default: 90,
         });
+        // default 是通用默认值；patent profile 实际生效的 300 由 normalizeOptions 在校验后补，
+        // 另经 profileDefaults 一并下发，使界面能显示会真正生效的缺省值而不必自行硬编码
         assert.deepEqual(desc.jpegPpi, {
-            type: 'number', description: 'JPEG 分辨率（PPI）', min: 72, max: 600, integer: true, default: 330,
+            type: 'number',
+            description: 'JPEG 分辨率（PPI）；xml.profile 为 patent 且未显式指定时取 300',
+            min: 72, max: 600, integer: true, default: 330,
+            profileDefaults: { patent: 300 },
         });
+        assert.equal(desc.jpegPpi.profileDefaults.patent, normalizeOptions({ xml: { profile: 'patent' } }).jpegPpi,
+            'profileDefaults 必须与 applyProfileDefaults 实际补的值一致');
+        assert.ok(!('profileDefaults' in desc.jpegQuality), '没有按 profile 的缺省值时不写该字段');
         assert.equal(desc.html.type, 'object');
         assert.deepEqual(desc.html.fields.theme.values, OPTION_ENUMS.htmlThemes);
         assert.equal(desc.html.fields.theme.default, 'apple');
@@ -238,5 +281,55 @@ describe('OPTION_ENUMS、describeOptions 与 redactOptions', () => {
             JSON.parse(JSON.stringify(opts)),
         );
         assert.equal(redactOptions(undefined), undefined);
+    });
+});
+
+// ============================================================
+// applyPatentImportDefaults
+// ============================================================
+
+describe('applyPatentImportDefaults', () => {
+    // 专利预检只接受宋体、黑体、楷体、仿宋；通用默认为微软雅黑
+    const PATENT_FONT = '宋体';
+    const GENERIC_FONT = '微软雅黑';
+    const eastAsiaOf = (options) => options.docx.fontFamily.eastAsia;
+
+    test('专利五书 XML 的三种输入类型（xml、zip）未显式给出中文字体时取宋体', () => {
+        const base = normalizeOptions({});
+
+        assert.equal(eastAsiaOf(base), GENERIC_FONT);
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(base, 'xml')), PATENT_FONT);
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(base, 'zip')), PATENT_FONT);
+    });
+
+    test('显式给出的照用，无论取值是否等于通用默认', () => {
+        const explicit = normalizeOptions({ docx: { fontFamily: { eastAsia: '黑体' } } });
+        const sameAsDefault = normalizeOptions({ docx: { fontFamily: { eastAsia: GENERIC_FONT } } });
+
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(explicit, 'xml')), '黑体');
+        assert.equal(eastAsiaOf(applyPatentImportDefaults(sameAsDefault, 'xml')), GENERIC_FONT);
+    });
+
+    test('其它输入类型原样返回同一引用，其余字段一律不动', () => {
+        const base = normalizeOptions({});
+
+        assert.equal(applyPatentImportDefaults(base, 'docx'), base);
+        assert.equal(applyPatentImportDefaults(base, 'md'), base);
+        assert.equal(applyPatentImportDefaults(base, undefined), base);
+
+        const patent = applyPatentImportDefaults(base, 'xml');
+        assert.deepEqual(
+            { ...patent, docx: { ...patent.docx, fontFamily: base.docx.fontFamily } },
+            base,
+            '只改中文字体一项',
+        );
+    });
+
+    test('返回值仍是归一结果：深冻结、再交 normalizeOptions 原样返回、重复调用幂等', () => {
+        const patent = applyPatentImportDefaults(normalizeOptions({}), 'xml');
+
+        assert.ok(Object.isFrozen(patent) && Object.isFrozen(patent.docx.fontFamily));
+        assert.equal(normalizeOptions(patent), patent);
+        assert.equal(applyPatentImportDefaults(patent, 'xml'), patent);
     });
 });

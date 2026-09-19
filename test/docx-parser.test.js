@@ -493,3 +493,39 @@ test('占位作者名不写入 meta：docx 库缺省的 Un-named 视为无作者
     assert.equal('author' in docA.meta, false);
     assert.equal(docB.meta.author, 'un-named 张三');
 });
+
+test('w:vertAlign 的上下标进 IR 的 superscript / subscript；成对的「~」不被当成删除线', async () => {
+    // Arrange：化学专利的典型写法——C₁~C₃₀ 的烷基、R² 基团，同一段内出现两个「~」
+    const buffer = await Packer.toBuffer(new Document({
+        sections: [{ children: [
+            new Paragraph({ children: [
+                new TextRun('C'), new TextRun({ text: '1', subScript: true }),
+                new TextRun('~C'), new TextRun({ text: '30', subScript: true }),
+                new TextRun('的烷基、C1~C30的烷氧基，R'),
+                new TextRun({ text: '2', superScript: true }),
+                new TextRun('基团'),
+            ] }),
+            new Paragraph({ children: [
+                new TextRun({ text: '甲', bold: true, subScript: true }),
+            ] }),
+        ] }],
+    }));
+
+    // Act
+    const doc = await parse({ buffer }, { sourceName: '上下标.docx' });
+    const paragraph = doc.ir.children.find((n) => plainText(n).startsWith('C'));
+
+    // Assert：上下标各成节点，文字逐字保留
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'subscript').map(plainText), ['1', '30', '甲']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'superscript').map(plainText), ['2']);
+
+    // Assert：两个「~」原样留在文本里，未生成 delete 节点
+    assert.equal(plainText(paragraph), 'C1~C30的烷基、C1~C30的烷氧基，R2基团');
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete'), []);
+
+    // Assert：加粗与下标可共存
+    const bold = collect(doc.ir, (n) => n.type === 'strong');
+    assert.equal(bold.length, 1);
+    assert.equal(plainText(bold[0]), '甲');
+    assert.equal(collect(bold[0], (n) => n.type === 'subscript').length, 1);
+});

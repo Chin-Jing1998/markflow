@@ -4,8 +4,8 @@
  * 按 options.xml.profile 分派：
  *   generic → renderers/xml/generic.js  通用文档结构（命名空间 urn:markflow:document:1），产物 {name}.xml，
  *             图片沿用 images/ 相对引用，由调度器连同 doc.assets 落盘
- *   patent  → renderers/xml/patent.js   国知局专利五书分文件 + {name}.zip + precheck.json，图片改为裸文件名
- *             平铺在 {name}/ 根下（omitDocAssets 为 true，调度器不再合并 doc.assets）
+ *   patent  → renderers/xml/patent.js   国知局专利五书分文件（<表格代码>/<表格代码>.xml）+ {name}.zip + precheck.json，
+ *             图片改名为 <表格代码>_<序号> 并放进各书目录（omitDocAssets 为 true，调度器不再合并 doc.assets）
  * 返回 { files, assets, extras, warnings, omitDocAssets, title? }（渲染器契约 v3 的 files 对象形态，外加
  * warnings、omitDocAssets 与可选 title——patent 以发明名称覆盖结果信封的 title——由 converters/index.js 合并进结果）。
  * profile 实现按需 require。

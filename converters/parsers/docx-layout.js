@@ -11,14 +11,30 @@
  *   - 制表符：run 内的 <w:tab/> → TAB 标记文本（w:tabs 里的制表位带属性，不受影响）
  *   - 题注：段落样式（含 basedOn 链）名为 caption / 题注 → 插 CAPTION 标记 run
  *   - 图片：每个含 a:blip 的 w:drawing 在 wp:docPr@descr 前写入序号标记 ⟦MF:k⟧（mammoth 以 descr、
- *     其次 title 作 alt），记录 wp:extent 的显示尺寸（EMU / 9525 = px）与是否浮动（wp:anchor）；
- *     VML 图片（v:imagedata）在 o:title 前写标记，尺寸取所属 v:shape 的 style（pt / in / cm / mm / px / pc → px）。
+ *     其次 title 作 alt），记录 wp:extent 的显示尺寸（EMU / 9525 = px，同时 EMU / 914400 × 25.4 = mm）
+ *     与是否浮动（wp:anchor）；VML 图片（v:imagedata，典型如 OLE 对象的预览图）整个元素换成等价的
+ *     最小 DrawingML，标记同样走 wp:docPr@descr——mammoth 的命名空间表不含
+ *     urn:schemas-microsoft-com:office:office，o:title 在它那里的键名是 Clark 记法，写在那里读不出来；
+ *     原替换文字取 o:title、其次所属 v:shape 的 alt，尺寸取该 v:shape 的 style
+ *     （pt / in / cm / mm / px / pc → px 与 mm 各算一份）。
  *     标记随 alt 回到 parsers/docx 的 convertImage，据此把尺寸对到资产名上，与图片出现顺序无关
  *     （实测样稿 wp:extent 16 个而 a:blip 14 个，按顺序配对必然错位）
+ *   - mc:Choice 内的图片一律不编号：mammoth 读 mc:AlternateContent 只取 mc:Fallback 一支
+ *     （collapseAlternateContent），Choice 里的图它永远看不到，编号只会让同一幅图占两个序号
+ *   - 化学式：起始位置落在 docx-chemistry 给出的化学区间（OLE ProgID 与 EMBED 域代码两条判据）内的图片，
+ *     其序号记入 roles，值为 'chemistry'；另两条判据（替换文字、EMF 字节）由 parsers/docx 的 convertImage 判定
+ *
+ * 像素与毫米两套并存且互不换算：px 供既有的版面还原（data.display，按 96 DPI 定义、取整）；
+ * mm 是 Word 中的物理显示尺寸（浮点、不取整），供 patent profile 按官方规则在 300 DPI 下重采样
+ * 附图与写 img/@wi、@he。由 px 反推 mm 会先丢一次精度，故两者各自从 EMU / CSS 长度直接算出。
  *
  * 契约：
- *   prepareLayout(docxBuffer) → { buffer, displays: Map<k, { width, height?, floating }> }
- *     无 document.xml 或无任何改写时原样返回入参 buffer
+ *   prepareLayout(docxBuffer) → {
+ *     buffer,
+ *     displays: Map<k, { width, height?, floating, widthMm?, heightMm? }>,
+ *     roles: Map<k, 'chemistry'>,
+ *   }
+ *     无 document.xml 或无任何改写时原样返回入参 buffer；mm 两项取不到即整条省略；roles 只记命中的序号
  *   parseImageMarker(alt) → { index: number | null, alt }：取出序号并还原原 alt
  * 说明：document.xml 与 styles.xml 属不可信文档内容，本模块只做字符串定位与替换，不执行其中任何指令。
  */
@@ -26,10 +42,17 @@ const JSZip = require('jszip');
 const cheerio = require('cheerio');
 const { MARKERS, indentMarker } = require('../ir/markers');
 const { findBlocks, findCloseTag, readTag } = require('./docx-math');
+const { CHEMISTRY_ROLE, collectChemistryRanges, inChemistryRange } = require('./docx-chemistry');
 
 const DOCUMENT_PART = 'word/document.xml';
 const STYLES_PART = 'word/styles.xml';
 const EMU_PER_PX = 9525;
+const EMU_PER_INCH = 914400;
+const INCH_MM = 25.4;
+// VML 图片改写成的 DrawingML 所用命名空间（Transitional 一套即可，见 drawingXml 的说明）
+const WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+const A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+const PIC_NS = 'http://schemas.openxmlformats.org/drawingml/2006/picture';
 // 缺省字号：五号字 10.5pt = 21 半磅；一个字宽 = 半磅 × 10 twip
 const DEFAULT_HALF_POINTS = 21;
 const TWIPS_PER_HALF_POINT = 10;
@@ -43,29 +66,42 @@ const HEADING_NAME_RE = /^\s*(heading|标题)\s*\d/i;
 const HEADING_ID_RE = /^(Heading|标题)\s*\d/i;
 const CAPTION_NAME_RE = /^(caption|题注)$/i;
 const PX_PER_UNIT = Object.freeze({ pt: 96 / 72, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, px: 1, pc: 16 });
+// 同一组 CSS 单位换算到毫米；px 按 96 DPI 定义（VML 的裸数字按 px 处理，与 PX_PER_UNIT 一致）
+const MM_PER_UNIT = Object.freeze({
+    pt: INCH_MM / 72, in: INCH_MM, cm: 10, mm: 1, px: INCH_MM / 96, pc: INCH_MM / 6,
+});
 const TEXT_RUN_RE = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
 const MATH_SENTINEL_RE = /MFMATH\d+/g;
 
 async function prepareLayout(docxBuffer) {
     const zip = await JSZip.loadAsync(docxBuffer);
     const entry = zip.file(DOCUMENT_PART);
-    if (!entry) return { buffer: docxBuffer, displays: new Map() };
+    if (!entry) return { buffer: docxBuffer, displays: new Map(), roles: new Map() };
     const xml = await entry.async('string');
     const stylesEntry = zip.file(STYLES_PART);
     const styles = readStyles(stylesEntry ? await stylesEntry.async('string') : '');
 
     const edits = [];
     const displays = new Map();
+    const roles = new Map();
     const counter = { next: 0 };
-    collectDrawingEdits(xml, edits, displays, counter);
-    collectVmlEdits(xml, edits, displays, counter);
+    const chem = { ranges: collectChemistryRanges(xml), roles };
+    // mc:Choice 分支 mammoth 必定丢弃，其中的图片不编号（mc:Choice 只作 mc:AlternateContent 的子元素）
+    const hidden = findBlocks(xml, 'mc:Choice');
+    collectDrawingEdits(xml, edits, displays, counter, chem, hidden);
+    collectVmlEdits(xml, edits, displays, counter, chem, hidden);
     collectParagraphEdits(xml, styles, edits);
     collectTabEdits(xml, edits);
-    if (edits.length === 0) return { buffer: docxBuffer, displays };
+    if (edits.length === 0) return { buffer: docxBuffer, displays, roles };
 
     zip.file(DOCUMENT_PART, applyEdits(xml, edits));
     const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-    return { buffer, displays };
+    return { buffer, displays, roles };
+}
+
+// 图片起始位置落在化学区间内即记角色（判据 a 与 c，见 docx-chemistry）
+function markChemistry(chem, at, k) {
+    if (inChemistryRange(chem.ranges, at)) chem.roles.set(k, CHEMISTRY_ROLE);
 }
 
 function parseImageMarker(alt) {
@@ -93,8 +129,11 @@ function applyEdits(xml, edits) {
 // 图片：DrawingML 与 VML
 // ============================================================
 
-function collectDrawingEdits(xml, edits, displays, counter) {
+const inRanges = (ranges, index) => ranges.some((range) => index >= range.start && index < range.end);
+
+function collectDrawingEdits(xml, edits, displays, counter, chem, hidden) {
     for (const block of findBlocks(xml, 'w:drawing')) {
+        if (inRanges(hidden, block.start)) continue;
         const body = xml.slice(block.start, block.end);
         if (!/<a:blip\b[^>]*\br:(?:embed|link)\s*=/.test(body)) continue;
         const docPrAt = body.search(/<wp:docPr(?=[\s/>])/);
@@ -103,10 +142,14 @@ function collectDrawingEdits(xml, edits, displays, counter) {
         if (!docPr) continue;
         counter.next += 1;
         const k = counter.next;
+        markChemistry(chem, block.start, k);
         const extentAt = body.search(/<wp:extent(?=[\s/>])/);
         const extentTag = extentAt >= 0 ? readTag(body, extentAt) : null;
         const extent = extentTag ? attrsOf(body.slice(extentAt, extentTag.end + 1)) : new Map();
-        displays.set(k, sizeOf(emuToPx(extent.get('cx')), emuToPx(extent.get('cy')), /<wp:anchor(?=[\s>])/.test(body)));
+        displays.set(k, sizeOf(emuToPx(extent.get('cx')), emuToPx(extent.get('cy')), /<wp:anchor(?=[\s>])/.test(body), {
+            width: emuToMm(extent.get('cx')),
+            height: emuToMm(extent.get('cy')),
+        }));
         edits.push(altEdit(xml, block.start + docPrAt, block.start + docPr.end + 1, k));
     }
 }
@@ -117,47 +160,88 @@ function altEdit(xml, tagStart, tagEnd, k) {
     const attrs = attrsOf(tag);
     const descr = attrs.get('descr');
     const alt = descr && descr.trim() ? descr : (attrs.get('title') || '');
-    const value = `${imageMarker(k)}${alt.replace(/"/g, '&quot;')}`;
+    const value = `${imageMarker(k)}${quoteAttr(alt)}`;
     const existing = /\sdescr\s*=\s*("[^"]*"|'[^']*')/.exec(tag);
     if (existing) return { at: tagStart + existing.index, remove: existing[0].length, insert: ` descr="${value}"` };
     return { at: tagStart + '<wp:docPr'.length, remove: 0, insert: ` descr="${value}"` };
 }
 
-function collectVmlEdits(xml, edits, displays, counter) {
+// 只换掉 v:imagedata 这一个空元素：所属 v:shape、同级的文本框与 o:OLEObject 原样留下，
+// mammoth 对 w:pict（内容提到段落之后）与 w:object（就地行内）的既有处置也随之保持不变
+function collectVmlEdits(xml, edits, displays, counter, chem, hidden) {
     const re = /<v:imagedata(?=[\s/>])/g;
     for (let matched = re.exec(xml); matched; matched = re.exec(xml)) {
-        const tag = readTag(xml, matched.index);
-        if (!tag) break;
-        const tagText = xml.slice(matched.index, tag.end + 1);
-        const attrs = attrsOf(tagText);
-        if (!attrs.get('r:id')) continue;
+        const element = elementRange(xml, matched.index, 'v:imagedata');
+        if (!element) break;
+        re.lastIndex = element.end;
+        const attrs = attrsOf(xml.slice(matched.index, element.contentAt));
+        const rid = attrs.get('r:id');
+        if (!rid || inRanges(hidden, matched.index)) continue;
         counter.next += 1;
         const k = counter.next;
-        const style = shapeStyleBefore(xml, matched.index);
-        displays.set(k, sizeOf(cssLengthPx(style, 'width'), cssLengthPx(style, 'height'), /position\s*:\s*absolute/i.test(style)));
-        const existing = /\so:title\s*=\s*("([^"]*)"|'([^']*)')/.exec(tagText);
-        if (existing) {
-            const title = (existing[2] ?? existing[3] ?? '').replace(/"/g, '&quot;');
-            edits.push({ at: matched.index + existing.index, remove: existing[0].length, insert: ` o:title="${imageMarker(k)}${title}"` });
-        } else {
-            edits.push({ at: matched.index + '<v:imagedata'.length, remove: 0, insert: ` o:title="${imageMarker(k)}"` });
-        }
+        markChemistry(chem, matched.index, k);
+        const shape = shapeBefore(xml, matched.index);
+        const mm = { width: cssLengthMm(shape.style, 'width'), height: cssLengthMm(shape.style, 'height') };
+        displays.set(k, sizeOf(cssLengthPx(shape.style, 'width'), cssLengthPx(shape.style, 'height'),
+            /position\s*:\s*absolute/i.test(shape.style), mm));
+        const descr = `${imageMarker(k)}${quoteAttr(attrs.get('o:title') || shape.alt)}`;
+        edits.push({ at: matched.index, remove: element.end - matched.index, insert: drawingXml(rid, descr, mm) });
     }
 }
 
-// 所属 v:shape 的 style（取 imagedata 之前最近的 <v:shape 开标签，不含 v:shapetype）
-function shapeStyleBefore(xml, index) {
+// mammoth 读图只认 wp:inline > a:graphic > a:graphicData > pic:pic > pic:blipFill > a:blip 这条直系链
+// （getElementsByTagName 只看直接子元素），alt 取 wp:docPr@descr。wp / a / pic 三个前缀就地声明：
+// 它的命名空间表把 Transitional 与 Strict 两套 URI 映到同一短名，故两种文档都认；r 沿用文档自身的绑定
+function drawingXml(rid, descr, mm) {
+    const cx = mmToEmu(mm.width);
+    const cy = mmToEmu(mm.height);
+    return `<w:drawing xmlns:wp="${WP_NS}" xmlns:a="${A_NS}" xmlns:pic="${PIC_NS}"><wp:inline>`
+        + (cx > 0 && cy > 0 ? `<wp:extent cx="${cx}" cy="${cy}"/>` : '')
+        + `<wp:docPr id="0" name="VML" descr="${descr}"/>`
+        + `<a:graphic><a:graphicData uri="${PIC_NS}"><pic:pic>`
+        + '<pic:nvPicPr><pic:cNvPr id="0" name="VML"/><pic:cNvPicPr/></pic:nvPicPr>'
+        + `<pic:blipFill><a:blip r:embed="${quoteAttr(rid)}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>`
+        + '<pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>';
+}
+
+// 元素的字符区间：contentAt 为开标签之后，end 为整个元素之后（空元素两者相同）
+function elementRange(xml, start, tagName) {
+    const tag = readTag(xml, start);
+    if (!tag) return null;
+    if (tag.selfClosing) return { contentAt: tag.end + 1, end: tag.end + 1 };
+    const end = findCloseTag(xml, tagName, tag.end + 1);
+    return end < 0 ? null : { contentAt: tag.end + 1, end };
+}
+
+// 所属 v:shape 的 style 与 alt（取 imagedata 之前最近的 <v:shape 开标签，不含 v:shapetype）
+function shapeBefore(xml, index) {
+    const empty = { style: '', alt: '' };
     const at = xml.lastIndexOf('<v:shape', index);
-    if (at < 0 || !/[\s>]/.test(xml[at + '<v:shape'.length] || '')) return '';
+    if (at < 0 || !/[\s>]/.test(xml[at + '<v:shape'.length] || '')) return empty;
     const tag = readTag(xml, at);
-    return tag ? (attrsOf(xml.slice(at, tag.end + 1)).get('style') || '') : '';
+    if (!tag) return empty;
+    const attrs = attrsOf(xml.slice(at, tag.end + 1));
+    return { style: attrs.get('style') || '', alt: attrs.get('alt') || '' };
+}
+
+// 属性取值一路保持源文档的转义形态，只补一种：单引号属性里可能有的裸双引号
+const quoteAttr = (value) => String(value).replace(/"/g, '&quot;');
+
+// CSS 长度 → { value, unit }；取不到返回 null。单位缺省按 px（VML 的裸数字即 px）
+function cssLength(style, prop) {
+    const matched = new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*(\\d+(?:\\.\\d+)?)\\s*(pt|in|cm|mm|px|pc)?`, 'i').exec(style);
+    return matched ? { value: Number(matched[1]), unit: String(matched[2] || 'px').toLowerCase() } : null;
 }
 
 function cssLengthPx(style, prop) {
-    const matched = new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*(\\d+(?:\\.\\d+)?)\\s*(pt|in|cm|mm|px|pc)?`, 'i').exec(style);
-    if (!matched) return 0;
-    const factor = PX_PER_UNIT[String(matched[2] || 'px').toLowerCase()] || 1;
-    return Math.round(Number(matched[1]) * factor);
+    const length = cssLength(style, prop);
+    return length ? Math.round(length.value * (PX_PER_UNIT[length.unit] || 1)) : 0;
+}
+
+// 毫米不取整：物理尺寸要参与 300 DPI 目标像素的换算，先取整会把误差放大数倍
+function cssLengthMm(style, prop) {
+    const length = cssLength(style, prop);
+    return length ? length.value * (MM_PER_UNIT[length.unit] || MM_PER_UNIT.px) : 0;
 }
 
 const emuToPx = (value) => {
@@ -165,10 +249,21 @@ const emuToPx = (value) => {
     return Number.isFinite(emu) && emu > 0 ? Math.round(emu / EMU_PER_PX) : 0;
 };
 
-function sizeOf(width, height, floating) {
+const emuToMm = (value) => {
+    const emu = Number(value);
+    return Number.isFinite(emu) && emu > 0 ? (emu / EMU_PER_INCH) * INCH_MM : 0;
+};
+
+// 毫米 → EMU（写进合成的 wp:extent；mammoth 不读它，取不到尺寸时整个 wp:extent 省略）
+const mmToEmu = (mm) => (mm > 0 ? Math.round((mm / INCH_MM) * EMU_PER_INCH) : 0);
+
+// px 取整后 ≥ 1 才写，mm 为正即写；两者取不到时各自省略，下游据此判定是否有显示尺寸
+function sizeOf(width, height, floating, mm = {}) {
     const size = { width: width >= 1 ? width : 0 };
     if (height >= 1) size.height = height;
     size.floating = Boolean(floating);
+    if (mm.width > 0) size.widthMm = mm.width;
+    if (mm.height > 0) size.heightMm = mm.height;
     return size;
 }
 

@@ -6,11 +6,11 @@
  *   { kind: 'br' }                      软换行 → <br/>
  *   { kind: 'image', node }             图片（附图、栅格化的表格/公式）
  *   { kind: 'math', node }              未栅格化的公式
- *   { kind: 'element', node }           已构造好的 builder 节点（claim-ref / figref 等，由 splitText 产生）
- * 扁平表示便于三件事：剥离段首编号（前缀可能跨越加粗片段）、判断整段加粗/斜体、在未加标记的文本上
- * 包裹 claim-ref / figref（二者在 DTD 中只能直接位于 claim-text / p 之下，不能嵌在 b/i 内）。
- * docx 经 mammoth → turndown 链路后，上下标与下划线以 html 节点（<sub>、</sub>…）成对出现，此处按
- * 开闭标记维护当前标记集，使其还原为 DTD 的 sub / sup / u 元素。
+ *   { kind: 'element', node }           已构造好的 builder 节点，由 emitRuns 原样放行
+ * 扁平表示便于两件事：剥离段首编号（前缀可能跨越加粗片段）、判断整段加粗/斜体。
+ * 下划线与上下标在 IR 中已是 underline / superscript / subscript 节点（ir/inline-html 从 <u>/<sup>/<sub>
+ * 提升），此处转成 u / sup / sub 标记；未被提升而以成对 html 节点残留的（<sub>、</sub>…）按开闭标记
+ * 维护当前标记集，走同一条兜底路径，最终都还原为 DTD 的 u / sup / sub 元素。
  */
 const { stripHtml } = require('../../ir/util');
 
@@ -43,6 +43,8 @@ function walk(nodes, marks, state, runs) {
             case 'strong': walk(node.children || [], new Set([...marks, 'b']), state, runs); break;
             case 'emphasis': walk(node.children || [], new Set([...marks, 'i']), state, runs); break;
             case 'underline': walk(node.children || [], new Set([...marks, 'u']), state, runs); break;
+            case 'superscript': walk(node.children || [], new Set([...marks, 'sup']), state, runs); break;
+            case 'subscript': walk(node.children || [], new Set([...marks, 'sub']), state, runs); break;
             case 'inlineCode': runs.push(textRun(String(node.value == null ? '' : node.value), current())); break;
             case 'break': runs.push({ kind: 'br' }); break;
             case 'image': runs.push({ kind: 'image', node }); break;
@@ -149,30 +151,6 @@ function withoutMark(runs, mark) {
     return mergeText(runs.map((run) => (run.kind === 'text' ? textRun(run.text, [...run.marks].filter((item) => item !== mark)) : run)));
 }
 
-/**
- * 在未加标记的文本片段上按正则切分：每个匹配交给 wrap(match) 生成 builder 节点（或节点与字符串的数组），
- * 返回 null 则保留原文。
- */
-function splitText(runs, regex, wrap) {
-    const pattern = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : `${regex.flags}g`);
-    const out = [];
-    for (const run of runs) {
-        if (run.kind !== 'text' || run.marks.size > 0) { out.push(run); continue; }
-        let cursor = 0;
-        for (const match of run.text.matchAll(pattern)) {
-            const produced = wrap(match);
-            if (!produced) continue;
-            if (match.index > cursor) out.push(textRun(run.text.slice(cursor, match.index), run.marks));
-            for (const item of Array.isArray(produced) ? produced : [produced]) {
-                out.push(typeof item === 'string' ? textRun(item, run.marks) : { kind: 'element', node: item });
-            }
-            cursor = match.index + match[0].length;
-        }
-        if (cursor < run.text.length) out.push(textRun(run.text.slice(cursor), run.marks));
-    }
-    return out;
-}
-
 // ============================================================
 // 输出为 builder 子节点
 // ============================================================
@@ -200,5 +178,5 @@ function wrapMarks(text, marks, el) {
 }
 
 module.exports = {
-    flattenInline, runsText, trimRuns, stripPrefix, isWholeMark, withoutMark, splitText, emitRuns, textRun, MARK_ORDER,
+    flattenInline, runsText, trimRuns, stripPrefix, isWholeMark, withoutMark, emitRuns, textRun, MARK_ORDER,
 };

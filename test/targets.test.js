@@ -2,7 +2,9 @@
  * converters/targets.js 单元测试
  * 覆盖：默认目标、显式目标校验、非法目标与非法输入类型、规则表五项（classes/layout/ext/hint）、
  *       html/xml 接受三类输入、listTargets 由规则派生、旧二进制格式不再受理、路径归一化、URL 识别、
- *       resolveUserPath（~ 展开、file:// 转换、Windows 写法、错误文案）与 classifyInput 受理 ~ / file://
+ *       resolveUserPath（~ 展开、file:// 转换、Windows 写法、错误文案）与 classifyInput 受理 ~ / file://、
+ *       专利五书 XML 的三种输入（.xml、案卷 .zip、由调用方判定的五书目录）归入 markup 类且默认目标为 docx、
+ *       目录展开白名单 DIRECTORY_SCAN_EXTENSIONS 不含只在显式给出时受理的 .xml 与 .zip
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -11,6 +13,7 @@ const path = require('node:path');
 const {
     resolveTarget, classifyInput, assertTargetAllowed, getTargetRule, listTargets, detectInputType,
     DEFAULT_TARGETS, TARGETS, TARGET_RULES, INPUT_CLASS, SUPPORTED_EXTENSIONS,
+    DIRECTORY_SCAN_EXTENSIONS, EXPLICIT_ONLY_EXTENSIONS, BUNDLE_DIR_TYPE,
 } = require('../converters/targets');
 
 // ============================================================
@@ -52,8 +55,9 @@ test('显式目标与输入类型匹配时原样返回', () => {
 
 test('目标与输入类型不匹配时抛中文错误并说明原因', () => {
     assert.throws(() => resolveTarget('md', 'bundle'), /目标 bundle 不接受 md 输入：bundle 仅接受 Office、PDF 文件与网页输入/);
-    assert.throws(() => resolveTarget('pdf', 'docx'), /目标 docx 不接受 pdf 输入：docx 仅接受 Markdown 输入/);
-    assert.throws(() => resolveTarget('url', 'pdf'), /目标 pdf 不接受 url 输入：pdf 仅接受 Markdown 输入/);
+    assert.throws(() => resolveTarget('pdf', 'docx'), /目标 docx 不接受 pdf 输入：docx 仅接受 Markdown 与专利五书 XML（\.xml、案卷 \.zip、五书目录）输入/);
+    assert.throws(() => resolveTarget('url', 'pdf'), /目标 pdf 不接受 url 输入：pdf 仅接受 Markdown 与专利五书 XML（\.xml、案卷 \.zip、五书目录）输入/);
+    assert.throws(() => resolveTarget('zip', 'bundle'), /目标 bundle 不接受 zip 输入：bundle 仅接受 Office、PDF 文件与网页输入/);
 });
 
 test('未知目标格式抛错并列出可选值', () => {
@@ -111,7 +115,7 @@ test('listTargets 由规则派生：pdf 目标仅在 PDF 后端可用时列出�
         office: ['bundle', 'html', 'xml'],
         markup: ['docx', 'html', 'xml'],
         url: ['bundle', 'html', 'xml'],
-        inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', url: 'url' },
+        inputs: { docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', xml: 'markup', zip: 'markup', url: 'url' },
         capabilities: { pdfBackend: null },
     });
 
@@ -236,4 +240,40 @@ test('classifyInput：file:// 指向不支持的格式或无法转换时抛中�
         return true;
     });
     assert.throws(() => classifyInput('file:///tmp/a%2Fb.md', '/tmp'), /无法识别的 file:\/\/ 地址/);
+});
+
+// ============================================================
+// 专利五书 XML 反向导入的输入类型
+// ============================================================
+
+test('.xml 与 .zip 识别为 xml / zip 输入，归入 markup 类，未指定目标时取 docx；bundle 不受理', () => {
+    assert.equal(detectInputType('/案卷/100001.XML'), 'xml');
+    assert.equal(detectInputType('案卷.Zip'), 'zip');
+    for (const type of ['xml', 'zip']) {
+        assert.equal(INPUT_CLASS[type], 'markup');
+        assert.equal(DEFAULT_TARGETS[type], 'docx');
+        assert.equal(resolveTarget(type), 'docx');
+        for (const target of ['docx', 'pdf', 'html', 'xml']) assert.equal(resolveTarget(type, target), target);
+        assert.throws(() => resolveTarget(type, 'bundle'), new RegExp(`目标 bundle 不接受 ${type} 输入`));
+    }
+    assert.deepEqual(classifyInput('sub/案卷.zip', '/work'), { input: { path: path.resolve('/work', 'sub/案卷.zip') }, type: 'zip' });
+});
+
+test('目录展开白名单 = 受理扩展名去掉只在显式给出时受理的 .xml 与 .zip', () => {
+    assert.deepEqual(EXPLICIT_ONLY_EXTENSIONS, ['.xml', '.zip']);
+    assert.deepEqual(DIRECTORY_SCAN_EXTENSIONS, ['.docx', '.xlsx', '.pptx', '.pdf', '.md', '.markdown']);
+    assert.deepEqual(SUPPORTED_EXTENSIONS, [...DIRECTORY_SCAN_EXTENSIONS, ...EXPLICIT_ONLY_EXTENSIONS]);
+    for (const list of [EXPLICIT_ONLY_EXTENSIONS, DIRECTORY_SCAN_EXTENSIONS, SUPPORTED_EXTENSIONS]) assert.ok(Object.isFrozen(list));
+});
+
+test('classifyInput：调用方判定的专利五书目录不看扩展名，类型为 xml；未列入的目录照旧按扩展名拒绝', () => {
+    const dir = path.resolve('/work', '案卷-2026.09.18');
+    assert.equal(BUNDLE_DIR_TYPE, 'xml');
+    assert.deepEqual(classifyInput('案卷-2026.09.18', '/work', { bundleDirs: [dir] }), { input: { path: dir }, type: 'xml' });
+    assert.deepEqual(classifyInput('案卷-2026.09.18', '/work', { bundleDirs: new Set([dir]) }), { input: { path: dir }, type: 'xml' });
+    assert.throws(() => classifyInput('案卷-2026.09.18', '/work'), /不支持的输入格式：案卷-2026\.09\.18（支持 .*\.xml \.zip、专利五书目录与 http\(s\) 网址）/);
+    assert.throws(() => classifyInput('别的目录', '/work', { bundleDirs: [dir] }), /不支持的输入格式/);
+    // 列入的目录即便名字像别的类型也按五书目录处理；网址不受影响
+    assert.deepEqual(classifyInput('x.md', '/work', { bundleDirs: [path.resolve('/work', 'x.md')] }).type, 'xml');
+    assert.equal(classifyInput('https://example.com/a.zip', '/work', { bundleDirs: [dir] }).type, 'url');
 });

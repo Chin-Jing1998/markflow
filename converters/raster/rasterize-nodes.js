@@ -11,7 +11,8 @@
  *   - doc         处理后的文档（不修改入参，只在改动路径上新建节点）：命中节点替换为 image 节点
  *                 { type:'image', url:'images/<file>', alt, title:null,
  *                   data:{ assetName:'images/<file>', role:'table'|'formula', inline, width, height, dpi } }
- *                 并追加 assets（{ name, buffer, mime:'image/jpeg' }，名称与既有资源不冲突）
+ *                 原节点带 data.section（顶层块的分节信息）时一并继承，并追加 assets
+ *                 （{ name, buffer, mime:'image/jpeg' }，名称与既有资源不冲突）
  *   - rasterized  被替换的节点数
  *   - backend     实际调用的栅格后端名（raster/backend.js 的 detect().name）；无可用后端时为 null
  *   - warnings    中文提示（string[]）：不抛出业务错误。后端不可用或单任务失败时该节点降级——
@@ -25,6 +26,9 @@
  * inline：行内公式（位于段落内且 display 为假）为 true，其余为 false。
  *
  * 片段页由 raster/fragment.js 构造，出图由 raster/backend.js 负责；PNG 经 jimp 铺白转 JPG 并写入 jpegPpi 指定的 JFIF 密度。
+ * patent profile 下公式图另按墨迹紧裁：取墨迹外接矩形后四周各补 MATH_MARGIN_PX 白边，以贴合官方工具的
+ * 公式出图幅面（官方按 Word 的公式版面盒出图，含字形升降部，故我方不追求逐像素相等）；
+ * 表格图与其它 profile 不做紧裁。
  * converters/index.js 仅在 kinds 非空时经 moduleLoader 懒加载并调用本模块；本模块顶层不 require electron
  * 或其它重依赖（jimp 经 assets/jimp-loader.js 动态加载）。
  */
@@ -49,6 +53,14 @@ const DEFAULT_MAX_WIDTH = 1600;
 const DEFAULT_QUALITY = 90;
 const DEFAULT_PPI = 330;
 const WHITE = 0xffffffff;
+/**
+ * 公式图紧裁后四周补的留白（出图像素，300 DPI）。
+ * 依据：官方工具产出的公式图并非贴着墨迹出图，实测其单边留白为 1–8 px、均值约 4.8 px，且与公式大小无关，
+ * 故取固定值。本值在 0–12 px 的取值扫描中使幅面比最贴近官方（宽比均值 0.99、高比均值 0.95）。
+ */
+const MATH_MARGIN_PX = 4;
+/** 墨迹判定阈值：白底合成后 RGB 三通道最小值低于该值即计为墨迹（PNG 无压缩噪声，可贴近纯白取值） */
+const INK_THRESHOLD = 250;
 /** 段落序列的计数容器：公式的「段」号取最近的这类祖先（table 整张计一个段号） */
 const PARAGRAPH_LIKE = new Set(['paragraph', 'heading', KIND_TABLE]);
 const CELL_SEPARATOR = ' | ';
@@ -84,7 +96,8 @@ async function rasterizeNodes(doc, { kinds = [], options } = {}) {
     for (const target of targets) {
         const png = images.get(target.id);
         const outcome = Buffer.isBuffer(png)
-            ? await encodeJpeg(png, settings).catch((err) => ({ error: `JPEG 编码失败（${errText(err)}）` }))
+            ? await encodeJpeg(png, settings, { crop: settings.cropMath && target.kind === KIND_MATH })
+                .catch((err) => ({ error: `JPEG 编码失败（${errText(err)}）` }))
             : { error: png instanceof Error ? png.message : '后端未返回图像' };
         if (outcome.error) {
             warnings.push(`栅格化失败：${describe(target)}（${outcome.error}），${degradeText(target)}`);
@@ -163,23 +176,63 @@ function readSettings(options) {
         renderDpi: isPatent ? numberOr(patent.imageDpi, DEFAULT_DPI) : CSS_DPI * numberOr(raster.scale, DEFAULT_SCALE),
         // patent profile 下禁用缩放：专利图片的 wi/he 由原始像素与 DPI 换算
         maxWidth: isPatent ? 0 : numberOr(raster.maxWidth, DEFAULT_MAX_WIDTH),
+        // 公式图紧裁只在 patent profile 下生效：其余 profile 保持片段页原样出图
+        cropMath: isPatent,
     };
 }
 
 const numberOr = (value, fallback) => (Number.isFinite(value) ? value : fallback);
 
-/** PNG → 白底合成 → 按 maxWidth 限宽 → JPEG → 写入指定 PPI 的 JFIF 密度 */
-async function encodeJpeg(png, settings) {
+/** PNG → 白底合成 →（公式图）按墨迹紧裁 → 按 maxWidth 限宽 → JPEG → 写入指定 PPI 的 JFIF 密度 */
+async function encodeJpeg(png, settings, { crop = false } = {}) {
     const { Jimp } = await loadJimp();
     const image = await Jimp.read(png);
     const flat = new Jimp({ width: image.width, height: image.height, color: WHITE });
     flat.composite(image, 0, 0);
-    if (settings.maxWidth > 0 && flat.width > settings.maxWidth) {
-        flat.resize({ w: settings.maxWidth });
+    const shaped = crop ? cropToInk(flat, Jimp) : flat;
+    if (settings.maxWidth > 0 && shaped.width > settings.maxWidth) {
+        shaped.resize({ w: settings.maxWidth });
     }
     const density = Math.max(1, Math.round(settings.ppi));
-    const buffer = setJpegDensity(await flat.getBuffer(JPEG_MIME, { quality: settings.quality }), density);
-    return { buffer, width: flat.width, height: flat.height, dpi: density };
+    const buffer = setJpegDensity(await shaped.getBuffer(JPEG_MIME, { quality: settings.quality }), density);
+    return { buffer, width: shaped.width, height: shaped.height, dpi: density };
+}
+
+/**
+ * 按墨迹紧裁并补留白：取墨迹外接矩形，四周各补 MATH_MARGIN_PX 的白边。
+ * 整幅无墨迹时原样返回，不裁成 0×0。
+ */
+function cropToInk(image, Jimp) {
+    const bounds = inkBounds(image);
+    if (bounds === null) return image;
+    const ink = image.clone().crop({ x: bounds.left, y: bounds.top, w: bounds.width, h: bounds.height });
+    const canvas = new Jimp({
+        width: bounds.width + 2 * MATH_MARGIN_PX,
+        height: bounds.height + 2 * MATH_MARGIN_PX,
+        color: WHITE,
+    });
+    canvas.composite(ink, MATH_MARGIN_PX, MATH_MARGIN_PX);
+    return canvas;
+}
+
+/** 墨迹外接矩形；整幅皆白时返回 null */
+function inkBounds(image) {
+    const { data, width, height } = image.bitmap;
+    let left = width;
+    let right = -1;
+    let top = height;
+    let bottom = -1;
+    for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+            const offset = (y * width + x) * 4;
+            if (Math.min(data[offset], data[offset + 1], data[offset + 2]) >= INK_THRESHOLD) continue;
+            if (x < left) left = x;
+            if (x > right) right = x;
+            if (y < top) top = y;
+            if (y > bottom) bottom = y;
+        }
+    }
+    return right < 0 ? null : { left, top, width: right - left + 1, height: bottom - top + 1 };
 }
 
 // ============================================================
@@ -188,23 +241,32 @@ async function encodeJpeg(png, settings) {
 
 function createImageNode(target, name, { width, height, dpi }) {
     const alt = target.kind === KIND_TABLE ? `表格 ${target.index}` : (mathToText(target.node) || '公式');
-    return {
+    return withSection({
         type: 'image',
         url: name,
         alt,
         title: null,
         data: { assetName: name, role: ROLE_BY_KIND[target.kind], inline: target.inline, width, height, dpi },
-    };
+    }, target.node);
+}
+
+// 顶层块的 data.section（parsers/docx-sections 写入的分节信息）随替换或降级一并保留，否则该块会被归到前一节；
+// 原节点没有分节信息时原样返回。不改动入参
+function withSection(node, source) {
+    const section = source && source.data && source.data.section;
+    return section ? { ...node, data: { ...(node.data || {}), section } } : node;
 }
 
 /** table → 逐行段落（空表格移除）；math → 线性化文本（段内为 text 节点，独立成块为 paragraph） */
 function degradeNode(target) {
-    if (target.kind === KIND_MATH) return target.inParagraph ? createText(mathToText(target.node)) : degradeMath(target.node);
+    if (target.kind === KIND_MATH) {
+        return target.inParagraph ? createText(mathToText(target.node)) : withSection(degradeMath(target.node), target.node);
+    }
     const rows = Array.isArray(target.node.children) ? target.node.children.filter((row) => row && row.type === 'tableRow') : [];
     return rows
         .map((row) => (Array.isArray(row.children) ? row.children : []).map((cell) => collectText(cell).trim()).join(CELL_SEPARATOR))
         .filter((line) => line.trim() !== '')
-        .map((line) => createParagraph([createText(line)]));
+        .map((line) => withSection(createParagraph([createText(line)]), target.node));
 }
 
 function degradeAll(targets) {

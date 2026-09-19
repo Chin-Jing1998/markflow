@@ -119,7 +119,7 @@ function buildPdfView({ filePath, assetBase }) {
 
 /** JSON → { kind:'json', json, valid }；解析失败时按原文显示，并提示失败原因 */
 async function buildJsonView({ filePath }) {
-    const text = (await readTextFile(filePath)).replace(/^﻿/, '');
+    const text = (await readTextFile(filePath)).replace(/^\ufeff/, '');
     try {
         return { view: { kind: 'json', json: JSON.stringify(JSON.parse(text), null, 2), valid: true }, warnings: [] };
     } catch (err) {

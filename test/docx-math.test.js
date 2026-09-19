@@ -1,7 +1,8 @@
 /**
  * converters/parsers/docx-math.js 单元测试
  * 覆盖：哨兵替换（document.xml 不再含 m:oMath）、公式数量与 display 标记、
- *       无公式 docx 原样返回、restoreMath 的节点位置与相邻文本、入参不被修改
+ *       无公式 docx 原样返回、restoreMath 的节点位置与相邻文本、入参不被修改、
+ *       源稿字号读取（公式内 w:sz 优先、退到段落 w:pPr、取不到为 null）与写入 data.fontSizePt
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -57,6 +58,15 @@ async function buildWithFormulas() {
     ]);
     return wrapDisplayEquations(buffer);
 }
+
+/** 合成一个只含 word/document.xml 的包：extractMath 只读写该部件，不必是完整 docx */
+function buildPackage(body) {
+    const zip = new JSZip();
+    zip.file('word/document.xml', `<?xml version="1.0"?><w:document><w:body>${body}</w:body></w:document>`);
+    return zip.generateAsync({ type: 'nodebuffer' });
+}
+
+const mathRun = (props) => `<m:oMath><m:r>${props}<m:t>a</m:t></m:r></m:oMath>`;
 
 async function readDocumentXml(buffer) {
     const zip = await JSZip.loadAsync(buffer);
@@ -172,4 +182,64 @@ test('restoreMath：未知 OMML 元素记入 warnings，公式为空时原样返
     assert.ok(restored.warnings[0].includes('m:weird'));
     assert.equal(untouched.ir, ir);
     assert.deepEqual(untouched.warnings, []);
+});
+
+test('extractMath：字号取自公式内的 w:sz，公式内没有时退到段落 w:pPr，都没有时为 null', async () => {
+    // Arrange：① 公式内 28 半磅；② 公式内无 w:sz、段落 w:pPr 为 24 半磅；③ 两处都没有；④ 只有 w:szCs
+    const source = await buildPackage(
+        `<w:p>${mathRun('<w:rPr><w:sz w:val="28"/><w:szCs w:val="21"/></w:rPr>')}</w:p>`
+        + `<w:p><w:pPr><w:rPr><w:sz w:val="24"/></w:rPr></w:pPr>${mathRun('')}</w:p>`
+        + `<w:p>${mathRun('')}</w:p>`
+        + `<w:p>${mathRun('<w:rPr><w:szCs w:val="30"/></w:rPr>')}</w:p>`,
+    );
+
+    // Act
+    const { formulas } = await extractMath(source);
+
+    // Assert
+    assert.deepEqual(formulas.map((f) => f.fontSizePt), [14, 12, null, null], 'w:szCs 不得被当成 w:sz');
+});
+
+test('extractMath：字号取公式内出现最多的 w:sz，并列时取较大者，越界值忽略', async () => {
+    // Arrange
+    const many = (sizes) => `<w:p><m:oMath>${sizes.map((v) => `<m:r><w:rPr><w:sz w:val="${v}"/></w:rPr><m:t>a</m:t></m:r>`).join('')}</m:oMath></w:p>`;
+    const source = await buildPackage(many(['28', '28', '18']) + many(['24', '20']) + many(['0', '99999']));
+
+    // Act
+    const { formulas } = await extractMath(source);
+
+    // Assert
+    assert.equal(formulas[0].fontSizePt, 14, '出现两次的 28 半磅胜过一次的 18');
+    assert.equal(formulas[1].fontSizePt, 12, '各出现一次时取较大的 24 半磅');
+    assert.equal(formulas[2].fontSizePt, null, '0 与 99999 半磅均越界');
+});
+
+test('extractMath：相邻段落的 w:pPr 不会串到本段公式上', async () => {
+    // Arrange：前一段有 w:pPr 且已闭合，公式所在段没有
+    const source = await buildPackage(
+        '<w:p><w:pPr><w:rPr><w:sz w:val="52"/></w:rPr></w:pPr><w:r><w:t>标题</w:t></w:r></w:p>'
+        + `<w:p>${mathRun('')}</w:p>`,
+    );
+
+    // Act
+    const { formulas } = await extractMath(source);
+
+    // Assert
+    assert.equal(formulas[0].fontSizePt, null);
+});
+
+test('restoreMath：字号写进 math 节点的 data.fontSizePt，缺省时不写该字段', () => {
+    // Arrange
+    const ir = { type: 'root', children: [{ type: 'paragraph', children: [{ type: 'text', value: 'MFMATH1MFMATH2' }] }] };
+    const omml = '<m:oMath><m:r><m:t>a</m:t></m:r></m:oMath>';
+    const formulas = [{ id: 1, omml, display: false, fontSizePt: 14 }, { id: 2, omml, display: false, fontSizePt: null }];
+
+    // Act
+    const nodes = restoreMath(ir, formulas).ir.children[0].children;
+    const withoutMathml = restoreMath(ir, formulas, { mathml: false }).ir.children[0].children;
+
+    // Assert
+    assert.equal(nodes[0].data.fontSizePt, 14);
+    assert.ok(!('fontSizePt' in nodes[1].data), '取不到字号时不写入该字段，由下游按缺省字号出图');
+    assert.equal(withoutMathml[0].data.fontSizePt, 14, 'mathml=false 时同样带上字号');
 });

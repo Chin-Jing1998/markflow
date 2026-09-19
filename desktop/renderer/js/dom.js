@@ -35,16 +35,22 @@ export function delegate(root, type, selector, handler) {
 }
 
 export const TARGET_LABELS = Object.freeze({ bundle: 'MD 包', docx: 'DOCX', pdf: 'PDF', html: 'HTML', xml: 'XML' });
-export const TYPE_LABELS = Object.freeze({ docx: 'Word', xlsx: 'Excel', pptx: 'PowerPoint', pdf: 'PDF', md: 'Markdown', url: '网页' });
+export const TYPE_LABELS = Object.freeze({
+    docx: 'Word', xlsx: 'Excel', pptx: 'PowerPoint', pdf: 'PDF', md: 'Markdown', xml: '专利 XML', zip: '专利案卷', url: '网页',
+});
+/** 转档入口给出的输入项类别（mf:paths:expand 回包里 files[].kind）→ 标签；有 kind 时优先于 TYPE_LABELS */
+export const KIND_LABELS = Object.freeze({ bundle: '专利五书目录' });
 export const PHASE_LABELS = Object.freeze({ parsing: '解析中', rendering: '渲染中', writing: '写入中', done: '已完成', failed: '失败' });
 export const STATUS_LABELS = Object.freeze({ idle: '待转换', queued: '排队中', running: '转换中', done: '已完成', failed: '失败', cancelled: '已取消' });
 export const THEME_LABELS = Object.freeze({ system: '跟随系统', light: '浅色', dark: '深色' });
 
 export const targetLabel = (target) => TARGET_LABELS[target] || String(target || '').toUpperCase();
-export const typeLabel = (type) => TYPE_LABELS[type] || String(type || '');
+export const typeLabel = (type, kind) => KIND_LABELS[kind] || TYPE_LABELS[type] || String(type || '');
 
-/** 输入类型 → 目标类别（与 converters/targets.INPUT_CLASS 一致） */
-export const INPUT_CLASS = Object.freeze({ docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', url: 'url' });
+/** 输入类型 → 目标类别（与 converters/targets.INPUT_CLASS 逐键一致，desktop-main.test.js 守护两份表不漂移） */
+export const INPUT_CLASS = Object.freeze({
+    docx: 'office', xlsx: 'office', pptx: 'office', pdf: 'office', md: 'markup', xml: 'markup', zip: 'markup', url: 'url',
+});
 
 export function classOf(type) {
     return INPUT_CLASS[type] || null;

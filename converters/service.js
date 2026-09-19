@@ -20,7 +20,8 @@
  * describeOptionSpec(dotted) → describeOptions() 描述树中的节点，未知路径返回 null
  * describeOptionHint(paths)  → 取值说明「（可选 …；默认 …）」，CLI 帮助与 MCP 入参描述同源：多条路径取值相同则合并、
  *                       默认值不同逐段列出，取值不同则逐段列范围与默认；未知路径抛中文错误
- * planTasks(raws, requestedTarget, cwd) → [{ raw, input, target }]，任一项不合法即抛中文错误
+ * planTasks(raws, requestedTarget, cwd, hints?) → [{ raw, input, target }]，任一项不合法即抛中文错误；
+ *                       hints.bundles 为 scan.expandInputs 判定出的专利五书目录（绝对路径），这些输入是目录而非文件
  * runConversion({ tasks, outputDir, concurrency, onEvent, options }) → { ok, outputDir, results, errors }
  * extractArticle({ url, maxChars }) → { url, finalUrl, title, author?, publishedAt?, siteName?, excerpt?, lang?,
  *                       wordCount, extraction, markdown, truncated, images }：网页只读提取，不落盘、不下载图片（图片只列
@@ -46,7 +47,7 @@ const EXTRACT_OPTIONAL_META = Object.freeze(['author', 'publishedAt', 'siteName'
 const VALIDATOR_PROBE_XML = '<probe/>';
 const VALIDATOR_NAME = 'libxml2-wasm';
 const LIBREOFFICE_NAME = 'soffice';
-const LIBREOFFICE_ROLE = '非必需，仅作 PDF 出图的第三级后端与 patent profile 下 EMF/WMF 栅格化的兜底';
+const LIBREOFFICE_ROLE = '非必需，仅作 PDF 出图的第三级后端';
 
 // ============================================================
 // 能力探测
@@ -202,11 +203,12 @@ const FLAT_MAP = Object.freeze([
     ['rasterizeFormulas', ['xml.patent.rasterizeFormulas'], asBoolean],
     ['imageDpi', ['xml.patent.imageDpi'], asNumber],
     ['sectionDetection', ['xml.patent.sectionDetection'], asString],
+    ['xmlImportParagraphNumbers', ['xmlImport.paragraphNumbers'], asBoolean],
     ['rasterScale', ['raster.scale'], asNumber],
     ['rasterMaxWidth', ['raster.maxWidth'], asNumber],
 ]);
 // 嵌套段直接深合并（MCP 的 html{…} / docx{…} / mineru{…} 等）
-const NESTED_KEYS = Object.freeze(['mineru', 'html', 'pdf', 'docx', 'xml', 'raster']);
+const NESTED_KEYS = Object.freeze(['mineru', 'html', 'pdf', 'docx', 'xml', 'xmlImport', 'raster']);
 // 段内允许的扁平别名：MCP schema 用 xml{numberingStart} / docx{fontAscii} 这类一层写法表达嵌套字段，
 // 以免 z.object 再套一层（嵌套越深越容易被 zod 转成 $ref，而 Desktop 客户端不接受 $ref）
 const SECTION_ALIASES = Object.freeze({
@@ -221,7 +223,7 @@ const SECTION_ALIASES = Object.freeze({
     docx: Object.freeze({ fontAscii: 'fontFamily.ascii', fontEastAsia: 'fontFamily.eastAsia' }),
 });
 // 与目标绑定的选项段 → 用到该段的目标。pdf 渲染器以 html 段排版（仅主题换成 pdf.theme），故 html 段同属 pdf 目标；
-// 未列出的段（mineru、raster）与顶层键不绑定目标，始终校验
+// 未列出的段（mineru、raster，以及作用于解析阶段、与目标无关的 xmlImport）与顶层键不绑定目标，始终校验
 const SECTION_TARGETS = Object.freeze({
     html: Object.freeze(['html', 'pdf']),
     pdf: Object.freeze(['pdf']),
@@ -353,10 +355,14 @@ const sectionDefaults = (entries) => entries
 // 任务规划与执行
 // ============================================================
 
-/** 归类输入并裁决目标；不触碰文件系统，存在性由调用方或 convert 负责 */
-function planTasks(raws, requestedTarget, cwd) {
+/**
+ * 归类输入并裁决目标；不触碰文件系统，存在性由调用方或 convert 负责。
+ * 专利五书目录没有扩展名可判，由调用方把 scan.expandInputs 的 bundles 原样传入（省略即不受理目录输入）
+ */
+function planTasks(raws, requestedTarget, cwd, { bundles } = {}) {
+    const bundleDirs = new Set(Array.isArray(bundles) ? bundles : []);
     return raws.map((raw) => {
-        const { input, type } = classifyInput(raw, cwd);
+        const { input, type } = classifyInput(raw, cwd, { bundleDirs });
         return { raw, input, target: resolveTarget(type, requestedTarget) };
     });
 }

@@ -245,7 +245,7 @@ function caretTop(textarea, offset) {
     mirror.style.width = `${Math.max(0, textarea.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight))}px`;
     mirror.textContent = textarea.value.slice(0, offset);
     const marker = document.createElement('span');
-    marker.textContent = '​';
+    marker.textContent = '\u200b';
     mirror.append(marker);
     document.body.append(mirror);
     const top = marker.offsetTop;

@@ -3,11 +3,17 @@
  *
  * profile 取值与行为来源：
  *   'basic' — 通用 HTML：基础选项 + 移除 script/style/noscript（源自 ir/util.js:78）
- *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img + 保留 <u>（mammoth 经 styleMap 'u => u' 产出，
- *             由 ir/inline-html 提升为 underline 节点）
+ *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img + 保留 <u>/<sup>/<sub> + 转义「~」
+ *             （<u> 由 mammoth 经 styleMap 'u => u' 产出，<sup>/<sub> 由 w:vertAlign 默认产出；
+ *             三者均由 ir/inline-html 提升为 underline / superscript / subscript 节点）
  *   'url'   — 网页正文：基础选项 + 内联样式识别 + figure/figcaption + section 块级
  *             + 移除 script/style/noscript/iframe/nav/footer/aside（源自 旧版 url.js:239）
  *             + 表格转 GFM（turndown 核心不含表格支持，缺失时网页表格退化为逐行纯文本，IR 得不到 table 节点）
+ *
+ * word profile 的输出约定（与 ir/inline-html 配套）：
+ *   - 文本中的「~」一律转义为 \~：Word 正文里的「~」多为区间号（化学专利的「C1~C30的烷基」），
+ *     而 remark-gfm 默认 singleTilde，成对的单个「~」会被解析成 delete 节点、波浪号连同区间含义一起丢失。
+ *     只在本 profile 转义，Markdown 输入的 ~删除线~ 语义不受影响
  *
  * url profile 的输出约定（与 ir/markers、ir/inline-html 配套）：
  *   - 粗体、斜体、删除线一律输出 <strong>/<em>/<del> HTML 而非 ** / * / ~~：CommonMark 的 flanking 规则在中文
@@ -34,6 +40,10 @@ const BASE_OPTIONS = {
 
 const BASIC_REMOVED_TAGS = ['script', 'style', 'noscript'];
 const URL_REMOVED_TAGS = ['script', 'style', 'noscript', 'iframe', 'nav', 'footer', 'aside'];
+// word profile 输出为行内 HTML 的标签：Markdown 没有对应语法，由 ir/inline-html 提升为 IR 节点
+const WORD_INLINE_TAGS = ['u', 'sup', 'sub'];
+// 「~」及其前导反斜杠（判定是否已被 turndown 自身转义）
+const TILDE_RE = /(\\*)~/g;
 
 // CSS font-weight 视为加粗的取值：bold、600-999、1000
 const BOLD_STYLE_RE = /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i;
@@ -141,7 +151,26 @@ function configureWord(service) {
         filter: (node) => node.nodeName === 'IMG' && !node.getAttribute('src'),
         replacement: () => '',
     });
-    service.keep(['u']);
+    // 不用 service.keep：keep 输出 outerHTML，标签内的首尾空白会与 turndown 置于标签外的同一份空白重复
+    //（「K<sub>3 </sub>(348」变成两个空格），且标签内的文本绕过 escape、其中的「~」得不到转义。
+    // 改为按常规规则处理内容，只在外层补回标签本身（不带属性）
+    service.addRule('inlineFormat', {
+        filter: WORD_INLINE_TAGS,
+        replacement: (content, node) => {
+            const tag = node.nodeName.toLowerCase();
+            return content ? `<${tag}>${content}</${tag}>` : '';
+        },
+    });
+    const escapeMarkdown = service.escape.bind(service);
+    service.escape = (text) => escapeTildes(escapeMarkdown(text));
+}
+
+/**
+ * 在 turndown 自身的转义结果上补转义「~」。turndown 的转义表只处理行首的 ~~~，且会把文本中的字面
+ * 反斜杠加倍，因此按前导反斜杠的奇偶判定：奇数个表示该「~」已被转义，原样保留；偶数个（含 0 个）补一个。
+ */
+function escapeTildes(text) {
+    return text.replace(TILDE_RE, (matched, slashes) => (slashes.length % 2 === 1 ? matched : `${slashes}\\~`));
 }
 
 // [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整

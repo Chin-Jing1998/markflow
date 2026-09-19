@@ -7,7 +7,8 @@
  *     <body> 块级：heading[level] / p / list[ordered,start] > item[checked] / table > row[header] > cell[align]
  *            / code[lang] / quote / figure > image[src,alt,width,height] / hr / section-break[kind,index,title] </body>
  *   </document>
- *   行内：b / i / s / code / a[href] / br / image / math[display]（MathML 内嵌，经解析重建保证 well-formed）
+ *   行内：b / i / s / u / sup / sub / code / a[href] / br / image / math[display]
+ *        （MathML 内嵌，经解析重建保证 well-formed）
  * slideBreak / sheetSection 保真为 section-break，不降级；图片沿用 images/ 相对引用（资产由调度器落盘）；
  * 文本经 builder.cleanText 剔除 XML 1.0 非法控制字符。产物 {name}.xml。
  */
@@ -123,6 +124,8 @@ function inlineNode(node, doc) {
         case 'emphasis': return [el('i', {}, inline(node.children, doc))];
         case 'delete': return [el('s', {}, inline(node.children, doc))];
         case 'underline': return [el('u', {}, inline(node.children, doc))];
+        case 'superscript': return [el('sup', {}, inline(node.children, doc))];
+        case 'subscript': return [el('sub', {}, inline(node.children, doc))];
         case 'inlineCode': return [el('code', {}, [String(node.value == null ? '' : node.value)])];
         case 'link': return [el('a', { href: node.url || null }, inline(node.children, doc))];
         case 'break': return [el('br')];

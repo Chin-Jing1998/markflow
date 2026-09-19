@@ -6,7 +6,10 @@
  *     使 Markdown 中的 <img> 独占一行、其后的图注能被识别为「紧随图片」；
  *   - 浮动图片（data.floating，来自 docx 的 wp:anchor）不论位置一律从文字中取出，按原顺序排在该段文字之后
  *     ——锚定在段落上的浮动图在版面上位于文字之外，常见排布是「标签段 → 浮动图 → 图号段」；
- *   - 只含图片的段落里有多张可拆图片时，逐张成段。
+ *   - 只含图片的段落里有多张可拆图片时，逐张成段；
+ *   - 同一原段落拆出的每一块写 data.splitGroup = <整数>（同组同值，按文档顺序递增），未被拆的段落不写该键。
+ *     专利渲染层据此在正文三书里把同组的相邻块并回一个段落（一个 Word 段落 = 一个 <p>，段号不顺延），
+ *     见 renderers/xml/blocks 的 mergeSplitGroups；md / html / docx 渲染器不读该键，产物不受影响。
  * markCaptions(ir) → 新树：先 splitImageParagraphs，再在块级兄弟序列里给紧随「只含图片的段落」的段落定角色：
  *   ≤ 60 字且匹配 ^(图|附图|Fig\.?|Figure)\s*序号、^图\s*[|｜:：]、^[▲△↑] → data.role = 'caption'；
  *   匹配 ^(注|来源|图源|图片来源|资料来源)[:：] → 'image_footnote'；
@@ -31,24 +34,33 @@ const CAPTION_ROLES = new Set(['caption', 'image_footnote']);
 // ============================================================
 
 function splitImageParagraphs(ir) {
-    return splitNode(ir);
+    return splitNode(ir, createGroupCounter());
 }
 
-function splitNode(node) {
+// 分组号发生器：每调用一次给出下一个号，同一原段落拆出的各块共用一个号
+function createGroupCounter() {
+    let issued = 0;
+    return () => {
+        issued += 1;
+        return issued;
+    };
+}
+
+function splitNode(node, nextGroup) {
     if (!node || typeof node !== 'object' || !Array.isArray(node.children)) return node;
     const isBlockParent = BLOCK_PARENTS.has(node.type);
     let changed = false;
     const children = [];
     for (const child of node.children) {
-        const next = splitNode(child);
-        const parts = isBlockParent && next && next.type === 'paragraph' ? splitParagraph(next) : [next];
+        const next = splitNode(child, nextGroup);
+        const parts = isBlockParent && next && next.type === 'paragraph' ? splitParagraph(next, nextGroup) : [next];
         if (parts.length !== 1 || parts[0] !== child) changed = true;
         children.push(...parts);
     }
     return changed ? { ...node, children } : node;
 }
 
-function splitParagraph(node) {
+function splitParagraph(node, nextGroup) {
     const items = Array.isArray(node.children) ? node.children : [];
     if (!items.some((item) => isImage(item) && (isBig(item) || isFloating(item)))) return [node];
 
@@ -64,8 +76,11 @@ function splitParagraph(node) {
     const blocks = leading.images.map(imageParagraph);
     if (middle.length > 0) blocks.push({ ...node, children: middle });
     blocks.push(...floating.map(imageParagraph), ...trailing.images.map(imageParagraph));
-    return blocks;
+    return blocks.length > 1 ? stampGroup(blocks, nextGroup()) : blocks;
 }
+
+// 同组标记只写 data.splitGroup，块的其它内容原样保留
+const stampGroup = (blocks, group) => blocks.map((block) => ({ ...block, data: { ...(block.data || {}), splitGroup: group } }));
 
 // 从一端连续取可拆的大图（其间的空白与换行一并跳过）；返回图片与消耗的项数
 function peel(items, side) {

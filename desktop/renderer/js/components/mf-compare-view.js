@@ -12,6 +12,7 @@ import { api } from '../api.js';
 import { icon } from '../icons.js';
 import { classOf, escapeHtml, escapeAttr, targetLabel, typeLabel } from '../dom.js';
 import { notify } from './mf-toast.js';
+import { describeKeys } from '../format-options.mjs';
 import './mf-source-pane.js';
 import './mf-product-pane.js';
 import './mf-format-panel.js';
@@ -190,7 +191,7 @@ class MfCompareView extends HTMLElement {
         if (productPane.product !== preview.product) productPane.product = preview.product;
         this.bindScrollSync();
         this.querySelector('mf-format-panel').context = {
-            formats: state.formats, target: preview.target, type: preview.type,
+            formats: state.formats, sessionId: preview.sessionId, target: preview.target, type: preview.type,
             options: this.pending || preview.options, busy,
         };
         const files = preview.product && Array.isArray(preview.product.files) ? preview.product.files : [];
@@ -233,7 +234,7 @@ class MfCompareView extends HTMLElement {
         const actions = {
             pick: () => this.pickFile(),
             'open-url': () => this.openUrl(),
-            refresh: () => this.rerender(this.pending || null, { force: true }),
+            refresh: () => this.rerender(this.pending || this.effectiveOptions(), { force: true }),
             export: () => this.exportProduct(),
             close: () => this.close(),
         };
@@ -299,6 +300,15 @@ class MfCompareView extends HTMLElement {
         this.rerender(this.pending || preview.options, { force: true, target });
     }
 
+    /**
+     * 当前生效的扁平选项。「刷新预览」必须带上它：主进程每次 render 都按 { ...设置默认项, ...本次入参 }
+     * 重算会话选项，不带就等于把用户在面板上设过的项全部撤回（实时目标下 pending 为空，尤其容易踩到）。
+     */
+    effectiveOptions() {
+        const preview = store.get().preview;
+        return preview && preview.options ? preview.options : null;
+    }
+
     async rerender(options, { reparse = false, force = false, target = null } = {}) {
         const preview = store.get().preview;
         if (!preview) return;
@@ -326,7 +336,8 @@ class MfCompareView extends HTMLElement {
                 previewBusy: false,
                 preview: state.preview ? { ...state.preview, ...update, sourceView: update.sourceView || state.preview.sourceView, live: update.product.live } : state.preview,
             }));
-            if (next.reparsed) notify(`已按「${next.changedKeys.join('、')}」重新解析源文件`, 'info');
+            // 提示里给字段的中文标签而不是扁平键名（describeKeys 取不到标签的键回退为键名）
+            if (next.reparsed) notify(`已按「${describeKeys(next.changedKeys)}」重新解析源文件`, 'info');
         } catch (err) {
             store.set({ previewBusy: false, previewError: err.message });
             notify(err.message, 'error', 6000);

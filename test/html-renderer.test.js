@@ -453,3 +453,18 @@ test('<u> 渲染为 u 元素、<img width> 带校验后的宽度；白名单外�
     assert.ok(!html.includes('onclick') && !html.includes('<span'), '白名单外的 HTML 应剥离');
     assert.ok(html.includes('外来标签'), '剥离后保留文字');
 });
+
+test('underline / superscript / subscript 输出 <u> / <sup> / <sub> 元素（原始 HTML 仍不透传）', async () => {
+    // Arrange：IR 经 ir/inline-html 提升（与各 parser 同一链路）
+    const { liftInlineHtml } = require('../converters/ir/inline-html');
+    const ir = liftInlineHtml(await parseMarkdown('C<sub>1</sub>~C<sub>30</sub>、R<sup>2</sup>、<u>注</u>\n'));
+
+    // Act
+    const html = await htmlRenderer.render(makeDoc(ir));
+
+    // Assert
+    assert.ok(html.includes('C<sub>1</sub>'), html);
+    assert.ok(html.includes('C<sub>30</sub>'), html);
+    assert.ok(html.includes('R<sup>2</sup>'), html);
+    assert.ok(html.includes('<u>注</u>'), html);
+});

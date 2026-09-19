@@ -20,6 +20,8 @@
  *     （范围见 output.js），single 布局本就覆盖同一文件、不清理
  *   convert({ input: { path? | url? }, target, outputDir, options?, onProgress?, allowPrivateNetwork?, nameRegistry?, order?, clean?, skipExisting? }) 依次组合三者
  *     → { ok, target, name, title, sourceType, outputPath, outputs, imagesCount, warnings, options, extras, backends }
+ *   input.path 一般是文件；唯一受理的目录是「专利五书目录」（converters/scan.js 的 isPatentBundleDir），整个目录
+ *   作为一项 xml 输入交 parsers/xml 合并导入，产物名取目录名（不去扩展名——目录名里的点不是扩展名）。
  *   clean 与 skipExisting 为写盘策略参数（非用户 options：不经 normalizeOptions、不回显到结果的 options；缺省 false，
  *   非布尔值抛中文错误）：
  *     skipExisting 为 true 且主产物已存在即跳过本次转换——主产物 folder 布局为 {outputDir}/{name}/{name}.{ext}、
@@ -33,14 +35,16 @@
  *   nameRegistry 与 order 为服务层内部参数（非用户 options）：批量转换时由 runConversion 传入同一张
  *   converters/naming.js 的登记表与本任务的批内序号，使同批内派生出同名产物的任务改名而不互相覆盖，
  *   且最终名只由序号决定（与解析快慢无关）；不传登记表即用派生名原样落盘，行为与引入登记表之前一致。
- *   options 经 converters/options.js 归一（非法值抛中文错误），透传 parser ctx（ctx.options）与渲染器；
+ *   options 经 converters/options.js 归一（非法值抛中文错误），归一之后按输入类型补默认值
+ *   （applyPatentImportDefaults：专利五书 XML 输入且未显式给出中文字体时取宋体，依据见 options.js），
+ *   再透传 parser ctx（ctx.options）与渲染器；
  *   返回值中的 options 为脱敏后的生效值（mineru.token 置 null），extras 为已落盘附属文件的相对路径。
  *
  * 渲染器契约 v3：render(doc, options, { imageMode }) → string | Buffer
  *   | { files: { '<posix 相对路径>': string|Buffer }, assets?, extras?, warnings?, omitDocAssets?, title? }
  *   string/Buffer 视为主产物 {name}.<ext>（ext 取自 targets.js 的规则表，string 按 utf8）；files 的键可用 {name} 占位符；
  *   warnings（string[]）并入 convert 结果的 warnings；omitDocAssets 为 true 时不再合并 doc.assets，落盘的图片
- *   只取渲染器返回的 assets（patent profile 把图片改名后平铺到产物目录根下即依赖此项）；title 为非空字符串时
+ *   只取渲染器返回的 assets（patent profile 把图片改名为 <表格代码>_<序号> 并放进各书目录即依赖此项）；title 为非空字符串时
  *   覆盖结果信封的 title（patent profile 给出发明名称），parseDocument 的标题解析不受影响。
  *   layout 'single' 的目标只允许一个文件，经 output.writeSingle 落盘为 {outputDir}/{name}.<ext>；
  *   layout 'folder' 的经 output.writeFolder 落盘到 {outputDir}/{name}/，outputs 形状见 output.js。
@@ -66,9 +70,9 @@ const { sanitizeFolderName, stripExt, collectText } = require('./ir/util');
 const { statOrNull, toBuffer, isFile } = require('./util');
 const {
     detectInputType, assertTargetAllowed, getTargetRule, listTargets,
-    SUPPORTED_EXTENSIONS, REMOTE_URL_RE,
+    SUPPORTED_EXTENSIONS, REMOTE_URL_RE, BUNDLE_DIR_TYPE,
 } = require('./targets');
-const { normalizeOptions, redactOptions } = require('./options');
+const { normalizeOptions, applyPatentImportDefaults, redactOptions } = require('./options');
 const { prependFrontMatter } = require('./web/frontmatter');
 const output = require('./output');
 const { runBatch } = require('./batch');
@@ -105,7 +109,7 @@ async function convert(params = {}) {
     const source = await resolveSource(input);
     await assertOutputDir(outputDir);
     assertTargetAllowed(target, source.type);
-    const options = normalizeOptions(rawOptions);
+    const options = applyPatentImportDefaults(normalizeOptions(rawOptions), source.type);
     const emit = createProgressEmitter(onProgress);
     const skipCheck = skipExisting === true ? { outputDir, target, options, source } : null;
 
@@ -161,7 +165,7 @@ function assertBooleanParam(value, key) {
 }
 
 // 主产物：folder 布局为 {outputDir}/{name}/{name}.{ext}，single 布局为 {outputDir}/{name}.{ext}；ext 取自规则表，
-// 唯 xml 的 patent profile 不产出 {name}.xml，以五书与图片的同一平铺集合 {name}.zip 为主产物。
+// 唯 xml 的 patent profile 不产出 {name}.xml，以五书与图片打成的 {name}.zip 为主产物。
 // outputsKey 与落盘路径一致：single 布局取目标名（见 writeDocument），folder 布局取扩展名（见 output.js）
 function mainProductOf({ outputDir, target, name, options }) {
     const { layout, ext: ruleExt } = getTargetRule(target);
@@ -199,7 +203,7 @@ async function skipIfExisting({ outputDir, target, options, source, name, title,
 async function parseDocument({ input, target, options: rawOptions, allowPrivateNetwork = false, onProgress } = {}) {
     const source = await resolveSource(input);
     if (target !== undefined && target !== null) getTargetRule(target);
-    const options = normalizeOptions(rawOptions);
+    const options = applyPatentImportDefaults(normalizeOptions(rawOptions), source.type);
     return parseResolved({ source, target, options, allowPrivateNetwork, emit: createProgressEmitter(onProgress) });
 }
 
@@ -212,7 +216,7 @@ async function parseResolved({ source, target, options, allowPrivateNetwork, emi
 
     // 标题：meta.title → 首个 H1 → 文件名（去扩展名）→ 默认值；渲染前写回 meta.title
     const rawTitle = extractRawTitle(parsed);
-    const title = rawTitle || (source.type === 'url' ? '' : stripExt(source.sourceName)) || DEFAULT_TITLE;
+    const title = rawTitle || (source.type === 'url' ? '' : baseNameOf(source)) || DEFAULT_TITLE;
     const name = resolveOutputName(source, rawTitle);
     let doc = {
         ...parsed,
@@ -270,6 +274,10 @@ async function resolveSource(input) {
     if (!path.isAbsolute(filePath)) throw new Error(`输入路径必须是绝对路径：${filePath}`);
     const stat = await statOrNull(filePath);
     if (!stat) throw new Error(`输入文件不存在：${filePath}`);
+    // 唯一受理的目录输入：专利五书目录。scan.js 只依赖 targets 与零依赖的 xml/dom，按需加载即可
+    if (stat.isDirectory() && await require('./scan').isPatentBundleDir(filePath)) {
+        return { type: BUNDLE_DIR_TYPE, path: filePath, sourceName: path.basename(filePath), isDirectory: true };
+    }
     if (!stat.isFile()) throw new Error(`输入路径不是文件：${filePath}`);
 
     const type = detectInputType(filePath);
@@ -303,9 +311,12 @@ function firstH1Text(node) {
     return '';
 }
 
+// 本地输入的基名：文件去扩展名；目录（专利五书目录）原样采用，目录名里的点不是扩展名
+const baseNameOf = (source) => (source.isDirectory ? source.sourceName : stripExt(source.sourceName));
+
 // 文件输入取文件名；网页输入取标题，无标题时取「主机名-时间戳」
 function resolveOutputName(source, rawTitle) {
-    if (source.type !== 'url') return sanitizeFolderName(stripExt(source.sourceName));
+    if (source.type !== 'url') return sanitizeFolderName(baseNameOf(source));
     if (rawTitle) return sanitizeFolderName(rawTitle);
     return sanitizeFolderName(`${hostnameForFileName(source.url)}-${formatTimestamp()}`);
 }
@@ -330,7 +341,8 @@ function formatTimestamp(date = new Date()) {
 async function renderDocument(doc, target, rawOptions, { imageMode } = {}) {
     if (!doc || typeof doc !== 'object' || !doc.ir) throw new Error('renderDocument 需要有效的 IR 文档');
     const rule = getTargetRule(target);
-    const options = normalizeOptions(rawOptions);
+    // 桌面端按扁平选项重新构造 options 后才调本函数（不经 convert / parseDocument），输入类型只能从 doc.meta 读
+    const options = applyPatentImportDefaults(normalizeOptions(rawOptions), doc.meta && doc.meta.sourceType);
     const mode = imageMode || defaultImageMode(target, options);
     const rendered = target === 'bundle'
         ? await renderBundle(doc, options, mode)
@@ -341,7 +353,7 @@ async function renderDocument(doc, target, rawOptions, { imageMode } = {}) {
     const docExtras = rendered.omitDocExtras ? [] : finalizeMineruExtras(asArray(doc.extras), doc);
     return {
         files: rendered.files,
-        // 渲染器声明 omitDocAssets（如 patent profile 把图片改名平铺）时，文档资产以其返回的 assets 为准
+        // 渲染器声明 omitDocAssets（如 patent profile 把图片改名后放进各书目录）时，文档资产以其返回的 assets 为准
         assets: [...(rendered.omitDocAssets ? [] : asArray(doc.assets)), ...asArray(rendered.assets)],
         extras: [...docExtras, ...asArray(rendered.extras)],
         warnings: asArray(rendered.warnings),

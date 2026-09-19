@@ -5,7 +5,8 @@
  * （assets/md-images 只认 type 'image'）与各渲染器都认不出来。本模块在解析后把其中安全、可识别的部分提升为节点：
  *   - 只含一个 <img> 的 html 节点 → image 节点；处于块级位置时包进段落
  *   - 块级的 <p|div|figure> 只包着 img / br（与 figcaption）→ 图片段落 + 图注段落（data.role = 'caption'）
- *   - 同级兄弟中成对的 <u> / <strong|b> / <em|i> / <del|s> → underline / strong / emphasis / delete，<br> → break；
+ *   - 同级兄弟中成对的 <u> / <strong|b> / <em|i> / <del|s> / <sup> / <sub>
+ *     → underline / strong / emphasis / delete / superscript / subscript，<br> → break；
  *     按栈配对，配不上的标签删除、保留其间内容；只包着图片的格式标签直接拆除（图片不承载粗斜体）
  *   - 其余 HTML 维持 html 节点，仍由各渲染器剥离
  *   - 发生过提升的兄弟序列里，相邻同类格式节点与相邻文本合并，同类嵌套拍平
@@ -25,9 +26,13 @@
 
 const FORMAT_TYPES = Object.freeze({
     u: 'underline', strong: 'strong', b: 'strong', em: 'emphasis', i: 'emphasis', del: 'delete', s: 'delete',
+    sup: 'superscript', sub: 'subscript',
 });
-const PHRASING_PARENTS = new Set(['paragraph', 'heading', 'tableCell', 'emphasis', 'strong', 'delete', 'underline', 'link', 'linkReference']);
-const MERGEABLE_TYPES = new Set(['strong', 'emphasis', 'delete', 'underline']);
+const PHRASING_PARENTS = new Set([
+    'paragraph', 'heading', 'tableCell', 'emphasis', 'strong', 'delete', 'underline',
+    'superscript', 'subscript', 'link', 'linkReference',
+]);
+const MERGEABLE_TYPES = new Set(['strong', 'emphasis', 'delete', 'underline', 'superscript', 'subscript']);
 
 // 属性段：允许引号内出现 > 与 <，其余位置不允许
 const ATTR_BODY = `(?:[^<>"']|"[^"]*"|'[^']*')*`;

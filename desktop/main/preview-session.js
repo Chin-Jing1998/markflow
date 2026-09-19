@@ -13,7 +13,7 @@
  *   render({ sessionId, target, options })
  *     → { sessionId, target, options, product, warnings, reparsed, changedKeys, sourceView? }
  *     仅当 REPARSE_KEYS 里的项发生变化时才重新解析（imageFormat / jpegQuality / jpegPpi / math / pdfBackend /
- *     xml profile 与 patent 子项 / mineru 各项 / raster 各项——它们都作用在解析管线上），
+ *     xml profile 与 patent 子项 / 五书 XML 反向导入的段号 / mineru 各项 / raster 各项——它们都作用在解析管线上），
  *     此时连同来源栏一起重建；其余选项只重渲染，界面据此做 300 ms 防抖实时预览。
  *   export({ sessionId, outputDir? })
  *     → { outputPath, outputs, extras, warnings, libraryId, name, title, managed }
@@ -38,7 +38,9 @@
  *
  * 图片寻址：会话建一个临时目录，source/ 放来源栏的图、product/ 放产物栏的图，
  * sid 授权该临时目录（PDF 来源另加该文件所在目录），渲染进程一律经 mf-asset://<sid>/… 取图，
- * 不开放任何 file:// 通道。
+ * 不开放任何 file:// 通道。xml 产物的图片与所属 XML 同目录（patent 五书按官方案卷结构落在
+ * product/<表格代码>/ 内，img/@file 为裸文件名），故各分文件的取图基址取其所在目录；分文件另带
+ * book（xml-view 按内容判定的书目）与 label（书目名 + 相对路径），主视图据 book 选说明书。
  */
 const path = require('path');
 const fsp = require('fs').promises;
@@ -65,13 +67,16 @@ const EDIT_VIEW_DIRNAME = 'edit-view';
 const NAME_TOKEN = '{name}';
 const PDF_PREVIEW_NAME = 'preview.pdf';
 const PRECHECK_FILE = 'precheck.json';
+/** xml-view 给出的书目标识：说明书那一份作产物栏主视图 */
+const PRIMARY_XML_BOOK = 'description';
 const MAX_SESSIONS = 3;
 /** 来源栏用「结构视图」呈现（无原始版式可直转）的输入类型 */
 const STRUCTURED_SOURCE_TYPES = Object.freeze(['xlsx', 'pptx', 'url']);
-/** 改这些扁平选项须重新解析：它们作用在 parseDocument 的管线（图片归一、栅格化、PDF 后端）上 */
+/** 改这些扁平选项须重新解析：它们作用在 parseDocument 的管线（图片归一、栅格化、PDF 后端、五书 XML 反向导入）上 */
 const REPARSE_KEYS = Object.freeze([
     'imageFormat', 'jpegQuality', 'jpegPpi', 'math', 'pdfBackend',
     'xmlProfile', 'patentParts', 'rasterizeTables', 'rasterizeFormulas', 'imageDpi', 'sectionDetection',
+    'xmlImportParagraphNumbers',
     'mineruModel', 'mineruOcr', 'mineruFormula', 'mineruTable', 'mineruLang', 'mineruTimeout', 'pageRanges',
     'rasterScale', 'rasterMaxWidth',
 ]);
@@ -315,11 +320,16 @@ function createPreviewSessions(deps = {}) {
                 continue;
             }
             if (!name.toLowerCase().endsWith('.xml')) continue;
-            const view = buildXmlView(String(content), { assetBase: base, indent: options.xml.indent, label: name });
-            parts.push({ name, xml: view.xml, structuredHtml: view.structuredHtml, profile: view.profile, error: view.error });
+            // 图片与所属 XML 同目录：patent 为各书的表格代码目录（100003/100003.xml 引 100003_1.jpg），
+            // generic 的 XML 在产物根下，取图基址即随 XML 所在目录走
+            const view = buildXmlView(String(content), { assetBase: `${base}${assetDirOf(name)}`, indent: options.xml.indent, label: name });
+            parts.push({
+                name, label: view.bookLabel ? `${view.bookLabel}（${name}）` : name, book: view.book,
+                xml: view.xml, structuredHtml: view.structuredHtml, profile: view.profile, error: view.error,
+            });
         }
-        // 主视图取说明书（patent 五书里内容最全的一份），generic 只有一份 XML 时即它自己
-        const primaryIndex = Math.max(0, parts.findIndex((part) => part.name.startsWith('description')));
+        // 主视图取说明书（patent 五书里内容最全的一份，按内容判定而非文件名），generic 只有一份 XML 时即它自己
+        const primaryIndex = Math.max(0, parts.findIndex((part) => part.book === PRIMARY_XML_BOOK));
         const primary = parts[primaryIndex] || null;
         return {
             view: primary
@@ -360,6 +370,9 @@ function createPreviewSessions(deps = {}) {
     }
 
     const fileNames = (session, rendered) => Object.keys(rendered.files).map((key) => key.replace('{name}', session.name));
+
+    /** 产物内相对路径 → 其所在目录的 URL 片段（带结尾斜杠；根下的文件为空串） */
+    const assetDirOf = (name) => name.split('/').slice(0, -1).map((segment) => `${encodeURIComponent(segment)}/`).join('');
 
     // ---------- render ----------
 
