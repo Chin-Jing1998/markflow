@@ -206,7 +206,7 @@ async function readJsonOrNull(filePath) {
     const stat = await statOrNull(filePath);
     if (!stat || !stat.isFile() || stat.size > MAX_TEXT_BYTES) return null;
     try {
-        return JSON.parse((await fsp.readFile(filePath, 'utf8')).replace(/^﻿/, ''));
+        return JSON.parse((await fsp.readFile(filePath, 'utf8')).replace(/^\ufeff/, ''));
     } catch (err) {
         return null;
     }
