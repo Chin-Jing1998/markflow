@@ -151,7 +151,9 @@ test('成功路径：上传中不对外 → 运行 → 成功；快照、强制�
     });
 
     const [call] = service.calls;
-    assert.deepEqual([call.existed, call.dirMode, call.target, call.concurrency, call.outputDir], [true, 0o700, 'xml', 1, outputDir]);
+    assert.deepEqual([call.existed, call.target, call.concurrency, call.outputDir], [true, 'xml', 1, outputDir]);
+    // 上传目录只许本用户读写；Windows 没有 POSIX 权限位，stat 给不出 0o700
+    if (process.platform !== 'win32') assert.equal(call.dirMode, 0o700);
     assert.deepEqual(service.flatOptions[0], { flat: { jpegPpi: 300, ...FORCED_OPTIONS }, scope: { targets: ['xml'] } }, 'patent 与 validate 由本模块强制，设置里的同名项盖不掉');
     assert.deepEqual(FORCED_OPTIONS, { xmlProfile: 'patent', validate: true });
     assert.equal(fs.existsSync(path.dirname(reserved.uploadPath)), false, '任务结束即删除上传的临时目录');

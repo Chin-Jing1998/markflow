@@ -116,6 +116,8 @@ const caseDir = path.join(root, '案件 A');
 fs.mkdirSync(caseDir, { recursive: true });
 const savedDoc = path.join(caseDir, '一种装置-发明.docx');
 fs.writeFileSync(savedDoc, 'x');
+/** Word 加载项只面向 macOS；Windows 没有 POSIX 权限位，chmod 造不出只读目录，「a:」在那里又是盘符前缀——相关断言只在 POSIX 上执行 */
+const IS_POSIX = process.platform !== 'win32';
 const readonlyDir = path.join(root, 'readonly');
 fs.mkdirSync(readonlyDir);
 fs.writeFileSync(path.join(readonlyDir, '只读.docx'), 'x');
@@ -156,7 +158,7 @@ test('非法源路径：一律弃用并改存输出目录，绝不写到由该�
         [`${caseDir}/../../逃逸.docx`, /\.\. 段/, '未命名文档-20260918-090507'],
         [path.join(caseDir, '不存在.docx'), /没有这个文件/, '不存在'],
         [caseDir, /没有这个文件/, '案件 A'],
-        [path.join(readonlyDir, '只读.docx'), /不可写/, '只读'],
+        ...(IS_POSIX ? [[path.join(readonlyDir, '只读.docx'), /不可写/, '只读']] : []),
         ['https://contoso.sharepoint.com/sites/a/%E4%BA%91%E7%AB%AF.docx', /云端/, '未命名文档-20260918-090507'],
     ];
     for (const [sourcePath, noteRe, baseName] of cases) {
@@ -172,7 +174,7 @@ test('非法源路径：一律弃用并改存输出目录，绝不写到由该�
 test('文件名只用来起名：目录部分与扩展名被剥掉，非法字符被清洗', async () => {
     assert.equal(baseNameFromFileName('../../etc/cron.d/evil.docx'), 'evil');
     assert.equal(baseNameFromFileName('C:\\Users\\x\\申请.docx'), '申请');
-    assert.equal(baseNameFromFileName('a:b*c?.docx'), 'a_b_c', '非法字符换成下划线，首尾的下划线由 sanitizeFolderName 剥掉');
+    if (IS_POSIX) assert.equal(baseNameFromFileName('a:b*c?.docx'), 'a_b_c', '非法字符换成下划线，首尾的下划线由 sanitizeFolderName 剥掉');
     assert.equal(baseNameFromFileName('   '), '');
     assert.equal(baseNameFromFileName('..'), '');
     const location = await resolveOutputLocation({ sourcePath: 'https://x.example/云端.docx', fileName: '../../云端文档.docx', fallbackDir, now: FIXED_NOW });

@@ -48,7 +48,7 @@ function installerFor(home, overrides = {}) {
 // 安装、状态与卸载
 // ============================================================
 
-test('defaultWefDir：官方规定的旁加载目录', () => {
+test('defaultWefDir：官方规定的旁加载目录', { skip: process.platform === 'win32' && '旁加载目录是 macOS 路径，Windows 上的分隔符不同' }, () => {
     assert.equal(defaultWefDir('/Users/someone'), '/Users/someone/Library/Containers/com.microsoft.Word/Data/Documents/wef');
     assert.ok(!defaultWefDir(path.join(root, 'x')).startsWith(os.homedir()) || root.startsWith(os.homedir()), '测试只用临时目录下的假 home');
 });
@@ -106,8 +106,8 @@ test('Word 的数据目录不存在：不替它造容器目录，提示先启动
 });
 
 test('目录不可写（模拟 macOS 未授权访问其他 App 的数据）：中文错误附带可粘贴的手动命令', async (t) => {
-    if (typeof process.getuid === 'function' && process.getuid() === 0) {
-        t.skip('root 不受目录权限限制');
+    if (process.platform === 'win32' || (typeof process.getuid === 'function' && process.getuid() === 0)) {
+        t.skip('Windows 没有 POSIX 权限位，root 不受目录权限限制');
         return;
     }
     const home = fakeHome();
@@ -128,8 +128,8 @@ test('目录不可写（模拟 macOS 未授权访问其他 App 的数据）：�
 });
 
 test('连数据目录都不让看（stat 即被拒）：按「未获授权」提示并给手动命令，而不是误报「未找到 Word 的数据目录」', async (t) => {
-    if (typeof process.getuid === 'function' && process.getuid() === 0) {
-        t.skip('root 不受目录权限限制');
+    if (process.platform === 'win32' || (typeof process.getuid === 'function' && process.getuid() === 0)) {
+        t.skip('Windows 没有 POSIX 权限位，root 不受目录权限限制');
         return;
     }
     const home = fakeHome();
