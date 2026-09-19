@@ -394,7 +394,9 @@ test('reserve() 未决期间请求即断开（只发了请求头）：任务不�
         await until(() => ctx.jobs.stats().pending === 0 && leftovers(ctx.tmpRoot).length === 0, `第 ${round} 次断开后名额与临时目录释放`);
     }
     assert.deepEqual(ctx.jobs.stats(), { pending: 0, running: 0, records: 0 }, '没有任何任务停留在 uploading');
-    assert.ok(ctx.logs.filter((line) => line === '[addin] POST → 400 upload-aborted').length === 6, '每次断开都按 upload-aborted 记了一条');
+    // 访问日志在名额与临时目录释放之后才写（错误沿 await 链回到 handle 的 catch），上面的轮询可能恰好落在两者之间，
+    // 故等它而不是立即断言——曾在全量并行时偶发地只数到 5 条
+    await until(() => ctx.logs.filter((line) => line === '[addin] POST → 400 upload-aborted').length === 6, '每次断开都按 upload-aborted 记了一条');
 
     const ok = request(ctx.port, { method: 'POST', target: '/v1/jobs', headers: uploadHeaders(token), body: DOCX });
     await until(() => gate.state.held === 7, '正常上传进入 reserve 的窗口');
