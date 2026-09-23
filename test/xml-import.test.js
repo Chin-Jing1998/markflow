@@ -9,6 +9,7 @@
  *   安全——img/@file 越界、符号链接逃逸、魔数与扩展名、zip 条目数 / 单条目 / 谎报大小 / 总量上限、
  *     不安全条目名、符号链接条目、XML 大小与嵌套深度上限；
  *   末尾修剪——trimInline 在 8 万个空格或回车长段上的耗时上限，与线性化之前的实现逐字等价（差分）；
+ *   图号段判定——figureLabelNumber 在 figure-labels 里 8 万个空格长段上的耗时上限（经 booksToIr），与线性化之前的实现逐字等价（差分）；
  *   问题清单——全部带「导入：」前缀，人工参照夹具的丢失项清单不多不少。
  * 夹具一律程序化合成（test/fixtures/patent/roundtrip/build-roundtrip-fixtures.js），正文为虚构示例。
  */
@@ -810,5 +811,143 @@ describe('trimInline：末尾修剪线性于串长', () => {
         assert.ok(hits.removed > 0, '末尾修剪没有样本删去字符');
         assert.ok(hits.stoppedAtNbsp > 0, '没有样本在删去空白后止于 U+00A0');
         assert.ok(hits.nbspKept > 0, '没有样本以 U+00A0 结尾而原样保留');
+    });
+});
+
+// ============================================================
+// figureLabelNumber：图号段判定线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { booksToIr, figureLabelNumber } = require('../converters/parsers/xml/patent');
+
+// 耗时用例的输入规模：figure-labels 里「图7」与「a」之间夹 8 万个半角空格，「a」之后接回车与「b」
+const FIGURE_LABEL_STRESS_LENGTH = 80000;
+// 耗时上限取绝对值，理由同上一节。200 ms 使两侧余量都不小于 5 倍——线性化之前的 /^\s*图\s*(\d+)\s*(.*)$/ 在这一规模上
+// 经 booksToIr 实测约 1.9 至 2.2 秒，是上限的 9 倍以上：(\d+) 后的 \s* 与 (.*) 都能取这段空白，. 跨不过回车而 $ 只认串尾，
+// 引擎对这段空白的每一种切分都重扫到回车，耗时随段长平方增长；线性化之后经 booksToIr 实测约 1.1 至 1.4 毫秒（每次新起进程），
+// 不到上限的百分之一
+const FIGURE_LABEL_STRESS_BUDGET_MS = 200;
+
+// 线性化之前的图号段正则，逐字照录，仅作短输入的差分参照：(\d+) 后的 \s* 与 (.*) 在同一段空白上互相回溯，
+// 不可用于耗时用例的输入规模
+const LEGACY_FIGURE_LABEL_RE = /^\s*图\s*(\d+)\s*(.*)$/;
+// 本节另需的不可见字符以码点生成：U+2029（段分隔符）、U+FEFF（零宽不换行空格）、U+000B（垂直制表符）
+const FIGURE_LABEL_PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
+const FIGURE_LABEL_ZERO_WIDTH_NO_BREAK_SPACE = String.fromCharCode(0xFEFF);
+const FIGURE_LABEL_VERTICAL_TAB = String.fromCharCode(0x0B);
+// 行终止符：正则的 . 不匹配的恰是这四个，它们却都属 \s——旧式的判定正卡在这一出入上
+const FIGURE_LABEL_LINE_TERMINATORS = ['\n', '\r', LINE_SEPARATOR, FIGURE_LABEL_PARAGRAPH_SEPARATOR];
+// 结构化随机串的空白段从这十个 \s 成员中抽取：六个空白（U+00A0 沿用文件头导入的 NBSP）与四个行终止符
+const FIGURE_LABEL_SPACE_TOKENS = [
+    ' ', '\t', IDEOGRAPHIC_SPACE, NBSP, FIGURE_LABEL_ZERO_WIDTH_NO_BREAK_SPACE, FIGURE_LABEL_VERTICAL_TAB, ...FIGURE_LABEL_LINE_TERMINATORS,
+];
+// 差分字母表：上述十个 \s 成员，加「图」、两个数字、西文可见字符与半角、全角冒号，共 16 个记号
+const FIGURE_LABEL_DIFF_ALPHABET = [...FIGURE_LABEL_SPACE_TOKENS, '图', '1', '2', 'a', ':', '：'];
+// 分支 → 诊断用的说明，声明顺序即报出顺序
+const FIGURE_LABEL_BRANCHES = Object.freeze({
+    prefixMismatch: '前缀不符',
+    matchedWithRest: '匹配且余下部分非空',
+    matchedEmptyRest: '匹配且余下部分为空',
+    lineTerminatorAfterSpaces: '极大空白之后含行终止符而不匹配（一位数字）',
+    longDigitsThenLineTerminator: '长数字段后接行终止符而不匹配（两位以上数字）',
+});
+
+// 分支归类：只用旧式的 exec 结果与测试内独立算出的输入特征，不借用 figureLabelNumber 的内部状态。空白一律以 trimStart 剥离——
+// 它删去的字符集（WhiteSpace 与 LineTerminator）与 \s 相同，却不经正则。末两个分支同属「前缀相符、极大空白之后的余下部分含行终止符」，
+// 按数字段长短分开：一位数字只有其后的空白可供回溯，两位以上的数字段另可逐位回退。前缀相符、旧式不匹配而余下部分不含行终止符，
+// 即与等价判据矛盾，返回 null 交调用方报错
+function classifyFigureLabelSample(text, legacyMatch) {
+    if (legacyMatch) return legacyMatch[2] === '' ? 'matchedEmptyRest' : 'matchedWithRest';
+    const afterLead = text.trimStart();
+    if (!afterLead.startsWith('图')) return 'prefixMismatch';
+    const afterMark = afterLead.slice(1).trimStart();
+    let digitCount = 0;
+    while (digitCount < afterMark.length && afterMark[digitCount] >= '0' && afterMark[digitCount] <= '9') digitCount += 1;
+    if (digitCount === 0) return 'prefixMismatch';
+    const rest = afterMark.slice(digitCount).trimStart();
+    if (!FIGURE_LABEL_LINE_TERMINATORS.some((terminator) => rest.includes(terminator))) return null;
+    return digitCount >= 2 ? 'longDigitsThenLineTerminator' : 'lineTerminatorAfterSpaces';
+}
+
+describe('figureLabelNumber：图号段判定线性于串长', () => {
+    test('figure-labels 在「图7」与回车之间夹 8 万个半角空格不触发回溯：booksToIr 单次调用在绝对上限内，输出逐字正确，后一幅图仍接续为图 2', async (t) => {
+        // Arrange：在计时区间外新构造 DOM 树与导入上下文。第一幅图的 figure-labels 在极大空白之后含回车，旧式判为不是图号段，
+        // 图号取上一幅加一即 1；第二幅不带任何属性，图号接续为 2——若新实现误从第一幅取出 7，第二幅会变成图 8。
+        // 两幅图都没有 img，导入不读图，importer 只需备好 importImage
+        const element = (name, attrs = {}, children = []) => ({ type: 'element', name, attrs, children });
+        const labels = `图7${' '.repeat(FIGURE_LABEL_STRESS_LENGTH)}a\rb`;
+        const documentRoot = element('cn-application-body', {}, [
+            element('cn-drawings', {}, [element('figure', { 'figure-labels': labels }), element('figure')]),
+        ]);
+        const ctx = { images: { importImage: async () => null }, report: createReport(), paragraphNumbers: false };
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        const result = await booksToIr([{ name: '100002.xml', dir: '.', root: documentRoot }], ctx);
+        const elapsedMs = elapsedMsSince(started);
+        t.diagnostic(`booksToIr 实测 ${elapsedMs.toFixed(1)} ms`);
+
+        // Assert：先验输出正确，以免「快」来自少做了事——第一幅的 figure-labels 经空白归一后是图号段，原样写进缺图占位；
+        // 第二幅没有图号段，占位里是接续的图号
+        const section = { index: 1, header: '说明书附图' };
+        assert.deepStrictEqual(result, {
+            children: [
+                { type: 'heading', depth: 1, children: [{ type: 'text', value: '说明书附图' }], data: { role: 'section-title', section } },
+                { type: 'paragraph', children: [{ type: 'text', value: '［缺图：图7 a b］' }], data: { section } },
+                { type: 'paragraph', children: [{ type: 'text', value: '［缺图：图2］' }], data: { section } },
+            ],
+            inventionTitle: '',
+            summary: { drawings: { figures: 2 } },
+        });
+        assert.ok(
+            elapsedMs < FIGURE_LABEL_STRESS_BUDGET_MS,
+            `booksToIr 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${FIGURE_LABEL_STRESS_BUDGET_MS} ms`,
+        );
+    });
+
+    test('与线性化之前的正则逐字等价：BMP 逐码元扫描、穷举短串与种子固定的随机串，五个分支均有样本', (t) => {
+        // Arrange：BMP 逐码元扫描，每个码元放进三个位置——「图1」之后与余下部分之中（行终止符集合的出入）；「图」的前后
+        // （前缀里 \s 的出入）；「图1」之后紧接换行（跳过极大空白所用字符集的出入：该码元属 \s 则连同换行一并跳过而匹配，
+        // 否则余下部分含换行而不匹配）
+        const samples = [];
+        for (let code = 0; code <= 0xFFFF; code += 1) {
+            const c = String.fromCharCode(code);
+            samples.push(`图1${c}a${c}b`, `${c}图${c}1`, `图1${c}\n`);
+        }
+        assert.equal(samples.length, 196608);
+
+        // 穷举短串：字母表上 0 到 3 个记号的全部组合共 4369 个，各以原样、接在「图1」之后、接在「图12」之后三种形态放入
+        for (const tail of everyStringUpTo(3, FIGURE_LABEL_DIFF_ALPHABET)) samples.push(tail, `图1${tail}`, `图12${tail}`);
+        assert.equal(samples.length, 209715);
+
+        // 种子固定的随机串各 40000 个：一般随机串为字母表上 0 到 10 个记号；结构化随机串贴近真实的图号段，依次为空白 0 到 2 个、
+        // 「图」、空白 0 到 2 个、1 到 4 位数字、空白 0 到 3 个、字母表上 0 到 6 个记号
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomTokens = (alphabet, maxCount) => Array.from({ length: Math.floor(random() * (maxCount + 1)) }, () => pick(alphabet)).join('');
+        const randomSpaces = (maxCount) => randomTokens(FIGURE_LABEL_SPACE_TOKENS, maxCount);
+        const randomDigits = () => Array.from({ length: 1 + Math.floor(random() * 4) }, () => String(Math.floor(random() * 10))).join('');
+        for (let i = 0; i < 40000; i += 1) samples.push(randomTokens(FIGURE_LABEL_DIFF_ALPHABET, 10));
+        for (let i = 0; i < 40000; i += 1) {
+            samples.push(`${randomSpaces(2)}图${randomSpaces(2)}${randomDigits()}${randomSpaces(3)}${randomTokens(FIGURE_LABEL_DIFF_ALPHABET, 6)}`);
+        }
+        assert.equal(samples.length, 289715);
+
+        // Act & Assert：逐个比较第 1 组，旧式不匹配时对应 null
+        const counts = Object.fromEntries(Object.keys(FIGURE_LABEL_BRANCHES).map((branch) => [branch, 0]));
+        for (const text of samples) {
+            const legacyMatch = LEGACY_FIGURE_LABEL_RE.exec(text);
+            const expected = legacyMatch ? legacyMatch[1] : null;
+            const actual = figureLabelNumber(text);
+            // 只在不一致时拼装诊断信息，免得近 29 万次调用都付这笔开销
+            if (actual !== expected) assert.equal(actual, expected, `text=${toCodePoints(text)}`);
+            const branch = classifyFigureLabelSample(text, legacyMatch);
+            if (branch === null) assert.fail(`前缀相符、旧式不匹配，极大空白之后却不含行终止符：text=${toCodePoints(text)}`);
+            counts[branch] += 1;
+        }
+        // 覆盖自证：五个分支都须有样本，差分才不是只对某一类输入空转
+        t.diagnostic(`样本 ${samples.length} 个；`
+            + Object.entries(FIGURE_LABEL_BRANCHES).map(([branch, label]) => `${label} ${counts[branch]} 个`).join('；'));
+        for (const [branch, label] of Object.entries(FIGURE_LABEL_BRANCHES)) assert.ok(counts[branch] > 0, `没有样本落入「${label}」分支`);
     });
 });

@@ -49,7 +49,11 @@ const NUMBER_RE = /^\d{1,6}$/;
 const PARAGRAPH_NUMBER_GAP = '  ';
 // 与 renderers/xml/claims.js 的 CLAIM_START_RE 同一判据
 const CLAIM_START_RE = /^\s*\d+\s*[.、．]/;
-const FIGURE_LABEL_RE = /^\s*图\s*(\d+)\s*(.*)$/;
+// 图号段判定（figureLabelNumber）所用：确定的前缀、单个空白字符、行终止符（LF、CR、U+2028、U+2029，即正则的 . 不匹配的四个字符）。
+// 行终止符按码点构造，源码里不出现看不见的字面量
+const FIGURE_LABEL_HEAD_RE = /^\s*图\s*(\d+)/;
+const SPACE_CHAR_RE = /\s/;
+const LINE_TERMINATOR_RE = new RegExp(`[${[0x0a, 0x0d, 0x2028, 0x2029].map((code) => String.fromCharCode(code)).join('')}]`);
 
 const text = (value) => ({ type: 'text', value });
 const paragraph = (children) => ({ type: 'paragraph', children });
@@ -300,7 +304,7 @@ function attachLooseLabels(entries) {
     entries.forEach((entry, index) => {
         if (entry.kind !== 'note') return;
         const label = plainText(entry.node).replace(/\s+/g, ' ').trim();
-        if (!FIGURE_LABEL_RE.test(label)) return;
+        if (figureLabelNumber(label) === null) return;
         const owner = [index - 1, index + 1].find((at) => entries[at] && entries[at].kind === 'figure' && !labelOf.has(at));
         if (owner === undefined) return;
         labelOf.set(owner, label);
@@ -314,8 +318,8 @@ function attachLooseLabels(entries) {
 function figureNumber(entry, lastNum) {
     const declared = String(entry.node.attrs.num || '').trim();
     if (NUMBER_RE.test(declared) && Number(declared) >= 1) return Number(declared);
-    const fromLabel = FIGURE_LABEL_RE.exec(entry.label || entry.node.attrs['figure-labels'] || '');
-    return fromLabel ? Number(fromLabel[1]) : lastNum + 1;
+    const fromLabel = figureLabelNumber(entry.label || entry.node.attrs['figure-labels'] || '');
+    return fromLabel !== null ? Number(fromLabel) : lastNum + 1;
 }
 
 async function figureBlocks(entry, { num, order, labels }, ctx) {
@@ -338,9 +342,22 @@ async function figureBlocks(entry, { num, order, labels }, ctx) {
 // 没有 figure-labels 时取 cn-drawing-p 里的图号段原文（可带图注，如「图3：局部放大图」），再没有即「图N」
 function figureLabel(entry, num) {
     const attr = String(entry.node.attrs['figure-labels'] || '').replace(/\s+/g, ' ').trim();
-    if (FIGURE_LABEL_RE.test(attr)) return attr;
+    if (figureLabelNumber(attr) !== null) return attr;
     if (attr) return `图${num} ${attr}`;
-    return entry.label && FIGURE_LABEL_RE.test(entry.label) ? entry.label : `图${num}`;
+    return entry.label && figureLabelNumber(entry.label) !== null ? entry.label : `图${num}`;
 }
 
-module.exports = { booksToIr, BOOKS, BOOK_ORDER, SECTION_TITLE_ROLE };
+// 图号段「图N……」的图号：是图号段时返回其数字串，否则为 null，与旧式 /^\s*图\s*(\d+)\s*(.*)$/ 的 exec 第 1 组逐字等价。
+// 旧式随段长平方增长：(\d+) 后的 \s* 与 (.*) 都能取同一段空白，. 跨不过行终止符而 $ 只认串尾，空白之后有行终止符时，引擎对
+// 这段空白的每一种切分都重扫到行终止符；长数字段同理，(\d+) 每让一位数字给 (.*) 就再扫一遍。新式线性于串长：前缀
+// ^\s*图\s*(\d+) 是确定的，取极大数字段即可——少取的数字只会挪进 (.*)，挡不掉其后已有的行终止符；再跳过其后的极大空白
+// （其中的行终止符由 \s* 吃下），余下部分不含行终止符即匹配
+function figureLabelNumber(label) {
+    const head = FIGURE_LABEL_HEAD_RE.exec(label);
+    if (!head) return null;
+    let end = head[0].length;
+    while (end < label.length && SPACE_CHAR_RE.test(label[end])) end += 1;
+    return LINE_TERMINATOR_RE.test(label.slice(end)) ? null : head[1];
+}
+
+module.exports = { booksToIr, BOOKS, BOOK_ORDER, SECTION_TITLE_ROLE, figureLabelNumber };
