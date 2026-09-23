@@ -320,3 +320,154 @@ describe('patent profile：官方五书模板形态的 docx 端到端', () => {
         assert.ok(report.validation.files.every((item) => item.valid), JSON.stringify(report.validation));
     });
 });
+
+// ============================================================
+// normalizeTitle：外层括号修剪线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { normalizeTitle } = require('../converters/renderers/xml/sections');
+
+// 耗时用例的输入规模：a 与 b 之间夹 8 万个全角闭括号，这一长段不处于串尾
+const BRACKET_STRESS_LENGTH = 80000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。200 ms 使两侧余量都不小于 5 倍——
+// 旧式 /^[开括号]+|[闭括号]+$/g 在这一规模上实测约 2.8 至 3.7 秒（2 万、4 万时约 0.16、0.78 秒，耗时随段长
+// 平方增长），是上限的 14 倍以上；逐码元扫描之后单次调用至多约 0.4 毫秒，不到上限的五百分之一
+const BRACKET_STRESS_BUDGET_MS = 200;
+
+const elapsedMsSince = (started) => Number(process.hrtime.bigint() - started) / 1e6;
+
+// 逐码元扫描之前的实现，仅作短输入的差分参照：外层括号一步是「量词 + 行尾锚」的全局正则，在不处于串尾的长闭括号段上
+// 逐位回溯，不可用于耗时用例的输入规模。各步正则与先后顺序照录旧文件，只把中间结果拆成变量，并以替换回调记下外层括号
+// 一步删去的是首部还是尾部，供差分用例自证没有对某一分支空转
+const LEGACY_BRACKET_RE = /^[(（\[［【〖〔《{｛]+|[)）\]］】〗〕》}｝]+$/g;
+const LEGACY_TRAILING_COLON_RE = /[:：]$/;
+const LEGACY_ENUM_PREFIX_RE = /^(?:[一二三四五六七八九十]+|\d+)\s*[、.．]\s*/;
+
+function legacyNormalizeTitle(text, openBrackets, hits) {
+    const compact = String(text || '').replace(/\s+/g, '');
+    let head = false;
+    let tail = false;
+    // 首部分支只匹配开括号、尾部分支只匹配闭括号，两类字符不相交，看匹配段的首字即知命中的是哪一支
+    const stripped = compact.replace(LEGACY_BRACKET_RE, (match) => {
+        if (openBrackets.has(match[0])) head = true;
+        else tail = true;
+        return '';
+    });
+    if (head && tail) hits.both += 1;
+    else if (head) hits.headOnly += 1;
+    else if (tail) hits.tailOnly += 1;
+    return stripped.replace(LEGACY_TRAILING_COLON_RE, '').replace(LEGACY_ENUM_PREFIX_RE, '');
+}
+
+// 旧式两支各自删得掉的字符：按 BMP 全部码元枚举，「c + x」经旧式只剩 x 者为开括号，「x + c」只剩 x 者为闭括号。
+// 由旧式的行为求得而非手抄，差分字母表因此在构造上涵盖全部开括号与闭括号
+function legacyBracketChars() {
+    const open = [];
+    const close = [];
+    for (let code = 0; code <= 0xffff; code += 1) {
+        const unit = fromCode(code);
+        if (`${unit}x`.replace(LEGACY_BRACKET_RE, '') === 'x') open.push(unit);
+        if (`x${unit}`.replace(LEGACY_BRACKET_RE, '') === 'x') close.push(unit);
+    }
+    return { open, close };
+}
+
+// 字母表上由 0 到 maxLength 个记号拼成的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    const all = [''];
+    let level = [''];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((token) => prefix + token));
+        for (const item of level) all.push(item);
+    }
+    return all;
+}
+
+// 种子固定的 32 位伪随机数发生器（mulberry32）：每次运行抽到同一批样本，失败可原样复现
+function createSeededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let mixed = Math.imul(state ^ (state >>> 15), state | 1);
+        mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// 逐码点列出，失败输出里的不可见字符也能看清
+const toCodePoints = (value) => (typeof value !== 'string'
+    ? String(value)
+    : Array.from(value, (unit) => unit.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' '));
+
+describe('normalizeTitle：外层括号修剪线性于串长', () => {
+    test('夹在可见字符之间的 8 万个闭括号不触发回溯：单次调用在绝对上限内，输出逐字正确', (t) => {
+        // Arrange：在计时区间外新构造字符串——V8 对「同一字符串对象 + 同一全局正则」的 replace 结果有缓存
+        const input = `（a${'）'.repeat(BRACKET_STRESS_LENGTH)}b）`;
+        const expected = `a${'）'.repeat(BRACKET_STRESS_LENGTH)}b`;
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        const result = normalizeTitle(input);
+        const elapsedMs = elapsedMsSince(started);
+        t.diagnostic(`normalizeTitle 实测 ${elapsedMs.toFixed(2)} ms`);
+
+        // Assert：先验输出正确，以免「快」来自少做了事——首部开括号与尾部闭括号各删一个，中段闭括号原样保留。
+        // 输出长达 8 万字，不一致时只报长度与首尾，免得断言信息被整串淹没
+        assert.ok(result === expected,
+            `输出不符：长度 ${result.length}（应为 ${expected.length}），首 3 字 ${JSON.stringify(result.slice(0, 3))}，末 3 字 ${JSON.stringify(result.slice(-3))}`);
+        assert.ok(
+            elapsedMs < BRACKET_STRESS_BUDGET_MS,
+            `normalizeTitle 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${BRACKET_STRESS_BUDGET_MS} ms`,
+        );
+    });
+
+    test('与逐码元扫描之前的实现逐字等价：BMP 逐码元、穷举短串与种子固定的随机串，只删首部、只删尾部、两端都删均有样本', (t) => {
+        // Arrange：开、闭括号由旧式的行为求得；字母表另含可见字符、会被先行删去的空白、冒号、序号用字与分隔符，共 31 个记号
+        const { open, close } = legacyBracketChars();
+        assert.ok(open.length > 0 && close.length > 0 && open.every((unit) => !close.includes(unit)), '开、闭括号须各自非空且互不相交');
+        const alphabet = [...open, ...close, 'a', '文', ' ', IDEOGRAPHIC_SPACE, '\n', ':', '：', '一', '、', '1', '.'];
+
+        // 非字符串入参 4 个：经 String(text || '') 归一
+        const samples = [undefined, null, 0, 42];
+        // BMP 逐码元 65536 个：每个码元同时放在串首与串尾，新式的括号字符集比旧式多一个或少一个字符都会暴露
+        for (let code = 0; code <= 0xffff; code += 1) samples.push(`${fromCode(code)}a${fromCode(code)}`);
+        // 穷举 30784 个：字母表上由 0 到 3 个记号拼成的全部字符串
+        const exhaustive = everyStringUpTo(3, alphabet);
+        assert.equal(exhaustive.length, 30784);
+        samples.push(...exhaustive);
+
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomTokens = (tokens, count) => Array.from({ length: count }, () => pick(tokens)).join('');
+        // 一般随机串 40000 个：字母表上 0 到 24 个记号
+        for (let i = 0; i < 40000; i += 1) samples.push(randomTokens(alphabet, Math.floor(random() * 25)));
+        // 结构化随机串 40000 个：开括号段 + 可选序号 + 中段 + 闭括号段 + 可选冒号，贴近「（一、技术领域）：」一类标题。
+        // 首尾两段以本类括号为主，夹杂空白与另一类括号
+        const edgeRun = (primary, other) => randomTokens(
+            [...primary, ...primary, ...primary, ...other, ' ', IDEOGRAPHIC_SPACE], Math.floor(random() * 5),
+        );
+        const enumPrefixes = ['', '', '一、', '十二、', '1.', '12．', '3 、'];
+        const colons = ['', '', ':', '：'];
+        for (let i = 0; i < 40000; i += 1) {
+            samples.push(edgeRun(open, close) + pick(enumPrefixes) + randomTokens(alphabet, Math.floor(random() * 6))
+                + edgeRun(close, open) + pick(colons));
+        }
+        assert.equal(samples.length, 176324);
+
+        // Act & Assert
+        const openBrackets = new Set(open);
+        const hits = { headOnly: 0, tailOnly: 0, both: 0 };
+        for (const sample of samples) {
+            const expected = legacyNormalizeTitle(sample, openBrackets, hits);
+            const actual = normalizeTitle(sample);
+            // 只在不一致时拼装诊断信息，免得十余万次调用都付这笔开销
+            if (actual !== expected) assert.equal(actual, expected, `输入 [${toCodePoints(sample)}]`);
+        }
+        // 覆盖自证：外层括号一步只删首部、只删尾部、两端都删三种情形都须有样本，差分才不是对某一分支空转
+        t.diagnostic(`样本 ${samples.length} 个；外层括号一步删去字符的样本数：只删首部 ${hits.headOnly}，`
+            + `只删尾部 ${hits.tailOnly}，两端都删 ${hits.both}`);
+        assert.ok(hits.headOnly > 0, '没有只删首部的样本');
+        assert.ok(hits.tailOnly > 0, '没有只删尾部的样本');
+        assert.ok(hits.both > 0, '没有两端都删的样本');
+    });
+});
