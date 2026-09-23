@@ -145,9 +145,16 @@ function trimRuns(runs) {
         if (list[i].kind === 'text') { list[i] = textRun(list[i].text.trimEnd(), list[i].marks); break; }
     }
     list = list.filter((run) => !(run.kind === 'text' && run.text === ''));
-    while (list.length && list[0].kind === 'br') list = list.slice(1);
-    while (list.length && list[list.length - 1].kind === 'br') list = list.slice(0, -1);
-    return list;
+    // 首尾的软换行：先求首个非软换行片段的下标 start（没有则为长度），再自尾向前求末个非软换行片段的下标加一 end
+    // （下限为 start），只切片一次。逐个 slice 的旧写法每删一个就复制整个数组，首尾各 N 个软换行时复制量随 N 平方增长；
+    // 下标法每个片段至多看一次，线性于片段数。二者删去的是同一段：旧写法第一个循环删去极大软换行前缀、第二个循环删去
+    // 余下部分的极大软换行后缀，下标法求出的边界相同；全为软换行时旧写法第一个循环删光、第二个循环不执行，下标法
+    // start 等于长度、end 取下限 start，结果同为空数组。两式都返回新数组，不改动入参
+    let start = 0;
+    while (start < list.length && list[start].kind === 'br') start += 1;
+    let end = list.length;
+    while (end > start && list[end - 1].kind === 'br') end -= 1;
+    return list.slice(start, end);
 }
 
 /**

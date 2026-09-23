@@ -5,7 +5,9 @@
  *       p 与 claim-text 两种语境下的输出形态一致；
  *       trimRuns 尾部空白修剪在 8 万个全角空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）；
  *       flattenInline 的软换行合并（joinSoftBreaks）在 8 万个不以换行结尾的 ASCII 空格长段上的耗时上限，
- *       与改为自换行起匹配之前的实现逐字等价（差分，BMP 逐码元与随机串，各分支设命中计数）
+ *       与改为自换行起匹配之前的实现逐字等价（差分，BMP 逐码元与随机串，各分支设命中计数）；
+ *       trimRuns 删除首尾软换行在首尾各 4 万个软换行上的耗时上限，与改为下标定界之前的实现逐项等价
+ *       （差分，结构穷举与随机片段列表，各分支设命中计数，并验返回新数组、不改动入参）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -357,4 +359,166 @@ test('与改为自换行起匹配之前的软换行合并逐字等价：BMP 逐�
     t.diagnostic(`样本 ${samples.length} 个；各分支命中样本数：`
         + Object.entries(SOFT_BREAK_BRANCHES).map(([key, label]) => `${label} ${hits[key]}`).join('；'));
     for (const [key, label] of Object.entries(SOFT_BREAK_BRANCHES)) assert.ok(hits[key] > 0, `分支「${label}」没有样本命中`);
+});
+
+// ============================================================
+// trimRuns：首尾软换行的删除线性于片段数（耗时上限与逐项等价）
+// ============================================================
+
+// 耗时用例的输入规模：首尾各 4 万个软换行。可达性（经 parseDocument + renderDocument 渲染五书 XML 实测）：md 输入里
+// 段首连续的反斜杠硬换行、段首或段尾连续的 <br>、标题开头连续的 <br>、围栏代码块首尾的空行都会把连续的软换行原样
+// 送到 trimRuns 的首尾，段号之后连续的 <br> 则经 stripPrefix 送到；docx 段首段尾连续的 <w:br/> 在 turndown 输出的
+// Markdown 里成了空行，到不了这里
+const EDGE_BREAK_STRESS_COUNT = 40000;
+// 耗时上限取绝对值，理由同上。100 ms 使两侧余量都不小于 5 倍——逐个 slice 的旧写法每删一个就复制整个数组，在这一
+// 输入上实测约 1.1 至 1.3 秒，为上限的 10 倍以上（耗时随垃圾回收起伏：首尾各 1 万、2 万、4 万、8 万个软换行夹一个
+// 文本片段时，直接调用依次约 0.04、0.53、2.3、5.9 秒）；改为下标定界、只切片一次之后单次调用至多约 5 毫秒，
+// 不到上限的二十分之一
+const EDGE_BREAK_STRESS_BUDGET_MS = 100;
+
+test('首尾各 4 万个软换行（其间夹空文本与空白文本）的删除不随数量平方增长：单次调用在绝对上限内，输出逐项正确', (t) => {
+    // Arrange：在计时区间外新构造片段列表。首个与末个文本片段只有空白，修剪后为空、被 filter 去掉；首部与尾部的软换行
+    // 各被一个空文本片段隔成两截，filter 之后才连成一段；「甲」与「乙」之间的软换行在中段，须原样保留
+    const half = EDGE_BREAK_STRESS_COUNT / 2;
+    const breaks = (count) => Array.from({ length: count }, () => ({ kind: 'br' }));
+    const middleBreak = { kind: 'br' };
+    const runs = [
+        textRun(' \t', []), ...breaks(half), textRun('', ['i']), ...breaks(half),
+        textRun('甲', ['b']), middleBreak, textRun('乙', []),
+        ...breaks(half), textRun('', []), ...breaks(half), textRun(` ${IDEOGRAPHIC_SPACE}`, ['u']),
+    ];
+    const expected = [textRun('甲', ['b']), middleBreak, textRun('乙', [])];
+
+    // Act：计时区间只包这一次调用
+    const started = process.hrtime.bigint();
+    const result = trimRuns(runs);
+    const elapsedMs = elapsedMsSince(started);
+    t.diagnostic(`trimRuns 实测 ${elapsedMs.toFixed(2)} ms`);
+
+    // Assert：先验输出正确，以免「快」来自少做了事；不一致时只报片段数与前 4 个片段，免得失败信息列出 8 万个软换行
+    assert.ok(sameRuns(result, expected), `输出不符：共 ${result.length} 个片段，前 4 个为 ${describeRuns(result.slice(0, 4))}`);
+    assert.ok(
+        elapsedMs < EDGE_BREAK_STRESS_BUDGET_MS,
+        `trimRuns 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${EDGE_BREAK_STRESS_BUDGET_MS} ms`,
+    );
+});
+
+// 改为下标定界之前的实现（尾部修剪已是 trimEnd），仅作短输入的差分参照：首尾软换行逐个 slice，每删一个就复制整个数组，
+// 不可用于耗时用例的输入规模。函数体照录本项修改前的文件，只在两处删除软换行的循环里计数，并留下 filter 前后的列表，
+// 供差分用例按分支统计命中
+function legacyBreakSliceTrimRuns(runs, seen) {
+    let list = runs.map((run) => (run.kind === 'text' ? textRun(run.text, run.marks) : run));
+    const first = list.findIndex((run) => run.kind === 'text');
+    if (first >= 0) list[first] = textRun(list[first].text.replace(/^\s+/, ''), list[first].marks);
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+        if (list[i].kind === 'text') { list[i] = textRun(list[i].text.trimEnd(), list[i].marks); break; }
+    }
+    const trimmed = list;
+    list = list.filter((run) => !(run.kind === 'text' && run.text === ''));
+    const filtered = list;
+    let removedHead = 0;
+    let removedTail = 0;
+    while (list.length && list[0].kind === 'br') { list = list.slice(1); removedHead += 1; }
+    while (list.length && list[list.length - 1].kind === 'br') { list = list.slice(0, -1); removedTail += 1; }
+    recordEdgeBreakBranches(seen, { runs, trimmed, filtered, removedHead, removedTail, result: list });
+    return list;
+}
+
+// 差分用例须有样本命中的分支（键 → 失败信息与诊断输出里的说明）
+const EDGE_BREAK_BRANCHES = Object.freeze({
+    headRemoved: '删去首部软换行',
+    tailRemoved: '删去尾部软换行',
+    allBreaksEmptied: 'filter 后只剩软换行而结果为空',
+    allBreaksAfterTextRemoved: '其中原有的文本片段经修剪或 filter 全部去掉',
+    headJoinedByFilter: '首部软换行之前或之间的空文本片段被 filter 去掉后才连成首部段',
+    tailJoinedByFilter: '尾部软换行之后或之间的空文本片段被 filter 去掉后才连成尾部段',
+    noEdgeBreak: '首尾都不是软换行而不删',
+    middleBreakKept: '中段软换行保留',
+    headBlockedByNonText: '首个片段是图片、公式或已构造节点而挡住其后的软换行',
+    tailBlockedByNonText: '末个片段是图片、公式或已构造节点而挡住其前的软换行',
+});
+
+const isOpaqueRun = (run) => Boolean(run) && run.kind !== 'text' && run.kind !== 'br';
+// 列表首部、尾部连续软换行的个数
+const leadingBreakCount = (list) => {
+    let count = 0;
+    while (count < list.length && list[count].kind === 'br') count += 1;
+    return count;
+};
+const trailingBreakCount = (list) => {
+    let count = 0;
+    while (count < list.length && list[list.length - 1 - count].kind === 'br') count += 1;
+    return count;
+};
+
+// 记下一次修剪命中的分支。trimmed 为首尾修剪之后、filter 之前的列表，filtered 为 filter 之后的列表：删去的首部软换行
+// 比 trimmed 首部连续的软换行多，说明其前或其间原有空文本片段、被 filter 去掉后才连成一段，尾部同理
+function recordEdgeBreakBranches(seen, { runs, trimmed, filtered, removedHead, removedTail, result }) {
+    if (removedHead > 0) seen.add('headRemoved');
+    if (removedTail > 0) seen.add('tailRemoved');
+    if (filtered.length > 0 && result.length === 0) {
+        seen.add('allBreaksEmptied');
+        if (runs.some((run) => run.kind === 'text')) seen.add('allBreaksAfterTextRemoved');
+    }
+    if (removedHead > leadingBreakCount(trimmed)) seen.add('headJoinedByFilter');
+    if (removedTail > trailingBreakCount(trimmed)) seen.add('tailJoinedByFilter');
+    if (filtered.length > 0 && removedHead === 0 && removedTail === 0) seen.add('noEdgeBreak');
+    if (result.some((run) => run.kind === 'br')) seen.add('middleBreakKept');
+    if (result.length > 1 && isOpaqueRun(result[0]) && result[1].kind === 'br') seen.add('headBlockedByNonText');
+    if (result.length > 1 && isOpaqueRun(result[result.length - 1]) && result[result.length - 2].kind === 'br') seen.add('tailBlockedByNonText');
+}
+
+test('与改为下标定界之前的实现逐项等价：结构穷举与种子固定的随机片段列表，各分支均有样本命中，返回新数组且不改动入参', (t) => {
+    // Arrange：结构穷举——软换行、空文本、空白文本、可见文本、图片五种片段，长度 0 到 6 的全部排列共 19531 个；
+    // 每个位置都新建对象，非文本片段按对象同一性比对才有意义
+    const makers = [
+        () => ({ kind: 'br' }), () => textRun('', []), () => textRun(' ', ['b']), () => textRun('a', []), () => ({ kind: 'image', node: {} }),
+    ];
+    const samples = [];
+    for (let length = 0; length <= 6; length += 1) {
+        for (let code = 0; code < makers.length ** length; code += 1) {
+            const runs = [];
+            for (let i = 0, rest = code; i < length; i += 1, rest = Math.floor(rest / makers.length)) runs.push(makers[rest % makers.length]());
+            samples.push(runs);
+        }
+    }
+    // 随机片段列表 100000 个：0 到 10 个片段，软换行约占四成；文本片段约占四成半（0 到 2 个字符，取自各种空白与
+    // 可见字符，空文本约占三分之一），其余为图片、公式与已构造节点
+    const random = createSeededRandom(20260923);
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const chars = [' ', '\t', '\n', IDEOGRAPHIC_SPACE, NO_BREAK_SPACE, 'a', '文'];
+    const marks = ['b', 'i', 'u', 'sup', 'sub'];
+    const randomRun = () => {
+        const roll = random();
+        if (roll < 0.4) return { kind: 'br' };
+        if (roll < 0.85) {
+            return textRun(Array.from({ length: Math.floor(random() * 3) }, () => pick(chars)).join(''), marks.filter(() => random() < 0.3));
+        }
+        return { kind: pick(['image', 'math', 'element']), node: {} };
+    };
+    for (let i = 0; i < 100000; i += 1) samples.push(Array.from({ length: Math.floor(random() * 11) }, randomRun));
+    assert.equal(samples.length, 119531);
+
+    // Act & Assert
+    const hits = Object.fromEntries(Object.keys(EDGE_BREAK_BRANCHES).map((key) => [key, 0]));
+    for (const runs of samples) {
+        const before = runs.slice();
+        const beforeTexts = runs.map((run) => run.text);
+        const seen = new Set();
+        const expected = legacyBreakSliceTrimRuns(runs, seen);
+        const actual = trimRuns(runs);
+        // 只在不一致时拼装诊断信息，免得十余万次调用都付这笔开销
+        if (!sameRuns(actual, expected)) {
+            assert.fail(`输入 ${describeRuns(runs)}；实际 ${describeRuns(actual)}；应为 ${describeRuns(expected)}`);
+        }
+        // 返回新数组；入参数组的长度、各位置上的对象与文本片段的文字都不变
+        if (actual === runs || runs.length !== before.length || runs.some((run, i) => run !== before[i] || run.text !== beforeTexts[i])) {
+            assert.fail(`返回了入参本身或改动了入参：${describeRuns(before)}`);
+        }
+        for (const key of seen) hits[key] += 1;
+    }
+    // 覆盖自证：各分支都须有样本命中，差分才不是空转
+    t.diagnostic(`样本 ${samples.length} 个；各分支命中样本数：`
+        + Object.entries(EDGE_BREAK_BRANCHES).map(([key, label]) => `${label} ${hits[key]}`).join('；'));
+    for (const [key, label] of Object.entries(EDGE_BREAK_BRANCHES)) assert.ok(hits[key] > 0, `分支「${label}」没有样本命中`);
 });
