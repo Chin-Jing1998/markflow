@@ -321,3 +321,215 @@ test('规范化：空白段紧邻四种行终止符之前或位于串尾时删�
         assert.equal(normalizeMarkdown(input), expected, name);
     }
 });
+
+// ============================================================
+// 空元素清理的耗时与语义等价：removeEmptyElements 须线性于节点数
+// ============================================================
+
+const cheerio = require('cheerio');
+const { removeEmptyElements, isAttached } = require('../converters/web/noise');
+
+// 耗时用例的载荷规模：载荷 A、B 为同一父元素下 10 万个并列子元素，拆包载荷 C 为 3 万组 <br><i></i>（6 万个子元素）。
+// 改写之前三条路径各有一处平方级：A 的 $el.find(内容后代选择器) 把 span 的全部子元素交给 css-select 的
+// prepareContext，其中 removeSubsets 对这组根逐个做 lastIndexOf / includes；B 的 $el.remove() 逐个在父节点
+// children 上做 lastIndexOf + splice；C 先两次 .find()，再由 $el.replaceWith($el.contents()) 对每个子节点做
+// removeElement。本机实测（每次新构造输入并重新载入，各 3 次，取值区间）：A 1 万 91–97 ms、2 万 374–377 ms、
+// 4 万 1394–1400 ms、8 万 5696–5792 ms、10 万 9030–9133 ms；B 1 万 132–136 ms、2 万 442–475 ms、4 万 1392–1442 ms、
+// 8 万 4980–5034 ms、10 万 7871–8359 ms；C 1 万组 895–1274 ms、2 万组 3692–5473 ms、3 万组 8886–11317 ms、
+// 4 万组 17523–17999 ms（每翻倍约 4 倍）
+const EMPTY_STRESS_CHILDREN = 100000;
+const EMPTY_STRESS_BREAK_PAIRS = 30000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。
+// 1000 ms 使两侧余量都不小于 5 倍——改写之前三种载荷最快的一次（A 9030 ms、B 7871 ms、C 8886 ms）分别是它的
+// 9.0、7.8、8.8 倍；改写之后同一载荷各实测 9 次，最慢一次为 A 98 ms、B 133 ms、C 51 ms，余量分别为 10.2、7.5、
+// 19.6 倍，故慢机以及 node --test 多文件并行抢占 CPU 时都不会误报。直接调用 removeEmptyElements、计时区间只包
+// 这一次调用：cheerio.load 与 cleanNoise 的其余三步不计入，两侧余量只反映本函数
+const EMPTY_STRESS_BUDGET_MS = 1000;
+
+// 载入片段并只对 removeEmptyElements 一次调用计时；每个用例各自新构造输入、重新载入
+function timedRemoveEmptyElements(html) {
+    const $ = cheerio.load(html, null, false);
+    const started = process.hrtime.bigint();
+    removeEmptyElements($);
+    return [$, elapsedMsSince(started)];
+}
+
+test('空元素清理：span 下 10 万个只含不换行空格的并列子元素不触发平方级扫描，耗时在绝对上限内且结构原样保留', () => {
+    // Arrange：span 的文本只有不换行空格，按规则保留；改写之前判定它有无内容后代的一次 .find() 即平方级
+    const html = `<p>甲x<span>${'<i>&nbsp;</i>'.repeat(EMPTY_STRESS_CHILDREN)}</span>y乙</p>`;
+
+    // Act
+    const [$, elapsedMs] = timedRemoveEmptyElements(html);
+
+    // Assert：先验结果正确，以免「快」来自少做了事——span 连同全部子元素与两端文字原样保留
+    const span = $('span');
+    assert.equal(span.length, 1, 'span 应保留');
+    assert.equal(span[0].children.length, EMPTY_STRESS_CHILDREN, 'span 的子元素应一个不少');
+    const text = $('p').text();
+    assert.ok(text.startsWith('甲x') && text.endsWith('y乙'), '载荷两端的可见文字应保留');
+    assert.ok($.html() === html, '整段 HTML 应逐字不变');
+    assert.ok(elapsedMs < EMPTY_STRESS_BUDGET_MS, `清理实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${EMPTY_STRESS_BUDGET_MS} ms`);
+});
+
+test('空元素清理：同一段落下 10 万个只含空格的 span 逐个删除不触发平方级拼接，耗时在绝对上限内且两端文字相连', () => {
+    // Arrange：每个 span 只含 ASCII 空格且不含 br，按规则删除；改写之前逐个 .remove() 即平方级
+    const html = `<p>甲${'<span> </span>'.repeat(EMPTY_STRESS_CHILDREN)}乙</p>`;
+
+    // Act
+    const [$, elapsedMs] = timedRemoveEmptyElements(html);
+
+    // Assert：先验结果正确——span 全部删除，段落里只剩两端文字
+    assert.equal($('span').length, 0, 'span 应全部删除');
+    assert.equal($.html(), '<p>甲乙</p>');
+    assert.ok(elapsedMs < EMPTY_STRESS_BUDGET_MS, `清理实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${EMPTY_STRESS_BUDGET_MS} ms`);
+});
+
+test('空元素清理：只含换行的 span 下 3 万组 br 与空 i 拆包不触发平方级扫描，耗时在绝对上限内且子元素按原序留在段落下', () => {
+    // Arrange：span 没有文本、含 br，按规则拆包；空 i 不在空元素白名单内，随之留在段落下
+    const pairs = '<br><i></i>'.repeat(EMPTY_STRESS_BREAK_PAIRS);
+    const html = `<p>甲<span>${pairs}</span>乙</p>`;
+
+    // Act
+    const [$, elapsedMs] = timedRemoveEmptyElements(html);
+
+    // Assert：先验结果正确——span 拆包，br 与 i 数量不变、按原序夹在两端文字之间
+    assert.equal($('span').length, 0, 'span 应拆包');
+    assert.equal($('p')[0].children.length, EMPTY_STRESS_BREAK_PAIRS * 2 + 2, '段落下应为两端文字加全部 br 与 i');
+    assert.equal($('br').length, EMPTY_STRESS_BREAK_PAIRS, 'br 应一个不少');
+    assert.equal($('i').length, EMPTY_STRESS_BREAK_PAIRS, 'i 应一个不少');
+    assert.ok($.html() === `<p>甲${pairs}乙</p>`, 'br 与 i 应按原序留在段落下');
+    assert.ok(elapsedMs < EMPTY_STRESS_BUDGET_MS, `清理实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${EMPTY_STRESS_BUDGET_MS} ms`);
+});
+
+// 改写之前的 removeEmptyElements 及其常量，仅作短输入的差分参照：其中 .find()、.remove()、.replaceWith() 在同一
+// 父元素下大量子节点时平方级，不可用于耗时用例的输入规模
+const LEGACY_EMPTY_TAGS = 'p, div, section, span, li, blockquote, h1, h2, h3, h4, h5, h6, article, header, figure, a';
+const LEGACY_CONTENT_DESCENDANTS = 'img, video, audio, iframe, table, embed, object, svg, canvas, picture, source';
+const LEGACY_EMPTY_SWEEP_ROUNDS = 3;
+const LEGACY_INLINE_WRAPPERS = new Set(['span', 'a']);
+const LEGACY_ASCII_SPACE_ONLY_RE = /^[ \t\r\n\f]*$/;
+
+function legacyRemoveEmptyElements($) {
+    for (let round = 0; round < LEGACY_EMPTY_SWEEP_ROUNDS; round += 1) {
+        let changed = 0;
+        $(LEGACY_EMPTY_TAGS).each((_, el) => {
+            if (!isAttached(el)) return;
+            const $el = $(el);
+            if ($el.text().trim()) return;
+            if ($el.find(LEGACY_CONTENT_DESCENDANTS).length > 0) return;
+            if (LEGACY_INLINE_WRAPPERS.has(el.tagName)) {
+                if (!LEGACY_ASCII_SPACE_ONLY_RE.test($el.text())) return;
+                if ($el.find('br').length > 0) {
+                    $el.replaceWith($el.contents());
+                    changed += 1;
+                    return;
+                }
+            }
+            $el.remove();
+            changed += 1;
+        });
+        if (changed === 0) return;
+    }
+}
+
+// 定种子的 mulberry32 伪随机数：同一种子每次生成同一批树，用例失败可原样复现（与 url-parser 测试同一写法）
+function seededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6D2B79F5) >>> 0;
+        let t = Math.imul(state ^ (state >>> 15), 1 | state);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+const EMPTY_DIFF_SEED = 20260923;
+const EMPTY_DIFF_TREE_COUNT = 10000;
+const EMPTY_DIFF_MAX_DEPTH = 4;
+const EMPTY_DIFF_MAX_CHILDREN = 4;
+// 字母表：空元素白名单的全部标签、内容后代的全部标签，以及 br、i、em、template、svg、math、script、style；
+// span、a 另各重复四次，以提高行内包装元素的出现率
+const EMPTY_DIFF_TAGS = Object.freeze([
+    'p', 'div', 'section', 'span', 'li', 'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'article', 'header', 'figure', 'a',
+    'img', 'video', 'audio', 'iframe', 'table', 'embed', 'object', 'svg', 'canvas', 'picture', 'source',
+    'br', 'i', 'em', 'template', 'math', 'script', 'style',
+    'span', 'a', 'span', 'a', 'span', 'a', 'span', 'a',
+]);
+// 文本：空串、ASCII 空白（空格、制表符、换行）、不换行空格、全角空格、可见字
+const IDEOGRAPHIC_SPACE = String.fromCharCode(0x3000);
+const EMPTY_DIFF_TEXTS = Object.freeze(['', ' ', '\t', '\n', NBSP, IDEOGRAPHIC_SPACE, '甲']);
+// 空白倾向的子树：行内包装元素的子树有七成改从这里取，只含 ASCII 空白文本与 br、行内元素、template、img，
+// 用于造出「只包着换行」的拆包情形及其边界（夹着 img 则整体保留，br 藏在 template 里则视父节点而定）
+const EMPTY_DIFF_BLANK_TAGS = Object.freeze(['br', 'br', 'br', 'i', 'em', 'span', 'a', 'template', 'img']);
+const EMPTY_DIFF_BLANK_TEXTS = Object.freeze(['', ' ', '\t', '\n']);
+const EMPTY_DIFF_BLANK_CHANCE = 0.7;
+const EMPTY_DIFF_VOID_TAGS = new Set(['img', 'br', 'embed', 'source']);
+// 原始文本元素只生成文本内容：其内的标签字符不经 HTML 解析
+const EMPTY_DIFF_RAW_TEXT_TAGS = new Set(['script', 'style', 'iframe']);
+
+// 随机森林：顶层 1 到 3 个节点，其下每个元素 0 到 EMPTY_DIFF_MAX_CHILDREN 个子节点、深度至多 EMPTY_DIFF_MAX_DEPTH，
+// 文本与元素混排；blank 为真时只生成空白倾向的子树
+function randomEmptyForest(random, depth = EMPTY_DIFF_MAX_DEPTH, blank = false) {
+    const pickFrom = (list) => list[Math.floor(random() * list.length)];
+    const count = depth === EMPTY_DIFF_MAX_DEPTH
+        ? 1 + Math.floor(random() * 3)
+        : Math.floor(random() * (EMPTY_DIFF_MAX_CHILDREN + 1));
+    let html = '';
+    for (let index = 0; index < count; index += 1) {
+        if (depth <= 0 || random() < 0.3) {
+            html += pickFrom(blank ? EMPTY_DIFF_BLANK_TEXTS : EMPTY_DIFF_TEXTS);
+            continue;
+        }
+        const tag = pickFrom(blank ? EMPTY_DIFF_BLANK_TAGS : EMPTY_DIFF_TAGS);
+        if (EMPTY_DIFF_VOID_TAGS.has(tag)) {
+            html += `<${tag}>`;
+        } else if (EMPTY_DIFF_RAW_TEXT_TAGS.has(tag)) {
+            html += `<${tag}>${pickFrom(EMPTY_DIFF_TEXTS)}</${tag}>`;
+        } else {
+            const blankInside = blank || (LEGACY_INLINE_WRAPPERS.has(tag) && random() < EMPTY_DIFF_BLANK_CHANCE);
+            html += `<${tag}>${randomEmptyForest(random, depth - 1, blankInside)}</${tag}>`;
+        }
+    }
+    return html;
+}
+
+// 在这一份载入的 cheerio 实例上计数 remove 与 replaceWith 的调用：$.fn 为每次载入各自的原型，不影响其他载入
+function countMutations($) {
+    const counts = { remove: 0, replaceWith: 0 };
+    const { remove, replaceWith } = $.fn;
+    $.fn.remove = function countedRemove(...args) {
+        counts.remove += 1;
+        return remove.apply(this, args);
+    };
+    $.fn.replaceWith = function countedReplaceWith(...args) {
+        counts.replaceWith += 1;
+        return replaceWith.apply(this, args);
+    };
+    return counts;
+}
+
+test('空元素清理与改写之前的实现逐字等价：定种子随机森林上 $.html() 逐字相同', () => {
+    // Arrange
+    const random = seededRandom(EMPTY_DIFF_SEED);
+    const stats = { removedTrees: 0, unwrappedTrees: 0 };
+
+    for (let index = 0; index < EMPTY_DIFF_TREE_COUNT; index += 1) {
+        const html = randomEmptyForest(random);
+        const $legacy = cheerio.load(html, null, false);
+        const $current = cheerio.load(html, null, false);
+        const counts = countMutations($legacy);
+
+        // Act
+        legacyRemoveEmptyElements($legacy);
+        removeEmptyElements($current);
+
+        // Assert
+        assert.equal($current.html(), $legacy.html(), `第 ${index} 棵树：${html}`);
+        if (counts.remove > 0) stats.removedTrees += 1;
+        if (counts.replaceWith > 0) stats.unwrappedTrees += 1;
+    }
+
+    // Assert：核对面确实铺开了——过半的树发生了删除，发生拆包的树超过十分之一
+    assert.ok(stats.removedTrees > EMPTY_DIFF_TREE_COUNT / 2, `发生删除的树应过半：${JSON.stringify(stats)}`);
+    assert.ok(stats.unwrappedTrees > EMPTY_DIFF_TREE_COUNT / 10, `发生拆包的树应超过十分之一：${JSON.stringify(stats)}`);
+});
