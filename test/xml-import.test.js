@@ -12,6 +12,8 @@
  *   图号段判定——figureLabelNumber 在 figure-labels 里 8 万个空格长段上的耗时上限（经 booksToIr），与线性化之前的实现逐字等价（差分）；
  *   换行归一的耗时——joinLineBreaks 在不以换行结尾的 8 万个空格（或空格与制表符交替）长段上的耗时上限，与自换行起匹配
  *     之前的实现逐字等价（差分）；
+ *   首尾空白节点剥离——trimInline 在段首、段尾各 6 万个空白节点（换行与空白文本交替）上的耗时上限，与一次切片之前的
+ *     实现逐项等价、不改动入参（差分）；
  *   问题清单——全部带「导入：」前缀，人工参照夹具的丢失项清单不多不少。
  * 夹具一律程序化合成（test/fixtures/patent/roundtrip/build-roundtrip-fixtures.js），正文为虚构示例。
  */
@@ -1088,5 +1090,165 @@ describe('joinLineBreaks：换行归一线性于串长', () => {
         // 覆盖自证：各可达分支须有样本命中，差分才不是只对「无事可做」的输入空转
         t.diagnostic(`样本 ${samples.length} 个；各分支命中样本数 ${Object.entries(hits).map(([key, count]) => `${key}=${count}`).join('，')}`);
         for (const [key, label] of Object.entries(LINE_BREAK_HIT_LABELS)) assert.ok(hits[key] > 0, `没有样本命中：${label}`);
+    });
+});
+
+// ============================================================
+// trimInline：首尾空白节点的剥离线性于节点数（耗时上限与逐项等价）
+// ============================================================
+
+// 耗时用例的输入规模：段首、段尾各 6 万个空白节点（换行与只含 [ \t\r\n] 的文本交替），中间夹 3 个须保留的节点。
+// 每侧 4 万个时旧写法在新起进程中只要约 1.0 至 1.1 秒、离上限的 5 倍太近，故取 6 万
+const BLANK_EDGE_STRESS_COUNT = 60000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。200 ms 使两侧余量都不小于 5 倍——
+// 逐个 slice 的旧写法在这一规模上实测约 2.2 至 3.2 秒（复制量随空白节点数平方增长；新起进程中最快），是上限的 10 倍以上；
+// 改为一次切片之后单次调用实测至多约 2.2 毫秒（新起进程；本文件内约 1.6 至 1.8 毫秒），约为上限的百分之一
+const BLANK_EDGE_STRESS_BUDGET_MS = 200;
+
+// 一次切片之前的实现（本项修改前的 trimInline），仅作短输入的差分参照：首尾每剥去一个空白节点就复制一次整个数组，不可用于
+// 耗时用例的输入规模。trimInline 与 trimEdgeSpaceEnd 照录旧文件；其所用的 textNode、EDGE_SPACE_START_RE 与 isBlankEdge 同上文
+// 的 legacyTextNode、LEGACY_EDGE_SPACE_START_RE、legacyIsBlankEdge 逐字相同，直接复用。只在两处循环与首末修剪处记下本样本命中的分支
+const LEGACY_EDGE_SPACE_CHAR_RE = /[ \t\r\n]/;
+
+function legacyTrimEdgeSpaceEnd(text) {
+    let end = text.length;
+    while (end > 0 && LEGACY_EDGE_SPACE_CHAR_RE.test(text[end - 1])) end -= 1;
+    return text.slice(0, end);
+}
+
+function legacyTrimInlineBySlices(nodes, branches) {
+    let list = [...nodes];
+    while (list.length > 0 && legacyIsBlankEdge(list[0])) {
+        branches.add(list[0].type === 'break' ? 'leadingBreak' : 'leadingBlankText');
+        list = list.slice(1);
+    }
+    while (list.length > 0 && legacyIsBlankEdge(list[list.length - 1])) {
+        branches.add(list[list.length - 1].type === 'break' ? 'trailingBreak' : 'trailingBlankText');
+        list = list.slice(0, -1);
+    }
+    noteStripOutcome(branches, nodes, list);
+    if (list.length === 0) return list;
+    const first = list[0];
+    if (first.type === 'text') {
+        list[0] = legacyTextNode(first.value.replace(LEGACY_EDGE_SPACE_START_RE, ''));
+        if (list[0].value !== first.value) branches.add('firstTextTrimmed');
+    }
+    const last = list[list.length - 1];
+    if (last.type === 'text') {
+        list[list.length - 1] = legacyTextNode(legacyTrimEdgeSpaceEnd(last.value));
+        if (list[list.length - 1].value !== last.value) branches.add('lastTextTrimmed');
+    }
+    return list;
+}
+
+// 剥去首尾空白节点之后、修剪首末文本之前，按保留下来的节点记下分支：nodes 为入参，list 为保留的节点
+function noteStripOutcome(branches, nodes, list) {
+    if (list.length === 0) {
+        if (nodes.length > 0) branches.add('allBlank');
+        return;
+    }
+    if (list.length === nodes.length) branches.add('nothingToStrip');
+    const first = list[0];
+    const last = list[list.length - 1];
+    if (isNbspOnlyText(first)) branches.add('nbspStopsLeading');
+    if (isNbspOnlyText(last)) branches.add('nbspStopsTrailing');
+    if (first.type !== 'text' && first.type !== 'break') branches.add('otherStopsLeading');
+    if (last.type !== 'text' && last.type !== 'break') branches.add('otherStopsTrailing');
+    if (list.length === 1 && first.type === 'text') branches.add('singleText');
+}
+
+// 只由 [ \t\r\n] 与 U+00A0 组成、且至少含一个 U+00A0 的文本：不是空白节点，若把 U+00A0 也当作空白（trim、\s）就会被误剥
+const isNbspOnlyText = (node) => node.type === 'text' && node.value.includes(NBSP)
+    && Array.from(node.value).every((ch) => ch === NBSP || LEGACY_EDGE_SPACE_CHAR_RE.test(ch));
+
+// 差分用例须有样本命中的分支：键为计数名，值为未命中时的说明。计数以样本为单位，同一样本内多次命中同一分支只计一次
+const STRIP_HIT_LABELS = Object.freeze({
+    leadingBreak: '首部剥去换行',
+    leadingBlankText: '首部剥去空白文本节点',
+    trailingBreak: '尾部剥去换行',
+    trailingBlankText: '尾部剥去空白文本节点',
+    allBlank: '非空列表全为空白节点、结果为空',
+    nothingToStrip: '首尾无可剥离、原样保留',
+    firstTextTrimmed: '首个保留节点是文本、被去前导空白',
+    lastTextTrimmed: '末个保留节点是文本、被去尾部空白',
+    singleText: '首末保留节点为同一文本节点（先去前导、再去尾部）',
+    nbspStopsLeading: '首部剥离止于只含空白与 U+00A0 的文本（U+00A0 不算空白）',
+    nbspStopsTrailing: '尾部剥离止于只含空白与 U+00A0 的文本（U+00A0 不算空白）',
+    otherStopsLeading: '首部剥离止于 strong、image 等非文本非换行节点',
+    otherStopsTrailing: '尾部剥离止于 strong、image 等非文本非换行节点',
+});
+
+// 差分样本的节点来源：换行；只含 [ \t\r\n] 的文本（0 到 3 个字符，含空串）；TRIM_DIFF_ALPHABET 上的任意文本（0 到 5 个字符）；
+// 其它行内节点——OTHER_INLINE_NODE_BUILDERS 之外另加内容只有空白的 emphasis，它不是文本，不能当作空白节点剥去
+const BLANK_EDGE_CHARS = [' ', '\t', '\r', '\n'];
+const STRIP_OTHER_NODE_BUILDERS = [
+    ...OTHER_INLINE_NODE_BUILDERS,
+    () => ({ type: 'emphasis', children: [{ type: 'text', value: ' \t' }] }),
+];
+
+describe('trimInline：首尾空白节点的剥离线性于节点数', () => {
+    test('段首、段尾各 6 万个空白节点（换行与空白文本交替）不触发逐个复制：单次调用在绝对上限内，输出逐项正确', (t) => {
+        // Arrange：在计时区间外新构造节点列表——中段依次为首个文本（带前导空白与 U+00A0）、加粗、末个文本（带 U+00A0 与尾部空白）
+        const blankText = () => ({ type: 'text', value: TRAILING_EDGE_SPACES });
+        const nodes = [
+            ...Array.from({ length: BLANK_EDGE_STRESS_COUNT }, (_, i) => (i % 2 === 0 ? { type: 'break' } : blankText())),
+            { type: 'text', value: ` \t${NBSP}甲 ` },
+            { type: 'strong', children: [{ type: 'text', value: '乙' }] },
+            { type: 'text', value: ` 丙${NBSP} \r\n` },
+            ...Array.from({ length: BLANK_EDGE_STRESS_COUNT }, (_, i) => (i % 2 === 0 ? blankText() : { type: 'break' })),
+        ];
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        const result = trimInline(nodes);
+        const elapsedMs = elapsedMsSince(started);
+        t.diagnostic(`trimInline 实测 ${elapsedMs.toFixed(2)} ms`);
+
+        // Assert：先验输出正确，以免「快」来自少做了事——首尾空白节点全部剥去；首个文本只去前导的半角空白、保留 U+00A0，
+        // 末个文本只去尾部的半角空白、保留 U+00A0，中段的加粗原样。先比长度，免得剥离失败时打出八万项的差异
+        assert.equal(result.length, 3, `保留节点数 ${result.length}，应为 3`);
+        assert.deepEqual(result, [
+            { type: 'text', value: `${NBSP}甲 ` },
+            { type: 'strong', children: [{ type: 'text', value: '乙' }] },
+            { type: 'text', value: ` 丙${NBSP}` },
+        ]);
+        assert.ok(
+            elapsedMs < BLANK_EDGE_STRESS_BUDGET_MS,
+            `trimInline 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${BLANK_EDGE_STRESS_BUDGET_MS} ms`,
+        );
+    });
+
+    test('与一次切片之前的实现逐项等价：种子固定的随机节点列表，首尾各类剥离与挡住剥离的节点均有样本，入参不被改动', (t) => {
+        // Arrange：种子固定的随机节点列表 40000 个，各含 0 到 10 个节点；换行约占三成、只含半角空白的文本约占四分之一，
+        // 首尾常有成串的空白节点
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomText = (alphabet, maxLength) => Array.from({ length: Math.floor(random() * (maxLength + 1)) }, () => pick(alphabet)).join('');
+        const randomNode = () => {
+            const roll = random();
+            if (roll < 0.3) return { type: 'break' };
+            if (roll < 0.55) return { type: 'text', value: randomText(BLANK_EDGE_CHARS, 3) };
+            if (roll < 0.85) return { type: 'text', value: randomText(TRIM_DIFF_ALPHABET, 5) };
+            return pick(STRIP_OTHER_NODE_BUILDERS)();
+        };
+        const samples = Array.from({ length: 40000 }, () => Array.from({ length: Math.floor(random() * 11) }, randomNode));
+        assert.equal(samples.length, 40000);
+
+        // Act & Assert
+        const hits = Object.fromEntries(Object.keys(STRIP_HIT_LABELS).map((key) => [key, 0]));
+        for (const nodes of samples) {
+            const snapshot = structuredClone(nodes);
+            const branches = new Set();
+            const expected = legacyTrimInlineBySlices(nodes, branches);
+            for (const key of branches) hits[key] += 1;
+            const actual = trimInline(nodes);
+            // 只在不一致时拼装诊断信息，免得四万次调用都付这笔开销
+            if (!isDeepStrictEqual(actual, expected)) assert.deepEqual(actual, expected, `nodes=${describeNodes(nodes)}`);
+            // 两式都返回新数组、只在新数组上替换首末元素：不得返回入参本身，入参列表及其中的节点也不得被改动
+            if (actual === nodes || !isDeepStrictEqual(nodes, snapshot)) assert.fail(`返回了入参本身或改动了入参：nodes=${describeNodes(snapshot)}`);
+        }
+        // 覆盖自证：各可达分支须有样本命中，差分才不是只对「无事可做」的输入空转
+        t.diagnostic(`样本 ${samples.length} 个；各分支命中样本数 ${Object.entries(hits).map(([key, count]) => `${key}=${count}`).join('，')}`);
+        for (const [key, label] of Object.entries(STRIP_HIT_LABELS)) assert.ok(hits[key] > 0, `没有样本命中：${label}`);
     });
 });

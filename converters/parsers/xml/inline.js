@@ -163,10 +163,24 @@ function mergeText(nodes) {
     return out;
 }
 
+/**
+ * 剥去首尾的空白节点（换行，或只含 [ \t\r\n] 的文本），再去首个文本节点的前导空白、末个文本节点的尾部空白。
+ * 保留区间 [start, end) 先以下标求出、只切片一次。旧写法每剥去一个首尾节点就 slice 一次整个数组，首尾有 n 个空白节点时
+ * 复制量随 n 平方增长（一段里段首连写 8 万个 <br/>、XML 约 400 KB 即耗时约 2 秒）；现各节点至多判定一次，数组只在展开与
+ * 切片时各复制一次，总成本线性于节点数。
+ *
+ * 与逐个 slice 的旧写法等价：旧式第一个循环删去极大的空白前缀，第二个循环删去剩余部分的极大空白后缀。start 为首个非空白
+ * 节点的下标（没有则为长度），end 为最后一个非空白节点的下标加一（没有则等于 start），[start, end) 正是旧式剩下的区间；
+ * isBlankEdge 无副作用，且两式对它的调用次序与次数本就相同。全为空白时旧式第一个循环删光、第二个循环不执行，新式 start
+ * 为长度、end 等于 start，结果同为空数组。两式都在新数组上替换首末元素，不改动入参 nodes
+ */
 function trimInline(nodes) {
-    let list = [...nodes];
-    while (list.length > 0 && isBlankEdge(list[0])) list = list.slice(1);
-    while (list.length > 0 && isBlankEdge(list[list.length - 1])) list = list.slice(0, -1);
+    const all = [...nodes];
+    let start = 0;
+    while (start < all.length && isBlankEdge(all[start])) start += 1;
+    let end = all.length;
+    while (end > start && isBlankEdge(all[end - 1])) end -= 1;
+    const list = all.slice(start, end);
     if (list.length === 0) return list;
     const first = list[0];
     if (first.type === 'text') list[0] = textNode(first.value.replace(EDGE_SPACE_START_RE, ''));
