@@ -97,7 +97,10 @@ function extractByReadability(html) {
 
     let article;
     try {
-        article = new Readability(document, { ...READABILITY_OPTIONS }).parse();
+        const reader = new Readability(document, { ...READABILITY_OPTIONS });
+        // 可见性判定换成不经 linkedom 的 el.style 取值的等价实现，理由与前提见 isProbablyVisible
+        reader._isProbablyVisible = isProbablyVisible;
+        article = reader.parse();
     } catch (err) {
         return null;
     }
@@ -139,13 +142,108 @@ const DOM_STYLE_ACCESS = Object.freeze({
     parentOf: (node) => node.parentElement,
 });
 
-// isProbablyReaderable 内部依赖 matches/className 等 DOM 能力，异常时按不可读处理
+// isProbablyReaderable 内部依赖 matches/className 等 DOM 能力，异常时按不可读处理。可见性判定经公开选项
+// visibilityChecker 换成不经 linkedom 的 el.style 取值的等价实现，理由见 inlineStyleValue
 function isReaderable(document) {
     try {
-        return isProbablyReaderable(document, { ...READERABLE_OPTIONS });
+        return isProbablyReaderable(document, { ...READERABLE_OPTIONS, visibilityChecker: isNodeVisible });
     } catch (err) {
         return false;
     }
+}
+
+/**
+ * 元素内联 style 中属性 name 的取值，与 linkedom 0.18.13 的 node.style[name] 逐字相同，而耗时线性于 style 的长度。
+ * name 须已是连字符小写形式：linkedom 查表前先经 uhyphen 把驼峰名转成连字符小写，此处不做该转换；调用方只传
+ * display 与 visibility，二者经 uhyphen 不变。没有 style 属性或没有匹配的声明时返回空串。
+ *
+ * 旧写法为何超线性：两处可见性判定原经 linkedom 的 node.style.display／visibility 取值，linkedom 取值前先以正则
+ * \s*;\s* 切分整个 style 属性值（css-style-declaration.js 的 updateKeys）。在不邻接分号的长段空白上，该正则从段内每个
+ * 起点都要吞下其后的全部空白、找不到分号再逐步回溯，耗时随段长平方增长：纯空格 style 为 8／16／32／64 KB 时，首次读取
+ * style.display 依次约 34／128／506／2015 ms，isProbablyReaderable 读 <p> 的 style 在 8／16／32 KB 时依次约
+ * 34／130／690 ms；64 KB 的长空白 style 使整条提取链路实测约 2.0 至 4.9 秒（替换后约 1 至 5 毫秒），按平方律外推，
+ * 1 MB 时达数分钟。
+ * 不改用「先截短 style 中的连续空白」：Readability 的输出会保留或复制部分 style 的原值——svg 子树的 style 不经
+ * _cleanStyles 清除；_unwrapNoscriptImages 把含图片扩展名的 style 复制为 data-old-style，并以 === 比较新旧两值；
+ * _fixLazyImages 把 svg 内 img 的 style 复制进 src——截短即改变输出。
+ *
+ * 新写法为何线性：一次 split(';') 加逐段各一次 trim，线性于 style 的长度；每次可见性判定对 display、visibility 各求值
+ * 一次。isProbablyReaderable 对每个候选元素至多判定一次；Readability 每轮 _grabArticle 对每个元素至多判定一次，
+ * 重试至多四轮（每轮去掉一个标志，共三个）。故两处判定的总耗时线性于页面中 style 的总长。
+ *
+ * 为何逐字等价（记 s 为 style 属性的当前值，R 为正则 \s*;\s* ）：
+ *   (a) s.split(R) 与 s.split(';') 段数相同、一一对应：R 不能匹配空串，每处匹配恰含一个分号，另含其后的全部空白与其前
+ *       尚未被上一处匹配吞下的全部空白，故每个分号恰对应一处匹配。前者第 i 段等于后者第 i 段去掉首部空白（i > 0 时）
+ *       与尾部空白（i 非末段时）；段内有冒号时，多出的首部空白落在首个冒号之前、属于键，多出的尾部空白落在首个冒号
+ *       之后、属于值，而段内有无冒号不变。linkedom 以 [key, ...rest] = rule.split(':') 取首个冒号前后的两部分，与此处的
+ *       两次 slice 相同
+ *   (b) 正则的 \s 与 String.prototype.trim 去除的是同一字符集（WhiteSpace 与 LineTerminator），故多出的空白恰被 trim 去尽
+ *   (c) linkedom 把各段存入 Map，键与值皆非空才写入、后写覆盖先写，取值为 get(name) ?? ''。name 非空，故其效果就是
+ *       「键等于 name 且值非空的最后一段」的值，没有则为空串
+ *   (d) 没有 style 属性时，linkedom 清空 Map，取值为空串，与此处相同
+ *   (e) linkedom 缓存切分结果，只在属性经 value 设值器改写（置 CHANGED）或换成另一个 Attr 时重新切分；属性值的写入只有
+ *       构造 Attr、解析期新建（parse-from-string）与 value 设值器三处，故它读到的总是当前属性值的切分结果。例外是经
+ *       node.style.X = v 写入：该途径直接改缓存的 Map，其值可与属性值的切分结果不一致（如写入含分号或首尾空白的值），
+ *       本链路（annotateLayout、可读性预判与 Readability 0.6.0）没有这种写法
+ *   (f) 读的是 linkedom 所切分的同一个值：getAttributeNode('style').value 即 linkedom 读取的 [VALUE]。不用 getAttribute，
+ *       因其在 XML 文档中返回转义后的值
+ * package.json 以 ^0.18.13 允许 linkedom 升级到 0.18.x：若取值规则改变，test/web-extract.test.js 中以 linkedom 的
+ * el.style 为参照的差分用例会报出。
+ */
+function inlineStyleValue(node, name) {
+    const attr = node.getAttributeNode('style');
+    if (!attr) return '';
+    let found = '';
+    for (const piece of attr.value.split(';')) {
+        const colon = piece.indexOf(':');
+        if (colon < 0) continue;
+        const key = piece.slice(0, colon).trim();
+        const value = piece.slice(colon + 1).trim();
+        if (key === name && value) found = value;
+    }
+    return found;
+}
+
+/**
+ * 可读性预判的可见性判定：照录 Readability 0.6.0 的 Readability-readerable.js 中的 isNodeVisible（isProbablyReaderable
+ * 缺省的 visibilityChecker），只把 node.style.display 换成 inlineStyleValue(node, 'display')，经公开选项 visibilityChecker
+ * 传入。库实现不看 visibility，此处照旧。照录的约定见 isProbablyVisible。
+ */
+function isNodeVisible(node) {
+    // SVG、MathML 节点可能没有 style 或 className.includes，故先判空（库注释之意）
+    return (
+        (!node.style || inlineStyleValue(node, 'display') != 'none')
+        && !node.hasAttribute('hidden')
+        // class 含 fallback-image 者照常显示，以免维基百科的数学公式图片被当作隐藏（库注释之意）
+        && (!node.hasAttribute('aria-hidden')
+            || node.getAttribute('aria-hidden') != 'true'
+            || (node.className && node.className.includes && node.className.includes('fallback-image')))
+    );
+}
+
+/**
+ * Readability 的可见性判定：照录 Readability 0.6.0 的 _isProbablyVisible，只把 node.style.display 与
+ * node.style.visibility 换成 inlineStyleValue 的取值，由 extractByReadability 覆盖到 Readability 实例上。
+ *
+ * 两处照录的共同约定：
+ *   - 保留 !node.style 的判空、松散比较 !=，以及各子表达式的先后次序与短路结构。node.style 为真时，linkedom 取值同样要
+ *     调用该元素的 getAttributeNode('style') 并切分其值，故新写法不引入新的异常点
+ *   - 只读不写、不改 DOM，Readability 输出中保留或复制的 style 原值不受影响
+ *   - 覆盖 _isProbablyVisible 依赖 Readability 0.6.0 的私有方法名，库内仅 _grabArticle 一处（Readability.js 第 1066 行）
+ *     经 this 调用它。package.json 以 ^0.6.0 允许升级到 0.6.x：若方法名或语义改变，test/web-extract.test.js 中以库自身
+ *     实现为参照的差分用例会报出
+ */
+function isProbablyVisible(node) {
+    // SVG、MathML 节点可能没有 style 或 className.includes，故先判空（库注释之意）
+    return (
+        (!node.style || inlineStyleValue(node, 'display') != 'none')
+        && (!node.style || inlineStyleValue(node, 'visibility') != 'hidden')
+        && !node.hasAttribute('hidden')
+        // class 含 fallback-image 者照常显示，以免维基百科的数学公式图片被当作隐藏（库注释之意）
+        && (!node.hasAttribute('aria-hidden')
+            || node.getAttribute('aria-hidden') != 'true'
+            || (node.className && node.className.includes && node.className.includes('fallback-image')))
+    );
 }
 
 // ---------- 三级：旧兜底链路 ----------
@@ -180,4 +278,5 @@ function longestDiv($) {
 module.exports = {
     extractContent, matchesHost, annotateLayout,
     SITE_SELECTORS, MIN_READABILITY_TEXT_LENGTH, READERABLE_OPTIONS,
+    inlineStyleValue, isNodeVisible, isProbablyVisible,
 };
