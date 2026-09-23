@@ -5,7 +5,8 @@
  *       同类嵌套拍平与相邻合并、只包图片的格式标签拆除、<figure>/<p> 包图与 figcaption 图注、其它 HTML 保留、
  *       无可提升内容时返回原引用、入参不变；
  *       matchImgTag 的 <img> 标签识别在 8 万个空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）；
- *       matchInlineTag 的行内标签识别在 8 万个空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）
+ *       matchInlineTag 的行内标签识别在 8 万个空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）；
+ *       replaceTagsWithSpace 的图注去标签在 8 万个未闭合「<」长段上的耗时上限，与线性化之前的实现逐字等价（差分）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -613,4 +614,148 @@ test('matchInlineTag 与线性化之前的 TAG_RE 逐组等价：BMP 逐码元�
     assert.ok(counts.bareSelfClose > 0, '没有名后直接「/>」的样本');
     assert.ok(counts.otherAfterName > 0, '没有名后为其它字符的样本');
     assert.ok(counts.closingWithAttrs > 0, '没有带属性的闭标签样本');
+});
+
+// ============================================================
+// replaceTagsWithSpace：图注去标签线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { replaceTagsWithSpace } = require('../converters/ir/inline-html');
+
+// 耗时用例的输入规模：块级 <figure> 的 figcaption 里是 8 万个「<」，其后直到图注的闭标签都没有「>」
+const CAPTION_STRESS_LENGTH = 80000;
+// 上限的取法同 IMG_STRESS_BUDGET_MS。200 ms 使两侧余量都不小于 5 倍——线性化之前的 /<[^>]*>/g 经 liftInlineHtml 在这一规模上
+// 实测约 1.9 至 2.3 秒（2 万、4 万时约 0.14、0.57 秒，耗时随「<」的个数平方增长），是上限的 9 倍以上；线性化之后单次调用
+// 实测约 0.3 至 1.2 毫秒，不到上限的一百五十分之一
+const CAPTION_STRESS_BUDGET_MS = 200;
+
+test('figcaption 里 8 万个「<」其后无「>」，图注去标签不触发回溯：liftInlineHtml 单次调用在绝对上限内，输出逐字正确', (t) => {
+    // Arrange：在计时区间外新构造字符串与树，根节点下只有这一个块级 html 节点
+    const tree = {
+        type: 'root',
+        children: [{
+            type: 'html',
+            value: `<figure><img src="a.png"><figcaption>${'<'.repeat(CAPTION_STRESS_LENGTH)}</figcaption></figure>`,
+        }],
+    };
+    const expected = [
+        { type: 'paragraph', children: [{ type: 'image', url: 'a.png', alt: '', title: null }] },
+        { type: 'paragraph', data: { role: 'caption' }, children: [{ type: 'text', value: '<'.repeat(CAPTION_STRESS_LENGTH) }] },
+    ];
+
+    // Act：计时区间只包这一次调用
+    const started = process.hrtime.bigint();
+    const result = liftInlineHtml(tree);
+    const elapsedMs = elapsedMsSince(started);
+    t.diagnostic(`liftInlineHtml 实测 ${elapsedMs.toFixed(2)} ms`);
+
+    // Assert：先验输出正确，以免「快」来自少做了事——<figure> 照常拆成图片段落与图注段落，图注里的「<」无一闭合、逐个保留
+    if (!isDeepStrictEqual(result.children, expected)) assert.fail(`根节点子节点不符：${briefNodes(result.children)}`);
+    assert.ok(
+        elapsedMs < CAPTION_STRESS_BUDGET_MS,
+        `liftInlineHtml 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${CAPTION_STRESS_BUDGET_MS} ms`,
+    );
+});
+
+// 线性化之前的实现，仅作短输入的差分参照：某个「<」之后再无「>」时，[^>]* 从该处扫到串尾再逐位回退、处处失配，其后每个
+// 「<」起点都重来一遍，耗时随这一段的长度平方增长，不可用于耗时用例的输入规模。替换式照录旧文件 liftWrapper 的图注处理
+const legacyReplaceTagsWithSpace = (text) => String(text).replace(/<[^>]*>/g, ' ');
+
+// 行终止符：LF、CR，以及以码点生成的 U+2028、U+2029；[^>] 不排除它们，标签可以跨行
+const CAPTION_LINE_TERMINATORS = ['\n', '\r', LINE_SEPARATOR, PARAGRAPH_SEPARATOR];
+// 图注去标签差分的典型样本，逐一对应下文的分支：不含「<」；含「<」而零匹配；恰一处匹配；两处及以上匹配；匹配之后仍余
+// 未闭合的「<」；标签内含第二个「<」；空标签「<>」；标签之外的孤立「>」（含位于首个「<」之前者，以及引号里的「>」使匹配
+// 提前结束后余下的「>」）；标签内含行终止符
+const CAPTION_TYPICAL_SAMPLES = [
+    '', '图 1 示意图', 'a > b', '>>',
+    '<', 'a<b', '<<<', '> <', '图<注 1',
+    '<b>', '图 1 <b>', 'a<b>c',
+    '<b>示意</b>', '<i>x</i><u>y</u>', '<a><b><c>',
+    '<b>x<', '<b>x</b><', '<a>b<c<',
+    '<a<b>', '<<b>', 'x<a<b>y',
+    '<>', 'a<>b', '<><>',
+    '>a<b>', 'a>b<c>d', '<b>>', '> <i>x</i> >', '<a title="x>y">',
+    '<a\nb>', '<a\r\nb>', `<a${LINE_SEPARATOR}b>`, `<br${PARAGRAPH_SEPARATOR}/>`,
+];
+// 穷举短串的字母表：「<」「>」、字母、半角空格与 LF
+const CAPTION_DIFF_ALPHABET = ['<', '>', 'a', ' ', '\n'];
+// 一般随机串的记号：「<」「>」各放三份以提高出现频率；斜杠、引号、等号、字母、数字与中文；各类空白与行终止符
+const CAPTION_RANDOM_TOKENS = [
+    '<', '<', '<', '>', '>', '>', '/', '"', "'", '=', 'a', 'B', '1', '图', '注',
+    ' ', '\t', '\n', '\r', NBSP, IDEOGRAPHIC_SPACE, BYTE_ORDER_MARK, LINE_SEPARATOR, PARAGRAPH_SEPARATOR,
+];
+// 结构化随机串的片段：成对的格式标签、带属性与引号的标签（含引号里的「>」）、自闭合标签；未闭合的「<」、孤立的「>」、
+// 空标签、含第二个「<」或行终止符的标签；图注正文与空白
+const CAPTION_RANDOM_FRAGMENTS = [
+    '<b>', '</b>', '<i>', '</i>', '<br/>', '<span class="x y">', '</span>', `<a title='甲 "乙"'>`, '<a title="x>y">', '</a>',
+    '<', '<<', '>', '>>', '<>', '<a<b>', '<a\nb>', `<i${LINE_SEPARATOR}>`,
+    '图 1', '示意', 'x/y', ' ', NBSP, '\n',
+];
+
+test('replaceTagsWithSpace 与线性化之前的图注去标签逐字等价：BMP 逐码元、穷举短串与种子固定的随机串，九类分支均有样本', (t) => {
+    // Arrange：典型样本在前
+    const samples = [...CAPTION_TYPICAL_SAMPLES];
+    // BMP 逐码元 262144 个：每个码元放进四个对「<」「>」敏感的位置——标签之内、未闭合的「<」之后、首个标签之前、末个「>」
+    // 与其后未闭合的「<」之间；码元若被误当作「<」或「>」，匹配的起止或末个「>」的位置就会改变
+    for (let code = 0; code <= 0xffff; code += 1) {
+        const unit = String.fromCharCode(code);
+        samples.push(`<a${unit}b>`, `<${unit}`, `${unit}<b>`, `<a>${unit}<`);
+    }
+    // 穷举 97656 个：字母表上由 0 到 7 个记号拼成的全部字符串
+    for (const text of everyStringUpTo(7, CAPTION_DIFF_ALPHABET)) samples.push(text);
+    const random = createSeededRandom(20260923);
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    // 一般随机串 30000 个：0 到 24 个随机记号
+    for (let i = 0; i < 30000; i += 1) {
+        samples.push(Array.from({ length: Math.floor(random() * 25) }, () => pick(CAPTION_RANDOM_TOKENS)).join(''));
+    }
+    // 结构化随机串 30000 个：0 到 8 个图注片段，贴近真实图注里标签与正文交错的骨架
+    for (let i = 0; i < 30000; i += 1) {
+        samples.push(Array.from({ length: Math.floor(random() * 9) }, () => pick(CAPTION_RANDOM_FRAGMENTS)).join(''));
+    }
+    assert.equal(samples.length, CAPTION_TYPICAL_SAMPLES.length + 419800);
+
+    // Act & Assert
+    const counts = {
+        noOpen: 0, zeroMatch: 0, oneMatch: 0, multiMatch: 0, trailingOpen: 0,
+        nestedOpen: 0, emptyTag: 0, strayClose: 0, strayCloseBeforeOpen: 0, terminatorInTag: 0,
+    };
+    for (const sample of samples) {
+        const expected = legacyReplaceTagsWithSpace(sample);
+        const actual = replaceTagsWithSpace(sample);
+        // 只在不一致时拼装诊断信息，免得数十万次调用都付这笔开销
+        if (actual !== expected) assert.fail(`输入 [${toCodePoints(sample)}]：新式 ${describeGroup(actual)}，旧式 ${describeGroup(expected)}`);
+        // 分支归类只用旧式的结果与测试内独立求得的输入特征：tags 为旧式正则在该样本上的全部匹配
+        const tags = sample.match(/<[^>]*>/g) || [];
+        const firstOpen = sample.indexOf('<');
+        if (firstOpen < 0) counts.noOpen += 1;
+        else if (tags.length === 0) counts.zeroMatch += 1;
+        else if (tags.length === 1) counts.oneMatch += 1;
+        else counts.multiMatch += 1;
+        // 旧式结果里残留的「<」都在末个「>」之后，即未闭合者
+        if (tags.length > 0 && expected.includes('<')) counts.trailingOpen += 1;
+        if (tags.some((tag) => tag.indexOf('<', 1) > 0)) counts.nestedOpen += 1;
+        if (tags.includes('<>')) counts.emptyTag += 1;
+        // 每处匹配恰含一个「>」，即其末字符；「>」的总数多于匹配数时，多出者都在标签之外
+        if (sample.split('>').length - 1 > tags.length) {
+            counts.strayClose += 1;
+            if (firstOpen >= 0 && sample.indexOf('>') < firstOpen) counts.strayCloseBeforeOpen += 1;
+        }
+        if (tags.some((tag) => CAPTION_LINE_TERMINATORS.some((terminator) => tag.includes(terminator)))) counts.terminatorInTag += 1;
+    }
+    // 覆盖自证：九类分支都须有样本，孤立的「>」另须有位于首个「<」之前者，差分才不是对某一分支空转
+    t.diagnostic(`样本 ${samples.length} 个；不含「<」${counts.noOpen}，含「<」而零匹配 ${counts.zeroMatch}，恰一处匹配 ${counts.oneMatch}，`
+        + `两处及以上匹配 ${counts.multiMatch}，匹配之后仍余未闭合的「<」${counts.trailingOpen}，标签内含第二个「<」${counts.nestedOpen}，`
+        + `空标签「<>」${counts.emptyTag}，标签之外的孤立「>」${counts.strayClose}（位于首个「<」之前 ${counts.strayCloseBeforeOpen}），`
+        + `标签内含行终止符 ${counts.terminatorInTag}`);
+    assert.ok(counts.noOpen > 0, '没有不含「<」的样本');
+    assert.ok(counts.zeroMatch > 0, '没有含「<」而零匹配的样本');
+    assert.ok(counts.oneMatch > 0, '没有恰一处匹配的样本');
+    assert.ok(counts.multiMatch > 0, '没有两处及以上匹配的样本');
+    assert.ok(counts.trailingOpen > 0, '没有匹配之后仍余未闭合「<」的样本');
+    assert.ok(counts.nestedOpen > 0, '没有标签内含第二个「<」的样本');
+    assert.ok(counts.emptyTag > 0, '没有空标签「<>」的样本');
+    assert.ok(counts.strayClose > 0, '没有标签之外孤立「>」的样本');
+    assert.ok(counts.strayCloseBeforeOpen > 0, '没有孤立「>」位于首个「<」之前的样本');
+    assert.ok(counts.terminatorInTag > 0, '没有标签内含行终止符的样本');
 });
