@@ -36,6 +36,7 @@ const { fetchText, fetchBinary } = require('../net/fetch-guard');
 const { getExtFromContentType, getExtFromUrl } = require('../ir/util');
 const { extractContent, matchesHost } = require('../web/extract');
 const { cleanNoise, isAttached } = require('../web/noise');
+const { hasDescendantTag, createTreeEditor } = require('../web/dom');
 const { normalizeMarkdown } = require('../web/normalize');
 const { capWhitespaceRuns } = require('../web/whitespace');
 const { extractMetadata, countWords } = require('../web/metadata');
@@ -71,6 +72,9 @@ const NESTED_BLOCK_TAG_SET = new Set(NESTED_BLOCK_TAGS);
 const VISIBLE_TEXT_RE = /[^\s]/;
 // 空 span 里须保留的空白：U+00A0 不换行空格、U+3000 全角空格（码点声明，源码不出现不可见字面量）
 const KEPT_SPACE_RE = new RegExp(`[${String.fromCharCode(0x00a0)}${String.fromCharCode(0x3000)}]`);
+// 空 span 的后代判定（见 tidyEmptySpans）：含 img 的保留、含 br 的拆包；按标签名比对，故为 Set
+const IMAGE_TAG_SET = new Set(['img']);
+const LINE_BREAK_TAG_SET = new Set(['br']);
 // BR 标记折叠：一段连续的 BR（可夹空白与换行），不吞下一行行首的缩进。
 // 首字符是必需的 BR，非 BR 位置一步即弃；紧邻其前的行内空白不写进正则，改由 collapseBreakMarkers
 // 向前回看并入——写成前导的 [ \t]* 会让不含 BR 的超长空白串上每个起点都吞到段尾再逐位回溯，耗时随长度平方增长
@@ -350,42 +354,20 @@ function markIndents($) {
 }
 
 /**
- * 是否含嵌套块后代。语义等价于 $(el).find(NESTED_BLOCK_SELECTOR).length > 0，但命中即停、显式栈遍历
- * （不递归，深层嵌套不爆栈），耗时线性于元素数：cheerio 的 .find() 把该元素的全部子元素交给
- * css-select 的 prepareContext，其中 removeSubsets 对这组根逐个做 lastIndexOf，同级子元素 n 个即 O(n²)
+ * 是否含嵌套块后代。语义等价于 $(el).find(NESTED_BLOCK_SELECTOR).length > 0，判定交给 web/dom 的 hasDescendantTag：
+ * 命中即停、显式栈遍历（不递归，深层嵌套不爆栈）。cheerio 的 .find() 把该元素的全部子元素交给 css-select 的
+ * prepareContext，其中 removeSubsets 对这组根逐个做 lastIndexOf，同级子元素 n 个即 O(n²)。与 .find() 逐字等价的
+ * 依据（元素判定、只比对标签名、原始文本与注释、template 内容片段的可见性）见 hasDescendantTag 的注释
  *
- * 与 .find() 逐字等价的四条依据，均以 cheerio 1.2.0 的实测行为为准而非直觉：
- *   - 元素以 attribs 是否存在判定：<script>、<style> 的 type 分别是 'script'、'style' 而非 'tag'，
- *     domhandler 的 isTag 同样把三者都算元素（与 web/whitespace 同一约定）；文本与注释节点没有 attribs
- *   - 只比对标签名、不看命名空间：css-select 的标签匹配就是名字相等，故 <svg>、<math> 里的 section、
- *     figure 一样算嵌套块（二者不在 HTML 规范的 breakout 列表中，会留在外来命名空间内）
- *   - 注释没有子节点，<script>、<style> 的子节点只有原始文本，进去也匹配不到，不必单独排除
- *   - <template> 的内容被 parse5 放进一个 type 为 'root' 的非元素子节点，它可见与否取决于 el 的父节点：
- *     父节点是元素时，css-select 的 absolutize 给选择器加上 :scope 后代，而后代组合子的
- *     getElementParent 不跨非元素节点，片段内的块一律匹配不到；el 位于载入根之下（父节点是 type 为
- *     'root' 的载入根）时不加 :scope，退化为纯标签匹配，domutils 的 find 穿过片段、其中的块照样计数。
- *     这是 cheerio 自身的不一致，此处照搬以保持标注结果逐字不变
+ * hasDescendantTag 的搜索根只取 el 的元素子节点，而改写之前本函数的初始栈含 el 的全部子节点，二者结果相同：候选的
+ * 叶子块（p、section、div、li、blockquote）不会是 template，其直接子节点中的非元素节点只有文本与注释，都没有子节点，
+ * 进不进栈都匹配不到；有子节点的非元素节点只有 template 的内容片段，而它只作 template 的子节点出现
  *
  * 命中即停使总成本线性：遍历从不进入嵌套块内部，而叶子块选择器是嵌套块标签的子集，故每个节点至多被
  * 其最近的叶子块祖先扫描一次——大量并列与深层嵌套同样成立
  */
 function hasNestedBlock(el) {
-    const shouldEnterFragments = !isElementNode(el.parent);
-    const stack = (el.children || []).slice();
-    while (stack.length > 0) {
-        const node = stack.pop();
-        const isElement = isElementNode(node);
-        if (isElement && NESTED_BLOCK_TAG_SET.has(node.name)) return true;
-        if (!isElement && !shouldEnterFragments) continue;
-        // 逐个 push 而非展开传参：子元素上万时 push(...children) 会超出实参个数上限
-        for (const child of node.children || []) stack.push(child);
-    }
-    return false;
-}
-
-// 元素节点的判定：<script>、<style> 的 type 不是 'tag'，故以 attribs 是否存在为准
-function isElementNode(node) {
-    return Boolean(node && node.attribs);
+    return hasDescendantTag(el, NESTED_BLOCK_TAG_SET);
 }
 
 function styleChainOf(el) {
@@ -427,28 +409,40 @@ function collectLeadingTexts(node, out) {
     return false;
 }
 
-// 微信把一句加粗拆成多个相邻 <strong>，直接相邻的并为一个，避免产出空的粗体边界
+// 微信把一句加粗拆成多个相邻 <strong>，直接相邻的并为一个，避免产出空的粗体边界。
+// 并入走 web/dom 的批量改树：cheerio 原生的 append + remove 在同一父元素下大量子节点时平方级（逐个删除后继时在父节点
+// children 上 lastIndexOf + splice，搬移时对每个节点在旧父节点 children 上 indexOf + splice）。按 $('strong') 的前序
+// 快照逐个处理、只把紧随当前 strong 的同名兄弟并入当前 strong，符合批量改树的安全性前提：前序遍历中当前 strong 及其
+// 后继兄弟的子树在轮到之前从未被改动，absorb 时当前 strong 的 children 末项即真实的末子节点；遍历结束即压实。
+// 原生 append 在后继 strong 无子节点时会把当前 strong 末子节点的 next 置为 undefined，改写后保持 null，
+// 渲染与后续判定（均按真假判断）不受影响
 function mergeAdjacentStrong($) {
+    const editor = createTreeEditor();
     $('strong').each((_, el) => {
         if (!isAttached(el)) return;
         for (let next = el.next; next && next.type === 'tag' && next.name === 'strong'; next = el.next) {
-            $(el).append($(next).contents());
-            $(next).remove();
+            editor.absorb(el, next);
         }
     });
+    editor.flush();
 }
 
-// 空 span：含 <br> 的拆包保留换行；只含不换行空格或全角空格的保留；其余删除
+// 空 span：含 <br> 的拆包保留换行；只含不换行空格或全角空格的保留；其余删除。
+// 后代判定与删除、拆包走 web/dom：cheerio 的 .find()、.remove()、.replaceWith() 在同一父元素下大量子节点时平方级。
+// 按 $('span') 的前序快照逐个处理、只删除或拆包当前 span，符合批量改树的安全性前提：前序遍历中当前 span 的子树在
+// 轮到之前从未被改动，途中的 .text() 与后代判定读到的都是真实结构；遍历结束即压实。只在含 br 后代时拆包，
+// 故被拆包的 span 至少有一个子节点
 function tidyEmptySpans($) {
+    const editor = createTreeEditor();
     $('span').each((_, el) => {
         if (!isAttached(el)) return;
-        const $el = $(el);
-        if ($el.find('img').length > 0) return;
-        const text = $el.text();
+        if (hasDescendantTag(el, IMAGE_TAG_SET)) return;
+        const text = $(el).text();
         if (VISIBLE_TEXT_RE.test(text) || KEPT_SPACE_RE.test(text)) return;
-        if ($el.find('br').length > 0) $el.replaceWith($el.contents());
-        else $el.remove();
+        if (hasDescendantTag(el, LINE_BREAK_TAG_SET)) editor.unwrap(el);
+        else editor.remove(el);
     });
+    editor.flush();
 }
 
 function buildMarkdown(html, title) {
@@ -531,4 +525,4 @@ function isolateImageLines(markdown) {
     return out.join('\n');
 }
 
-module.exports = { parse, collapseBreakMarkers, markIndents };
+module.exports = { parse, collapseBreakMarkers, markIndents, tidyEmptySpans, mergeAdjacentStrong };
