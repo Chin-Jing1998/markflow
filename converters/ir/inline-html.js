@@ -126,7 +126,7 @@ function liftWrapper(value, ctx) {
         } else if (/^<br/i.test(text)) {
             items.push({ type: 'break' });
         } else if (/^<figcaption/i.test(text)) {
-            const caption = plainText(String(token[1] || '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+            const caption = plainText(replaceTagsWithSpace(String(token[1] || ''))).replace(/\s+/g, ' ').trim();
             if (caption) captions.push(caption);
         }
         index = tokenRe.lastIndex;
@@ -137,6 +137,20 @@ function liftWrapper(value, ctx) {
         paragraph(images),
         ...captions.map((caption) => ({ type: 'paragraph', data: { role: 'caption' }, children: [{ type: 'text', value: caption }] })),
     ];
+}
+
+// 图注的去标签。旧式为 replace(/<[^>]*>/g, ' ')：某个「<」之后再无「>」时，[^>]* 从该处扫到串尾再逐位回退、处处失配，其后
+// 每个「<」起点都重来一遍，耗时随这一段的长度平方增长。新式先求末个「>」的下一位 end，只对 [0, end) 执行原正则替换，再原样
+// 接上 [end, 串尾)。等价判据：起点 p 处能否匹配、止于何处，只取决于 p 处是否为「<」与 p 之后首个「>」的位置——p < end 且
+// p 处为「<」时，end - 1 处的「>」在其后，首个「>」落在 [0, end) 之内，截取前后相同；p ≥ end 时其后再无「>」，旧式在该处
+// 失配，截取后的前缀里也没有这样的起点。故全局替换逐轮取得的匹配序列相同，[end, 串尾) 在旧式里同样原样保留。线性：前缀里
+// 每个「<」之后都有「>」，[^>]* 止于首个「>」即一次成功、不回退，下一轮自该「>」之后起算，每个码元只被扫过常数次
+
+/** 自左向右把「<」至其后首个「>」的每一段（含两端）换成一个半角空格；与 String(text).replace(/<[^>]*>/g, ' ') 逐字相同 */
+function replaceTagsWithSpace(text) {
+    const value = String(text);
+    const end = value.lastIndexOf('>') + 1;
+    return value.slice(0, end).replace(/<[^>]*>/g, ' ') + value.slice(end);
 }
 
 function trimBreaks(items) {
@@ -390,4 +404,4 @@ function decodeEntities(text) {
     });
 }
 
-module.exports = { liftInlineHtml, decodeEntities, matchImgTag, matchInlineTag };
+module.exports = { liftInlineHtml, decodeEntities, matchImgTag, matchInlineTag, replaceTagsWithSpace };
