@@ -15,7 +15,9 @@
 const LEAF_BLOCK_SELECTOR = 'p, section, div, li, blockquote';
 const NESTED_BLOCK_SELECTOR = 'p, section, div, li, blockquote, ul, ol, table, figure, pre, h1, h2, h3, h4, h5, h6';
 
-const TEXT_INDENT_RE = /(?:^|;)\s*text-indent\s*:\s*(-?\d+(?:\.\d+)?)\s*(em|rem|px)?\s*(?:!important)?\s*(?=;|$)/i;
+// 旧式数值之后的三个 \s* 之间只隔两个可空项，不命中时要把同一段空白在三者之间的各种分法逐一试遍，耗时随段长立方增长；
+// 现把单位与 !important 各自连同其后的空白并成可选组，每段空白只归一处，匹配位置与各捕获组均与旧式相同
+const TEXT_INDENT_RE = /(?:^|;)\s*text-indent\s*:\s*(-?\d+(?:\.\d+)?)\s*(?:(em|rem|px)\s*)?(?:!important\s*)?(?=;|$)/i;
 const FONT_SIZE_RE = /(?:^|;)\s*font-size\s*:\s*(\d+(?:\.\d+)?)px/i;
 const DEFAULT_FONT_PX = 16;
 const ROOT_FONT_PX = 16;

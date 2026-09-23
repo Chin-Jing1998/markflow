@@ -5,7 +5,8 @@
  *       区间自 separate 之后起算、非化学域无区间、空入参）；EMF 判据（签名命中、非 EMF 不扫、
  *       无签名、截断、非 Buffer、超上限只扫尾部，均不抛错）；角色标记（三种取值、带分号余文、
  *       不匹配时 alt 原样）与判据优先级；合成夹具端到端（角色与 alt 逐图比对、CML 不入 alt、
- *       prepareLayout 的 OOXML 侧角色）；md / html / docx 三个目标对带角色图片的产物与无角色时逐字相同。
+ *       prepareLayout 的 OOXML 侧角色）；md / html / docx 三个目标对带角色图片的产物与无角色时逐字相同；
+ *       版本后缀剥离在「.1」长段上的耗时上限，stripVersionSuffix 与 isChemistryProgId 同线性化之前的实现逐字等价（差分）。
  * 样稿正文与结构式内容一律为虚构示例。
  */
 const { test, describe } = require('node:test');
@@ -312,5 +313,168 @@ describe('md / html 目标不读图片角色，docx 目标只把角色写进替�
         }
         assert.equal(without.includes('markflow:role='), false);
         assert.equal(withRole.replace(/markflow:role=(?:formula|table|chemistry);/g, ''), without);
+    });
+});
+
+// ============================================================
+// 判据 a：版本后缀的剥离线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { stripVersionSuffix } = require('../converters/parsers/docx-chemistry');
+
+// 耗时用例的输入规模：两个 x 之间夹 4 万组「.1」，共 8 万个字符，这一长段不处于串尾
+const VERSION_STRESS_LENGTH = 80000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。200 ms 使两侧余量都不小于 5 倍——
+// 逐段剥离之前的 /\.\d+(?:\.\d+)*$/ 在这一规模上实测约 3.4 至 3.8 秒（耗时随段长平方增长），是上限的 16 倍以上；
+// 逐段剥离之后单次调用实测至多约 0.09 毫秒，不到上限的两千分之一
+const VERSION_STRESS_BUDGET_MS = 200;
+
+const elapsedMsSince = (started) => Number(process.hrtime.bigint() - started) / 1e6;
+
+// 不算 \d 的数字，以码点生成：阿拉伯-印度数字一（U+0661）与全角数字一（U+FF11）
+const ARABIC_INDIC_ONE = String.fromCharCode(0x0661);
+const FULLWIDTH_ONE = String.fromCharCode(0xff11);
+
+// 逐段剥离之前的实现，仅作短输入的差分参照：/\.\d+(?:\.\d+)*$/ 在不处于串尾的「.数字」长段上逐位回溯，不可用于耗时用例的
+// 输入规模。正则与 isChemistryProgId 照录旧文件；白名单集合照旧文件的写法由导出的 CHEMISTRY_PROG_ID_LIST 构造
+const LEGACY_VERSION_SUFFIX_RE = /\.\d+(?:\.\d+)*$/;
+const LEGACY_CHEMISTRY_PROG_IDS = new Set(CHEMISTRY_PROG_ID_LIST.map((id) => id.toLowerCase()));
+
+function legacyIsChemistryProgId(progId) {
+    const value = String(progId == null ? '' : progId).trim().toLowerCase();
+    if (!value) return false;
+    return LEGACY_CHEMISTRY_PROG_IDS.has(value) || LEGACY_CHEMISTRY_PROG_IDS.has(value.replace(LEGACY_VERSION_SUFFIX_RE, ''));
+}
+
+// 剥离差分的字母表：点号；ASCII 数字 0、1、9；字母 a、x；不算 \d 的两种数字；连字符与空格
+const VERSION_DIFF_ALPHABET = ['.', '0', '1', '9', 'a', 'x', ARABIC_INDIC_ONE, FULLWIDTH_ONE, '-', ' '];
+
+// 字母表上长度 0 到 maxLength 的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    const all = [''];
+    let level = [''];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((token) => prefix + token));
+        for (const text of level) all.push(text);
+    }
+    return all;
+}
+
+// 种子固定的 32 位伪随机数发生器（mulberry32）：每次运行抽到同一批样本，失败可原样复现
+function createSeededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let mixed = Math.imul(state ^ (state >>> 15), state | 1);
+        mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// 逐码点列出，失败输出里的不可见字符也能看清；非字符串入参按 String() 显示
+const toCodePoints = (text) => (typeof text !== 'string'
+    ? String(text)
+    : Array.from(text, (ch) => ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' '));
+
+describe('isChemistryProgId：版本后缀的剥离线性于串长', () => {
+    test('夹在两个 x 之间的 8 万个字符的「.1」长段不触发回溯：单次调用在绝对上限内，判定逐字正确', () => {
+        // Arrange：在计时区间外新构造字符串
+        const input = `x${'.1'.repeat(VERSION_STRESS_LENGTH / 2)}x`;
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        const result = isChemistryProgId(input);
+        const elapsedMs = elapsedMsSince(started);
+
+        // Assert：先验判定正确，以免「快」来自少做了事——长段不处于串尾，不构成版本后缀；
+        // 同样长度的真版本后缀则须整段剥去，剥后命中白名单
+        assert.equal(result, false);
+        assert.equal(isChemistryProgId(`ChemDraw.Document${'.1'.repeat(VERSION_STRESS_LENGTH / 2)}`), true);
+        assert.ok(
+            elapsedMs < VERSION_STRESS_BUDGET_MS,
+            `isChemistryProgId 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${VERSION_STRESS_BUDGET_MS} ms`,
+        );
+    });
+
+    test('剥离与旧正则逐字等价：穷举短串与种子固定的结构化随机串，须有样本确实剥去后缀', (t) => {
+        // Arrange：10 个字符的字母表上长度 0 到 5 的全部字符串共 111111 个
+        const samples = everyStringUpTo(5, VERSION_DIFF_ALPHABET);
+        assert.equal(samples.length, 111111);
+
+        // 结构化随机串 50000 个：前缀 + 0 到 5 段「点号 + 1 到 3 位数字」+ 尾巴，再随机删去或插入 0 到 2 个字符。
+        // 数字偶尔取不算 \d 的两种，使后缀在中途断开；前缀含 chem3d 一类点号之前带数字的写法
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const prefixes = ['', 'chemdraw.document', 'chem3d.document', 'x', 'a-', '.', '1', ARABIC_INDIC_ONE, ' '];
+        const segmentDigits = ['0', '1', '9', '0', '1', '9', '0', '1', '9', ARABIC_INDIC_ONE, FULLWIDTH_ONE];
+        const tails = ['', '', '', '', 'x', '.', '..', '.0', 'a1', '-', ' ', ARABIC_INDIC_ONE, FULLWIDTH_ONE];
+        const mutate = (text) => {
+            const at = Math.floor(random() * (text.length + 1));
+            if (random() < 0.5) return text.slice(0, at) + text.slice(at + 1);
+            return text.slice(0, at) + pick(VERSION_DIFF_ALPHABET) + text.slice(at);
+        };
+        for (let i = 0; i < 50000; i += 1) {
+            let text = pick(prefixes);
+            for (let k = Math.floor(random() * 6); k > 0; k -= 1) {
+                text += `.${Array.from({ length: 1 + Math.floor(random() * 3) }, () => pick(segmentDigits)).join('')}`;
+            }
+            text += pick(tails);
+            for (let m = Math.floor(random() * 3); m > 0; m -= 1) text = mutate(text);
+            samples.push(text);
+        }
+        assert.equal(samples.length, 161111);
+
+        // Act & Assert
+        let stripped = 0;
+        for (const value of samples) {
+            const expected = value.replace(LEGACY_VERSION_SUFFIX_RE, '');
+            const actual = stripVersionSuffix(value);
+            // 只在不一致时拼装诊断信息，免得十余万次调用都付这笔开销
+            if (actual !== expected) assert.equal(actual, expected, `value=[${toCodePoints(value)}]`);
+            if (expected !== value) stripped += 1;
+        }
+        // 覆盖自证：须有样本确实剥去了后缀，差分才不是只对「无事可做」的输入空转
+        t.diagnostic(`样本 ${samples.length} 个；确有剥离的样本 ${stripped} 个`);
+        assert.ok(stripped > 0, '没有样本确实剥去后缀');
+    });
+
+    test('判定与旧实现逐一相同：白名单与近似 ProgID 随机大小写后接随机后缀，判定为 true 与经剥离才命中的样本均有', (t) => {
+        // Arrange：白名单 8 项与 5 个不在白名单内的近似写法，逐字符随机大小写，前后随机补空白（判定前会 trim），再接随机后缀，
+        // 共 30000 个：后缀一半由 0 到 6 个随机记号拼成，一半为 0 到 3 段「点号 + 1 到 2 位数字」、其中四成再补一个随机记号。
+        // 另加非字符串与空值 7 个
+        const random = createSeededRandom(20260924);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const baseIds = [...CHEMISTRY_PROG_ID_LIST, 'ChemDraw', 'Chem3D', 'Equation.3', 'ChemDraw.Documents', 'KingDraw.Document'];
+        const suffixTokens = ['.', '.', '6', '0', '1', '20', '.6.0', '..', 'x', 'beta', ' ', '-', ARABIC_INDIC_ONE, FULLWIDTH_ONE];
+        const edgeSpaces = ['', '', ' ', '\t', ' \n'];
+        const randomCase = (text) => Array.from(text, (ch) => (random() < 0.5 ? ch.toUpperCase() : ch.toLowerCase())).join('');
+        const versionSegment = () => `.${Array.from({ length: 1 + Math.floor(random() * 2) }, () => pick(['0', '1', '6', '9'])).join('')}`;
+        const randomSuffix = () => (random() < 0.5
+            ? Array.from({ length: Math.floor(random() * 7) }, () => pick(suffixTokens)).join('')
+            : Array.from({ length: Math.floor(random() * 4) }, versionSegment).join('') + (random() < 0.4 ? pick(suffixTokens) : ''));
+        const samples = [];
+        for (let i = 0; i < 30000; i += 1) samples.push(pick(edgeSpaces) + randomCase(pick(baseIds)) + randomSuffix() + pick(edgeSpaces));
+        samples.push(null, undefined, 0, 6, 1.25, '', '   ');
+        assert.equal(samples.length, 30007);
+
+        // Act & Assert
+        const counts = { hit: 0, hitViaStrip: 0, miss: 0 };
+        for (const progId of samples) {
+            const expected = legacyIsChemistryProgId(progId);
+            const actual = isChemistryProgId(progId);
+            if (actual !== expected) assert.equal(actual, expected, `progId=[${toCodePoints(progId)}]`);
+            if (!expected) {
+                counts.miss += 1;
+            } else {
+                counts.hit += 1;
+                if (!LEGACY_CHEMISTRY_PROG_IDS.has(String(progId).trim().toLowerCase())) counts.hitViaStrip += 1;
+            }
+        }
+        // 覆盖自证：须有样本判定为 true，其中须有样本是剥去版本后缀之后才命中白名单，也须有样本判定为 false
+        t.diagnostic(`样本 ${samples.length} 个；判定为 true ${counts.hit} 个（其中剥去版本后缀后才命中 ${counts.hitViaStrip} 个），`
+            + `判定为 false ${counts.miss} 个`);
+        assert.ok(counts.hit > 0, '没有样本判定为 true');
+        assert.ok(counts.hitViaStrip > 0, '没有样本在剥去版本后缀后才命中白名单');
+        assert.ok(counts.miss > 0, '没有样本判定为 false');
     });
 });

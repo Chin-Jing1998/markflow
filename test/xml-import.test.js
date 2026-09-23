@@ -8,6 +8,7 @@
  *   图片——角色、显示尺寸的取法、资产去重与改名、缺图占位；
  *   安全——img/@file 越界、符号链接逃逸、魔数与扩展名、zip 条目数 / 单条目 / 谎报大小 / 总量上限、
  *     不安全条目名、符号链接条目、XML 大小与嵌套深度上限；
+ *   末尾修剪——trimInline 在 8 万个空格或回车长段上的耗时上限，与线性化之前的实现逐字等价（差分）；
  *   问题清单——全部带「导入：」前缀，人工参照夹具的丢失项清单不多不少。
  * 夹具一律程序化合成（test/fixtures/patent/roundtrip/build-roundtrip-fixtures.js），正文为虚构示例。
  */
@@ -659,3 +660,155 @@ function forgeUncompressedSize(zipBuffer, entryName, fake) {
     patch(Buffer.from([0x50, 0x4B, 0x01, 0x02]), 24, 28, 46);
     return out;
 }
+
+// ============================================================
+// trimInline：末尾修剪线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { isDeepStrictEqual } = require('node:util');
+const { trimInline } = require('../converters/parsers/xml/inline');
+
+// 耗时用例的输入规模：a 与 b 之间夹 8 万个同一种半角空白，这一长段不处于串尾
+const EDGE_SPACE_STRESS_LENGTH = 80000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。200 ms 使两侧余量都不小于 5 倍——
+// 逐字符扫描之前的 /[ \t\r\n]+$/ 在这一规模上两种形态实测约 1.8 至 2.4 秒（耗时随段长平方增长），是上限的 9 倍以上；
+// 逐字符扫描之后单次调用实测至多约 0.2 毫秒（每次新起进程的冷调用），约为上限的千分之一
+const EDGE_SPACE_STRESS_BUDGET_MS = 200;
+// 串尾须删去的空白：半角空格、制表符、回车与换行各一个
+const TRAILING_EDGE_SPACES = ' \t\r\n';
+
+const elapsedMsSince = (started) => Number(process.hrtime.bigint() - started) / 1e6;
+
+// 宽义空白以码点生成，源码里不出现看不见的字面量；不间断空格沿用文件头自夹具模块导入的 NBSP（U+00A0）
+const IDEOGRAPHIC_SPACE = String.fromCharCode(0x3000);
+const LINE_SEPARATOR = String.fromCharCode(0x2028);
+
+// 逐字符扫描之前的实现，仅作短输入的差分参照：/[ \t\r\n]+$/ 在不处于串尾的长段上逐位回溯，不可用于耗时用例的输入规模。
+// 两个正则、textNode、isBlankEdge 与 trimInline 照录旧文件，只把末尾修剪的结果拆成变量，以便在 hits 上记下覆盖计数
+const LEGACY_EDGE_SPACE_START_RE = /^[ \t\r\n]+/;
+const LEGACY_EDGE_SPACE_END_RE = /[ \t\r\n]+$/;
+const legacyTextNode = (value) => ({ type: 'text', value });
+const legacyIsBlankEdge = (node) => node.type === 'break' || (node.type === 'text' && node.value.replace(LEGACY_EDGE_SPACE_START_RE, '') === '');
+
+function legacyTrimInline(nodes, hits) {
+    let list = [...nodes];
+    while (list.length > 0 && legacyIsBlankEdge(list[0])) list = list.slice(1);
+    while (list.length > 0 && legacyIsBlankEdge(list[list.length - 1])) list = list.slice(0, -1);
+    if (list.length === 0) return list;
+    const first = list[0];
+    if (first.type === 'text') list[0] = legacyTextNode(first.value.replace(LEGACY_EDGE_SPACE_START_RE, ''));
+    const last = list[list.length - 1];
+    if (last.type === 'text') {
+        const trimmed = last.value.replace(LEGACY_EDGE_SPACE_END_RE, '');
+        if (trimmed !== last.value) hits.removed += 1;
+        if (trimmed !== last.value && trimmed.endsWith(NBSP)) hits.stoppedAtNbsp += 1;
+        if (trimmed === last.value && last.value.endsWith(NBSP)) hits.nbspKept += 1;
+        list[list.length - 1] = legacyTextNode(trimmed);
+    }
+    return list;
+}
+
+// 差分字母表：旧字符类 [ \t\r\n] 的四个成员；不在其内、trimEnd 却会删去的三种宽义空白（U+00A0、U+3000、U+2028）；
+// 西文与汉字的可见字符各一个
+const TRIM_DIFF_ALPHABET = [' ', '\t', '\r', '\n', NBSP, IDEOGRAPHIC_SPACE, LINE_SEPARATOR, 'a', '文'];
+// 其它行内节点：修剪不改动它们，只决定首尾是否落在文本上；每次新建，样本之间不共享对象
+const OTHER_INLINE_NODE_BUILDERS = [
+    () => ({ type: 'image', url: 'images/1.png', alt: '' }),
+    () => ({ type: 'strong', children: [{ type: 'text', value: ' 加粗 ' }] }),
+    () => ({ type: 'superscript', children: [{ type: 'text', value: '2' }] }),
+];
+
+// 字母表上长度 0 到 maxLength 的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    const all = [''];
+    let level = [''];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((token) => prefix + token));
+        for (const text of level) all.push(text);
+    }
+    return all;
+}
+
+// 种子固定的 32 位伪随机数发生器（mulberry32）：每次运行抽到同一批样本，失败可原样复现
+function createSeededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let mixed = Math.imul(state ^ (state >>> 15), state | 1);
+        mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// 逐码点列出，失败输出里的不可见字符也能看清
+const toCodePoints = (text) => Array.from(text, (ch) => ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' ');
+const describeNodes = (nodes) => nodes.map((node) => (node.type === 'text' ? `text[${toCodePoints(node.value)}]` : node.type)).join(', ');
+
+describe('trimInline：末尾修剪线性于串长', () => {
+    // [形态说明, 长段所用字符]：导入链路上文本先经 joinLineBreaks，空格与制表符的长段在其 LINE_BREAK_RE 上另有回溯，
+    // 纯回车的长段在该正则的首个回车处即失配、只落在末尾修剪上。这里直接调用 trimInline，只考察末尾修剪本身
+    const stressShapes = [
+        ['8 万个空格', ' '],
+        ['8 万个回车（CR）', '\r'],
+    ];
+
+    for (const [label, spaceChar] of stressShapes) {
+        test(`末尾文本节点里夹在可见字符之间的 ${label}不触发回溯：单次调用在绝对上限内，输出逐字正确`, () => {
+            // Arrange：在计时区间外新构造字符串与节点
+            const run = spaceChar.repeat(EDGE_SPACE_STRESS_LENGTH);
+            const nodes = [{ type: 'text', value: `a${run}b${TRAILING_EDGE_SPACES}` }];
+
+            // Act：计时区间只包这一次调用
+            const started = process.hrtime.bigint();
+            const result = trimInline(nodes);
+            const elapsedMs = elapsedMsSince(started);
+
+            // Assert：先验输出正确，以免「快」来自少做了事——串尾的空白删去，夹在中间的长段原样保留
+            assert.deepEqual(result, [{ type: 'text', value: `a${run}b` }]);
+            assert.ok(
+                elapsedMs < EDGE_SPACE_STRESS_BUDGET_MS,
+                `trimInline 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${EDGE_SPACE_STRESS_BUDGET_MS} ms`,
+            );
+        });
+    }
+
+    test('与逐字符扫描之前的实现逐字等价：穷举短串与种子固定的随机节点列表，末尾的删除与 U+00A0 的保留均有样本', (t) => {
+        // Arrange：9 个字符的字母表上长度 0 到 5 的全部字符串共 66430 个，各以两种形态成列：单个文本节点（首尾修剪落在
+        // 同一节点上），以及「图片 + 文本 + 换行」（末尾的换行先被丢弃，文本成为末节点，首部修剪不碰它）
+        const samples = [];
+        for (const text of everyStringUpTo(5, TRIM_DIFF_ALPHABET)) {
+            samples.push([{ type: 'text', value: text }]);
+            samples.push([OTHER_INLINE_NODE_BUILDERS[0](), { type: 'text', value: text }, { type: 'break' }]);
+        }
+        assert.equal(samples.length, 132860);
+
+        // 种子固定的随机节点列表 30000 个：0 到 6 个节点，文本、换行与其它行内节点混排，文本长 0 到 8 个字符
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomText = () => Array.from({ length: Math.floor(random() * 9) }, () => pick(TRIM_DIFF_ALPHABET)).join('');
+        const randomNode = () => {
+            const roll = random();
+            if (roll < 0.55) return { type: 'text', value: randomText() };
+            if (roll < 0.75) return { type: 'break' };
+            return pick(OTHER_INLINE_NODE_BUILDERS)();
+        };
+        for (let i = 0; i < 30000; i += 1) samples.push(Array.from({ length: Math.floor(random() * 7) }, randomNode));
+        assert.equal(samples.length, 162860);
+
+        // Act & Assert
+        const hits = { removed: 0, stoppedAtNbsp: 0, nbspKept: 0 };
+        for (const nodes of samples) {
+            const expected = legacyTrimInline(nodes, hits);
+            const actual = trimInline(nodes);
+            // 只在不一致时拼装诊断信息，免得十余万次调用都付这笔开销
+            if (!isDeepStrictEqual(actual, expected)) assert.deepEqual(actual, expected, `nodes=${describeNodes(nodes)}`);
+        }
+        // 覆盖自证：须有样本的末尾修剪确实删去了字符，也须有样本以 U+00A0 结尾而原样保留、删去空白后止于 U+00A0，
+        // 差分才不是只对「无事可做」的输入空转
+        t.diagnostic(`样本 ${samples.length} 个；末尾修剪删去字符 ${hits.removed} 个，其中删后止于 U+00A0 ${hits.stoppedAtNbsp} 个；`
+            + `以 U+00A0 结尾而原样保留 ${hits.nbspKept} 个`);
+        assert.ok(hits.removed > 0, '末尾修剪没有样本删去字符');
+        assert.ok(hits.stoppedAtNbsp > 0, '没有样本在删去空白后止于 U+00A0');
+        assert.ok(hits.nbspKept > 0, '没有样本以 U+00A0 结尾而原样保留');
+    });
+});

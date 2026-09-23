@@ -26,7 +26,8 @@ const IMG = 'img';
 const DEFAULT_UNDERLINE_STYLE = 'single';
 const LINE_BREAK_RE = /[ \t]*\r?\n[ \t\r\n]*/g;
 const EDGE_SPACE_START_RE = /^[ \t\r\n]+/;
-const EDGE_SPACE_END_RE = /[ \t\r\n]+$/;
+// 末尾修剪逐字符判定用的单字符正则，字符集与 EDGE_SPACE_START_RE 相同
+const EDGE_SPACE_CHAR_RE = /[ \t\r\n]/;
 // 汉字、全角标点：与 renderers/xml/inline.js 的 CJK_RE 同一范围。按码点声明——区间端点里的兼容表意字与常用字字形相同，
 // 写成字面量无从分辨
 const CJK_RANGES = Object.freeze([[0x2E80, 0x2FFF], [0x3000, 0x303F], [0x3400, 0x4DBF], [0x4E00, 0x9FFF], [0xF900, 0xFAFF], [0xFF00, 0xFFEF]]);
@@ -142,11 +143,19 @@ function trimInline(nodes) {
     const first = list[0];
     if (first.type === 'text') list[0] = textNode(first.value.replace(EDGE_SPACE_START_RE, ''));
     const last = list[list.length - 1];
-    if (last.type === 'text') list[list.length - 1] = textNode(last.value.replace(EDGE_SPACE_END_RE, ''));
+    if (last.type === 'text') list[list.length - 1] = textNode(trimEdgeSpaceEnd(last.value));
     return list;
 }
 
 const isBlankEdge = (node) => node.type === 'break' || (node.type === 'text' && node.value.replace(EDGE_SPACE_START_RE, '') === '');
+
+// 自串尾逐字符回退，代替「量词 + 行尾锚」的 /[ \t\r\n]+$/：该正则在不处于串尾的空白长段上从每个起点都贪婪吃到段尾再逐位回溯，
+// 耗时随段长平方增长。只认 EDGE_SPACE_CHAR_RE 的四个字符，不能换成 trimEnd（它会删去 U+00A0，见文件头）
+function trimEdgeSpaceEnd(text) {
+    let end = text.length;
+    while (end > 0 && EDGE_SPACE_CHAR_RE.test(text[end - 1])) end -= 1;
+    return text.slice(0, end);
+}
 
 function plainText(node) {
     if (!node) return '';

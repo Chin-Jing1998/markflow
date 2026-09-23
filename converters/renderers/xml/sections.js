@@ -56,7 +56,9 @@ const CLAIM_SUBJECT_RE = /^\s*\d+\s*[、.．]\s*(一种[^，,：:；;]{2,40}?)(?
 const TERMINAL_PUNCT_RE = /[，。；：,.;:！？!?]/;
 const SUBJECT_PREFIX_RE = /^一种/;
 // 标题归一：去全部空白、外层括号、尾部冒号与「一、」「1.」一类序号
-const BRACKET_RE = /^[(（\[［【〖〔《{｛]+|[)）\]］】〗〕》}｝]+$/g;
+// 外层括号的单个开括号与单个闭括号：只匹配一个字符的非全局正则，由 normalizeTitle 自两端向内逐码元判定
+const OPEN_BRACKET_CHAR_RE = /[(（\[［【〖〔《{｛]/;
+const CLOSE_BRACKET_CHAR_RE = /[)）\]］】〗〕》}｝]/;
 const ENUM_PREFIX_RE = /^(?:[一二三四五六七八九十]+|\d+)\s*[、.．]\s*/;
 const TRAILING_COLON_RE = /[:：]$/;
 // 官方标记码位（不可见字符一律以码点声明、运行时生成，源码里不出现看不见的字面量）
@@ -211,7 +213,14 @@ function stripMarkedNumber(runs, headRe, tailRe) {
 // ============================================================
 
 function normalizeTitle(text) {
-    return String(text || '').replace(/\s+/g, '').replace(BRACKET_RE, '').replace(TRAILING_COLON_RE, '').replace(ENUM_PREFIX_RE, '');
+    const compact = String(text || '').replace(/\s+/g, '');
+    // 外层括号自两端向内逐码元剥除，不用 /[闭括号]+$/ 一类「量词 + 行尾锚」的正则：后者在不处于串尾的
+    // 长闭括号段上从每个起点都吃到段尾再逐位回溯，耗时随段长平方增长
+    let start = 0;
+    while (start < compact.length && OPEN_BRACKET_CHAR_RE.test(compact[start])) start += 1;
+    let end = compact.length;
+    while (end > start && CLOSE_BRACKET_CHAR_RE.test(compact[end - 1])) end -= 1;
+    return compact.slice(start, end).replace(TRAILING_COLON_RE, '').replace(ENUM_PREFIX_RE, '');
 }
 
 function isTitleCandidate(block, sectionDetection) {
