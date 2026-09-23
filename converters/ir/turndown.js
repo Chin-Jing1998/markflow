@@ -218,6 +218,45 @@ function escapeAttr(value) {
  * 耗时须线性于块长：一段内连写 n 个 <br> 时，逐个重扫兄弟节点即成平方级，故首次遇到某块时整块线性扫描一次，
  * 把其中每个 <br> 的归类写入 WeakMap，同块其余 <br> 直接查表。剥离一律按下标手工扫描，不写「量词 + 行尾锚」或
  * 「前导量词 + 必需字符」形态的正则：长串换行记号位于中段时，这类正则从每个起点逐位回溯，耗时随长度平方增长。
+ *
+ * 强调定界符的失效与改写。成因：CommonMark 的 flanking 规则要求开定界符后面不是空白，且后面是标点时前面须为空白、
+ * 标点或行首；闭定界符前面不是空白，且前面是标点时后面须为空白、标点或行尾（micromark 的标点取 \p{P} 与 \p{S}，空白
+ * 取 \s，行首行尾同算空白）。中文正文里的强调常以书名号、引号、冒号、句号收尾而两侧紧贴汉字（「依据**《专利法》**的规定」
+ * 「**注意：**本发明」），定界符不成立、字面星号进入 IR，md 渲染时再被转义成 \*\*；内层的 <u>、<sup>、<sub>、图片与链接
+ * 处在边界上时定界符贴着「<」「!」「[」，同样失效。两对定界符紧邻时（「***甲****乙*」「**加粗***。*」）星号串合并成一个
+ * 定界符串，micromark 按自己的拆分（其「3 的倍数」规则按剩余长度计，与 cmark 不同）配对，结果无从推演。
+ * 写法：加粗、斜体规则不再直接写定界符，而在定界符的位置写四种哨兵（加粗开、加粗闭、斜体开、斜体闭），configureWord
+ * 包装 service.turndown，在整篇输出上由 resolveWordEmphasis 按栈给哨兵配对，逐对决定写成 ** / * 还是 <strong> / <em>——
+ * 后者由 ir/inline-html 在 remark 解析后还原为 strong / emphasis 节点，与标点无关。判定按最终输出中真实相邻的字符进行；
+ * 各对的结论互不依赖——凡与别的哨兵相邻即改写为标签，与相邻那一对的写法无关，只有整段包住的两对一并决定。处理顺序为
+ * 闭哨兵的先后（内层先于外层、前一兄弟先于后一兄弟），整段包住的判定在内层这一对上完成、外层随之定案。
+ * 判定依据（任一命中即改写为标签）：
+ *   - 核心为空：整对删除，只在输入混入同码点字符时出现；核心含换行：标题内处在强调中段的「两个空格 + 换行」；
+ *   - 同类嵌套（Strong 字符样式叠加加粗 run 时 mammoth 产出 <strong><strong>）：内外两对都改写，否则内层的开定界符
+ *     会与外层配对，「**甲**乙**丙**」里的乙失去加粗；改写后由 ir/inline-html 拍平为一个节点；
+ *   - 开哨兵的前后、闭哨兵的前后四个位置任一处是别的哨兵：写定界符会与相邻对的定界符合并成串。唯一例外是加粗恰好整段
+ *     包住斜体（或斜体整段包住加粗）且外层两侧都不贴着哨兵：合并串 ***X*** 是 CommonMark 规定的 emphasis(strong(X))
+ *     写法，按 X 的首尾字符与外层的外侧字符做同一 flanking 判定，成立则两对都写定界符，否则两对都改写；
+ *   - flanking 不成立：核心首字符是空白，或是标点而开定界符的前一字符既非空白、标点也非串首；核心末字符是空白，或是
+ *     标点而闭定界符的后一字符既非空白、标点也非串尾。串首串尾与换行符同算空白，与 micromark 一致：块级前缀（「# 」
+ *     「-   」）之后的位置在 micromark 里是行首，在本串里是空格，同属空白。
+ *     辅助平面字符的归类：micromark 4 以 UTF-16 码元为单位（preprocess 按 charCodeAt 切分，attention 取前一码元交
+ *     classifyCharacter），单个代理项不匹配 \p{P}|\p{S} 也不是空白，辅助平面的标点与符号在其眼中一律为「其他」；
+ *     CommonMark 0.31.2 按字符定义，同一字符则算标点。两种归类下都不得写出会失效的定界符，故取其严：核心首末字符按
+ *     码点归类，辅助平面的标点与符号算标点（对外侧字符的要求更严）；外侧字符凡属辅助平面一律按「其他」，不因其为标点
+ *     而放宽（对核心首末为标点的情形更严）；BMP 字符两种归类相同、照旧。代价是少数本可写定界符的情形改写为标签
+ *     （核心只有 U+1F600 而两侧为汉字时改写；外侧为 U+1F600 而核心为书名号时本就失效），IR 不变；只有加粗斜体
+ *     整段包住、核心首尾为辅助平面符号而外侧为汉字时，改写后 IR 由 emphasis(strong) 变为 strong(emphasis)。
+ *     整段包住的 ***X*** 判定走同一规则。
+ * 哨兵取 XML 1.0 不允许出现的 C0 控制字符 U+001C–U+001F（FS、GS、RS、US），docx 正文不可能含有，也不与 ir/markers 的
+ * 私用区标记（U+EF00 起）相交；一律以码点生成。输入混入同码点字符时行为确定：按栈配对，配不成对的（无对应开哨兵的
+ * 闭哨兵、到串尾仍未闭合的开哨兵、被异类闭哨兵越过的开哨兵）一律删除，其余照常判定，产物不含任何哨兵。
+ * 已知表现：加粗整段包住斜体而外层贴着别的强调时（「<strong><em>甲</em></strong><em>乙</em>」）两对都改写为标签，IR 为
+ * strong(emphasis) 而非定界符 ***X*** 解析出的 emphasis(strong)，两种次序各渲染器同等处理；只包着图片的加粗改写为标签时，
+ * ir/inline-html 拆除该格式帧（图片不承载加粗），写定界符时则仍为 strong(image)。
+ * 耗时线性于输出长度：配对、删除孤儿、判定与写出各扫描一遍；配对按种类各维护一个开哨兵栈，闭哨兵直接取同类栈顶，越过
+ * 的开哨兵逐个弹出，每个哨兵入栈出栈至多各一次；判定只看每对的四个相邻位置与核心首尾字符，核心是否含换行查换行符的
+ * 前缀计数表，不切取核心子串（交替嵌套 n 层时逐对切取即成平方级）。扫描一律按下标进行，不用正则。
  */
 
 // turndown 7.2 判定块级所用的标签（其内部 blockElements 未导出，此处照录），换行的归类须与之一致
@@ -236,6 +275,34 @@ const TRIMMABLE_CHAR_RE = /\s/;
 const ELEMENT_NODE = 1;
 const TEXT_NODE = 3;
 const CDATA_SECTION_NODE = 4;
+// 强调定界符的哨兵：XML 1.0 不允许出现的 C0 控制字符 U+001C–U+001F（FS、GS、RS、US），一律以码点生成。
+// 码点的次序即种类与开闭：偶数位为开、奇数位为闭，前两个为加粗、后两个为斜体
+const SENTINEL_FIRST = 0x1c;
+const SENTINEL_LAST = 0x1f;
+const EM_SENTINEL_FIRST = 0x1e;
+const fromCode = (code) => String.fromCharCode(code);
+const STRONG_OPEN = fromCode(SENTINEL_FIRST);
+const STRONG_CLOSE = fromCode(SENTINEL_FIRST + 1);
+const EM_OPEN = fromCode(EM_SENTINEL_FIRST);
+const EM_CLOSE = fromCode(EM_SENTINEL_FIRST + 1);
+// 是否含哨兵的快速判定：单个字符类、无量词
+const SENTINEL_RE = new RegExp(`[${STRONG_OPEN}-${EM_CLOSE}]`);
+const EMPHASIS_FORMS = Object.freeze({
+    strong: { delimiter: '**', open: '<strong>', close: '</strong>' },
+    em: { delimiter: '*', open: '<em>', close: '</em>' },
+});
+// flanking 判定的字符类别：标点取 \p{P} 与 \p{S}，空白取 \s（同 TRIMMABLE_CHAR_RE），串首串尾同算空白。micromark 4 按 UTF-16
+// 码元归类，辅助平面字符（两个代理项码元）在其眼中一律为「其他」，CommonMark 则按字符（码点）定义；两种归类下都不得写出会失效
+// 的定界符，故取其严：核心首末字符按码点归类（辅助平面的标点、符号算标点），外侧字符凡属辅助平面一律按「其他」（见 isFlankingSafe）
+const PUNCTUATION_RE = /[\p{P}\p{S}]/u;
+const MAX_BMP_CODE_POINT = 0xffff;
+const CHAR_SPACE = 'space';
+const CHAR_PUNCT = 'punct';
+const CHAR_OTHER = 'other';
+// 每对哨兵的写法
+const FORM_DELIMITER = 'delimiter';
+const FORM_HTML = 'html';
+const FORM_DROP = 'drop';
 
 /** word profile 的换行规则与加粗、斜体规则（说明见上方块注释） */
 function addBreakRules(service) {
@@ -245,13 +312,14 @@ function addBreakRules(service) {
         filter: 'br',
         replacement: (content, node, options) => (isMidBreak(node, midBreaks) ? HTML_BREAK : `${options.br}\n`),
     });
+    // 定界符的位置先写哨兵，写成 ** / * 还是 <strong> / <em> 由 resolveWordEmphasis 在整篇输出上决定（见下方块注释）
     service.addRule('wordStrong', {
         filter: ['strong', 'b'],
-        replacement: (content, node, options) => wrapOutsideBreaks(content, options.strongDelimiter, `${options.br}\n`),
+        replacement: (content, node, options) => wrapOutsideBreaks(content, STRONG_OPEN, STRONG_CLOSE, `${options.br}\n`),
     });
     service.addRule('wordEmphasis', {
         filter: ['em', 'i'],
-        replacement: (content, node, options) => wrapOutsideBreaks(content, options.emDelimiter, `${options.br}\n`),
+        replacement: (content, node, options) => wrapOutsideBreaks(content, EM_OPEN, EM_CLOSE, `${options.br}\n`),
     });
 }
 
@@ -321,17 +389,17 @@ function nextOutsideSubtree(node, block) {
 }
 
 /**
- * 以定界符包裹：首尾的换行记号与相邻空白剥到定界符之外，其中只输出段中换行 <br>（理由见上方块注释）。
+ * 以开闭记号包裹：首尾的换行记号与相邻空白剥到记号之外，其中只输出段中换行 <br>（理由见上方块注释）。
  * 核心为空（只含换行与空白）时只输出剥下的 <br>，只含换行的 run 由此保住段中换行；既无 <br> 又无核心时返回空串，
  * 同默认规则
  */
-function wrapOutsideBreaks(content, delimiter, lineBreak) {
+function wrapOutsideBreaks(content, open, close, lineBreak) {
     const head = leadingBreaks(content, lineBreak);
     const tail = trailingBreaks(content, head.end, lineBreak);
     const core = content.slice(head.end, tail.start);
     const htmlBreaks = (tokens) => tokens.filter((token) => token === HTML_BREAK).join('');
     if (!core) return htmlBreaks([...head.tokens, ...tail.tokens]);
-    return `${htmlBreaks(head.tokens)}${delimiter}${core}${delimiter}${htmlBreaks(tail.tokens)}`;
+    return `${htmlBreaks(head.tokens)}${open}${core}${close}${htmlBreaks(tail.tokens)}`;
 }
 
 /** 自串首起连续的换行记号与空白：返回其终点与其中的换行记号（按原序） */
@@ -390,6 +458,209 @@ function isEscaped(content, index) {
     return count % 2 === 1;
 }
 
+// ---------- 强调定界符：哨兵配对与写法定夺（说明见上方块注释） ----------
+
+/**
+ * 把 word profile 的 turndown 输出里的强调哨兵换成 ** / * 或 <strong> / <em>，配不成对的哨兵删除；不含哨兵时原样返回。
+ * 全程按下标扫描、不建位置索引：先按栈配对并标出孤儿，再把串切成相邻两个保留哨兵之间的文本段（孤儿删去、两侧文本并为
+ * 一段），各对的相邻字符、是否贴着别的哨兵、核心是否为空或含换行都从文本段及其换行计数得出，最后逐段写出
+ */
+function resolveWordEmphasis(markdown) {
+    const raw = String(markdown);
+    if (!SENTINEL_RE.test(raw)) return raw;
+    const pairs = pairSentinels(raw);
+    const { kept, segments, newlines } = splitBySentinels(raw, pairs);
+    markSameKindNesting(kept);
+    for (const pair of pairs) decideEmphasisForm(pair, kept, segments, newlines);
+    const parts = [];
+    for (let index = 0; index < kept.length; index += 1) {
+        parts.push(segments[index]);
+        const { pair, open } = kept[index];
+        if (pair.form === FORM_DROP) continue;
+        const forms = EMPHASIS_FORMS[pair.kind];
+        parts.push(pair.form === FORM_DELIMITER ? forms.delimiter : open ? forms.open : forms.close);
+    }
+    parts.push(segments[kept.length]);
+    return parts.join('');
+}
+
+/**
+ * 按栈给哨兵配对：闭哨兵取同类开哨兵中最近的一个，被它越过的（更晚入栈、尚未闭合的）开哨兵与无对应开哨兵的闭哨兵、
+ * 到串尾仍未闭合的开哨兵同为孤儿。返回按闭哨兵先后排列的各对，其 tokens 为串中全部哨兵的记录（孤儿的 pair 为 null）。
+ * 每个哨兵入栈、出栈至多各一次，线性于串长
+ */
+function pairSentinels(raw) {
+    const tokens = [];
+    const stack = [];
+    const openByKind = { strong: [], em: [] };
+    const pairs = [];
+    for (let at = 0; at < raw.length; at += 1) {
+        const code = raw.charCodeAt(at);
+        if (code < SENTINEL_FIRST || code > SENTINEL_LAST) continue;
+        const token = { at, kind: code < EM_SENTINEL_FIRST ? 'strong' : 'em', open: code % 2 === 0, pair: null };
+        tokens.push(token);
+        if (token.open) {
+            token.pair = { kind: token.kind, openAt: -1, closeAt: -1, form: null, nested: false };
+            stack.push(token);
+            openByKind[token.kind].push(token);
+            continue;
+        }
+        const opens = openByKind[token.kind];
+        if (opens.length === 0) continue;
+        const match = opens[opens.length - 1];
+        // 越过的开哨兵按入栈的逆序弹出，此时各自恰是本种类栈的栈顶
+        while (stack[stack.length - 1] !== match) {
+            const skipped = stack.pop();
+            openByKind[skipped.kind].pop();
+            skipped.pair = null;
+        }
+        stack.pop();
+        opens.pop();
+        token.pair = match.pair;
+        pairs.push(match.pair);
+    }
+    for (const token of stack) token.pair = null;
+    pairs.tokens = tokens;
+    return pairs;
+}
+
+/**
+ * 按保留的哨兵切段：segments[k] 为第 k 个保留哨兵之前（上一个保留哨兵之后）的文本，segments[kept.length] 为串尾的文本，
+ * 孤儿哨兵删去、其两侧文本并为一段；newlines[k] 为 segments[0..k] 中换行符的累计个数。各对记下开闭哨兵在 kept 中的下标
+ */
+function splitBySentinels(raw, pairs) {
+    const kept = [];
+    const segments = [];
+    const newlines = [];
+    const pieces = [];
+    let copied = 0;
+    let count = 0;
+    const closeSegment = () => {
+        const segment = pieces.length === 1 ? pieces[0] : pieces.join('');
+        pieces.length = 0;
+        count += countNewlines(segment);
+        segments.push(segment);
+        newlines.push(count);
+    };
+    for (const token of pairs.tokens) {
+        pieces.push(raw.slice(copied, token.at));
+        copied = token.at + 1;
+        if (!token.pair) continue;
+        closeSegment();
+        if (token.open) token.pair.openAt = kept.length;
+        else token.pair.closeAt = kept.length;
+        kept.push({ pair: token.pair, open: token.open });
+    }
+    pieces.push(raw.slice(copied));
+    closeSegment();
+    return { kept, segments, newlines };
+}
+
+function countNewlines(text) {
+    let count = 0;
+    for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) count += 1;
+    return count;
+}
+
+/** 同类嵌套：内外两对都标记 nested，各自改写为标签（否则内层的开定界符会与外层配对） */
+function markSameKindNesting(kept) {
+    const open = { strong: [], em: [] };
+    for (const { pair, open: isOpen } of kept) {
+        const stack = open[pair.kind];
+        if (!isOpen) {
+            stack.pop();
+            continue;
+        }
+        if (stack.length > 0) {
+            pair.nested = true;
+            stack[stack.length - 1].nested = true;
+        }
+        stack.push(pair);
+    }
+}
+
+/**
+ * 逐对定夺写法。调用顺序为闭哨兵的先后：内层先于外层、前一兄弟先于后一兄弟；整段包住它的另一类对随它一并决定，
+ * 轮到该对时已有结论则跳过。开哨兵在 kept 中的下标为 a、闭哨兵为 b 时，核心即 segments[a + 1 .. b]，
+ * 一段为空串即该处两个哨兵紧邻（segments[0] 与 segments[kept.length] 为空则是串首、串尾）
+ */
+function decideEmphasisForm(pair, kept, segments, newlines) {
+    if (pair.form) return;
+    const a = pair.openAt;
+    const b = pair.closeAt;
+    const end = kept.length;
+    if (b === a + 1 && segments[b] === '') {
+        pair.form = FORM_DROP;
+        return;
+    }
+    if (pair.nested || newlines[b] - newlines[a] > 0) {
+        pair.form = FORM_HTML;
+        return;
+    }
+    const before = segments[a];
+    const first = segments[a + 1];
+    const last = segments[b];
+    const after = segments[b + 1];
+    const outer = a > 0 && b + 1 < end && before === '' && after === '' ? kept[a - 1].pair : null;
+    if (outer && outer === kept[b + 1].pair && outer.kind !== pair.kind && !outer.form && !outer.nested
+        && (a === 1 || segments[a - 1] !== '') && (b + 2 === end || segments[b + 2] !== '') && first !== '' && last !== '') {
+        // 合并串 ***X***：按 X 的首尾字符与外层的外侧字符判定，两对同进退
+        const ok = isFlankingSafe(segments[a - 1], first, last, segments[b + 2]);
+        pair.form = ok ? FORM_DELIMITER : FORM_HTML;
+        outer.form = pair.form;
+        return;
+    }
+    if ((a > 0 && before === '') || first === '' || last === '' || (b + 1 < end && after === '')) {
+        pair.form = FORM_HTML;
+        return;
+    }
+    pair.form = isFlankingSafe(before, first, last, after) ? FORM_DELIMITER : FORM_HTML;
+}
+
+/**
+ * CommonMark 的 flanking 判定：开定界符（前一字符为 before 段的末字符、核心首字符为 first 段的首字符）须为左侧 flanking，
+ * 闭定界符（核心末字符为 last 段的末字符、后一字符为 after 段的首字符）须为右侧 flanking；空段即串首或串尾。
+ * 核心首末字符按码点归类，外侧字符按 classOfOutside 归类（辅助平面一律为「其他」），两种归类取其严（理由见块注释）
+ */
+function isFlankingSafe(before, first, last, after) {
+    const beforeClass = classOfOutside(codePointBefore(before, before.length));
+    const firstClass = classOf(codePointAt(first, 0));
+    const lastClass = classOf(codePointBefore(last, last.length));
+    const afterClass = classOfOutside(codePointAt(after, 0));
+    const canOpen = firstClass !== CHAR_SPACE && (firstClass !== CHAR_PUNCT || beforeClass !== CHAR_OTHER);
+    const canClose = lastClass !== CHAR_SPACE && (lastClass !== CHAR_PUNCT || afterClass !== CHAR_OTHER);
+    return canOpen && canClose;
+}
+
+/** 按码点归类：串首串尾（null）与 \s 为空白，\p{P} 与 \p{S} 为标点（辅助平面的标点、符号在内），其余为「其他」 */
+function classOf(codePoint) {
+    if (codePoint === null) return CHAR_SPACE;
+    const char = String.fromCodePoint(codePoint);
+    if (TRIMMABLE_CHAR_RE.test(char)) return CHAR_SPACE;
+    return PUNCTUATION_RE.test(char) ? CHAR_PUNCT : CHAR_OTHER;
+}
+
+/** 外侧字符的归类：辅助平面字符一律为「其他」（micromark 4 只看贴着定界符的那个代理项码元），其余同 classOf */
+function classOfOutside(codePoint) {
+    return codePoint !== null && codePoint > MAX_BMP_CODE_POINT ? CHAR_OTHER : classOf(codePoint);
+}
+
+/** 始于 at 的码点；越界为 null */
+function codePointAt(text, at) {
+    return at >= 0 && at < text.length ? text.codePointAt(at) : null;
+}
+
+/** 止于 at（最后一个码元的下标为 at - 1）的码点，代理对按整体取；at 不大于 0 时为 null */
+function codePointBefore(text, at) {
+    if (at <= 0 || at > text.length) return null;
+    const low = text.charCodeAt(at - 1);
+    if (low >= 0xdc00 && low <= 0xdfff && at >= 2) {
+        const high = text.charCodeAt(at - 2);
+        if (high >= 0xd800 && high <= 0xdbff) return text.codePointAt(at - 2);
+    }
+    return low;
+}
+
 // ---------- 各 profile 配置 ----------
 
 function configureBasic(service) {
@@ -399,6 +670,9 @@ function configureBasic(service) {
 function configureWord(service) {
     addTableRule(service);
     addBreakRules(service);
+    // 强调规则写出的哨兵在整篇输出上统一定夺写法（见 resolveWordEmphasis），哨兵不外泄
+    const turndown = service.turndown.bind(service);
+    service.turndown = (input) => resolveWordEmphasis(turndown(input));
     service.addRule('emptyImg', {
         filter: (node) => node.nodeName === 'IMG' && !node.getAttribute('src'),
         replacement: () => '',

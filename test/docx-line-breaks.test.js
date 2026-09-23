@@ -396,6 +396,7 @@ describe('turndown word profile：换行写法与强调规则', () => {
         const service = createTurndownService('word');
         const upstream = service.escape.bind(service);
         service.escape = (value) => upstream(value).replace(/</g, '\\<');
-        assert.equal(toMarkdown('<p>前文<strong>加粗&lt;br&gt;</strong>后文</p>', service), '前文**加粗\\<br>**后文');
+        // 旧期望「前文**加粗\<br>**后文」本身即 flanking 失效（闭定界符前是「>」、后是汉字），现按定界符后处理改写为标签
+        assert.equal(toMarkdown('<p>前文<strong>加粗&lt;br&gt;</strong>后文</p>', service), '前文<strong>加粗\\<br></strong>后文');
     });
 });
