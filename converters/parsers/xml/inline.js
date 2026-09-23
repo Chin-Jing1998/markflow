@@ -24,7 +24,10 @@ const STYLE_ONLY_ELEMENTS = new Set(['smallcaps', 'overscore']);
 const CODED_OBJECT_ELEMENTS = new Set(['math', 'table', 'chem', 'cn-mathf', 'cn-tablef']);
 const IMG = 'img';
 const DEFAULT_UNDERLINE_STYLE = 'single';
-const LINE_BREAK_RE = /[ \t]*\r?\n[ \t\r\n]*/g;
+// 换行归一只匹配自换行起的部分：「\r?\n」及其后的极大空白；紧邻其前的空格与制表符由 joinLineBreaks 向前回看并入。首项在每个
+// 位置只做常数步判定，尾部贪婪量词后无后续项、不回溯。不写成 /[ \t]*\r?\n[ \t\r\n]*/g：其前导量词在不以换行结尾的空格制表符
+// 长段上从每个起点都吞到段尾、再因缺换行逐位回退而失败，耗时随段长平方增长
+const LINE_BREAK_RE = /\r?\n[ \t\r\n]*/g;
 const EDGE_SPACE_START_RE = /^[ \t\r\n]+/;
 // 末尾修剪逐字符判定用的单字符正则，字符集与 EDGE_SPACE_START_RE 相同
 const EDGE_SPACE_CHAR_RE = /[ \t\r\n]/;
@@ -113,13 +116,38 @@ const hasCodedContent = (node) => node.children.some((child) => child.type === '
 // 文本归一与整理
 // ============================================================
 
+/**
+ * 含换行的空白串按两侧字符归一（口径见文件头与 edgeJoin）。LINE_BREAK_RE 只匹配自换行起的部分，紧邻其前的极大空格制表符段
+ * 在此逐段向前回看并入，回看不越过上一段的结束位置 cursor（首段为 0）；各段回看扫过的区间互不重叠，总成本线性于串长。
+ *
+ * 与旧式全局正则「[ \t]*\r?\n[ \t\r\n]*」的 replace 逐字等价。两种写法都自上一段的结束位置 cursor 续查。设 q 为不小于 cursor、
+ * 「\r?\n」能在此匹配的首个位置；旧的最左匹配起点为 p、其中换行的位置为 r。[p, r) 全为空格或制表符，且 r 同为「\r?\n」能匹配
+ * 的位置，故 r ≥ q；q 本身又是旧正则的可行起点，故 p ≤ q。若 r > q，则 q 落在 [p, r) 内而须为空格或制表符，与 whole[q] 为
+ * 回车或换行矛盾，故 r = q，p 取可行起点中最左者，即 max(cursor, 紧邻 q 之前的极大空格制表符段的起点)，恰为回看所得。换行部分
+ * 二者都在 q 处以同样的贪婪方式匹配「\r?\n」，尾部 [ \t\r\n]* 同为极大匹配，故段终点相同，传给判定的 before、after 逐字一致。
+ * 尾部字符集含空格与制表符，上一段结束位置上的字符不可能是空格或制表符（除非已到串尾），故回看实际总是先止于别的字符或串首，
+ * 「不越过 cursor」只起防御作用
+ */
 function joinLineBreaks(value) {
-    return String(value == null ? '' : value).replace(LINE_BREAK_RE, (match, offset, whole) => {
-        const before = whole[offset - 1] || '';
-        const after = whole[offset + match.length] || '';
-        if (!before || !after) return edgeJoin(before || after);
-        return CJK_RE.test(before) || CJK_RE.test(after) ? '' : ' ';
-    });
+    const whole = String(value == null ? '' : value);
+    const pieces = [];
+    let cursor = 0;
+    for (const match of whole.matchAll(LINE_BREAK_RE)) {
+        let start = match.index;
+        while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
+        pieces.push(whole.slice(cursor, start));
+        cursor = match.index + match[0].length;
+        pieces.push(joinOneLineBreak(whole[start - 1] || '', whole[cursor] || ''));
+    }
+    pieces.push(whole.slice(cursor));
+    return pieces.join('');
+}
+
+// 单段的替换判定，与改写前的回调相同：任一侧为空即落在文本节点边界上，交 edgeJoin；两侧皆有字符时，任一侧为汉字或全角标点
+// 即删除，否则换成一个空格
+function joinOneLineBreak(before, after) {
+    if (!before || !after) return edgeJoin(before || after);
+    return CJK_RE.test(before) || CJK_RE.test(after) ? '' : ' ';
 }
 
 // 换行落在文本节点的边界上：另一侧是汉字或同样为空（整个节点只有排版空白）即删除，西文留一个空格
