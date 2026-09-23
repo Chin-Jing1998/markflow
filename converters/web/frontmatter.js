@@ -108,8 +108,11 @@ function quote(text) {
 const BOM = String.fromCharCode(0xfeff);
 const OPEN_FENCE_RE = new RegExp(`^${BOM}?---[ \\t]*\\r?\\n`);
 const CLOSE_FENCE_RE = /^(---|\.\.\.)[ \t]*$/;
-const KEY_LINE_RE = /^([A-Za-z_][\w.-]*)[ \t]*:[ \t]*(.*)$/;
+// 键值行的前缀：键名、冒号及其两侧的半角空白。冒号之后的余下部分由 matchKeyLine 另查行终止符
+const KEY_LINE_HEAD_RE = /^([A-Za-z_][\w.-]*)[ \t]*:[ \t]*/;
 const LIST_ITEM_RE = /^[ \t]*-[ \t]+(.*)$/;
+// 行终止符：LF、CR、U+2028、U+2029，即正则里 . 不匹配的四个码元。以码点构造，理由同 BOM
+const LINE_TERMINATOR_RE = new RegExp(`[${[0x0a, 0x0d, 0x2028, 0x2029].map((code) => String.fromCharCode(code)).join('')}]`);
 
 /**
  * 摘掉 Markdown 文本开头的 YAML front matter。
@@ -143,9 +146,9 @@ function parseBlock(lines) {
             continue;
         }
 
-        const matched = KEY_LINE_RE.exec(line);
+        const matched = matchKeyLine(line);
         if (!matched) continue;
-        const [, key, rawValue] = matched;
+        const [key, rawValue] = matched;
         const value = rawValue.trim();
         if (!value) {
             // 空值：后续可能跟着块式数组，先占位为数组，收不到条目就在收尾时降级为空串
@@ -157,6 +160,22 @@ function parseBlock(lines) {
         listKey = '';
     }
     return finalize(data);
+}
+
+/**
+ * 识别键值行 `key: value`，返回 [键名, 冒号之后的余下部分]；不是键值行时返回 null。
+ * 旧式 /^([A-Za-z_][\w.-]*)[ \t]*:[ \t]*(.*)$/ 在冒号后的空白段上平方级回溯：[ \t]* 与 (.*) 能吃同一段空白，余下部分
+ * 含行终止符时 .* 跨不过它、$ 又只认串尾，引擎对这段空白的每一种分法都重扫到行终止符为止。前缀是确定的（键名只能取
+ * 极大的 [\w.-] 段，其后两段空白也只能取极大），故正则只认前缀、失配时至多回退一遍，余下部分再线性查一遍行终止符。
+ * 等价判据：余下部分不含行终止符时旧式恰好匹配，第 2 组即余下部分；含则旧式对任何分法都失配。
+ * @param {string} line
+ * @returns {[string, string] | null}
+ */
+function matchKeyLine(line) {
+    const head = KEY_LINE_HEAD_RE.exec(line);
+    if (!head) return null;
+    const rest = line.slice(head[0].length);
+    return LINE_TERMINATOR_RE.test(rest) ? null : [head[1], rest];
 }
 
 // 收尾：始终没收到条目的占位数组降级为空串，避免出现 `key: []` 这种与原文不符的值
@@ -218,4 +237,4 @@ function unescapeDouble(text) {
     });
 }
 
-module.exports = { buildFrontMatter, prependFrontMatter, stripFrontMatter, FIELD_ORDER };
+module.exports = { buildFrontMatter, prependFrontMatter, stripFrontMatter, FIELD_ORDER, matchKeyLine };
