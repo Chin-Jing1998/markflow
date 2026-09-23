@@ -529,3 +529,40 @@ test('w:vertAlign 的上下标进 IR 的 superscript / subscript；成对的「~
     assert.equal(plainText(bold[0]), '甲');
     assert.equal(collect(bold[0], (n) => n.type === 'subscript').length, 1);
 });
+
+test('表格单元格与图片替代文字中的「~」与星号逐字进入 IR，不被当成删除线与斜体', async () => {
+    // Arrange：单元格取 textContent、图片 alt 由内置 image 规则处理，两者都不经 turndown 文本节点的转义
+    const ALT = '10~20℃与30~40℃对比';
+    const buffer = await Packer.toBuffer(new Document({
+        sections: [{ children: [
+            new Table({
+                rows: [
+                    new TableRow({ children: [cell('温度'), cell('代号')] }),
+                    new TableRow({ children: [cell('10~20℃、30~40℃'), cell('a*b*c')] }),
+                ],
+            }),
+            new Paragraph({ children: [new ImageRun({
+                type: 'png',
+                data: PNG,
+                transformation: { width: 8, height: 8 },
+                altText: { title: ALT, description: ALT, name: ALT },
+            })] }),
+        ] }],
+    }));
+
+    // Act
+    const doc = await parse({ buffer }, { sourceName: '转义.docx' });
+
+    // Assert：单元格文本逐字保留
+    const rows = collect(doc.ir, (n) => n.type === 'tableRow');
+    assert.deepEqual(rows.map((r) => r.children.map(plainText)), [['温度', '代号'], ['10~20℃、30~40℃', 'a*b*c']]);
+
+    // Assert：图片替代文字逐字保留
+    const images = collect(doc.ir, (n) => n.type === 'image');
+    assert.equal(images.length, 1);
+    assert.equal(images[0].alt, ALT);
+
+    // Assert：两条通道都未误生成 delete 与 emphasis 节点
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete'), []);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'emphasis'), []);
+});

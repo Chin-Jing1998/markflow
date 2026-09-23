@@ -1,19 +1,54 @@
 /**
  * converters/ir/turndown.js 单元测试
- * 覆盖：HTML 表格 → GFM 表格的列数判定（取各行最大值、短行补空单元格、排除嵌套表格的行）
+ * 覆盖：HTML 表格 → GFM 表格的列数判定（取各行最大值、短行补空单元格、排除嵌套表格的行）、
+ *       各 profile 的「~」转义（含超长反斜杠串上的线性耗时、与线性化之前实现的差分等价）、
+ *       url profile 的保真约定（HTML 标签、标记、图注、上下标），
+ *       表格单元格与图片 alt 接入 service.escape（转义顺序、换行折叠、src 与 title 沿用内置规则），
+ *       以及 turndown → remark-gfm → ir/inline-html 的全链路结果
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
+const TurndownService = require('turndown');
 const { createTurndownService } = require('../converters/ir/turndown');
 const { MARKERS } = require('../converters/ir/markers');
+const { loadUnified } = require('../converters/ir/unified-loader');
+const { liftInlineHtml } = require('../converters/ir/inline-html');
 
 // 表格规则在 word 与 url 两个 profile 上都挂着，两者行为应一致
 const PROFILES_WITH_TABLE = ['word', 'url'];
+// 三个 profile 的产物都交给 singleTilde 的 remark-gfm 解析，故「~」转义与 profile 无关
+const ALL_PROFILES = ['basic', 'word', 'url'];
 
 function toMarkdown(html, profile = 'word') {
     return createTurndownService(profile).turndown(html).trim();
 }
+
+// liftInlineHtml 的 source 取值：word profile 的产物来自 parsers/docx，其余来自 parsers/url
+const SOURCE_OF = { basic: 'web', word: 'docx', url: 'web' };
+
+// turndown → remark-parse + remark-gfm → liftInlineHtml，与 parsers/docx、parsers/url 内的调用同序
+async function toIr(html, profile = 'url') {
+    const md = toMarkdown(html, profile);
+    const { unified, remarkParse, remarkGfm } = await loadUnified();
+    return { md, ir: liftInlineHtml(unified().use(remarkParse).use(remarkGfm).parse(md), { source: SOURCE_OF[profile] }) };
+}
+
+function collect(node, predicate, out = []) {
+    if (!node || typeof node !== 'object') return out;
+    if (predicate(node)) out.push(node);
+    if (Array.isArray(node.children)) for (const child of node.children) collect(child, predicate, out);
+    return out;
+}
+
+function plainText(node) {
+    if (!node || typeof node !== 'object') return '';
+    if (node.type === 'text' || node.type === 'inlineCode') return String(node.value || '');
+    if (!Array.isArray(node.children)) return '';
+    return node.children.map(plainText).join('');
+}
+
+const textsOfType = (ir, type) => collect(ir, (n) => n.type === type).map(plainText);
 
 test('不规则表格按最长行确定列数，短行补空单元格', () => {
     // Arrange：首行 1 列、次行 3 列
@@ -119,14 +154,319 @@ test('word profile 保留 <sup>/<sub>（mammoth 由 w:vertAlign 产出），交 
     assert.equal(toMarkdown('<p>C<sub>1</sub>的烷基</p>', 'word'), 'C<sub>1</sub>的烷基');
 });
 
-test('word profile：文本中的「~」转义为 \\~，避免成对的单波浪号被 remark-gfm 解析为删除线', () => {
-    // 区间号「~」成对出现时最易受害，须逐个转义
-    assert.equal(toMarkdown('<p>C1~C30的烷基、C1~C30的烷氧基</p>', 'word'), 'C1\\~C30的烷基、C1\\~C30的烷氧基');
-    // turndown 自身只转义行首的 ~~~，已带反斜杠的不重复转义，其余补齐
-    assert.equal(toMarkdown('<p>~~~甲</p>', 'word'), '\\~\\~\\~甲');
-    // 文本中的字面反斜杠先被转义成 \\，其后的 ~ 仍须转义
-    assert.equal(toMarkdown('<p>甲\\~乙</p>', 'word'), '甲\\\\\\~乙');
-    // url profile 与 basic profile 不受影响（Markdown 输入的 ~删除线~ 语义保持）
-    assert.equal(toMarkdown('<p>C1~C30</p>', 'url'), 'C1~C30');
-    assert.equal(toMarkdown('<p>C1~C30</p>', 'basic'), 'C1~C30');
+test('各 profile：文本中的「~」转义为 \\~，避免成对的单波浪号被 remark-gfm 解析为删除线', () => {
+    // Act & Assert：HTML 文本中的「~」恒为字面量，三个 profile 一视同仁
+    for (const profile of ALL_PROFILES) {
+        // 区间号「~」成对出现时最易受害，须逐个转义
+        assert.equal(toMarkdown('<p>C1~C30的烷基、C1~C30的烷氧基</p>', profile), 'C1\\~C30的烷基、C1\\~C30的烷氧基', profile);
+        // turndown 自身只转义行首的 ~~~，已带反斜杠的不重复转义，其余补齐
+        assert.equal(toMarkdown('<p>~~~甲</p>', profile), '\\~\\~\\~甲', profile);
+        // 文本中的字面反斜杠先被转义成 \\，其后的 ~ 仍须转义
+        assert.equal(toMarkdown('<p>甲\\~乙</p>', profile), '甲\\\\\\~乙', profile);
+    }
+});
+
+test('url profile 保留 <sup>/<sub>（网页的化学式与脚注标号），交 ir/inline-html 提升', () => {
+    // Act & Assert：上下标为行内标签，不额外分段
+    assert.equal(toMarkdown('<p>R<sup>2</sup>、C<sub>1</sub>的烷基</p>', 'url'), 'R<sup>2</sup>、C<sub>1</sub>的烷基');
+    // 上标内的链接照常转 Markdown（脚注标号的常见写法）
+    assert.equal(toMarkdown('<p>结论<sup><a href="#fn1">[1]</a></sup>成立</p>', 'url'), '结论<sup>[\\[1\\]](#fn1)</sup>成立');
+    // 空标签不留残壳
+    assert.equal(toMarkdown('<p>甲<sup> </sup>乙</p>', 'url'), '甲 乙');
+});
+
+test('url profile：line-through 样式仍输出 <del>，既有的行内样式约定不受上下标规则影响', () => {
+    // Act & Assert：新规则注册在 URL_WRAP_RULES 表首、优先级最低，既有规则的命中不变
+    assert.equal(toMarkdown('<p><span style="text-decoration: line-through">作废</span></p>', 'url'), '<del>作废</del>');
+    assert.equal(toMarkdown('<p><sup style="text-decoration: line-through">废标</sup></p>', 'url'), '<del>废标</del>');
+});
+
+// ============================================================
+// url profile 全链路：turndown → remark-gfm → ir/inline-html
+// ============================================================
+
+test('url profile 全链路：区间号「~」逐字进入 IR，不产生 delete 节点', async () => {
+    // Act
+    const { md, ir } = await toIr('<p>C1~C30的烷基、疗程3~5天</p>');
+
+    // Assert
+    assert.equal(md, 'C1\\~C30的烷基、疗程3\\~5天');
+    assert.equal(plainText(ir), 'C1~C30的烷基、疗程3~5天');
+    assert.deepEqual(textsOfType(ir, 'delete'), []);
+});
+
+test('url profile 全链路：<sup>/<sub> 还原为 superscript / subscript 节点', async () => {
+    // Act
+    const { ir } = await toIr('<p>R<sup>2</sup>、C<sub>1</sub>的烷基</p>');
+
+    // Assert
+    assert.deepEqual(textsOfType(ir, 'superscript'), ['2']);
+    assert.deepEqual(textsOfType(ir, 'subscript'), ['1']);
+    assert.equal(plainText(ir), 'R2、C1的烷基');
+    assert.deepEqual(collect(ir, (n) => n.type === 'html'), []);
+});
+
+test('url profile 全链路：<del>/<s> 输出 <del> 标签而非 ~~，还原为 delete 节点且其中的「~」逐字保留', async () => {
+    // Act
+    const { md, ir } = await toIr('<p>原价<del>3~5元</del>，现价<s>作废</s>两元</p>');
+
+    // Assert
+    assert.equal(md, '原价<del>3\\~5元</del>，现价<del>作废</del>两元');
+    assert.ok(!md.includes('~~'), md);
+    assert.deepEqual(textsOfType(ir, 'delete'), ['3~5元', '作废']);
+    assert.equal(plainText(ir), '原价3~5元，现价作废两元');
+});
+
+// ============================================================
+// 表格单元格接入 service.escape（全链路：turndown → remark-gfm → ir/inline-html）
+// ============================================================
+
+// 单列表格：表头固定为「项」，其余每个入参各占一行
+const tableOf = (...cells) => `<table><tr><th>项</th></tr>${cells.map((c) => `<tr><td>${c}</td></tr>`).join('')}</table>`;
+// IR 中逐行的单元格文本（含表头行）
+const rowCells = (ir) => collect(ir, (n) => n.type === 'tableRow').map((row) => row.children.map(plainText));
+// 单元格转义后不应再被误解析出来的行内节点
+const INLINE_TYPES = ['delete', 'emphasis', 'strong', 'inlineCode', 'link'];
+
+test('表格单元格：成对的「~」与星号等行内记号被转义，逐字进入 IR 且不生成行内节点', async () => {
+    // Arrange：区间号、强调星号、下划线与反引号与链接写法
+    const html = tableOf('10~20℃、30~40℃', 'a*b*c', '_x_ 与 `y` 与 [z](u)');
+
+    // Act & Assert：表格规则挂在 word 与 url 两个 profile 上，行为应一致
+    for (const profile of PROFILES_WITH_TABLE) {
+        const { md, ir } = await toIr(html, profile);
+        const lines = md.split('\n');
+
+        // Assert：Markdown 数据行逐字符相符
+        assert.equal(lines[2], '| 10\\~20℃、30\\~40℃ |', profile);
+        assert.equal(lines[3], '| a\\*b\\*c |', profile);
+        assert.equal(lines[4], '| \\_x\\_ 与 \\`y\\` 与 \\[z\\](u) |', profile);
+
+        // Assert：全链路后各单元格文本与源文本逐字相等
+        assert.deepEqual(
+            rowCells(ir),
+            [['项'], ['10~20℃、30~40℃'], ['a*b*c'], ['_x_ 与 `y` 与 [z](u)']],
+            profile,
+        );
+
+        // Assert：删除线、强调、行内代码与链接一个都不应出现
+        for (const type of INLINE_TYPES) {
+            assert.deepEqual(textsOfType(ir, type), [], `${profile} 不应出现 ${type} 节点`);
+        }
+    }
+});
+
+test('表格单元格：字面反斜杠与竖线相邻时仍属同一单元格，反斜杠与「~」逐字保留', async () => {
+    // Arrange：a\|b 中的反斜杠为字面量，若不先加倍就补转义竖线，两者会配成一对、竖线重新成为列分隔符
+    const html = tableOf('a\\|b', '甲\\~乙~丙');
+
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        const { md, ir } = await toIr(html, profile);
+        const lines = md.split('\n');
+
+        // Assert：escape 先把反斜杠加倍，再补的竖线转义使其前导反斜杠为奇数个
+        assert.equal(lines[2], '| a\\\\\\|b |', profile);
+        assert.equal(lines[3], '| 甲\\\\\\~乙\\~丙 |', profile);
+
+        // Assert：每行恰一个单元格，字面反斜杠与两个「~」都在
+        assert.deepEqual(rowCells(ir), [['项'], ['a\\|b'], ['甲\\~乙~丙']], profile);
+    }
+});
+
+test('表格单元格：换行折叠与竖线转义的既有行为不变；行首记号转义后 IR 文本逐字不变', async () => {
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        // Assert：单元格内换行折叠为空格，未转义的竖线补反斜杠后仍属同一单元格
+        const folded = await toIr('<table><tr><td>甲\n乙</td><td>a|b</td></tr></table>', profile);
+        assert.deepEqual(rowCells(folded.ir), [['甲 乙', 'a|b']], profile);
+
+        // Assert：行首记号经 escape 后带上反斜杠，remark 解析时逐字还原，IR 文本不变
+        const markers = await toIr(tableOf('-5', '1. 项', '# 题', '&gt;90%'), profile);
+        assert.deepEqual(
+            markers.md.split('\n').slice(2),
+            ['| \\-5 |', '| 1\\. 项 |', '| \\# 题 |', '| \\>90% |'],
+            profile,
+        );
+        assert.deepEqual(rowCells(markers.ir), [['项'], ['-5'], ['1. 项'], ['# 题'], ['>90%']], profile);
+    }
+});
+
+// ============================================================
+// 图片 alt 接入 service.escape（新规则接管内置 image 规则）
+// ============================================================
+
+const firstImage = (ir) => collect(ir, (n) => n.type === 'image')[0];
+
+test('图片 alt：成对的「~」被转义，alt 逐字进入 IR 且不生成 delete 节点', async () => {
+    // Act & Assert：内置 image 规则为三个 profile 共用，新规则同样覆盖三者
+    for (const profile of ALL_PROFILES) {
+        const { md, ir } = await toIr('<p><img src="a.png" alt="10~20℃与30~40℃对比"></p>', profile);
+
+        assert.equal(md, '![10\\~20℃与30\\~40℃对比](a.png)', profile);
+        const images = collect(ir, (n) => n.type === 'image');
+        assert.equal(images.length, 1, profile);
+        assert.equal(images[0].alt, '10~20℃与30~40℃对比', profile);
+        assert.deepEqual(textsOfType(ir, 'delete'), [], profile);
+    }
+});
+
+test('图片 alt：内置转义表原有的覆盖面不因接管而回退（方括号、星号、结尾反斜杠）', async () => {
+    // Act & Assert
+    for (const profile of ALL_PROFILES) {
+        const bracket = await toIr('<p><img src="a.png" alt="图[1] 甲~乙~丙 *强*"></p>', profile);
+        assert.equal(bracket.md, '![图\\[1\\] 甲\\~乙\\~丙 \\*强\\*](a.png)', profile);
+        assert.equal(firstImage(bracket.ir).alt, '图[1] 甲~乙~丙 *强*', profile);
+
+        // 以反斜杠结尾：escape 先把它加倍，方括号才不会被吃掉
+        const backslash = await toIr('<p><img src="a.png" alt="甲~乙~\\"></p>', profile);
+        assert.equal(firstImage(backslash.ir).alt, '甲~乙~\\', profile);
+    }
+});
+
+test('图片 alt：只折叠换行，行内的制表符与连续空格逐字保留', async () => {
+    // Act & Assert
+    for (const profile of ALL_PROFILES) {
+        // Assert：换行后的「- 」原本会打断段落、使整张图片丢失，折叠为空格后图片完整
+        const multiline = await toIr('<p><img src="a.png" alt="甲~乙\n- 丙~丁"></p>', profile);
+        assert.equal(multiline.md, '![甲\\~乙 - 丙\\~丁](a.png)', profile);
+        assert.equal(firstImage(multiline.ir).alt, '甲~乙 - 丙~丁', profile);
+        assert.deepEqual(collect(multiline.ir, (n) => n.type === 'list'), [], profile);
+
+        // Assert：Word 自动生成的替代文字形如「图形用户界面\n\n描述已自动生成」，空行一并折叠为单个空格
+        const auto = await toIr('<p><img src="a.png" alt="图形用户界面\n\n描述已自动生成"></p>', profile);
+        assert.equal(firstImage(auto.ir).alt, '图形用户界面 描述已自动生成', profile);
+
+        // Assert：换行之外的空白不属折叠范围，制表符与连续空格原样保留
+        const inlineSpace = await toIr('<p><img src="a.png" alt="甲\t\t乙   丙~丁~"></p>', profile);
+        assert.equal(firstImage(inlineSpace.ir).alt, '甲\t\t乙   丙~丁~', profile);
+
+        // Assert：换行两侧的空白随换行一并折叠，首尾的换行不留空格（&#13;&#10; 为字符引用写入的 CRLF）
+        assert.equal(toMarkdown('<p><img src="a.png" alt="\n甲  \n\t 乙&#13;&#10;丙\n"></p>', profile), '![甲 乙 丙](a.png)', profile);
+    }
+});
+
+test('图片 src 与 title 的输出与内置规则逐字一致，title 中的「~」不转义', async () => {
+    // Act & Assert
+    for (const profile of ALL_PROFILES) {
+        // Assert：src 含「~」、空格与括号，title 含「~」与引号；title 不按 Markdown 解析，无须转义
+        const full = await toIr('<p><img src="dir/~u/a (1).png" alt="5~6与7~8" title="5~10 &quot;与&quot; 20~30"></p>', profile);
+        assert.equal(full.md, '![5\\~6与7\\~8](<dir/~u/a \\(1\\).png> "5~10 \\"与\\" 20~30")', profile);
+        assert.equal(firstImage(full.ir).url, 'dir/~u/a (1).png', profile);
+        assert.equal(firstImage(full.ir).title, '5~10 "与" 20~30', profile);
+
+        // Assert：无 src 的图片输出空串，无 alt 的图片输出 ![](src)
+        assert.equal(toMarkdown('<p><img alt="1~2~3"></p>', profile), '', profile);
+        assert.equal(toMarkdown('<p><img src="b.png"></p>', profile), '![](b.png)', profile);
+    }
+});
+
+test('url profile：带 data-mf-display 的图片仍由 imgDisplay 规则接管，优先级未被 alt 规则抢占', async () => {
+    // Act
+    const { md, ir } = await toIr('<p><img src="a.png" alt="10~20℃与30~40℃" data-mf-display="320"></p>', 'url');
+
+    // Assert：输出 HTML 而非 Markdown 图片，其 alt 不经 Markdown 解析，逐字还原
+    assert.equal(md, '<img src="a.png" alt="10~20℃与30~40℃" width="320">');
+    assert.equal(firstImage(ir).alt, '10~20℃与30~40℃');
+});
+
+// ============================================================
+// 「~」转义的耗时与语义等价：escapeTildes 须线性于文本长度
+// ============================================================
+
+// 耗时用例的输入规模：8 万个字面反斜杠，经 turndown 内置转义加倍后为 16 万。
+// 线性化之前的写法 /(\\*)~/g 在这一规模上实测 13661 ms（1 万 40 ms、4 万 777 ms，耗时随长度平方增长）
+const TILDE_STRESS_BACKSLASHES = 80000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。
+// 2000 ms 使两侧余量都不小于 5 倍——线性化之前的 13661 ms 是它的 6.8 倍，线性化之后实测数毫秒、
+// 不足它的百分之一，故慢机以及 node --test 多文件并行抢占 CPU 时都不会误报
+const TILDE_STRESS_BUDGET_MS = 2000;
+
+const elapsedMsSince = (started) => Number(process.hrtime.bigint() - started) / 1e6;
+
+// 线性化之前的 escapeTildes，仅作短输入的差分参照：其前导的 \\* 在不含「~」的长反斜杠串上逐位回溯，
+// 不可用于耗时用例的输入规模
+const legacyEscapeTildes = (text) => text.replace(/(\\*)~/g, (matched, slashes) => (slashes.length % 2 === 1 ? matched : `${slashes}\\~`));
+
+// 字母表上长度 0 到 maxLength 的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    let level = [''];
+    const all = [...level];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((character) => prefix + character));
+        all.push(...level);
+    }
+    return all;
+}
+
+test('escape：不含「~」的 8 万个反斜杠不触发回溯，耗时在绝对上限内且输出逐字正确', () => {
+    // Arrange：只用 url profile——escape 的包装挂在工厂层、与 profile 无关，而网页正文属不可信输入
+    const service = createTurndownService('url');
+    const input = '\\'.repeat(TILDE_STRESS_BACKSLASHES);
+
+    // Act
+    const started = process.hrtime.bigint();
+    const escaped = service.escape(input);
+    const elapsedMs = elapsedMsSince(started);
+
+    // Assert：先验输出正确，以免「快」来自少做了事
+    assert.equal(escaped.length, TILDE_STRESS_BACKSLASHES * 2, '内置转义把每个字面反斜杠加倍，长度应恰为输入的 2 倍');
+    assert.ok(!/[^\\]/.test(escaped), '输出应只含反斜杠');
+    assert.ok(elapsedMs < TILDE_STRESS_BUDGET_MS, `escape 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${TILDE_STRESS_BUDGET_MS} ms`);
+});
+
+test('turndown 全链路：正文含 8 万个反斜杠时耗时在绝对上限内，输出逐字正确', () => {
+    // Arrange：文本节点经 service.escape 转义，是全链路上唯一会被这段反斜杠拖慢的环节
+    const service = createTurndownService('url');
+    const html = `<p>${'\\'.repeat(TILDE_STRESS_BACKSLASHES)}</p>`;
+
+    // Act
+    const started = process.hrtime.bigint();
+    const md = service.turndown(html);
+    const elapsedMs = elapsedMsSince(started);
+
+    // Assert
+    assert.equal(md.length, TILDE_STRESS_BACKSLASHES * 2, '内置转义把每个字面反斜杠加倍，长度应恰为输入的 2 倍');
+    assert.ok(!/[^\\]/.test(md), '输出应只含反斜杠');
+    assert.ok(elapsedMs < TILDE_STRESS_BUDGET_MS, `turndown 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${TILDE_STRESS_BUDGET_MS} ms`);
+});
+
+test('escape 与线性化之前的实现逐字等价：{反斜杠, ~, 普通字符} 上长度不超过 7 的全部字符串', () => {
+    // Arrange：3 个字符的字母表上长度 0 到 7 的全部字符串共 3280 个
+    const samples = everyStringUpTo(7, ['\\', '~', 'a']);
+    const builtinEscape = TurndownService.prototype.escape;
+    assert.equal(samples.length, 3280);
+
+    // Act & Assert：工厂层的 escape 等于「内置转义 + 线性化之前的 escapeTildes」
+    for (const profile of ALL_PROFILES) {
+        const service = createTurndownService(profile);
+        for (const text of samples) {
+            assert.equal(service.escape(text), legacyEscapeTildes(builtinEscape(text)), `${profile}: ${JSON.stringify(text)}`);
+        }
+    }
+});
+
+test('escape：反斜杠串位于串首、串尾与「~」两侧时，奇偶判定对每个「~」独立成立', () => {
+    // Arrange：[HTML 文本中的字面值, 期望的 Markdown]
+    const cases = [
+        ['~', String.raw`\~`],                                          // 孤立的「~」
+        ['~~', String.raw`\~\~`],                                       // 连续两个「~」逐个转义
+        ['~a~', String.raw`\~a\~`],                                     // 「~」分居普通字符两侧
+        ['~~~', String.raw`\~\~\~`],                                    // 行首 ~~~ 被内置转义成 \~~~，首个「~」已带 1 个反斜杠，不重复转义
+        ['~~~~', String.raw`\~\~\~\~`],                                 // 行首 ~~~ 之后多出的「~」前无反斜杠，照常转义
+        ['a~~~', String.raw`a\~\~\~`],                                  // 同样三个「~」不在行首，内置转义不介入，三个都要转义
+        [String.raw`\~`, String.raw`\\\~`],                             // 反斜杠串紧邻「~」之前：1 个字面反斜杠加倍为 2 个，偶数故补转义
+        [String.raw`\\~`, String.raw`\\\\\~`],                          // 2 个字面反斜杠加倍为 4 个
+        [String.raw`\\\~甲`, String.raw`\\\\\\\~甲`],                    // 3 个字面反斜杠加倍为 6 个
+        ['~\\', String.raw`\~\\`],                                      // 反斜杠串位于串尾、紧随「~」之后，只受内置转义影响
+        [String.raw`a\\b`, String.raw`a\\\\b`],                         // 不含「~」时只有内置转义生效
+    ];
+
+    // Act & Assert
+    for (const profile of ALL_PROFILES) {
+        const service = createTurndownService(profile);
+        for (const [input, expected] of cases) {
+            assert.equal(service.escape(input), expected, `${profile}: ${JSON.stringify(input)}`);
+        }
+    }
 });

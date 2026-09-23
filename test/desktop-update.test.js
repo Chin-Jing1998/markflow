@@ -8,7 +8,7 @@
  *       settings.json 的 update 段：写入后可读回，损坏时按缺失处理且不牵连其余设置项；
  *       启动开关 checkUpdateOnStartup：关掉后启动判定为假，既不调用检测器也不发请求。
  */
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -32,8 +32,21 @@ const fakeSafeStorage = {
     decryptString: (buffer) => Buffer.from(buffer).toString('utf8').slice(4),
 };
 
+// makeStore 创建的目录逐一登记，全部用例结束后仅删除这些目录；test/tmp/ 另有其他测试文件使用，不整体清空
+const createdDirs = [];
+after(() => {
+    for (const dir of createdDirs) {
+        try {
+            fs.rmSync(dir, { recursive: true, force: true });
+        } catch (err) {
+            // Windows 上句柄未及时释放时删除可能失败；残留目录不影响测试结论，清理失败不计为测试失败
+        }
+    }
+});
+
 function makeStore() {
     const dir = fs.mkdtempSync(path.join(TMP_ROOT, 'update-'));
+    createdDirs.push(dir);
     const store = createSettingsStore({ dir, safeStorage: fakeSafeStorage, defaults: { outputDir: path.join(dir, 'out'), libraryRoot: path.join(dir, 'lib') } });
     store.load();
     return { dir, store };

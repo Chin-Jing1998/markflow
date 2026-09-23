@@ -5,7 +5,8 @@
  *       → 正文提取（web/extract 的三级链路：站点选择器 → Readability → 旧兜底）
  *       → 噪声清洗（web/noise）→ 图片逐张经 fetch-guard 下载进 assets（失败记 warning
  *       并保留原 URL），同时记下显示尺寸（web/image-display → data-mf-display）
- *       → 内联样式预处理（样式 → 语义标签、段首缩进 → INDENT 标记、合并相邻 <strong>）
+ *       → 超长空白截断（web/whitespace）→ 内联样式预处理（样式 → 语义标签、段首缩进 → INDENT 标记、
+ *       合并相邻 <strong>）
  *       → turndown('url') → collapseBreakMarkers（BR 标记折叠）→ 文本规范化（web/normalize）
  *       → remark-parse + remark-gfm → liftInlineHtml → restoreMarkers → markCaptions
  *
@@ -15,6 +16,9 @@
  *   - 成功下载的图片按文档顺序编号为 images/image_N.ext（N 从 1 起），与 assets 一一对应；
  *     取得到显示尺寸的图片节点带 data.display（见 converters/ir/schema.js）
  *   - 段首缩进进 paragraph.data.indent，图注进 paragraph.data.role；<br> 单个为硬换行、连续两个为分段
+ *   - 属性值与会进入输出的文本里，连续空白超过 256 个的部分在进入 turndown 前截断，不超过的逐字不动：
+ *     turndown 的 postProcess 正则在长空白串上平方级回溯，而依赖不能改。下游的 BR 折叠与行尾空白清理
+ *     自身线性于文本长度，不依赖这一截断
  *   - ctx.skipImages 为 true 时一张图都不下载：图片地址就地绝对化，清单挂在 data.images 上，
  *     assets 保持为空（供 MCP 的 extract_article 只读提取使用）
  *   - meta 除 title/sourceType/sourceName/sourceUrl/finalUrl 外，另含 extraction（实际命中的
@@ -24,7 +28,7 @@
 const cheerio = require('cheerio');
 const { loadUnified } = require('../ir/unified-loader');
 const { createDocument } = require('../ir/schema');
-const { createTurndownService } = require('../ir/turndown');
+const { createTurndownService, URL_REMOVED_TAGS } = require('../ir/turndown');
 const { MARKERS, indentMarker, stripMarkers, restoreMarkers } = require('../ir/markers');
 const { liftInlineHtml } = require('../ir/inline-html');
 const { markCaptions } = require('../ir/captions');
@@ -32,11 +36,13 @@ const { fetchText, fetchBinary } = require('../net/fetch-guard');
 const { getExtFromContentType, getExtFromUrl } = require('../ir/util');
 const { extractContent, matchesHost } = require('../web/extract');
 const { cleanNoise, isAttached } = require('../web/noise');
+const { hasDescendantTag, createTreeEditor, loadFragment, selectByTags } = require('../web/dom');
 const { normalizeMarkdown } = require('../web/normalize');
+const { capWhitespaceRuns } = require('../web/whitespace');
 const { extractMetadata, countWords } = require('../web/metadata');
 const { displaySizeOf, formatDisplayAttr } = require('../web/image-display');
 const {
-    createIndentResolver, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS,
+    createIndentResolver, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_TAGS, INDENT_SPACE_CLASS,
 } = require('../web/indent');
 const { notify, errText, hostnameOf } = require('../util');
 
@@ -60,12 +66,19 @@ const MIME_BY_EXT = {
 };
 // 段首缩进识别：遇到首个可见字符即停；「可见」不含 ASCII 空白、不换行空格与全角类空格
 const INDENT_SPACE_ONLY_RE = new RegExp(`^[${INDENT_SPACE_CLASS}]*$`);
+// 嵌套块判定按标签名逐个后代比对（见 hasNestedBlock），故把标签名列表转成 Set
+const NESTED_BLOCK_TAG_SET = new Set(NESTED_BLOCK_TAGS);
 // JS 的 \s 含不换行空格与全角空格，据此判定「有可见文字」
 const VISIBLE_TEXT_RE = /[^\s]/;
 // 空 span 里须保留的空白：U+00A0 不换行空格、U+3000 全角空格（码点声明，源码不出现不可见字面量）
 const KEPT_SPACE_RE = new RegExp(`[${String.fromCharCode(0x00a0)}${String.fromCharCode(0x3000)}]`);
-// BR 标记折叠：一段连续的 BR（可夹空白与换行），不吞下一行行首的缩进
-const BREAK_RUN_RE = new RegExp(`[ \\t]*${MARKERS.BR}(?:[ \\t\\n]*${MARKERS.BR})*[ \\t]*\\n*`, 'g');
+// 空 span 的后代判定（见 tidyEmptySpans）：含 img 的保留、含 br 的拆包；按标签名比对，故为 Set
+const IMAGE_TAG_SET = new Set(['img']);
+const LINE_BREAK_TAG_SET = new Set(['br']);
+// BR 标记折叠：一段连续的 BR（可夹空白与换行），不吞下一行行首的缩进。
+// 首字符是必需的 BR，非 BR 位置一步即弃；紧邻其前的行内空白不写进正则，改由 collapseBreakMarkers
+// 向前回看并入——写成前导的 [ \t]* 会让不含 BR 的超长空白串上每个起点都吞到段尾再逐位回溯，耗时随长度平方增长
+const BREAK_RUN_RE = new RegExp(`${MARKERS.BR}(?:[ \\t\\n]*${MARKERS.BR})*[ \\t]*\\n*`, 'g');
 const HEADING_LINE_RE = /^#{1,6}\s/;
 const LONE_IMG_LINE_RE = /^<img\b[^<>\n]*>[ \t]*$/;
 const FENCE_RE = /^\s{0,3}(```|~~~)/;
@@ -153,9 +166,9 @@ function cleanTitle(text) {
  * data URL 截断保留类型前缀——完整 base64 对阅读没有价值，还会撑爆返回体积。
  */
 function listImages(html, pageUrl) {
-    const $ = cheerio.load(html, null, false);
+    const $ = loadFragment(html);
     const images = [];
-    $('img').each((_, el) => {
+    selectByTags($, 'img').each((_, el) => {
         const $img = $(el);
         const raw = pickImageSource($img);
         // 懒加载属性已取值，清掉以免渲染端再度覆盖 src
@@ -187,11 +200,11 @@ function toDisplayUrl(raw, pageUrl) {
  * 显示尺寸在改写 src 之前取得并写入 data-mf-display（下载成败都写）。
  */
 async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warnings }) {
-    const $ = cheerio.load(html, null, false);
+    const $ = loadFragment(html);
     const host = hostnameOf(pageUrl);
     const candidates = [];
 
-    $('img').each((_, el) => {
+    selectByTags($, 'img').each((_, el) => {
         const $img = $(el);
         const raw = pickImageSource($img);
         if (!raw) return;
@@ -305,16 +318,19 @@ const STYLE_TO_TAG_RULES = [
     { selector: 'span', re: STRIKE_STYLE_RE, tag: 'del' },
 ];
 
+// 载入与各步取元素改走 web/dom：cheerio.load(html, null, false) 与根级 $(选择器) 在顶层大量并列节点时平方级，
+// loadFragment 与之逐字等价，selectByTags 与根级 $(选择器) 逐节点同序，二者都线性
 function preprocessHtml(html) {
-    const $ = cheerio.load(html, null, false);
+    const $ = loadFragment(html);
+    capWhitespaceRuns($, URL_REMOVED_TAGS);
     for (const { selector, re, tag } of STYLE_TO_TAG_RULES) {
-        $(selector).each((_, el) => {
+        selectByTags($, selector).each((_, el) => {
             if (re.test($(el).attr('style') || '')) {
                 $(el).replaceWith(`<${tag}>${$(el).html()}</${tag}>`);
             }
         });
     }
-    $('img').each((_, el) => {
+    selectByTags($, 'img').each((_, el) => {
         const dataSrc = $(el).attr('data-src');
         if (dataSrc && !$(el).attr('src')) $(el).attr('src', dataSrc);
     });
@@ -330,14 +346,31 @@ function preprocessHtml(html) {
  */
 function markIndents($) {
     const indentOf = createIndentResolver(CHEERIO_STYLE_ACCESS);
-    $(LEAF_BLOCK_SELECTOR).each((_, el) => {
+    selectByTags($, LEAF_BLOCK_SELECTOR).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
-        if ($el.find(NESTED_BLOCK_SELECTOR).length > 0) return;
+        if (hasNestedBlock(el)) return;
         if (!VISIBLE_TEXT_RE.test($el.text())) return;
         const count = indentOf(el) + takeLeadingSpaces(el);
         if (count > 0) $el.prepend(indentMarker(count));
     });
+}
+
+/**
+ * 是否含嵌套块后代。语义等价于 $(el).find(NESTED_BLOCK_SELECTOR).length > 0，判定交给 web/dom 的 hasDescendantTag：
+ * 命中即停、显式栈遍历（不递归，深层嵌套不爆栈）。cheerio 的 .find() 把该元素的全部子元素交给 css-select 的
+ * prepareContext，其中 removeSubsets 对这组根逐个做 lastIndexOf，同级子元素 n 个即 O(n²)。与 .find() 逐字等价的
+ * 依据（元素判定、只比对标签名、原始文本与注释、template 内容片段的可见性）见 hasDescendantTag 的注释
+ *
+ * hasDescendantTag 的搜索根只取 el 的元素子节点，而改写之前本函数的初始栈含 el 的全部子节点，二者结果相同：候选的
+ * 叶子块（p、section、div、li、blockquote）不会是 template，其直接子节点中的非元素节点只有文本与注释，都没有子节点，
+ * 进不进栈都匹配不到；有子节点的非元素节点只有 template 的内容片段，而它只作 template 的子节点出现
+ *
+ * 命中即停使总成本线性：遍历从不进入嵌套块内部，而叶子块选择器是嵌套块标签的子集，故每个节点至多被
+ * 其最近的叶子块祖先扫描一次——大量并列与深层嵌套同样成立
+ */
+function hasNestedBlock(el) {
+    return hasDescendantTag(el, NESTED_BLOCK_TAG_SET);
 }
 
 // markIndents 的 style 链访问器：自叶子块起沿 parent 向上，遇到首个非 'tag' 节点即止，口径与原先逐叶建链的
@@ -382,28 +415,40 @@ function collectLeadingTexts(node, out) {
     return false;
 }
 
-// 微信把一句加粗拆成多个相邻 <strong>，直接相邻的并为一个，避免产出空的粗体边界
+// 微信把一句加粗拆成多个相邻 <strong>，直接相邻的并为一个，避免产出空的粗体边界。
+// 并入走 web/dom 的批量改树：cheerio 原生的 append + remove 在同一父元素下大量子节点时平方级（逐个删除后继时在父节点
+// children 上 lastIndexOf + splice，搬移时对每个节点在旧父节点 children 上 indexOf + splice）。按 $('strong') 的前序
+// 快照逐个处理、只把紧随当前 strong 的同名兄弟并入当前 strong，符合批量改树的安全性前提：前序遍历中当前 strong 及其
+// 后继兄弟的子树在轮到之前从未被改动，absorb 时当前 strong 的 children 末项即真实的末子节点；遍历结束即压实。
+// 原生 append 在后继 strong 无子节点时会把当前 strong 末子节点的 next 置为 undefined，改写后保持 null，
+// 渲染与后续判定（均按真假判断）不受影响
 function mergeAdjacentStrong($) {
-    $('strong').each((_, el) => {
+    const editor = createTreeEditor();
+    selectByTags($, 'strong').each((_, el) => {
         if (!isAttached(el)) return;
         for (let next = el.next; next && next.type === 'tag' && next.name === 'strong'; next = el.next) {
-            $(el).append($(next).contents());
-            $(next).remove();
+            editor.absorb(el, next);
         }
     });
+    editor.flush();
 }
 
-// 空 span：含 <br> 的拆包保留换行；只含不换行空格或全角空格的保留；其余删除
+// 空 span：含 <br> 的拆包保留换行；只含不换行空格或全角空格的保留；其余删除。
+// 后代判定与删除、拆包走 web/dom：cheerio 的 .find()、.remove()、.replaceWith() 在同一父元素下大量子节点时平方级。
+// 按 $('span') 的前序快照逐个处理、只删除或拆包当前 span，符合批量改树的安全性前提：前序遍历中当前 span 的子树在
+// 轮到之前从未被改动，途中的 .text() 与后代判定读到的都是真实结构；遍历结束即压实。只在含 br 后代时拆包，
+// 故被拆包的 span 至少有一个子节点
 function tidyEmptySpans($) {
-    $('span').each((_, el) => {
+    const editor = createTreeEditor();
+    selectByTags($, 'span').each((_, el) => {
         if (!isAttached(el)) return;
-        const $el = $(el);
-        if ($el.find('img').length > 0) return;
-        const text = $el.text();
+        if (hasDescendantTag(el, IMAGE_TAG_SET)) return;
+        const text = $(el).text();
         if (VISIBLE_TEXT_RE.test(text) || KEPT_SPACE_RE.test(text)) return;
-        if ($el.find('br').length > 0) $el.replaceWith($el.contents());
-        else $el.remove();
+        if (hasDescendantTag(el, LINE_BREAK_TAG_SET)) editor.unwrap(el);
+        else editor.remove(el);
     });
+    editor.flush();
 }
 
 function buildMarkdown(html, title) {
@@ -417,18 +462,55 @@ function buildMarkdown(html, title) {
 /**
  * BR 标记折叠：连续两个及以上 → 分段（\n\n）；行首、行尾的 → 删除；单个 → 反斜杠硬换行（\ + 换行，
  * 不依赖行尾两空格，normalize 去行尾空白也不受影响）；标题行内的单个 BR 换成空格（标题不能跨行）
+ *
+ * BREAK_RUN_RE 只匹配以 BR 开头的部分，紧邻其前的极大行内空白在此逐次向前回看并入，回看不越过上一次
+ * 匹配的结束位置。折叠区间与「前导 [ \t]* + BR 段」的旧写法逐字相同——BR 段之前的空白里不含 BR，
+ * 故两种写法找到的 BR 段与前导空白的起点都一致；而各次回看扫过的区间互不重叠，总成本线性于文本长度
+ *
+ * 标题判定所需的行首位置 lineStart 同样按匹配顺序增量维护：各段起点 start（已并入前导空白）单调不减，
+ * 故每段之前只需把「下一个换行」的位置 nextNewline 推进过 start 之前的全部换行，lineStart 随之落在其中
+ * 最后一个换行之后；各次 indexOf 扫过的区间互不重叠，总成本同样线性于文本长度。旧写法每段都从段起点
+ * lastIndexOf 回扫到行首，同一行里 n 个单个 BR 合计 O(n²)
  */
 function collapseBreakMarkers(markdown) {
-    return String(markdown).replace(BREAK_RUN_RE, (run, offset, whole) => {
-        const count = run.split(MARKERS.BR).length - 1;
-        const newlines = run.replace(/[^\n]/g, '');
-        const lineStart = offset === 0 || whole[offset - 1] === '\n';
-        const lineEnd = newlines.length > 0 || offset + run.length >= whole.length;
-        if (lineStart || lineEnd) return newlines;
-        if (count >= 2) return '\n\n';
-        const lineHead = whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset);
-        return HEADING_LINE_RE.test(lineHead) ? ' ' : '\\\n';
-    });
+    const whole = String(markdown);
+    const pieces = [];
+    let cursor = 0;
+    let lineStart = 0;
+    let nextNewline = whole.indexOf('\n');
+    for (const match of whole.matchAll(BREAK_RUN_RE)) {
+        let start = match.index;
+        while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
+        while (nextNewline !== -1 && nextNewline < start) {
+            lineStart = nextNewline + 1;
+            nextNewline = whole.indexOf('\n', nextNewline + 1);
+        }
+        pieces.push(whole.slice(cursor, start));
+        cursor = match.index + match[0].length;
+        pieces.push(collapseOneBreakRun(whole.slice(start, cursor), start, lineStart, whole));
+    }
+    pieces.push(whole.slice(cursor));
+    return pieces.join('');
+}
+
+/**
+ * 单段的折叠判定：run 为「前导行内空白 + BR 段」，offset 为其在 whole 中的起点，lineStart 为 offset
+ * 所在行的行首位置（由 collapseBreakMarkers 按匹配顺序增量维护）。标题判定与旧写法
+ * HEADING_LINE_RE.test(whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset)) 等价，依据有二：
+ *   - lineStart 与 whole.lastIndexOf('\n', offset - 1) + 1 相同：二者都是 offset 之前最后一个换行的下一位，
+ *     offset 之前没有换行时都为 0；
+ *   - HEADING_LINE_RE 锚定串首，至多消费 7 个 UTF-16 码元（1 到 6 个 # 加 1 个空白字符），判定结果只取决于
+ *     行首起的前 7 个码元，故截到 Math.min(offset, lineStart + 7) 与截到 offset 判定结果相同，
+ *     而截取长度不再随行长增长
+ */
+function collapseOneBreakRun(run, offset, lineStart, whole) {
+    const count = run.split(MARKERS.BR).length - 1;
+    const newlines = run.replace(/[^\n]/g, '');
+    const atLineStart = offset === 0 || whole[offset - 1] === '\n';
+    const lineEnd = newlines.length > 0 || offset + run.length >= whole.length;
+    if (atLineStart || lineEnd) return newlines;
+    if (count >= 2) return '\n\n';
+    return HEADING_LINE_RE.test(whole.slice(lineStart, Math.min(offset, lineStart + 7))) ? ' ' : '\\\n';
 }
 
 /**
@@ -449,4 +531,4 @@ function isolateImageLines(markdown) {
     return out.join('\n');
 }
 
-module.exports = { parse, collapseBreakMarkers, markIndents };
+module.exports = { parse, collapseBreakMarkers, markIndents, tidyEmptySpans, mergeAdjacentStrong, listImages, preprocessHtml };
