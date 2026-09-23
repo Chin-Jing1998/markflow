@@ -3,7 +3,8 @@
  * 覆盖：<img> 提升（块级与行内、宽高与百分比、style 宽度、属性白名单）、src 协议白名单（脚本协议、实体编码与
  *       控制字符绕过、协议相对与绝对路径）、<u>/<strong|b>/<em|i>/<del|s>/<br> 配对提升、未配对标签删除留文本、
  *       同类嵌套拍平与相邻合并、只包图片的格式标签拆除、<figure>/<p> 包图与 figcaption 图注、其它 HTML 保留、
- *       无可提升内容时返回原引用、入参不变
+ *       无可提升内容时返回原引用、入参不变；
+ *       matchImgTag 的 <img> 标签识别在 8 万个空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -297,4 +298,177 @@ test('无可提升内容时返回原引用；入参树不被改动', async () =>
 
 test('decodeEntities 解码命名与数字实体，未知实体原样保留', () => {
     assert.equal(decodeEntities('&lt;a&gt; &amp; &quot;&#39;&#x4E2D;&#25991; &copy;'), '<a> & "\'中文 &copy;');
+});
+
+// ============================================================
+// matchImgTag：<img> 标签识别线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { isDeepStrictEqual } = require('node:util');
+const { matchImgTag } = require('../converters/ir/inline-html');
+
+// 耗时用例的输入规模：「<img」与 src 属性之间夹 8 万个半角空格，这一长段之后还有属性，不处于标签尾部
+const IMG_STRESS_LENGTH = 80000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。200 ms 使两侧余量都不小于 5 倍——
+// 线性化之前的 IMG_RE 经 liftInlineHtml 在这一规模上实测约 2.4 至 3.1 秒（2 万、4 万时约 0.17、0.66 秒，耗时随段长平方
+// 增长），是上限的 11 倍以上；线性化之后单次调用实测约 0.3 毫秒，不到上限的五百分之一
+const IMG_STRESS_BUDGET_MS = 200;
+
+const elapsedMsSince = (started) => Number(process.hrtime.bigint() - started) / 1e6;
+
+// 宽义空白以码点生成，源码里不出现看不见的字面量
+const NBSP = String.fromCharCode(0x00a0);
+const IDEOGRAPHIC_SPACE = String.fromCharCode(0x3000);
+const BYTE_ORDER_MARK = String.fromCharCode(0xfeff);
+const LINE_SEPARATOR = String.fromCharCode(0x2028);
+const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
+
+// 逐码点列出，失败输出里的不可见字符也能看清
+const toCodePoints = (value) => Array.from(value, (unit) => unit.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' ');
+// 捕获组的可读形式：字符串列出码点，未参与匹配者写 undefined，整体不匹配写 null
+const describeGroup = (value) => (typeof value === 'string' ? `[${toCodePoints(value)}]` : String(value));
+// 节点列表的简短形式：超过 40 字的字符串只报长度与首尾 3 字的码点，免得断言信息被 8 万字的整串淹没
+const briefNodes = (nodes) => JSON.stringify(nodes, (key, value) => (typeof value === 'string' && value.length > 40
+    ? `长 ${value.length}，首 [${toCodePoints(value.slice(0, 3))}]，尾 [${toCodePoints(value.slice(-3))}]`
+    : value));
+
+test('<img 与 src 之间的 8 万个空格不触发回溯：liftInlineHtml 单次调用在绝对上限内，输出逐字正确', (t) => {
+    // Arrange：在计时区间外新构造字符串与树，段落里只有这一个 html 节点
+    const tree = {
+        type: 'root',
+        children: [{ type: 'paragraph', children: [{ type: 'html', value: `<img${' '.repeat(IMG_STRESS_LENGTH)}src="a.png">` }] }],
+    };
+    const expected = [{ type: 'image', url: 'a.png', alt: '', title: null }];
+
+    // Act：计时区间只包这一次调用
+    const started = process.hrtime.bigint();
+    const result = liftInlineHtml(tree);
+    const elapsedMs = elapsedMsSince(started);
+    t.diagnostic(`liftInlineHtml 实测 ${elapsedMs.toFixed(2)} ms`);
+
+    // Assert：先验输出正确，以免「快」来自少做了事——长空白段之后的 src 照常识别，html 节点提升为 image 节点
+    const children = result.children[0].children;
+    if (!isDeepStrictEqual(children, expected)) assert.fail(`段落子节点不符：${briefNodes(children)}`);
+    assert.ok(
+        elapsedMs < IMG_STRESS_BUDGET_MS,
+        `liftInlineHtml 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${IMG_STRESS_BUDGET_MS} ms`,
+    );
+});
+
+// 线性化之前的实现，仅作短输入的差分参照：惰性的属性段与其后的 \s* 争抢同一段空白——属性段每向后扩一个记号，\s* 都把
+// 余下的空白重扫一遍，耗时随空白段长平方增长，不可用于耗时用例的输入规模。ATTR_BODY 与 IMG_RE 照录旧文件
+const LEGACY_ATTR_BODY = `(?:[^<>"']|"[^"]*"|'[^']*')*`;
+const LEGACY_IMG_RE = new RegExp(`^<img\\b(${LEGACY_ATTR_BODY}?)\\s*\\/?>$`, 'i');
+
+// 差分字母表 18 个记号：九种空白（半角空格、制表符、U+3000、U+00A0、U+FEFF、LF、CR、U+2028、U+2029），属性段的界符、
+// 引号与等号，字母与数字
+const HTML_DIFF_SPACES = [' ', '\t', IDEOGRAPHIC_SPACE, NBSP, BYTE_ORDER_MARK, '\n', '\r', LINE_SEPARATOR, PARAGRAPH_SEPARATOR];
+const HTML_DIFF_ALPHABET = [...HTML_DIFF_SPACES, '/', '>', '<', '"', "'", '=', 'a', 'S', '1'];
+// 结构化随机串的属性记号：无引号值；双引号与单引号段（段内含空白、另一种引号、< 与 >）；孤立的名、等号与斜杠；
+// 以及使属性段不合法的未闭合引号与裸 < >
+const HTML_DIFF_ATTR_TOKENS = [
+    'src=a.png', 'src="a b.png"', "alt='甲 乙'", 'title="a>b<c"', `alt='say "hi"'`, `x="'"`, 'width=10', 'd', '=', '/', 'f=g/',
+    '"unclosed', "'", 'e="', '<', '>',
+];
+// 结构化随机串的结尾片段：>、/>、空，以及 > 前后的多余字符
+const HTML_DIFF_ENDINGS = ['>', '>', '>', '>', '/>', '', 'x', '>>', '>x', '">', '<>'];
+// <img> 差分的前缀片段：合规写法（大小写不一）、\b 不成立的 <imgx 一类、不完整的 <im、带前导空白或缺尖括号者
+const IMG_DIFF_PREFIXES = [
+    '<img', '<img', '<img', '<IMG', '<Img', '<imgx', '<im', '<img_', '<img1', '<img-', '<img/', '<img"', 'img', '<', '', ' <img', '< img',
+];
+// <img> 差分的典型样本，六类分支各举数例：前缀不符；不以「>」结尾；匹配且属性段为空；匹配且属性段含引号段；
+// 以「/>」结尾而匹配；属性段不合法（未闭合引号、裸 < 或 >）而不匹配
+const IMG_TYPICAL_SAMPLES = [
+    '<imgx>', '<im>', '<img_ src=a>', 'img src=a>', ' <img src=a>',
+    '<img src=a', '<img src=a> ', '<img src="a>',
+    '<img>', '<IMG/>', '<img \n />', `<Img\t${IDEOGRAPHIC_SPACE}>`,
+    `<img src="a b.png" alt='甲 "乙"'>`, '<img title="a>b<c">',
+    '<img src=a.png/>', '<img src=a.png / >', '<img src="a.png"//>',
+    '<img src="a.png>', "<img alt='x>", '<img <src=a>', '<img src=a>>', '<img >x>',
+];
+// 分支归类用的前缀判据，在测试内独立求得：「<img」（不区分大小写）之后不是单词字符 [A-Za-z0-9_]，即旧式的 \b 成立
+const IMG_DIFF_HEAD_RE = /^<img(?![A-Za-z0-9_])/i;
+
+// 字母表上由 0 到 maxLength 个记号拼成的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    const all = [''];
+    let level = [''];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((token) => prefix + token));
+        for (const item of level) all.push(item);
+    }
+    return all;
+}
+
+// 种子固定的 32 位伪随机数发生器（mulberry32）：每次运行抽到同一批样本，失败可原样复现
+function createSeededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let mixed = Math.imul(state ^ (state >>> 15), state | 1);
+        mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// 结构化随机串：前缀片段 + 0 到 3 个「0 到 2 个空白 + 属性记号」+ 0 到 3 个空白 + 可选「/」+ 结尾片段
+function randomStructuredTag(random, prefixes) {
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const spaces = (max) => Array.from({ length: Math.floor(random() * (max + 1)) }, () => pick(HTML_DIFF_SPACES)).join('');
+    let text = pick(prefixes);
+    for (let count = Math.floor(random() * 4); count > 0; count -= 1) text += spaces(2) + pick(HTML_DIFF_ATTR_TOKENS);
+    return text + spaces(3) + (random() < 0.4 ? '/' : '') + pick(HTML_DIFF_ENDINGS);
+}
+
+test('matchImgTag 与线性化之前的 IMG_RE 逐组等价：BMP 逐码元、穷举短串与种子固定的随机串，六类分支均有样本', (t) => {
+    // Arrange：典型样本在前
+    const samples = [...IMG_TYPICAL_SAMPLES];
+    // BMP 逐码元 262144 个：每个码元放进四个对空白敏感的位置——紧接「<img」（\b 与属性段起点）、属性值之后、「/>」之前、
+    // 「/」与「>」之间，新式所用的 trimEnd 与旧式的 \s 字符集多一个或少一个都会暴露
+    for (let code = 0; code <= 0xffff; code += 1) {
+        const unit = String.fromCharCode(code);
+        samples.push(`<img${unit}>`, `<img${unit}src=a${unit}/>`, `<img src=a${unit}>`, `<img src=a/${unit}>`);
+    }
+    // 穷举 24700 个：「<img」「<IMG」各接字母表上由 0 到 3 个记号拼成的全部字符串，不补与补一个「>」两种形态各一
+    for (const head of ['<img', '<IMG']) {
+        for (const rest of everyStringUpTo(3, HTML_DIFF_ALPHABET)) samples.push(head + rest, `${head}${rest}>`);
+    }
+    const random = createSeededRandom(20260923);
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    // 一般随机串 30000 个：前缀片段后接字母表上 0 到 12 个记号
+    for (let i = 0; i < 30000; i += 1) {
+        samples.push(pick(IMG_DIFF_PREFIXES) + Array.from({ length: Math.floor(random() * 13) }, () => pick(HTML_DIFF_ALPHABET)).join(''));
+    }
+    // 结构化随机串 40000 个：贴近真实 <img> 标签的骨架，见 randomStructuredTag
+    for (let i = 0; i < 40000; i += 1) samples.push(randomStructuredTag(random, IMG_DIFF_PREFIXES));
+    assert.equal(samples.length, IMG_TYPICAL_SAMPLES.length + 356844);
+
+    // Act & Assert
+    const counts = { prefixMismatch: 0, unterminated: 0, emptyBody: 0, quotedBody: 0, selfClosing: 0, invalidBody: 0 };
+    for (const sample of samples) {
+        const legacy = LEGACY_IMG_RE.exec(sample);
+        const expected = legacy ? legacy[1] : null;
+        const actual = matchImgTag(sample);
+        // 只在不一致时拼装诊断信息，免得数十万次调用都付这笔开销
+        if (actual !== expected) assert.fail(`输入 [${toCodePoints(sample)}]：新式 ${describeGroup(actual)}，旧式 ${describeGroup(expected)}`);
+        // 分支归类只用旧式的结果与测试内独立求得的输入特征
+        if (!IMG_DIFF_HEAD_RE.test(sample)) counts.prefixMismatch += 1;
+        else if (!sample.endsWith('>')) counts.unterminated += 1;
+        else if (expected === null) counts.invalidBody += 1;
+        else {
+            if (expected === '') counts.emptyBody += 1;
+            if (/["']/.test(expected)) counts.quotedBody += 1;
+            if (sample.endsWith('/>')) counts.selfClosing += 1;
+        }
+    }
+    // 覆盖自证：六类分支都须有样本，差分才不是对某一分支空转
+    t.diagnostic(`样本 ${samples.length} 个；前缀不符 ${counts.prefixMismatch}，不以「>」结尾 ${counts.unterminated}，`
+        + `匹配且属性段为空 ${counts.emptyBody}，匹配且属性段含引号段 ${counts.quotedBody}，以「/>」结尾而匹配 ${counts.selfClosing}，`
+        + `属性段不合法而不匹配 ${counts.invalidBody}`);
+    assert.ok(counts.prefixMismatch > 0, '没有前缀不符的样本');
+    assert.ok(counts.unterminated > 0, '没有不以「>」结尾的样本');
+    assert.ok(counts.emptyBody > 0, '没有匹配且属性段为空的样本');
+    assert.ok(counts.quotedBody > 0, '没有匹配且属性段含引号段的样本');
+    assert.ok(counts.selfClosing > 0, '没有以「/>」结尾而匹配的样本');
+    assert.ok(counts.invalidBody > 0, '没有属性段不合法而不匹配的样本');
 });

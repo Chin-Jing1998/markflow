@@ -36,7 +36,9 @@ const MERGEABLE_TYPES = new Set(['strong', 'emphasis', 'delete', 'underline', 's
 
 // 属性段：允许引号内出现 > 与 <，其余位置不允许
 const ATTR_BODY = `(?:[^<>"']|"[^"]*"|'[^']*')*`;
-const IMG_RE = new RegExp(`^<img\\b(${ATTR_BODY}?)\\s*\\/?>$`, 'i');
+// 整段属性段判定：三个备选按首字符互斥，引号段只能止于下一个同种引号，回溯至多把每个引号段退一遍，线性于段长
+const ATTR_BODY_RE = new RegExp(`^${ATTR_BODY}$`);
+const IMG_HEAD_RE = /^<img\b/i;
 const TAG_RE = new RegExp(`^<(\\/)?([a-zA-Z][a-zA-Z0-9]*)(\\s${ATTR_BODY}?)?\\s*(\\/)?>$`);
 const ATTR_RE = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
 const WRAPPER_RE = new RegExp(`^<(p|div|figure)\\b${ATTR_BODY}>([\\s\\S]*)<\\/\\1\\s*>$`, 'i');
@@ -248,10 +250,31 @@ function classifyInline(raw, source) {
 // <img> 白名单重建
 // ============================================================
 
+// <img> 标签的词法识别。旧式为 ^<img\b(${ATTR_BODY}?)\s*\/?>$（i 标志）：惰性的属性段与其后的 \s* 争抢同一段空白（属性段
+// 的 [^<>"'] 分支同样吃空白），属性段每向后扩一个记号，\s* 都把余下的空白重扫一遍再失配，耗时随空白段长平方增长。新式先由
+// 尾部求出属性段唯一可行的终点，再对整段属性段做一次 ATTR_BODY_RE 判定，线性于串长。等价判据：属性段的记号切分唯一（< > " '
+// 以外的单个字符，或止于下一个同种引号的引号段）；尾部 \s*\/?>$ 可接受的终点恰为 [tagTailStart, 末字符]，其间只有空白与 /，
+// 引号段不可能止于其中，故切分走得到 tagTailStart 当且仅当其前整段是合法属性段，旧式惰性取到的最小可行终点也正是此处
+
+/** 尾部 \s*\/?> 的起点：去掉末尾的 >（调用方已确认）与紧邻其前的至多一个 /，再去掉尾随空白（trimEnd 与 \s 同集） */
+function tagTailStart(value) {
+    let end = value.length - 1;
+    if (value[end - 1] === '/') end -= 1;
+    return value.slice(0, end).trimEnd().length;
+}
+
+/** <img> 标签的词法识别：合规时返回属性段（可为空串），否则返回 null；与旧式的第 1 组逐字等价 */
+function matchImgTag(value) {
+    if (!IMG_HEAD_RE.test(value) || !value.endsWith('>')) return null;
+    // 属性段自「<img」之后起算；「<img」本身不含空白，tagTailStart 不会小于 4
+    const body = value.slice(4, tagTailStart(value));
+    return ATTR_BODY_RE.test(body) ? body : null;
+}
+
 function imageFromTag(value, source) {
-    const matched = IMG_RE.exec(String(value || '').trim());
-    if (!matched) return null;
-    const attrs = parseAttributes(matched[1] || '');
+    const body = matchImgTag(String(value || '').trim());
+    if (body === null) return null;
+    const attrs = parseAttributes(body);
     const src = attrs.has('src') ? safeSrc(attrs.get('src')) : null;
     if (!src) return null;
     const node = {
@@ -343,4 +366,4 @@ function decodeEntities(text) {
     });
 }
 
-module.exports = { liftInlineHtml, decodeEntities };
+module.exports = { liftInlineHtml, decodeEntities, matchImgTag };
