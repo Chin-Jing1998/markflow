@@ -5,7 +5,8 @@
  *       区间自 separate 之后起算、非化学域无区间、空入参）；EMF 判据（签名命中、非 EMF 不扫、
  *       无签名、截断、非 Buffer、超上限只扫尾部，均不抛错）；角色标记（三种取值、带分号余文、
  *       不匹配时 alt 原样）与判据优先级；合成夹具端到端（角色与 alt 逐图比对、CML 不入 alt、
- *       prepareLayout 的 OOXML 侧角色）；md / html / docx 三个目标对带角色图片的产物与无角色时逐字相同。
+ *       prepareLayout 的 OOXML 侧角色）；md / html / docx 三个目标对带角色图片的产物与无角色时逐字相同；
+ *       版本后缀剥离在「.1」长段上的耗时上限，stripVersionSuffix 与 isChemistryProgId 同线性化之前的实现逐字等价（差分）。
  * 样稿正文与结构式内容一律为虚构示例。
  */
 const { test, describe } = require('node:test');

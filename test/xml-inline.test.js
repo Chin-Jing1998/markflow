@@ -2,7 +2,8 @@
  * converters/renderers/xml/inline.js 单元测试
  * 覆盖：superscript / subscript 节点摊平为 sup / sub 标记，与 b / i / u 嵌套时按 MARK_ORDER 出元素；
  *       残留的 <sup>/<sub> html 节点（未被 ir/inline-html 提升时的兜底）同样还原；
- *       p 与 claim-text 两种语境下的输出形态一致
+ *       p 与 claim-text 两种语境下的输出形态一致；
+ *       trimRuns 尾部空白修剪在 8 万个全角空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
