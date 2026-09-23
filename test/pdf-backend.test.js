@@ -12,6 +12,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 
 const backend = require('../converters/pdf/backend');
+const tmp = require('../converters/tmp');
 
 const MOCK_PDF = Buffer.from('%PDF-1.4 mock-pdf');
 const MOCK_DOCX = Buffer.from('PKmock-docx');
@@ -32,10 +33,6 @@ const { getElectronPath } = require('../converters/chromium/spawn');
 function isSpawnBlocked(err) {
     if (!err) return false;
     return err.code === 'ELECTRON_SPAWN_FAILED' || /sandbox|seatbelt|EPERM|EACCES/i.test(String(err.message));
-}
-
-function countWorkerTempDirs() {
-    return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('markflow-pdf-worker-')).length;
 }
 
 function unavailableSoffice() {
@@ -77,7 +74,8 @@ test('electron-worker 真实出图：返回 %PDF 开头的 Buffer 并清理临�
         t.skip('本机未安装 electron 二进制');
         return;
     }
-    const before = countWorkerTempDirs();
+    // 只核对本次出图新建的目录：os.tmpdir() 全机共享，按前缀计数会受其他进程同前缀目录增删的干扰
+    const makeTempDir = t.mock.method(tmp, 'makeTempDir');
     let pdf;
     try {
         pdf = await backend.renderPdf({ html: '<h1>你好</h1>' });
@@ -90,7 +88,9 @@ test('electron-worker 真实出图：返回 %PDF 开头的 Buffer 并清理临�
     }
     assert.ok(Buffer.isBuffer(pdf));
     assert.equal(pdf.subarray(0, 4).toString('latin1'), '%PDF');
-    assert.equal(countWorkerTempDirs(), before, '工作进程临时目录应被清理');
+    const workerCalls = makeTempDir.mock.calls.filter((call) => call.arguments[0] === 'markflow-pdf-worker-');
+    assert.equal(workerCalls.length, 1, '本次出图应恰好新建一个工作进程临时目录');
+    assert.equal(fs.existsSync(await workerCalls[0].result), false, '工作进程临时目录应被清理');
 });
 
 test('soffice 分支：调用 getDocxBuffer，写入 DOCX 后经 convertFile 得到 PDF', async () => {
