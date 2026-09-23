@@ -18,7 +18,10 @@ const { stripHtml } = require('../../ir/util');
 const MARK_ORDER = Object.freeze(['b', 'i', 'u', 'sup', 'sub']);
 const HTML_TAG_RE = /^<(\/?)\s*([a-zA-Z][a-zA-Z0-9]*)\b[^>]*?>$/;
 const HTML_MARKS = Object.freeze({ b: 'b', strong: 'b', i: 'i', em: 'i', u: 'u', sup: 'sup', sub: 'sub' });
-const SOFT_BREAK_RE = /[ \t]*\n[ \t]*/g;
+// 软换行：换行及其后紧邻的空格与制表符。首字符即必需的换行，非换行位置一步即弃，尾部的贪婪量词后无后续项、不回溯；
+// 紧邻换行之前的空格与制表符不写进正则，改由 joinSoftBreaks 向前回看并入——写成前导的 [ \t]* 时，不以换行结尾的
+// 长空格制表符段上每个起点都要吞到段尾、再因缺换行逐位回退而失败，耗时随段长平方增长
+const SOFT_BREAK_RE = /\n[ \t]*/g;
 // 汉字、全角标点两侧的软换行直接删除，其余换成空格
 // 汉字、全角标点：与 parsers/xml/inline.js 的 CJK_RANGES 同一范围。按码点声明——首个区间端点 U+3000 不可见，
 // 兼容表意字与常用字字形相同，写成字面量无从分辨
@@ -79,12 +82,31 @@ function handleHtml(node, state, runs, current) {
     if (text) runs.push(textRun(text, current()));
 }
 
+/**
+ * 软换行合并：每段「换行及其前后紧邻的空格与制表符」两侧都是汉字或全角标点时删除，否则换成一个空格。
+ *
+ * SOFT_BREAK_RE 只匹配换行及其后的空格制表符，紧邻换行之前的极大空格制表符段在此逐段向前回看并入，回看不越过上一段的
+ * 结束位置。所得各段与旧写法（前导 [ \t]* + 换行 + [ \t]*）的各次匹配逐字相同：设 cursor 为上一段的结束位置、q 为
+ * 不小于 cursor 的首个换行。自 q 起即可匹配，故旧匹配的起点不晚于 q；其换行若落在 q 之后，q 便落在前导段内而须为空格或
+ * 制表符，与 q 处是换行矛盾，故其换行正是 q，起点为 cursor 与「q 之前极大空格制表符段的起点」二者中的较大者，即回看
+ * 所得；尾部同为贪婪的 [ \t]*，段终点也相同，传给判定的前后字符因而相同。尾部不含换行，连续换行拆成多段：如 'x\n \ny'
+ * 的第二段起于第二个换行，其前一位的空格已归第一段，回看须在此止步。各段回看扫过的区间互不重叠，总成本线性于串长
+ */
 function joinSoftBreaks(value) {
-    return String(value == null ? '' : value).replace(SOFT_BREAK_RE, (match, offset, whole) => {
-        const before = whole[offset - 1] || '';
-        const after = whole[offset + match.length] || '';
-        return CJK_RE.test(before) && CJK_RE.test(after) ? '' : ' ';
-    });
+    const whole = String(value == null ? '' : value);
+    const pieces = [];
+    let cursor = 0;
+    for (const match of whole.matchAll(SOFT_BREAK_RE)) {
+        let start = match.index;
+        while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
+        const end = match.index + match[0].length;
+        const before = whole[start - 1] || '';
+        const after = whole[end] || '';
+        pieces.push(whole.slice(cursor, start), CJK_RE.test(before) && CJK_RE.test(after) ? '' : ' ');
+        cursor = end;
+    }
+    pieces.push(whole.slice(cursor));
+    return pieces.join('');
 }
 
 // 相邻且标记相同的文本片段合并
