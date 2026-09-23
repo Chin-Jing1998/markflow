@@ -899,6 +899,120 @@ test('BR 折叠：行首、行中、行尾、标题行与前导空白的判定�
     }
 });
 
+// 行首回扫耗时用例的载荷规模：同一行里 20 万个单个 BR（与 'a' 交替，共 40 万字符）。行首定位改为增量维护
+// 之前，每个「不在行首、不在行尾、只含一个 BR」的段都从段起点 lastIndexOf 回扫到行首，同一行 n 段合计
+// O(n²)——本机直接调用实测 2.5 万 172 ms、5 万 674 ms、10 万 2428 ms、20 万 10138 ms（每翻倍约 4 倍）
+const BREAK_LINE_STRESS_COUNT = 200000;
+// 耗时上限取绝对值，理由同 BREAK_STRESS_BUDGET_MS。1000 ms 使两侧余量都不小于 5 倍——改动之前本用例
+// 3 次实测 9599.5 ms、9136.1 ms、9193.1 ms，最快一次是它的 9.1 倍；改动之后以同一载荷、同一计时区间
+// 3 次实测 26.8 ms、31.4 ms、26.5 ms，最慢一次不到它的 1/30，故慢机以及 node --test 多文件并行抢占 CPU
+// 时都不会误报
+const BREAK_LINE_STRESS_BUDGET_MS = 1000;
+
+// 差分用例：定种子伪随机生成 2 万个长 20 到 60 字符的串，用例失败可原样复现。上面穷举的长度上限 6
+// 放不下「标题前缀 + 两段单个 BR」（至少 7 个字符）与六级标题前缀后的单个 BR 这类组合，故另以长串抽样
+const BREAK_DIFF_SEED = 20260923;
+const BREAK_DIFF_COUNT = 20000;
+const BREAK_DIFF_MIN_LENGTH = 20;
+const BREAK_DIFF_MAX_LENGTH = 60;
+// 加权字母表（重复列出即加权）：BR 与 a 各占十分之三，使一行常含多段单个 BR；换行占十分之一，
+// 使一串通常跨几行、段间常夹换行
+const BREAK_DIFF_ALPHABET = Object.freeze([' ', TAB, '\n', BR, BR, BR, 'a', 'a', 'a', '#']);
+// 每到行首先以此概率插入标题前缀：1 到 7 个 # 接空格或制表符，其中 7 个 # 不成标题，用于核对判定窗口的边界
+const BREAK_DIFF_HEADING_RATE = 0.5;
+// 行中的单个 BR：前后各有一个可见字符，其间只隔零到多个行内空白。在上述字母表内，这类 BR 恰好各自成段
+// 并走到标题判定，故覆盖面按它计数：所在行有标题前缀、且它前面那个可见字符位于前缀之后的换成空格，
+// 其余换成反斜杠硬换行
+const MID_LINE_BREAK_RE = new RegExp(`(?<=[a#][ \\t]*)${BR}(?=[ \\t]*[a#])`, 'g');
+const HEADING_PREFIX_RE = /^#{1,6}[ \t]/;
+// 覆盖面各类的下限：定种子下实测最少的一类（三者兼具的行）为 2388 行。下限只为发现生成器被改得铺不开，
+// 故取约为其四成的 1000，不贴着实测值设定
+const BREAK_DIFF_MIN_HITS = 1000;
+
+// 随机串：逐字符从加权字母表抽取，每到行首先按概率插入标题前缀，最后截到抽定的长度
+function randomBreakText(random) {
+    const length = BREAK_DIFF_MIN_LENGTH + Math.floor(random() * (BREAK_DIFF_MAX_LENGTH - BREAK_DIFF_MIN_LENGTH + 1));
+    let text = '';
+    while (text.length < length) {
+        if ((text === '' || text.endsWith('\n')) && random() < BREAK_DIFF_HEADING_RATE) {
+            text += `${'#'.repeat(1 + Math.floor(random() * 7))}${random() < 0.5 ? ' ' : TAB}`;
+        }
+        text += BREAK_DIFF_ALPHABET[Math.floor(random() * BREAK_DIFF_ALPHABET.length)];
+    }
+    return text.slice(0, length);
+}
+
+// 覆盖面统计：逐行数出行中的单个 BR，分标题行内与非标题行内两类；另记同一行含两段以上的行数、
+// 之前隔着换行另有 BR 的段数，以及三者兼具（标题行、行内两段以上、之前隔着换行另有 BR）的行数
+function tallyBreakCoverage(text, coverage) {
+    let breakAbove = false;
+    for (const line of text.split('\n')) {
+        const prefix = HEADING_PREFIX_RE.exec(line);
+        const mids = (line.match(MID_LINE_BREAK_RE) || []).length;
+        const headingMids = prefix ? (line.slice(prefix[0].length).match(MID_LINE_BREAK_RE) || []).length : 0;
+        coverage.headingLine += headingMids;
+        coverage.plainLine += mids - headingMids;
+        if (mids >= 2) coverage.sameLine += 1;
+        if (breakAbove) coverage.belowNewline += mids;
+        if (breakAbove && headingMids >= 2) coverage.combined += 1;
+        if (line.includes(BR)) breakAbove = true;
+    }
+}
+
+test('BR 折叠行首定位：同一行 20 万个单个 BR 不触发平方级回扫，耗时在绝对上限内且逐个折成反斜杠硬换行', async () => {
+    // Arrange：'a' 与 BR 交替，每段都不在行首、不在行尾、只含一个 BR，所在行也不是标题，正确的输出是
+    // 每个 BR 都换成反斜杠硬换行；载荷在用例内现场构造，不与其他用例共用
+    const input = `${`a${BR}`.repeat(BREAK_LINE_STRESS_COUNT)}a`;
+    const expected = `${'a\\\n'.repeat(BREAK_LINE_STRESS_COUNT)}a`;
+
+    // Act：计时区间只包 collapseBreakMarkers 一次调用，载荷与期望串的构造在区间之外
+    const [output, ms] = await timed(() => collapseBreakMarkers(input));
+
+    // Assert：先验输出正确，以免「快」来自少做了事
+    assert.equal(output, expected, '每个单个 BR 都应折成反斜杠硬换行，其余字符逐字不变');
+    assert.ok(ms < BREAK_LINE_STRESS_BUDGET_MS, `折叠实测 ${ms.toFixed(1)} 毫秒，超出上限 ${BREAK_LINE_STRESS_BUDGET_MS} 毫秒`);
+});
+
+test('BR 折叠行首定位：定种子随机生成的 2 万个串上与线性化之前的实现逐字等价，覆盖同一行多段、标题行与段间换行', () => {
+    // Arrange
+    const random = seededRandom(BREAK_DIFF_SEED);
+    const coverage = { headingLine: 0, plainLine: 0, sameLine: 0, belowNewline: 0, combined: 0 };
+
+    for (let index = 0; index < BREAK_DIFF_COUNT; index += 1) {
+        const text = randomBreakText(random);
+
+        // Act & Assert
+        assert.equal(collapseBreakMarkers(text), legacyCollapseBreakMarkers(text), `第 ${index} 个串：${JSON.stringify(text)}`);
+        tallyBreakCoverage(text, coverage);
+    }
+
+    // Assert：核对面确实铺开了——标题行内与非标题行内的单个 BR、同一行多段、隔着换行的段以及三者兼具的行都不少
+    for (const [kind, hits] of Object.entries(coverage)) {
+        assert.ok(hits >= BREAK_DIFF_MIN_HITS, `覆盖面 ${kind} 只有 ${hits} 处，应不少于 ${BREAK_DIFF_MIN_HITS} 处`);
+    }
+});
+
+test('BR 折叠行首定位：同一行多段、标题行与跨行时逐字符合预期', () => {
+    // Arrange：[输入, 期望输出, 说明]
+    const cases = [
+        [`# 标题${BR}甲${BR}乙`, '# 标题 甲 乙', '标题行内的两段单个 BR 都换成空格'],
+        [`# 标题${BR}甲\n乙${BR}丙`, '# 标题 甲\n乙\\\n丙', '换行之后的下一行不是标题，其中的单个 BR 为反斜杠硬换行'],
+        [`甲${BR}乙\n## 小节${BR}丙${BR}丁`, '甲\\\n乙\n## 小节 丙 丁', '正文行之后的标题行，行内两段都换成空格'],
+        [`# 标题${BR}\n乙${BR}丙`, '# 标题\n乙\\\n丙', '换行被前一段吞下时，后一段的行首从该换行之后算起'],
+        [`甲${BR}\n# 标题${BR}乙`, '甲\n# 标题 乙', '换行被前一段吞下时，下一行的标题照常识别'],
+        [`甲${BR}乙\n丙\n# 标题${BR}丁`, '甲\\\n乙\n丙\n# 标题 丁', '两段之间隔着多行时，行首推进过其间的全部换行'],
+        [`###### 标题${BR}甲${BR}乙`, '###### 标题 甲 乙', '六级标题前缀连同空白共 7 个字符，恰在判定窗口之内'],
+        [`####### 七个${BR}甲`, '####### 七个\\\n甲', '7 个 # 不成标题'],
+        [`#${TAB}标题${BR}甲`, `#${TAB}标题 甲`, '# 后接制表符同样算标题'],
+        [`# ${BR}甲`, '#\\\n甲', '标题前缀的空白并入 BR 段，段前只剩 #，不算标题'],
+    ];
+
+    // Act & Assert
+    for (const [input, expected, note] of cases) {
+        assert.equal(collapseBreakMarkers(input), expected, `${note}：${JSON.stringify(input)}`);
+    }
+});
+
 // ============================================================
 // 段首缩进标注：嵌套块判定的耗时上限与语义等价
 // ============================================================

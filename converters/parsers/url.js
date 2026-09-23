@@ -466,32 +466,51 @@ function buildMarkdown(html, title) {
  * BREAK_RUN_RE 只匹配以 BR 开头的部分，紧邻其前的极大行内空白在此逐次向前回看并入，回看不越过上一次
  * 匹配的结束位置。折叠区间与「前导 [ \t]* + BR 段」的旧写法逐字相同——BR 段之前的空白里不含 BR，
  * 故两种写法找到的 BR 段与前导空白的起点都一致；而各次回看扫过的区间互不重叠，总成本线性于文本长度
+ *
+ * 标题判定所需的行首位置 lineStart 同样按匹配顺序增量维护：各段起点 start（已并入前导空白）单调不减，
+ * 故每段之前只需把「下一个换行」的位置 nextNewline 推进过 start 之前的全部换行，lineStart 随之落在其中
+ * 最后一个换行之后；各次 indexOf 扫过的区间互不重叠，总成本同样线性于文本长度。旧写法每段都从段起点
+ * lastIndexOf 回扫到行首，同一行里 n 个单个 BR 合计 O(n²)
  */
 function collapseBreakMarkers(markdown) {
     const whole = String(markdown);
     const pieces = [];
     let cursor = 0;
+    let lineStart = 0;
+    let nextNewline = whole.indexOf('\n');
     for (const match of whole.matchAll(BREAK_RUN_RE)) {
         let start = match.index;
         while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
+        while (nextNewline !== -1 && nextNewline < start) {
+            lineStart = nextNewline + 1;
+            nextNewline = whole.indexOf('\n', nextNewline + 1);
+        }
         pieces.push(whole.slice(cursor, start));
         cursor = match.index + match[0].length;
-        pieces.push(collapseOneBreakRun(whole.slice(start, cursor), start, whole));
+        pieces.push(collapseOneBreakRun(whole.slice(start, cursor), start, lineStart, whole));
     }
     pieces.push(whole.slice(cursor));
     return pieces.join('');
 }
 
-/** 单段的折叠判定：run 为「前导行内空白 + BR 段」，offset 为其在 whole 中的起点 */
-function collapseOneBreakRun(run, offset, whole) {
+/**
+ * 单段的折叠判定：run 为「前导行内空白 + BR 段」，offset 为其在 whole 中的起点，lineStart 为 offset
+ * 所在行的行首位置（由 collapseBreakMarkers 按匹配顺序增量维护）。标题判定与旧写法
+ * HEADING_LINE_RE.test(whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset)) 等价，依据有二：
+ *   - lineStart 与 whole.lastIndexOf('\n', offset - 1) + 1 相同：二者都是 offset 之前最后一个换行的下一位，
+ *     offset 之前没有换行时都为 0；
+ *   - HEADING_LINE_RE 锚定串首，至多消费 7 个 UTF-16 码元（1 到 6 个 # 加 1 个空白字符），判定结果只取决于
+ *     行首起的前 7 个码元，故截到 Math.min(offset, lineStart + 7) 与截到 offset 判定结果相同，
+ *     而截取长度不再随行长增长
+ */
+function collapseOneBreakRun(run, offset, lineStart, whole) {
     const count = run.split(MARKERS.BR).length - 1;
     const newlines = run.replace(/[^\n]/g, '');
-    const lineStart = offset === 0 || whole[offset - 1] === '\n';
+    const atLineStart = offset === 0 || whole[offset - 1] === '\n';
     const lineEnd = newlines.length > 0 || offset + run.length >= whole.length;
-    if (lineStart || lineEnd) return newlines;
+    if (atLineStart || lineEnd) return newlines;
     if (count >= 2) return '\n\n';
-    const lineHead = whole.slice(whole.lastIndexOf('\n', offset - 1) + 1, offset);
-    return HEADING_LINE_RE.test(lineHead) ? ' ' : '\\\n';
+    return HEADING_LINE_RE.test(whole.slice(lineStart, Math.min(offset, lineStart + 7))) ? ' ' : '\\\n';
 }
 
 /**
