@@ -39,7 +39,7 @@ const ATTR_BODY = `(?:[^<>"']|"[^"]*"|'[^']*')*`;
 // 整段属性段判定：三个备选按首字符互斥，引号段只能止于下一个同种引号，回溯至多把每个引号段退一遍，线性于段长
 const ATTR_BODY_RE = new RegExp(`^${ATTR_BODY}$`);
 const IMG_HEAD_RE = /^<img\b/i;
-const TAG_RE = new RegExp(`^<(\\/)?([a-zA-Z][a-zA-Z0-9]*)(\\s${ATTR_BODY}?)?\\s*(\\/)?>$`);
+const TAG_HEAD_RE = /^<(\/)?([a-zA-Z][a-zA-Z0-9]*)/;
 const ATTR_RE = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
 const WRAPPER_RE = new RegExp(`^<(p|div|figure)\\b${ATTR_BODY}>([\\s\\S]*)<\\/\\1\\s*>$`, 'i');
 const WRAPPER_TOKEN_SOURCE = `\\s+|<img\\b${ATTR_BODY}>|<br\\s*\\/?>|<figcaption\\b${ATTR_BODY}>([\\s\\S]*?)<\\/figcaption\\s*>`;
@@ -235,15 +235,39 @@ function classifyInline(raw, source) {
         const image = imageFromTag(value, source);
         return image ? { kind: 'image', node: image } : null;
     }
-    const matched = TAG_RE.exec(value);
+    const matched = matchInlineTag(value);
     if (!matched) return null;
-    const [, closing, rawName, attrText, selfClosing] = matched;
+    const [closing, rawName, attrText, selfClosing] = matched;
     const name = rawName.toLowerCase();
     if (name === 'br') return closing ? null : { kind: 'break' };
     const type = FORMAT_TYPES[name];
     if (!type || selfClosing) return null;
     if (closing) return attrText && attrText.trim() ? null : { kind: 'close', type };
     return { kind: 'open', type };
+}
+
+// 行内标签的词法识别。旧式为 ^<(\/)?([a-zA-Z][a-zA-Z0-9]*)(\s${ATTR_BODY}?)?\s*(\/)?>$：第 3 组里惰性的属性段与其后的 \s*
+// 争抢同一段空白，属性段每向后扩一个记号，\s* 都把余下的空白重扫一遍再失配，耗时随空白段长平方增长。新式由 TAG_HEAD_RE 一次
+// 确定前缀——标签名只能取到极大，名后若还有字母或数字，其后的 \s、/ 与 > 都接不上。名后是空白时，属性段止于
+// max(tagTailStart, 名后一位)，判据见 tagTailStart 上方的说明；该处之前不是合法属性段时，「第 3 组缺席」一支也不可能成功：
+// 那一支要求名后只剩空白与至多一个 /，而那时属性段为空、必然合法。第 4 组只看末字符前一位是否为 /。名后不是空白时，余下
+// 部分只能是 > 或 />
+
+/** 行内标签的词法识别：合规时返回 [闭标签的 /, 标签名, 属性段, 自闭合的 /]，未参与匹配者为 undefined；否则返回 null */
+function matchInlineTag(value) {
+    const head = TAG_HEAD_RE.exec(value);
+    if (!head || !value.endsWith('>')) return null;
+    const nameEnd = head[0].length;
+    // 名后一位用 charAt 取：越界时得空串、判为非空白（value 以 > 结尾而标签名止于字母或数字，名后其实总有字符）
+    if (/\s/.test(value.charAt(nameEnd))) {
+        const bodyEnd = Math.max(tagTailStart(value), nameEnd + 1);
+        if (!ATTR_BODY_RE.test(value.slice(nameEnd + 1, bodyEnd))) return null;
+        return [head[1], head[2], value.slice(nameEnd, bodyEnd), value[value.length - 2] === '/' ? '/' : undefined];
+    }
+    const rest = value.slice(nameEnd);
+    if (rest === '>') return [head[1], head[2], undefined, undefined];
+    if (rest === '/>') return [head[1], head[2], undefined, '/'];
+    return null;
 }
 
 // ============================================================
@@ -366,4 +390,4 @@ function decodeEntities(text) {
     });
 }
 
-module.exports = { liftInlineHtml, decodeEntities, matchImgTag };
+module.exports = { liftInlineHtml, decodeEntities, matchImgTag, matchInlineTag };

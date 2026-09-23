@@ -4,7 +4,8 @@
  *       控制字符绕过、协议相对与绝对路径）、<u>/<strong|b>/<em|i>/<del|s>/<br> 配对提升、未配对标签删除留文本、
  *       同类嵌套拍平与相邻合并、只包图片的格式标签拆除、<figure>/<p> 包图与 figcaption 图注、其它 HTML 保留、
  *       无可提升内容时返回原引用、入参不变；
- *       matchImgTag 的 <img> 标签识别在 8 万个空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）
+ *       matchImgTag 的 <img> 标签识别在 8 万个空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）；
+ *       matchInlineTag 的行内标签识别在 8 万个空格长段上的耗时上限，与线性化之前的实现逐字等价（差分）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -471,4 +472,145 @@ test('matchImgTag 与线性化之前的 IMG_RE 逐组等价：BMP 逐码元、�
     assert.ok(counts.quotedBody > 0, '没有匹配且属性段含引号段的样本');
     assert.ok(counts.selfClosing > 0, '没有以「/>」结尾而匹配的样本');
     assert.ok(counts.invalidBody > 0, '没有属性段不合法而不匹配的样本');
+});
+
+// ============================================================
+// matchInlineTag：行内标签识别线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { matchInlineTag } = require('../converters/ir/inline-html');
+
+// 耗时用例的输入规模：「<u」与属性 a 之间夹 8 万个半角空格，这一长段之后还有属性，不处于标签尾部
+const TAG_STRESS_LENGTH = 80000;
+// 上限的取法同 IMG_STRESS_BUDGET_MS。200 ms 使两侧余量都不小于 5 倍——线性化之前的 TAG_RE 经 liftInlineHtml 在这一规模上
+// 实测约 4.4 至 4.6 秒（2 万、4 万时约 0.32、1.2 秒，耗时随段长平方增长），是上限的 20 倍以上；线性化之后单次调用实测约
+// 0.15 至 0.25 毫秒，不到上限的八百分之一
+const TAG_STRESS_BUDGET_MS = 200;
+
+test('<u 与属性之间的 8 万个空格不触发回溯：liftInlineHtml 单次调用在绝对上限内，输出逐字正确', (t) => {
+    // Arrange：在计时区间外新构造字符串与树，段落里依次是带长空白段的开标签、文本与闭标签
+    const tree = {
+        type: 'root',
+        children: [{
+            type: 'paragraph',
+            children: [
+                { type: 'html', value: `<u${' '.repeat(TAG_STRESS_LENGTH)}a>` },
+                { type: 'text', value: 'x' },
+                { type: 'html', value: '</u>' },
+            ],
+        }],
+    };
+    const expected = [{ type: 'underline', children: [{ type: 'text', value: 'x' }] }];
+
+    // Act：计时区间只包这一次调用
+    const started = process.hrtime.bigint();
+    const result = liftInlineHtml(tree);
+    const elapsedMs = elapsedMsSince(started);
+    t.diagnostic(`liftInlineHtml 实测 ${elapsedMs.toFixed(2)} ms`);
+
+    // Assert：先验输出正确，以免「快」来自少做了事——带长空白段的开标签照常识别，与闭标签配对提升为 underline 节点
+    const children = result.children[0].children;
+    if (!isDeepStrictEqual(children, expected)) assert.fail(`段落子节点不符：${briefNodes(children)}`);
+    assert.ok(
+        elapsedMs < TAG_STRESS_BUDGET_MS,
+        `liftInlineHtml 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${TAG_STRESS_BUDGET_MS} ms`,
+    );
+});
+
+// 线性化之前的实现，仅作短输入的差分参照：可选的属性段组里，惰性的属性段与其后的 \s* 争抢同一段空白，耗时随空白段长平方
+// 增长，不可用于耗时用例的输入规模。TAG_RE 照录旧文件，属性段沿用上文照录的 LEGACY_ATTR_BODY
+const LEGACY_TAG_RE = new RegExp(`^<(\\/)?([a-zA-Z][a-zA-Z0-9]*)(\\s${LEGACY_ATTR_BODY}?)?\\s*(\\/)?>$`);
+
+// 行内标签差分的前缀片段：开、闭标签（名含数字、大小写不一）、名后紧跟非名字符的 <u_ 一类、缺名或名以数字开头、
+// 带前导空白或缺尖括号者
+const TAG_DIFF_PREFIXES = [
+    '<u', '<u', '<u', '</u', '</u', '<b1', '<Strong', '</B', '<br', '<img', '<u_', '<u-', '<u"', '</', '<', '<1', '< u', 'u', '',
+];
+// 行内标签差分的典型样本，逐一对应下文的分支：前缀不符；不以「>」结尾；名后为空白且匹配（含自闭合与带属性的闭标签）；
+// 名后为空白而属性段不合法；名后直接「>」；名后直接「/>」；名后为其它字符而不匹配
+const TAG_TYPICAL_SAMPLES = [
+    '<1u>', '</>', '< u>', 'u>', ' <u>',
+    '<u', '</u', '<u a',
+    '<u a>', '<u a="x y">', '</u a>', '<strong class="k" />', '<u\n>', '</u >', '<u />',
+    '<u "x>', "<u a='>", '<u <a>', '<u a>>',
+    '<u>', '</u>', '<b1>',
+    '<u/>', '<br/>',
+    '<u_>', '<u->', '<u//>', '<u"a">',
+];
+// 分支归类用的前缀判据，在测试内独立求得：「<」、可选的「/」与极大的标签名——旧式的标签名只能取到极大，名后若还有字母
+// 或数字，其后的 \s、/ 与 > 都接不上
+const TAG_DIFF_HEAD_RE = /^<\/?[a-zA-Z][a-zA-Z0-9]*/;
+
+// 两份捕获组逐组比较：整体不匹配时双方都须为 null；否则四组逐一相同，未参与匹配者须同为 undefined
+const sameTagGroups = (actual, expected) => (expected === null
+    ? actual === null
+    : Array.isArray(actual) && actual.length === expected.length && expected.every((group, index) => actual[index] === group));
+const describeTagGroups = (groups) => (Array.isArray(groups) ? `[${groups.map(describeGroup).join(', ')}]` : String(groups));
+
+test('matchInlineTag 与线性化之前的 TAG_RE 逐组等价：BMP 逐码元、穷举短串与种子固定的随机串，七类分支与带属性的闭标签均有样本', (t) => {
+    // Arrange：典型样本在前
+    const samples = [...TAG_TYPICAL_SAMPLES];
+    // BMP 逐码元 262144 个：每个码元放进四种样本——<u·a·>（名后的 \s 与 > 前的尾随空白）、<u·/>（名后紧接 />）、
+    // </u·>（闭标签的名后）、<u a/·>（/ 与 > 之间），新式所用的 /\s/、trimEnd 与旧式的 \s 字符集多一个或少一个都会暴露
+    for (let code = 0; code <= 0xffff; code += 1) {
+        const unit = String.fromCharCode(code);
+        samples.push(`<u${unit}a${unit}>`, `<u${unit}/>`, `</u${unit}>`, `<u a/${unit}>`);
+    }
+    // 穷举 24700 个：「<u」「</u」各接字母表上由 0 到 3 个记号拼成的全部字符串，不补与补一个「>」两种形态各一
+    for (const head of ['<u', '</u']) {
+        for (const rest of everyStringUpTo(3, HTML_DIFF_ALPHABET)) samples.push(head + rest, `${head}${rest}>`);
+    }
+    const random = createSeededRandom(20260923);
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    // 一般随机串 30000 个：前缀片段后接字母表上 0 到 12 个记号
+    for (let i = 0; i < 30000; i += 1) {
+        samples.push(pick(TAG_DIFF_PREFIXES) + Array.from({ length: Math.floor(random() * 13) }, () => pick(HTML_DIFF_ALPHABET)).join(''));
+    }
+    // 结构化随机串 40000 个：贴近真实行内标签的骨架，见 randomStructuredTag
+    for (let i = 0; i < 40000; i += 1) samples.push(randomStructuredTag(random, TAG_DIFF_PREFIXES));
+    assert.equal(samples.length, TAG_TYPICAL_SAMPLES.length + 356844);
+
+    // Act & Assert
+    const counts = {
+        prefixMismatch: 0, unterminated: 0, spaceSelfClosing: 0, spacePlain: 0, spaceInvalid: 0,
+        bareClose: 0, bareSelfClose: 0, otherAfterName: 0, closingWithAttrs: 0,
+    };
+    for (const sample of samples) {
+        const legacy = LEGACY_TAG_RE.exec(sample);
+        const expected = legacy ? [legacy[1], legacy[2], legacy[3], legacy[4]] : null;
+        const actual = matchInlineTag(sample);
+        // 只在不一致时拼装诊断信息，免得数十万次调用都付这笔开销
+        if (!sameTagGroups(actual, expected)) {
+            assert.fail(`输入 [${toCodePoints(sample)}]：新式 ${describeTagGroups(actual)}，旧式 ${describeTagGroups(expected)}`);
+        }
+        // 分支归类只用旧式的结果与测试内独立求得的输入特征
+        const head = TAG_DIFF_HEAD_RE.exec(sample);
+        if (!head) counts.prefixMismatch += 1;
+        else if (!sample.endsWith('>')) counts.unterminated += 1;
+        else {
+            const rest = sample.slice(head[0].length);
+            if (/^\s/.test(rest)) {
+                if (expected === null) counts.spaceInvalid += 1;
+                else if (expected[2]) counts[expected[3] === '/' ? 'spaceSelfClosing' : 'spacePlain'] += 1;
+            } else if (rest === '>') counts.bareClose += 1;
+            else if (rest === '/>') counts.bareSelfClose += 1;
+            else counts.otherAfterName += 1;
+        }
+        if (expected !== null && expected[0] === '/' && /\S/.test(expected[2] || '')) counts.closingWithAttrs += 1;
+    }
+    // 覆盖自证：七类分支（名后为空白且匹配者分第 4 组为「/」与为 undefined 两支）与带属性的闭标签都须有样本，
+    // 差分才不是对某一分支空转
+    t.diagnostic(`样本 ${samples.length} 个；前缀不符 ${counts.prefixMismatch}，不以「>」结尾 ${counts.unterminated}，`
+        + `名后为空白且匹配 ${counts.spaceSelfClosing + counts.spacePlain}（第 4 组为「/」${counts.spaceSelfClosing}，`
+        + `为 undefined ${counts.spacePlain}），名后为空白而属性段不合法 ${counts.spaceInvalid}，名后直接「>」${counts.bareClose}，`
+        + `名后直接「/>」${counts.bareSelfClose}，名后为其它字符 ${counts.otherAfterName}；带属性的闭标签 ${counts.closingWithAttrs}`);
+    assert.ok(counts.prefixMismatch > 0, '没有前缀不符的样本');
+    assert.ok(counts.unterminated > 0, '没有不以「>」结尾的样本');
+    assert.ok(counts.spaceSelfClosing > 0, '没有名后为空白、匹配且第 4 组为「/」的样本');
+    assert.ok(counts.spacePlain > 0, '没有名后为空白、匹配且第 4 组为 undefined 的样本');
+    assert.ok(counts.spaceInvalid > 0, '没有名后为空白而属性段不合法的样本');
+    assert.ok(counts.bareClose > 0, '没有名后直接「>」的样本');
+    assert.ok(counts.bareSelfClose > 0, '没有名后直接「/>」的样本');
+    assert.ok(counts.otherAfterName > 0, '没有名后为其它字符的样本');
+    assert.ok(counts.closingWithAttrs > 0, '没有带属性的闭标签样本');
 });
