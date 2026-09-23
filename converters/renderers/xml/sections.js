@@ -51,7 +51,7 @@ const BOOK_RULES = Object.freeze([
 const BOOK_KEYS = Object.freeze(['claims', 'description', 'drawings', 'abstract', 'abstractFigure']);
 const BOOK_LABELS = Object.freeze({ claims: '权利要求书', description: '说明书', drawings: '说明书附图', abstract: '说明书摘要', abstractFigure: '摘要附图' });
 const PART_HEADING_RE = /^(技术领域|背景技术|发明内容|实用新型内容|附图说明|具体实施方式|具体实施例|实施例)$/;
-const TITLE_FIELD_RE = /^\s*(?:发明创造|发明|实用新型)名称\s*[:：]?\s*(.+?)\s*$/;
+const TITLE_FIELD_HEAD_RE = /^\s*(?:发明创造|发明|实用新型)名称/;
 const CLAIM_SUBJECT_RE = /^\s*\d+\s*[、.．]\s*(一种[^，,：:；;]{2,40}?)(?=[，,：:；;]|其特征)/;
 const TERMINAL_PUNCT_RE = /[，。；：,.;:！？!?]/;
 const SUBJECT_PREFIX_RE = /^一种/;
@@ -83,6 +83,9 @@ const MARK_PARA_TAIL_RE = /^([\[［]\d+[\]］])号/;
 const MARK_CLAIM_RE = /^条号(?=\d+[.．、])/;
 const MARK_CLAIM_TAIL_RE = /^(\d+[.．、])号/;
 const MARK_FIGURE_RE = /^号(图\s*\d+)号$/;
+// 「发明名称」字段取值的逐字符判定（见 titleFieldValue）：单个空白字符；「.」不匹配的四个行终止符 LF、CR、U+2028、U+2029
+const SPACE_CHAR_RE = /\s/;
+const LINE_TERMINATOR_RE = new RegExp(`[${[0x0a, 0x0d, 0x2028, 0x2029].map(fromCode).join('')}]`);
 const MAX_TITLE_CANDIDATE = 12;
 const MAX_INVENTION_TITLE = 40;
 const MAX_ABSTRACT_PREAMBLE = 3;
@@ -293,11 +296,44 @@ function bookOfHeader(header) {
     return null;
 }
 
+// 「发明名称：X」字段的取值 X，不是该字段时为 null；与线性化之前的 /^\s*(?:发明创造|发明|实用新型)名称\s*[:：]?\s*(.+?)\s*$/
+// 的第 1 组逐字等价。旧式在「名称」后的同一段空白上有冒号前后的两个 \s*、惰性的 (.+?) 与末尾的 \s* 四个量词可取值，取值
+// 含行终止符而失配时逐一回溯全部切分组合，耗时随空白段长四次方增长（匹配成功时后两者互相回溯，也有平方级）。新式先以前缀正则
+// 取出前缀（首部空白只能取尽，三个备选至多一个后接「名称」，前缀唯一），再在余部 rest 上逐字符扫描：start 为跳过空白、
+// 至多一个冒号及其后空白之处，end 为 rest.trimEnd() 的长度（trimEnd 删的正是 \s 所指字符）。旧式自 start 起逐个递减地
+// 尝试取值起点 p，p 成功当且仅当 [p, max(p + 1, end)) 段非空且不含行终止符，故只有两种情形：
+//   start < end：取 [start, end) 段，含行终止符则整体不匹配（更小的起点只会多含字符）；
+//   start ≥ end（rest 只剩空白与至多一个冒号）：自串尾向前到 end 为止，首个不是行终止符的空白单独成为取值；都是行终止符
+//   时取 end 前的一个字符，即冒号本身（「发明名称：」后只跟行终止符时取值为「：」，照旧保留），没有冒号则不匹配
+function titleFieldValue(text) {
+    const head = TITLE_FIELD_HEAD_RE.exec(text);
+    if (!head) return null;
+    const rest = text.slice(head[0].length);
+    let start = skipSpaceChars(rest, 0);
+    if (rest[start] === ':' || rest[start] === '：') start = skipSpaceChars(rest, start + 1);
+    const end = rest.trimEnd().length;
+    if (start < end) {
+        const value = rest.slice(start, end);
+        return LINE_TERMINATOR_RE.test(value) ? null : value;
+    }
+    for (let at = rest.length - 1; at >= end; at -= 1) {
+        if (!LINE_TERMINATOR_RE.test(rest[at])) return rest[at];
+    }
+    return end > 0 ? rest[end - 1] : null;
+}
+
+// 自 from 起跳过空白字符，返回首个非空白字符的位置（没有则为串长）
+function skipSpaceChars(text, from) {
+    let at = from;
+    while (at < text.length && SPACE_CHAR_RE.test(text[at])) at += 1;
+    return at;
+}
+
 function extractTitleField(blocks) {
     for (const block of blocks) {
         if (block.kind !== 'paragraph' && block.kind !== 'heading') continue;
-        const match = TITLE_FIELD_RE.exec(block.text);
-        if (match) return { block, text: match[1] };
+        const value = titleFieldValue(block.text);
+        if (value !== null) return { block, text: value };
     }
     return null;
 }
@@ -433,4 +469,4 @@ const isSectionName = (text) => {
     return PART_HEADING_RE.test(title) || BOOK_RULES.some(([, re]) => re.test(title));
 };
 
-module.exports = { detectSections, normalizeTitle, isSectionName, BOOK_KEYS, PART_HEADING_RE, TITLE_FIELD_RE, CLAIM_SUBJECT_RE };
+module.exports = { detectSections, normalizeTitle, isSectionName, BOOK_KEYS, PART_HEADING_RE, titleFieldValue, CLAIM_SUBJECT_RE };

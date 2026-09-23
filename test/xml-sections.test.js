@@ -5,7 +5,9 @@
  *       标题段照旧生效；不带分节信息的块沿用前一块的分节；五种官方码位（U+E205 / E206 / E208 / E209 / E20A）
  *       各自的识别与剥离、产物无私用区残留；权项起始码位参与位置推定；字面汉字规则仅在全文无结构码位时启用；
  *       官方五书模板形态的合成 docx 端到端（解析 → 分节 → 五书 → DTD 校验）；normalizeTitle 外层括号修剪在
- *       8 万个闭括号长段上的耗时上限，与线性化之前的实现逐字等价（差分）。
+ *       8 万个闭括号长段上的耗时上限，与线性化之前的实现逐字等价（差分）；「发明名称」字段取值 titleFieldValue 经
+ *       detectSections 在 8 万个全角空格长段（匹配成功）与 450 个空格长段（取值跨行而匹配失败）上的耗时上限，与线性化
+ *       之前的实现逐字等价（差分）。
  * 样稿正文一律为虚构示例。
  */
 const { test, describe, after } = require('node:test');
@@ -470,5 +472,165 @@ describe('normalizeTitle：外层括号修剪线性于串长', () => {
         assert.ok(hits.headOnly > 0, '没有只删首部的样本');
         assert.ok(hits.tailOnly > 0, '没有只删尾部的样本');
         assert.ok(hits.both > 0, '没有两端都删的样本');
+    });
+});
+
+// ============================================================
+// titleFieldValue：「发明名称」字段取值线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { isDeepStrictEqual } = require('node:util');
+const { detectSections, titleFieldValue } = require('../converters/renderers/xml/sections');
+const { flattenBlocks } = require('../converters/renderers/xml/blocks');
+
+// 匹配成功形态的输入规模：「发明名称：X」与「Y」之间夹 8 万个全角空格
+const TITLE_FIELD_MATCH_STRESS_LENGTH = 80000;
+// 匹配失败形态的输入规模：「发明名称」之后 450 个半角空格，再接「A」、回车与「B」。旧式在这一形态上的耗时随空白段长
+// 四次方增长，段长数百即达秒级，故不取 8 万
+const TITLE_FIELD_MISMATCH_STRESS_LENGTH = 450;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。200 ms 使两侧余量都不小于 5 倍——旧式经
+// detectSections 在匹配成功形态上实测约 3.3 至 4.7 秒（2 万、4 万时约 0.23、0.90 秒，耗时随段长平方增长），是上限的
+// 16 倍以上；在匹配失败形态上实测约 2.9 秒（段长 200、400 时约 0.16、2.0 秒，每翻倍约 ×15，耗时随段长四次方增长），是上限
+// 的 14 倍以上。线性化之后两种形态的单次调用实测至多约 0.4 毫秒，不到上限的五百分之一
+const TITLE_FIELD_STRESS_BUDGET_MS = 200;
+
+// 线性化之前的正则，仅作短输入的差分参照（逐字照录旧文件）：在「名称」之后的长空白段上四次方级回溯，不可用于耗时用例的输入规模
+const LEGACY_TITLE_FIELD_RE = /^\s*(?:发明创造|发明|实用新型)名称\s*[:：]?\s*(.+?)\s*$/;
+// 分支归类的判据，在测试内独立计算、不借用新实现：前缀正则切出前缀之后的余部 rest（首部空白只能取尽，三个备选至多一个
+// 后接「名称」，前缀唯一）；rest 是否只剩空白与至多一个冒号；rest 的首个非空白字符是否为冒号
+const TITLE_FIELD_PREFIX_PROBE_RE = /^\s*(?:发明创造|发明|实用新型)名称/;
+const TITLE_FIELD_BLANK_REST_RE = /^\s*[:：]?\s*$/;
+const TITLE_FIELD_COLON_REST_RE = /^\s*[:：]/;
+const TITLE_FIELD_ONE_SPACE_RE = /^\s$/;
+// 差分用的空白：六种不是行终止符的空白（半角空格、制表符、U+3000、U+00A0、U+FEFF、U+000B），与「.」不匹配的四个行终止符
+const TITLE_FIELD_SPACES = [' ', '\t', IDEOGRAPHIC_SPACE, fromCode(0x00a0), fromCode(0xfeff), fromCode(0x000b)];
+const TITLE_FIELD_LINE_TERMINATORS = ['\n', '\r', fromCode(0x2028), fromCode(0x2029)];
+const TITLE_FIELD_LINE_TERMINATOR_RE = new RegExp(`[${TITLE_FIELD_LINE_TERMINATORS.join('')}]`);
+
+// 按旧式结果与输入特征归入分支：前缀不符；取值为正文（冒号在与不在分计）；有正文而含行终止符、不匹配；前缀之后只剩空白
+// 与至多一个冒号时，取值为单个非行终止空白、取值为冒号本身、不匹配。其余情形记为 unclassified，应无样本
+function titleFieldBranchOf(sample, expected) {
+    const prefix = TITLE_FIELD_PREFIX_PROBE_RE.exec(sample);
+    if (!prefix) return 'prefixMismatch';
+    const rest = sample.slice(prefix[0].length);
+    if (!TITLE_FIELD_BLANK_REST_RE.test(rest)) {
+        if (expected !== null) return TITLE_FIELD_COLON_REST_RE.test(rest) ? 'bodyAfterColon' : 'bodyWithoutColon';
+        return TITLE_FIELD_LINE_TERMINATOR_RE.test(rest) ? 'bodyWithLineTerminator' : 'unclassified';
+    }
+    if (expected === null) return 'blankUnmatched';
+    if (expected === ':' || expected === '：') return 'colonCaptured';
+    return TITLE_FIELD_ONE_SPACE_RE.test(expected) && !TITLE_FIELD_LINE_TERMINATOR_RE.test(expected) ? 'spaceCaptured' : 'unclassified';
+}
+
+describe('titleFieldValue：「发明名称」字段取值线性于串长', () => {
+    // 两段的块序列：段落 1 为载荷，段落 2 为「正文」
+    const titleFieldBlocks = (text) => flattenBlocks(createRoot([createParagraph(text), createParagraph('正文')]));
+    // 发明名称长达 8 万字，不一致时只报来源、长度与首尾，免得断言信息被整串淹没
+    const describeTitle = (title) => (title === null ? 'null'
+        : `来源 ${title.source}，长度 ${title.text.length}，首 3 字 ${JSON.stringify(title.text.slice(0, 3))}，末 3 字 ${JSON.stringify(title.text.slice(-3))}`);
+
+    test('取值夹 8 万个全角空格的「发明名称：X」字段（匹配成功）不触发回溯：detectSections 单次调用在绝对上限内，发明名称逐字正确', (t) => {
+        // Arrange：在计时区间外新构造字符串与块序列
+        const run = IDEOGRAPHIC_SPACE.repeat(TITLE_FIELD_MATCH_STRESS_LENGTH);
+        const blocks = titleFieldBlocks(`发明名称：X${run}Y`);
+        const expected = { text: `X${run}Y`, source: 'field' };
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        const result = detectSections(blocks);
+        const elapsedMs = elapsedMsSince(started);
+        t.diagnostic(`detectSections 实测 ${elapsedMs.toFixed(2)} ms`);
+
+        // Assert：先验输出正确，以免「快」来自少做了事——冒号之后的全部字符连同中段空白原样成为发明名称
+        assert.ok(isDeepStrictEqual(result.inventionTitle, expected),
+            `发明名称不符：${describeTitle(result.inventionTitle)}（应为${describeTitle(expected)}）`);
+        assert.ok(
+            elapsedMs < TITLE_FIELD_STRESS_BUDGET_MS,
+            `detectSections 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${TITLE_FIELD_STRESS_BUDGET_MS} ms`,
+        );
+    });
+
+    test('「发明名称」后接 450 个空格与跨行取值（匹配失败）不触发四次方级回溯：detectSections 单次调用在绝对上限内，该段照常作正文', (t) => {
+        // Arrange：在计时区间外新构造字符串与块序列；回车使取值「A、回车、B」跨行，旧式因此失配
+        const blocks = titleFieldBlocks(`发明名称${' '.repeat(TITLE_FIELD_MISMATCH_STRESS_LENGTH)}A\rB`);
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        const result = detectSections(blocks);
+        const elapsedMs = elapsedMsSince(started);
+        t.diagnostic(`detectSections 实测 ${elapsedMs.toFixed(2)} ms`);
+
+        // Assert：先验输出正确——该段不是发明名称字段，作为普通段落并入说明书。回退链上别无来源：该段长逾 40 字，不算标题
+        // 样段；全文无权项，也未给 meta.title，故不定发明名称并报 TITLE_MISSING（前导块无书目标题，另报 SECTION_UNCLASSIFIED）
+        assert.equal(result.inventionTitle, null);
+        assert.deepEqual(result.assignments.get(blocks[0].origin), { book: 'description', role: 'paragraph' });
+        assert.deepEqual(codesOf(result), [ISSUE_CODES.SECTION_UNCLASSIFIED, ISSUE_CODES.TITLE_MISSING]);
+        assert.ok(
+            elapsedMs < TITLE_FIELD_STRESS_BUDGET_MS,
+            `detectSections 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${TITLE_FIELD_STRESS_BUDGET_MS} ms`,
+        );
+    });
+
+    test('与线性化之前的实现逐字等价：BMP 逐码元、穷举短串与种子固定的随机串，六类分支（含取值为冒号本身）均有样本', (t) => {
+        // Arrange：字母表共 18 个记号——六种空白、四个行终止符、两种冒号、可见字符与前缀用字
+        const alphabet = [...TITLE_FIELD_SPACES, ...TITLE_FIELD_LINE_TERMINATORS, ':', '：', 'X', '甲', '发', '明', '名', '称'];
+
+        // BMP 逐码元 262144 个：每个码元放进四个位置——取值两侧（空白判定与 trimEnd 所删字符的出入）、冒号之后（其后只剩
+        // 空白时回退为单个字符）、前缀之前（首部空白）、取值中间（行终止符集合的出入）
+        const samples = [];
+        for (let code = 0; code <= 0xffff; code += 1) {
+            const unit = fromCode(code);
+            samples.push(`发明名称${unit}X${unit}`, `发明名称：${unit}`, `${unit}发明名称X`, `发明名称X${unit}Y`);
+        }
+        // 穷举 19608 个：「发明名称」之后接代表性记号（半角与全角空格、LF 与 U+2028、两种冒号、可见字符）上 0 到 5 个记号的全部组合
+        const exhaustive = everyStringUpTo(5, [' ', IDEOGRAPHIC_SPACE, '\n', fromCode(0x2028), ':', '：', 'X']);
+        assert.equal(exhaustive.length, 19608);
+        for (const rest of exhaustive) samples.push(`发明名称${rest}`);
+
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomTokens = (tokens, count) => Array.from({ length: count }, () => pick(tokens)).join('');
+        // 一般随机串 40000 个：0 到 2 个任意记号 + 前缀（完整、残缺或空）+ 0 到 12 个任意记号
+        const heads = ['发明名称', '发明创造名称', '实用新型名称', '发明', '名称', '创造名称', ''];
+        for (let i = 0; i < 40000; i += 1) {
+            samples.push(randomTokens(alphabet, Math.floor(random() * 3)) + pick(heads) + randomTokens(alphabet, Math.floor(random() * 13)));
+        }
+        // 结构化随机串 40000 个：若干空白 + 前缀之一（后六个为残缺前缀）+「名称」+ 空白 + 可选冒号 + 空白 + 若干记号
+        const blanks = [...TITLE_FIELD_SPACES, ...TITLE_FIELD_LINE_TERMINATORS];
+        const blankRun = (max) => randomTokens(blanks, Math.floor(random() * (max + 1)));
+        const prefixes = ['发明', '发明创造', '实用新型', '发', '明', '创造', '实用', '发明创', '新型'];
+        const colons = ['', '', ':', '：'];
+        for (let i = 0; i < 40000; i += 1) {
+            samples.push(`${blankRun(2)}${pick(prefixes)}名称${blankRun(3)}${pick(colons)}${blankRun(3)}${randomTokens(alphabet, Math.floor(random() * 7))}`);
+        }
+        assert.equal(samples.length, 361752);
+
+        // Act & Assert
+        const hits = {
+            prefixMismatch: 0, bodyAfterColon: 0, bodyWithoutColon: 0, bodyWithLineTerminator: 0,
+            spaceCaptured: 0, colonCaptured: 0, blankUnmatched: 0, unclassified: 0,
+        };
+        for (const sample of samples) {
+            const match = LEGACY_TITLE_FIELD_RE.exec(sample);
+            const expected = match ? match[1] : null;
+            const actual = titleFieldValue(sample);
+            // 只在不一致时拼装诊断信息，免得三十余万次调用都付这笔开销
+            if (actual !== expected) {
+                assert.equal(actual, expected, `输入 [${toCodePoints(sample)}]：新式 [${toCodePoints(actual)}]，旧式 [${toCodePoints(expected)}]`);
+            }
+            hits[titleFieldBranchOf(sample, expected)] += 1;
+        }
+        // 覆盖自证：六类分支都须有样本，差分才不是对某一分支空转；落在六类之外的样本应为 0
+        t.diagnostic(`样本 ${samples.length} 个；前缀不符 ${hits.prefixMismatch}；取值为正文：冒号之后 ${hits.bodyAfterColon}，`
+            + `无冒号 ${hits.bodyWithoutColon}；有正文而含行终止符、不匹配 ${hits.bodyWithLineTerminator}；前缀之后只剩空白与至多一个`
+            + `冒号时，取值为单个空白 ${hits.spaceCaptured}，取值为冒号本身 ${hits.colonCaptured}，不匹配 ${hits.blankUnmatched}`);
+        assert.ok(hits.prefixMismatch > 0, '没有前缀不符的样本');
+        assert.ok(hits.bodyAfterColon > 0, '没有冒号之后取正文的样本');
+        assert.ok(hits.bodyWithoutColon > 0, '没有无冒号而取正文的样本');
+        assert.ok(hits.bodyWithLineTerminator > 0, '没有正文含行终止符而不匹配的样本');
+        assert.ok(hits.spaceCaptured > 0, '没有取值为单个空白的样本');
+        assert.ok(hits.colonCaptured > 0, '没有取值为冒号本身的样本');
+        assert.ok(hits.blankUnmatched > 0, '没有只剩空白而不匹配的样本');
+        assert.equal(hits.unclassified, 0, '有样本落在六类分支之外');
     });
 });
