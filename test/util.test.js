@@ -3,7 +3,9 @@
  * 覆盖：sanitizeFolderName（含 Windows 保留名）、normalizeAuthor（占位作者名过滤）、stripExt、
  *       collectText、扩展名推断、ensureDir；
  *       stripHtml 的去标签在 8 万个未闭合「<」长段上的耗时上限，removeHtmlTags 与整条 stripHtml 同线性化之前的实现逐字等价（差分）；
- *       stripHtml 的去注释在 8 万个未闭合「<!--」长段上的耗时上限，removeHtmlComments 与整条 stripHtml 同线性化之前的实现逐字等价（差分）
+ *       stripHtml 的去注释在 8 万个未闭合「<!--」长段上的耗时上限，removeHtmlComments 与整条 stripHtml 同线性化之前的实现逐字等价（差分）；
+ *       stripHtml 的去 script/style 块在 8 万个「<script>x」长段上的耗时上限（其后无闭标签，或只有异名闭标签），
+ *       removeScriptStyleBlocks 与整条 stripHtml 同线性化之前的实现逐字等价（差分）
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -821,6 +823,255 @@ describe('stripHtml 去注释：线性于串长', () => {
         assert.ok(counts.nestedOpen > 0, '没有注释内含第二个「<!--」的样本');
         assert.ok(counts.terminatorInComment > 0, '没有注释内含行终止符的样本');
         assert.ok(counts.tailAfterLastClose > 0, '没有末个「-->」之后仍有字符的样本');
+        assert.ok(steps.blocks > 0, '没有删去 script/style 块的样本');
+        assert.ok(steps.comments > 0, '没有删去注释的样本');
+        assert.ok(steps.tags > 0, '整条清洗中没有删去标签的样本');
+        assert.ok(steps.entities > 0, '没有还原实体的样本');
+        assert.ok(steps.trim > 0, '没有修剪首尾的样本');
+    });
+});
+
+// ============================================================
+// stripHtml 去 script/style 块：线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+// 耗时用例的输入规模：8 万个「<script>x」，其后或无闭标签（形态 A），或只有一个异名闭标签「</style>」（形态 B）
+const BLOCK_STRESS_COUNT = 80000;
+// 上限的取法同 EDGE_STRESS_BUDGET_MS。200 ms 使两侧余量都不小于 5 倍——线性化之前的 /<(script|style)\b[\s\S]*?<\/\1\s*>/gi
+// 经 stripHtml 在这一规模上，于本文件内实测两种形态约 7.2 至 7.4 秒，在新进程里直接调用约 4.8 至 5.0 秒（新进程里 2 万、4 万个
+// 时约 0.29、1.2 秒，耗时随「<script>」的个数平方增长），较小者也是上限的 23 倍以上；线性化之后单独运行时单次调用约 4.8 至
+// 7.9 毫秒，全量并行运行时约 5.3 至 6.0 毫秒，仍不到上限的二十五分之一
+const BLOCK_STRESS_BUDGET_MS = 200;
+
+// 去 script/style 块一步的单步参照：某个开标签之后再无同名闭标签时，[\s\S]*? 从该处逐位扩展到串尾、处处失配，其后每个同名
+// 开标签都重来一遍，耗时随这一段的长度平方增长
+const legacyRemoveScriptStyleBlocks = (text) => String(text).replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '');
+
+// 大小写折叠会映射到 ASCII 字母的非 ASCII 字符，以码点生成：U+017F（大写为 S）、U+212A 开尔文符号（小写为 k）、U+0131
+// 无点 i（大写为 I）、U+0130 带点大写 I（小写为 i 加组合点）。旧式正则无 u 标志，i 只让 ASCII 字母按大小写匹配，它们既不能
+// 充当标签名的字母，也不算单词字符
+const LONG_S = String.fromCharCode(0x17f);
+const KELVIN_SIGN = String.fromCharCode(0x212a);
+const DOTLESS_I = String.fromCharCode(0x131);
+const DOTTED_CAPITAL_I = String.fromCharCode(0x130);
+// 分支计数用：把上述字符换成折叠目标之后才成起点者，即「位于标签名处而不构成起点」
+const FOLD_TARGETS = new Map([[LONG_S, 's'], [KELVIN_SIGN, 'k'], [DOTLESS_I, 'i'], [DOTTED_CAPITAL_I, 'i']]);
+const FOLD_CHAR_RE = new RegExp(`[${[...FOLD_TARGETS.keys()].join('')}]`);
+const FOLD_CHARS_RE = new RegExp(FOLD_CHAR_RE.source, 'g');
+// 闭标签名与「>」之间可出现的空白（\s 的成员）：制表、换行、回车、半角空格，以及以码点生成的五种非 ASCII 空白
+const BLOCK_WIDE_SPACES = [NBSP, IDEOGRAPHIC_SPACE, LINE_SEPARATOR, PARAGRAPH_SEPARATOR, BYTE_ORDER_MARK];
+const CLOSE_TAG_SPACES = ['\t', '\n', '\r', ' ', ...BLOCK_WIDE_SPACES];
+// 去 script/style 块差分的典型样本，逐一对应下文的分支：无起点（含名后不是词边界、只有闭标签）；有起点而零匹配（无闭标签、
+// 闭标签异名或残缺、闭标签名后空白再接非「>」）；恰一处匹配（含空块）；两处及以上匹配；开标签名含大写；闭标签名写法与开标签名
+// 不同；闭标签「>」前有空白（含五种非 ASCII 空白各一）；闭标签名后空白再接非「>」而其后另有闭标签；名后不是词边界；某名失配之后
+// 另一名仍有匹配；某名失配之后再现同名起点（含开标签名大小写不同者）；匹配内含另一起点；块内含行终止符；非 ASCII 折叠字符位于
+// 标签名处；孤立的闭标签位于首个起点之前；名后以非单词字符（含 U+00A0 与开尔文符号）构成词边界；与去注释、去标签、实体还原
+// 诸步的衔接；末两项为耗时用例两种形态的缩微形态
+const BLOCK_TYPICAL_SAMPLES = [
+    '', '图 1 示意图', '<scripts>', '<b>x</b>', '</script>',
+    '<script>', '<script>x', '<style>a</script>', '<script>x</style>', '<script>x</scrip>', '<script>a</script  b',
+    '<script>a</script>', 'x<style>p{}</style>y', '<script></script>', '<style></style>',
+    '<script>a</script><style>b</style>', '<script>a</script>x<script>b</script>',
+    '<SCRIPT>a</script>', '<Style>b</STYLE>',
+    '<script>a</SCRIPT>', '<STYLE>b</style>',
+    '<script>a</script >', '<script>a</script\t\n\r>', ...BLOCK_WIDE_SPACES.map((space) => `<script>a</script${space}>`),
+    '<script>a</script x></script>',
+    '<scripts>a</scripts>', '<style1>x</style1>', '<script_>x</script>', '<styles>x</style>',
+    '<script>a<style>b</style>', '<style>a<script>b</script>',
+    '<script>a<script>b', '<script>a<style>b</style><script>c', '<SCRIPT>a<script>b',
+    '<script>a<script>b</script>', '<script>a<style>b</script>', '<style><script></style>a</script>',
+    '<script>\n</script>', `<style>a${LINE_SEPARATOR}</style>`, '<script>a\r\n</script>',
+    `<${LONG_S}cript>x</script>`, `<scr${DOTLESS_I}pt>x</script>`, `<scr${DOTTED_CAPITAL_I}pt>x</script>`,
+    `<script>x</${LONG_S}cript>`,
+    '</style><style>a</style>', '</script>x<script>',
+    '<script/>x</script>', '<script\n>x</script>', '<script', `<script${NBSP}>x</script>`, `<script${KELVIN_SIGN}>x</script>`,
+    '<script><!-- </script> -->x', '<!-- <script> -->x</script>', '<b><script>a</script></b>',
+    '&lt;script&gt;alert(1)&lt;/script&gt;', '<script>a</script>&amp;b',
+    '<script>x'.repeat(8), `${'<script>x'.repeat(8)}</style>`,
+];
+// 穷举短串的字母表：大小写各异的开标签与闭标签、闭标签名后带空白者、残缺的闭标签、名后不是词边界的开标签、正文与「>」
+const BLOCK_DIFF_ALPHABET = ['<script>', '<STYLE>', '</SCRIPT>', '</style >', '</script', '<scripts>', 'x', '>'];
+// 一般随机串的记号：两名的开标签头与闭标签头（大小写各异）、「>」（两份）「<」「/」；打破词边界的字母、数字与下划线；闭标签名后
+// 可出现的各类空白；四个非 ASCII 折叠字符；注释的起止记号、标签、实体与中文
+const BLOCK_RANDOM_TOKENS = [
+    '<script', '<SCRIPT', '<ScRiPt', '<style', '<STYLE', '<Style', '</script', '</SCRIPT', '</style', '</sTyLe',
+    '>', '>', '<', '/', 'x', 'a', '1', '_',
+    ...CLOSE_TAG_SPACES, LONG_S, KELVIN_SIGN, DOTLESS_I, DOTTED_CAPITAL_I,
+    '<!--', '-->', '<b>', '&lt;', '&amp;', '图',
+];
+// 结构化随机串的片段：完整的块（大小写各异、带属性、块内含标签或行终止符、闭标签名后带空白）；两名的开标签与闭标签（闭标签名后
+// 带各类空白）；闭标签名后空白再接非「>」；名后不是词边界的开标签；标签名处或名后含非 ASCII 折叠字符者；注释、标签、实体与正文
+const BLOCK_RANDOM_FRAGMENTS = [
+    '<script>a</script>', '<SCRIPT>a</script>', '<style>p{}</STYLE>', '<script type="t">a<b>c</script >',
+    `<style>a</style${NBSP}>`, '<script>\n</script>',
+    '<script>', '<Script>', '<style>', '<STYLE>', '</script>', '</SCRIPT >', '</style>', '</Style>',
+    `</style${IDEOGRAPHIC_SPACE}>`, `</script${LINE_SEPARATOR}>`, `</script${PARAGRAPH_SEPARATOR}>`, `</style${BYTE_ORDER_MARK}>`,
+    '</script\t>', '</style\r\n>', '</script x>', '<scripts>', '<style1>', '<script_>',
+    `<${LONG_S}cript>`, `<scr${DOTLESS_I}pt>`, `<scr${DOTTED_CAPITAL_I}pt>`, `</${LONG_S}tyle>`, `<script${KELVIN_SIGN}>`,
+    '<!-- x -->', '<!--', '-->', '<b>', '</b>', '&lt;script&gt;', '&amp;',
+    'x', '图 1', ' ', '\n', NBSP,
+];
+
+describe('stripHtml 去 script/style 块：线性于串长', () => {
+    // [形态说明, 构造输入]：两种形态的输出都是 8 万个「x」。形态 B 的末个闭标签在串尾，「只用末个闭标签做单一前缀限定」的做法在它
+    // 上面前缀即全串，每个「<script」仍扫到串尾，借此拦住这一错误做法
+    const stressShapes = [
+        ['8 万个「<script>x」其后无闭标签', () => '<script>x'.repeat(BLOCK_STRESS_COUNT)],
+        ['8 万个「<script>x」之后只有异名闭标签「</style>」', () => `${'<script>x'.repeat(BLOCK_STRESS_COUNT)}</style>`],
+    ];
+
+    for (const [label, buildInput] of stressShapes) {
+        test(`${label}，去 script/style 块不触发回溯：stripHtml 单次调用在绝对上限内，输出逐字正确`, (t) => {
+            // Arrange：在计时区间外新构造字符串——V8 对「同一字符串对象 + 同一全局正则」的 replace 结果有缓存
+            const input = buildInput();
+            const expected = 'x'.repeat(BLOCK_STRESS_COUNT);
+
+            // Act：计时区间只包这一次调用
+            const started = process.hrtime.bigint();
+            const result = util.stripHtml(input);
+            const elapsedMs = elapsedMsSince(started);
+            t.diagnostic(`stripHtml 实测 ${elapsedMs.toFixed(2)} ms`);
+
+            // Assert：先验输出正确，以免「快」来自少做了事——开标签与异名闭标签都由去标签一步删去，「x」逐个保留。不一致时只报长度
+            // 与首尾各 8 个码点，免得断言信息被 72 万字的整串淹没
+            if (result !== expected) {
+                assert.fail(`stripHtml 输出不符：长 ${result.length}，首 [${toCodePoints(result.slice(0, 8))}]，`
+                    + `尾 [${toCodePoints(result.slice(-8))}]`);
+            }
+            assert.ok(
+                elapsedMs < BLOCK_STRESS_BUDGET_MS,
+                `stripHtml 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${BLOCK_STRESS_BUDGET_MS} ms`,
+            );
+        });
+    }
+
+    test('removeScriptStyleBlocks 与 stripHtml 同线性化之前的实现逐字等价：BMP 逐码元、穷举短串与随机串，各分支与各步均有样本', (t) => {
+        // Arrange：典型样本在前
+        const samples = [...BLOCK_TYPICAL_SAMPLES, ...STRIP_HTML_CHAIN_SAMPLES];
+        // BMP 逐码元 262144 个：每个码元放进四个位置——开标签名之后，考察词边界；闭标签名与「>」之间，考察 \s；开标签名第 4 个
+        // 字母处，考察起点字母的大小写匹配；闭标签名第 4 个字母处，考察反向引用的大小写匹配
+        for (let code = 0; code <= 0xffff; code += 1) {
+            const unit = String.fromCharCode(code);
+            samples.push(`<script${unit}>x</script>`, `<script>x</script${unit}>`);
+            samples.push(`<scr${unit}pt>x</script>`, `<style>x</sty${unit}e>`);
+        }
+        // 穷举 37449 个：字母表上由 0 到 5 个记号拼成的全部字符串
+        for (const text of everyStringUpTo(5, BLOCK_DIFF_ALPHABET)) samples.push(text);
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomTokens = (tokens, count) => Array.from({ length: count }, () => pick(tokens)).join('');
+        // 一般随机串 30000 个：0 到 24 个随机记号
+        for (let i = 0; i < 30000; i += 1) samples.push(randomTokens(BLOCK_RANDOM_TOKENS, Math.floor(random() * 25)));
+        // 结构化随机串 30000 个：0 到 8 个片段，块、开闭标签、注释、标签、实体与正文交错，使整条清洗各步之间的衔接也有样本
+        for (let i = 0; i < 30000; i += 1) samples.push(randomTokens(BLOCK_RANDOM_FRAGMENTS, Math.floor(random() * 9)));
+        assert.equal(samples.length, BLOCK_TYPICAL_SAMPLES.length + STRIP_HTML_CHAIN_SAMPLES.length + 359593);
+
+        // Act & Assert：去 script/style 块一步的逐字比较，只在不一致时拼装诊断信息，免得数十万次调用都付这笔开销
+        const assertBlockStepMatchesLegacy = (value) => {
+            const expected = legacyRemoveScriptStyleBlocks(value);
+            const actual = util.removeScriptStyleBlocks(value);
+            if (actual !== expected) {
+                assert.fail(`输入 ${describeInput(value)}：removeScriptStyleBlocks 新式 ${describeInput(actual)}，`
+                    + `旧式 ${describeInput(expected)}`);
+            }
+        };
+        // 非字符串入参先比较去 script/style 块一步，再比较整条清洗
+        for (const value of STRIP_HTML_NON_STRING_INPUTS) {
+            assertBlockStepMatchesLegacy(value);
+            assertStripHtmlMatchesLegacy(value);
+        }
+        const counts = {
+            noHead: 0, zeroMatch: 0, oneMatch: 0, multiMatch: 0, upperOpen: 0, closeCaseDiffers: 0,
+            spaceBeforeClose: 0, nonAsciiSpaceBeforeClose: 0, closeNameSpaceNonGt: 0, headNotBoundary: 0,
+            otherNameAfterFail: 0, sameNameAfterFail: 0, headInsideMatch: 0, terminatorInBlock: 0,
+            foldCharAtName: 0, strayClose: 0, strayCloseBeforeHead: 0,
+        };
+        const steps = { blocks: 0, comments: 0, tags: 0, entities: 0, trim: 0 };
+        for (const sample of samples) {
+            assertBlockStepMatchesLegacy(sample);
+            assertStripHtmlMatchesLegacy(sample, steps);
+            // 分支归类只用旧式的结果与测试内独立求得的输入特征：blocks 为旧式正则在该样本上的全部匹配（带位置）；heads 为全部
+            // 起点，以否定前瞻 (?![A-Za-z0-9_]) 代替实现所用的 \b 求得
+            const blocks = Array.from(sample.matchAll(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi));
+            const heads = Array.from(sample.matchAll(/<(script|style)(?![A-Za-z0-9_])/gi));
+            if (heads.length === 0) counts.noHead += 1;
+            else if (blocks.length === 0) counts.zeroMatch += 1;
+            else if (blocks.length === 1) counts.oneMatch += 1;
+            else counts.multiMatch += 1;
+            // 其余各类每个样本至多记一次
+            const flags = new Set();
+            for (const [text, openName] of blocks) {
+                // 匹配以闭标签收尾：「</」、与开标签同名（大小写可异）的字母、空白，再接「>」
+                const [, closeName, space] = /<\/([A-Za-z]+)(\s*)>$/.exec(text);
+                if (/[A-Z]/.test(openName)) flags.add('upperOpen');
+                if (closeName !== openName) flags.add('closeCaseDiffers');
+                if (space.length > 0) flags.add('spaceBeforeClose');
+                if (/[^\x00-\x7f]/.test(space)) flags.add('nonAsciiSpaceBeforeClose');
+                if (TAG_LINE_TERMINATORS.some((terminator) => text.includes(terminator))) flags.add('terminatorInBlock');
+            }
+            // 尝试过的起点即不严格落在某处匹配内部者，其中不是匹配起点的为失配起点；按出现次序记下失配过的标签名
+            const failedNames = new Set();
+            for (const head of heads) {
+                const at = head.index;
+                if (blocks.some((block) => at > block.index && at < block.index + block[0].length)) {
+                    flags.add('headInsideMatch');
+                    continue;
+                }
+                const name = head[1].toLowerCase();
+                const matched = blocks.some((block) => block.index === at);
+                if (failedNames.has(name)) flags.add('sameNameAfterFail');
+                if (matched && failedNames.has(name === 'script' ? 'style' : 'script')) flags.add('otherNameAfterFail');
+                if (!matched) failedNames.add(name);
+            }
+            // 闭标签只在开头有「<」、只在末尾有「>」，不会跨在匹配的边界上：要么整个落在某处匹配之内，要么在一切匹配之外，
+            // 后者即孤立者
+            for (const close of sample.matchAll(/<\/(?:script|style)\s*>/gi)) {
+                const end = close.index + close[0].length;
+                if (blocks.some((block) => close.index >= block.index && end <= block.index + block[0].length)) continue;
+                flags.add('strayClose');
+                if (heads.length > 0 && close.index < heads[0].index) flags.add('strayCloseBeforeHead');
+            }
+            if (/<\/(?:script|style)\s+(?![\s>])/i.test(sample)) flags.add('closeNameSpaceNonGt');
+            if (/<(?:script|style)[A-Za-z0-9_]/i.test(sample)) flags.add('headNotBoundary');
+            if (FOLD_CHAR_RE.test(sample)) {
+                const headAt = new Set(heads.map((head) => head.index));
+                const folded = sample.replace(FOLD_CHARS_RE, (ch) => FOLD_TARGETS.get(ch));
+                if (Array.from(folded.matchAll(/<(script|style)(?![A-Za-z0-9_])/gi)).some((head) => !headAt.has(head.index))) {
+                    flags.add('foldCharAtName');
+                }
+            }
+            for (const flag of flags) counts[flag] += 1;
+        }
+        // 覆盖自证：去 script/style 块十五类分支都须有样本（前四类按判断链互斥），闭标签「>」前的空白另须有含非 ASCII 空白者，
+        // 孤立的闭标签另须有位于首个起点之前者；整条清洗的五步都须有样本确有作用。差分才不是对某一分支空转
+        t.diagnostic(`样本 ${samples.length} 个，另有非字符串入参 ${STRIP_HTML_NON_STRING_INPUTS.length} 个；`
+            + `去 script/style 块：无起点 ${counts.noHead}，有起点而零匹配 ${counts.zeroMatch}，恰一处匹配 ${counts.oneMatch}，`
+            + `两处及以上匹配 ${counts.multiMatch}，开标签名含大写 ${counts.upperOpen}，`
+            + `闭标签名写法与开标签名不同 ${counts.closeCaseDiffers}，闭标签「>」前有空白 ${counts.spaceBeforeClose}`
+            + `（含非 ASCII 空白 ${counts.nonAsciiSpaceBeforeClose}），闭标签名后空白再接非「>」${counts.closeNameSpaceNonGt}，`
+            + `名后不是词边界 ${counts.headNotBoundary}，某名失配之后另一名仍有匹配 ${counts.otherNameAfterFail}，`
+            + `某名失配之后再现同名起点 ${counts.sameNameAfterFail}，匹配内含另一起点 ${counts.headInsideMatch}，`
+            + `块内含行终止符 ${counts.terminatorInBlock}，非 ASCII 折叠字符位于标签名处 ${counts.foldCharAtName}，`
+            + `孤立的闭标签 ${counts.strayClose}（位于首个起点之前 ${counts.strayCloseBeforeHead}）`);
+        t.diagnostic(`整条清洗各步确有作用的样本数：删去 script/style 块 ${steps.blocks}，删去注释 ${steps.comments}，`
+            + `删去标签 ${steps.tags}，还原实体 ${steps.entities}，修剪首尾 ${steps.trim}`);
+        assert.ok(counts.noHead > 0, '没有无起点的样本');
+        assert.ok(counts.zeroMatch > 0, '没有有起点而零匹配的样本');
+        assert.ok(counts.oneMatch > 0, '没有恰一处匹配的样本');
+        assert.ok(counts.multiMatch > 0, '没有两处及以上匹配的样本');
+        assert.ok(counts.upperOpen > 0, '没有开标签名含大写的匹配');
+        assert.ok(counts.closeCaseDiffers > 0, '没有闭标签名写法与开标签名不同的匹配');
+        assert.ok(counts.spaceBeforeClose > 0, '没有闭标签「>」前有空白的匹配');
+        assert.ok(counts.nonAsciiSpaceBeforeClose > 0, '没有闭标签「>」前含非 ASCII 空白的匹配');
+        assert.ok(counts.closeNameSpaceNonGt > 0, '没有闭标签名后空白再接非「>」的样本');
+        assert.ok(counts.headNotBoundary > 0, '没有名后不是词边界的样本');
+        assert.ok(counts.otherNameAfterFail > 0, '没有某名失配之后另一名仍有匹配的样本');
+        assert.ok(counts.sameNameAfterFail > 0, '没有某名失配之后再现同名起点的样本');
+        assert.ok(counts.headInsideMatch > 0, '没有匹配内含另一起点的样本');
+        assert.ok(counts.terminatorInBlock > 0, '没有块内含行终止符的样本');
+        assert.ok(counts.foldCharAtName > 0, '没有非 ASCII 折叠字符位于标签名处的样本');
+        assert.ok(counts.strayClose > 0, '没有孤立闭标签的样本');
+        assert.ok(counts.strayCloseBeforeHead > 0, '没有孤立闭标签位于首个起点之前的样本');
         assert.ok(steps.blocks > 0, '没有删去 script/style 块的样本');
         assert.ok(steps.comments > 0, '没有删去注释的样本');
         assert.ok(steps.tags > 0, '整条清洗中没有删去标签的样本');
