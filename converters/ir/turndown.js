@@ -182,6 +182,214 @@ function escapeAttr(value) {
     return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// ---------- word profile：段内换行与强调定界符 ----------
+
+/*
+ * 成因：turndown 默认把 <br> 写成「两个空格 + 换行」（options.br + '\n'），默认的 strong / emphasis 规则把它原样
+ * 包进定界符：<strong><br />加粗</strong> →「**  \n加粗**」。开定界符后紧跟空白、闭定界符前紧跟空白时，按 CommonMark
+ * 的 flanking 规则都不能开闭强调，两侧星号成为字面文字；两个以上 <br> 连写时，中间行只剩两个空格、即为空行，
+ * 段落在此断开。另外，元素文本带首尾空白时 turndown 先对其内容整体 trim，贴在强调、下划线或链接内侧首尾的
+ * 「  \n」随之削掉，换行静默丢失（<strong> 加粗<br /></strong> →「 **加粗**」）。
+ *
+ * 换行规则按所在块的上下文取三种写法之一：
+ *   - 所在块为 h1–h6：沿用「两个空格 + 换行」，标题内换行的既有表现（标题 + 段落）不变；
+ *   - 在所在块的行内连续区中前面没有内容或后面没有内容（段首、段尾）：同样沿用原写法，由 remark 按块边界舍弃，
+ *     IR 与原先一致；
+ *   - 前后都有内容（段中）：输出行内 HTML <br>，由 ir/inline-html 提升为 break 节点。连写多个也不产生空行，
+ *     其中也没有空白可供 trim 削去。
+ * 不用反斜杠式（「\」+ 换行）：trim 只削掉其中的换行，留下的孤立反斜杠会转义下一个字符（「<u>下划线\</u>」
+ * 「[链接\](u)」），标签与链接随之失配。
+ * 块按 turndown 的块级元素判定，沿父链取最近的块级祖先；块内嵌套的块级元素（如 li 里的 ul）是行内连续区的边界，
+ * 不算内容。内容指含 [ \t\r\n] 以外字符的文本节点，或带非空 src 的 img（无 src 的由 emptyImg 规则删除）；其余元素
+ * 按其后代判定，<br> 本身不算内容。
+ *
+ * 加粗与斜体规则把内容首尾的换行记号（<br> 或「两个空格 + 换行」）剥到定界符之外，输出「首部 <br> + 定界符 + 核心 +
+ * 定界符 + 尾部 <br>」；嵌套时由内向外逐层剥离（斜体先剥到 * 外，加粗再剥到 ** 外）。剥下的「两个空格 + 换行」
+ * （段首段尾与标题内的换行）不再输出：remark 本就按块边界舍弃段首段尾的换行，留在输出里反而有害——列表项以两行
+ * 以上的空白行开头时成为空项、其后内容变为缩进代码块，外层链接被空行拆开；标题内处在强调首尾的换行随之舍弃，
+ * 标题不再被拆开。与换行记号相邻的空白一并剥去、不再输出：<br> 不贡献文本，这些空白处在元素文本的首尾，turndown
+ * 已据此在元素外侧补出 flanking 空白，留在定界符内侧既重复一份，又使定界符贴着空白而失效（换行与全角空格相邻时
+ * 即如此）。已知限制：turndown 补出的空白位于整个元素产出的外侧，剥出的 <br> 却在元素产出之内，二者次序因此颠倒。
+ * turndown 在调用规则之前已把这份空白拼进输出（见其 replacementForNode），规则内无从调整：以「换行 + 全角空格」
+ * 开头的 run，全角空格移到换行之前；以「全角空格 + 换行」结尾的 run，全角空格移到换行之后。修复前这类 run 的
+ * 换行整个丢失。尾部的 <br> 前紧邻奇数个反斜杠时，「<」是被转义的字面文字（文本中的「<」转义为 \< 之后），剥离
+ * 到此为止。
+ *
+ * 耗时须线性于块长：一段内连写 n 个 <br> 时，逐个重扫兄弟节点即成平方级，故首次遇到某块时整块线性扫描一次，
+ * 把其中每个 <br> 的归类写入 WeakMap，同块其余 <br> 直接查表。剥离一律按下标手工扫描，不写「量词 + 行尾锚」或
+ * 「前导量词 + 必需字符」形态的正则：长串换行记号位于中段时，这类正则从每个起点逐位回溯，耗时随长度平方增长。
+ */
+
+// turndown 7.2 判定块级所用的标签（其内部 blockElements 未导出，此处照录），换行的归类须与之一致
+const TURNDOWN_BLOCK_TAGS = new Set([
+    'ADDRESS', 'ARTICLE', 'ASIDE', 'AUDIO', 'BLOCKQUOTE', 'BODY', 'CANVAS', 'CENTER', 'DD', 'DIR', 'DIV', 'DL', 'DT',
+    'FIELDSET', 'FIGCAPTION', 'FIGURE', 'FOOTER', 'FORM', 'FRAMESET', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER',
+    'HGROUP', 'HR', 'HTML', 'ISINDEX', 'LI', 'MAIN', 'MENU', 'NAV', 'NOFRAMES', 'NOSCRIPT', 'OL', 'OUTPUT', 'P', 'PRE',
+    'SECTION', 'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL',
+]);
+const HEADING_TAGS = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+const HTML_BREAK = '<br>';
+// 与 turndown 折叠空白所用的字符集一致：只由这四种字符构成的文本节点不算内容
+const CONTENT_CHAR_RE = /[^ \t\r\n]/;
+// 单个空白字符，与 String.prototype.trim 去除的字符同集
+const TRIMMABLE_CHAR_RE = /\s/;
+const ELEMENT_NODE = 1;
+const TEXT_NODE = 3;
+const CDATA_SECTION_NODE = 4;
+
+/** word profile 的换行规则与加粗、斜体规则（说明见上方块注释） */
+function addBreakRules(service) {
+    // <br> 节点 → 是否在所在块的行内连续区中前后都有内容。每次 turndown 调用都解析出新的 DOM，键不会串用
+    const midBreaks = new WeakMap();
+    service.addRule('wordLineBreak', {
+        filter: 'br',
+        replacement: (content, node, options) => (isMidBreak(node, midBreaks) ? HTML_BREAK : `${options.br}\n`),
+    });
+    service.addRule('wordStrong', {
+        filter: ['strong', 'b'],
+        replacement: (content, node, options) => wrapOutsideBreaks(content, options.strongDelimiter, `${options.br}\n`),
+    });
+    service.addRule('wordEmphasis', {
+        filter: ['em', 'i'],
+        replacement: (content, node, options) => wrapOutsideBreaks(content, options.emDelimiter, `${options.br}\n`),
+    });
+}
+
+function isMidBreak(br, midBreaks) {
+    if (!midBreaks.has(br)) {
+        const block = enclosingBlock(br);
+        if (HEADING_TAGS.has(block.nodeName)) return false;
+        classifyBreaks(block, midBreaks);
+    }
+    return midBreaks.get(br) === true;
+}
+
+/** 最近的块级祖先；父链上没有块级元素时（以脱离文档的 DOM 节点为输入）取最顶层的祖先 */
+function enclosingBlock(node) {
+    let top = node;
+    for (let parent = node.parentNode; parent; parent = parent.parentNode) {
+        if (TURNDOWN_BLOCK_TAGS.has(parent.nodeName)) return parent;
+        top = parent;
+    }
+    return top;
+}
+
+/**
+ * 按文档顺序把块内节点扫描一遍（不进入嵌套的块级元素，它们归各自的块扫描），把其中每个 <br> 的归类写入 midBreaks。
+ * waiting 为当前行内连续区中尚未见到后续内容的 <br> 及其前面是否已有内容，每个 <br> 入列、出列各一次
+ */
+function classifyBreaks(block, midBreaks) {
+    let waiting = [];
+    let contentBefore = false;
+    const settle = (contentAfter) => {
+        for (const { br, before } of waiting) midBreaks.set(br, before && contentAfter);
+        waiting = [];
+    };
+    const meetContent = () => {
+        settle(true);
+        contentBefore = true;
+    };
+    let node = block.firstChild;
+    while (node) {
+        let descend = false;
+        if (node.nodeType === TEXT_NODE || node.nodeType === CDATA_SECTION_NODE) {
+            if (CONTENT_CHAR_RE.test(node.data)) meetContent();
+        } else if (node.nodeType === ELEMENT_NODE) {
+            if (node.nodeName === 'BR') {
+                waiting.push({ br: node, before: contentBefore });
+            } else if (TURNDOWN_BLOCK_TAGS.has(node.nodeName)) {
+                // 嵌套的块级元素：行内连续区在此断开
+                settle(false);
+                contentBefore = false;
+            } else if (node.nodeName === 'IMG') {
+                if (node.getAttribute('src')) meetContent();
+            } else {
+                descend = Boolean(node.firstChild);
+            }
+        }
+        node = descend ? node.firstChild : nextOutsideSubtree(node, block);
+    }
+    settle(false);
+}
+
+/** 文档顺序中跳过 node 的子树之后的下一个节点；越出 block 时返回 null */
+function nextOutsideSubtree(node, block) {
+    for (let current = node; current && current !== block; current = current.parentNode) {
+        if (current.nextSibling) return current.nextSibling;
+    }
+    return null;
+}
+
+/**
+ * 以定界符包裹：首尾的换行记号与相邻空白剥到定界符之外，其中只输出段中换行 <br>（理由见上方块注释）。
+ * 核心为空（只含换行与空白）时只输出剥下的 <br>，只含换行的 run 由此保住段中换行；既无 <br> 又无核心时返回空串，
+ * 同默认规则
+ */
+function wrapOutsideBreaks(content, delimiter, lineBreak) {
+    const head = leadingBreaks(content, lineBreak);
+    const tail = trailingBreaks(content, head.end, lineBreak);
+    const core = content.slice(head.end, tail.start);
+    const htmlBreaks = (tokens) => tokens.filter((token) => token === HTML_BREAK).join('');
+    if (!core) return htmlBreaks([...head.tokens, ...tail.tokens]);
+    return `${htmlBreaks(head.tokens)}${delimiter}${core}${delimiter}${htmlBreaks(tail.tokens)}`;
+}
+
+/** 自串首起连续的换行记号与空白：返回其终点与其中的换行记号（按原序） */
+function leadingBreaks(content, lineBreak) {
+    const tokens = [];
+    let at = 0;
+    while (at < content.length) {
+        let token = null;
+        if (content.startsWith(HTML_BREAK, at)) token = HTML_BREAK;
+        else if (content.startsWith(lineBreak, at)) token = lineBreak;
+        if (token) {
+            tokens.push(token);
+            at += token.length;
+        } else if (TRIMMABLE_CHAR_RE.test(content[at])) {
+            at += 1;
+        } else {
+            break;
+        }
+    }
+    return { end: at, tokens };
+}
+
+/**
+ * 自串尾向前、不越过 floor 的连续换行记号与空白：返回其起点与其中的换行记号（按原序）。
+ * <br> 前紧邻奇数个反斜杠时「<」是被转义的字面文字，到此为止。串首无须此判定：首部的 <br> 之前只有换行记号与空白
+ */
+function trailingBreaks(content, floor, lineBreak) {
+    const tokens = [];
+    let at = content.length;
+    while (at > floor) {
+        let token = null;
+        if (endsAt(content, HTML_BREAK, at, floor) && !isEscaped(content, at - HTML_BREAK.length)) token = HTML_BREAK;
+        else if (endsAt(content, lineBreak, at, floor)) token = lineBreak;
+        if (token) {
+            tokens.push(token);
+            at -= token.length;
+        } else if (TRIMMABLE_CHAR_RE.test(content[at - 1])) {
+            at -= 1;
+        } else {
+            break;
+        }
+    }
+    return { start: at, tokens: tokens.reverse() };
+}
+
+/** content 中止于 end 的一段恰为 token，且起点不小于 floor */
+function endsAt(content, token, end, floor) {
+    const start = end - token.length;
+    return start >= floor && content.startsWith(token, start);
+}
+
+/** 下标 index 处的字符前紧邻奇数个反斜杠，即该字符已被转义 */
+function isEscaped(content, index) {
+    let count = 0;
+    for (let at = index - 1; at >= 0 && content[at] === '\\'; at -= 1) count += 1;
+    return count % 2 === 1;
+}
+
 // ---------- 各 profile 配置 ----------
 
 function configureBasic(service) {
@@ -190,6 +398,7 @@ function configureBasic(service) {
 
 function configureWord(service) {
     addTableRule(service);
+    addBreakRules(service);
     service.addRule('emptyImg', {
         filter: (node) => node.nodeName === 'IMG' && !node.getAttribute('src'),
         replacement: () => '',
