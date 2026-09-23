@@ -13,8 +13,7 @@
  *
  * 清洗属常规行为，不写入 warnings。
  */
-const cheerio = require('cheerio');
-const { hasDescendantTag, createTreeEditor } = require('./dom');
+const { hasDescendantTag, createTreeEditor, loadFragment, selectElements, selectByTags } = require('./dom');
 
 // 属性规则的 match 为析取范式：外层任一组命中即判为噪声，组内令牌须全部出现。
 const NOISE_ATTR_RULES = Object.freeze([
@@ -65,6 +64,9 @@ const MAX_CONSECUTIVE_BR = 2;
 const MAX_REMOVAL_TEXT_RATIO = 0.5;
 
 /**
+ * 载入与四条规则的取元素改走 web/dom：cheerio.load(html, null, false) 与根级 $(选择器) 在顶层大量并列节点时平方级，
+ * loadFragment 与之逐字等价，selectElements、selectByTags 与根级 $(选择器) 逐节点同序，三者都线性
+ *
  * @param {string} html 正文 HTML 片段
  * @returns {string} 清洗后的 HTML 片段
  */
@@ -72,7 +74,7 @@ function cleanNoise(html) {
     const source = String(html == null ? '' : html);
     if (!source.trim()) return source;
 
-    const $ = cheerio.load(source, null, false);
+    const $ = loadFragment(source);
     const totalLength = $.root().text().trim().length;
     removeByAttributes($, totalLength);
     removeByText($);
@@ -101,9 +103,17 @@ function matchNoiseRule(tokens) {
     return null;
 }
 
+// 属性规则的候选元素：自有属性 class 或 id 存在且值不为 null。对应 css-select 的 '[class], [id]'——属性存在选择器
+// 经 domutils 的 hasAttrib 判定（attribs 的自有属性、值非 null），供 selectElements 与之逐元素同值
+function hasClassOrId(el) {
+    const { attribs } = el;
+    return (Object.hasOwn(attribs, 'class') && attribs.class != null)
+        || (Object.hasOwn(attribs, 'id') && attribs.id != null);
+}
+
 function removeByAttributes($, totalLength) {
     // 文档序遍历：父元素先被删除时，其子元素随之消失，无需再判定
-    $('[class], [id]').each((_, el) => {
+    selectElements($, hasClassOrId).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
         const tokens = [...tokensOf($el.attr('class')), ...tokensOf($el.attr('id'))];
@@ -130,7 +140,7 @@ function exceedsRemovalBudget($el, totalLength) {
 // ---------- 规则二：引导文案 ----------
 
 function removeByText($) {
-    $(TEXT_RULE_TAGS).each((_, el) => {
+    selectByTags($, TEXT_RULE_TAGS).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
         const text = $el.text().replace(/\s+/g, ' ').trim();
@@ -144,7 +154,7 @@ function removeByText($) {
 
 // 连续的 <br> 超过 MAX_CONSECUTIVE_BR 个时，多余的删除（其间的空白文本节点一并清掉）
 function collapseLineBreaks($) {
-    $('br').each((_, el) => {
+    selectByTags($, 'br').each((_, el) => {
         let seen = 1;
         let node = el.nextSibling;
         const pending = [];
@@ -177,7 +187,7 @@ function removeEmptyElements($) {
     for (let round = 0; round < EMPTY_SWEEP_ROUNDS; round += 1) {
         let changed = 0;
         const editor = createTreeEditor();
-        $(EMPTY_TAGS).each((_, el) => {
+        selectByTags($, EMPTY_TAGS).each((_, el) => {
             if (!isAttached(el)) return;
             const $el = $(el);
             if ($el.text().trim()) return;
@@ -198,4 +208,4 @@ function removeEmptyElements($) {
     }
 }
 
-module.exports = { cleanNoise, tokensOf, isAttached, removeEmptyElements, NOISE_ATTR_RULES, NOISE_TEXT_RULES };
+module.exports = { cleanNoise, tokensOf, isAttached, removeEmptyElements, hasClassOrId, NOISE_ATTR_RULES, NOISE_TEXT_RULES };

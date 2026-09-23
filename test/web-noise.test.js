@@ -533,3 +533,33 @@ test('空元素清理与改写之前的实现逐字等价：定种子随机森�
     assert.ok(stats.removedTrees > EMPTY_DIFF_TREE_COUNT / 2, `发生删除的树应过半：${JSON.stringify(stats)}`);
     assert.ok(stats.unwrappedTrees > EMPTY_DIFF_TREE_COUNT / 10, `发生拆包的树应超过十分之一：${JSON.stringify(stats)}`);
 });
+
+// ============================================================
+// 片段载入与根级查询：顶层大量并列节点时 cleanNoise 的耗时上限
+// ============================================================
+
+// 载荷为顶层 8 万个并列的 <p>段</p>：不带 class、id、br，文字不命中任何引导文案规则，也不是空元素，四步清洗都不
+// 改动它，正确的输出就是原串；逐个 .remove() 等不在本节范围内的路径也就一条都不走。改写之前 cleanNoise 做一次
+// 片段载入 cheerio.load(html, null, false)、四次根级查询（属性规则、文案规则、连续 br 削减、空元素清理各一次），
+// 二者都随顶层节点数平方增长，病因与分规模实测见 test/url-parser.test.js 的「片段载入与根级查询」一节
+const NOISE_STRESS_COUNT = 80000;
+// 耗时上限取绝对值，理由同 TRAILING_STRESS_BUDGET_MS。1500 ms 使两侧余量都不小于 5 倍——改写之前本用例 3 次实测
+// （1 次单独运行、2 次运行整个文件）17339.8、18391.9、16250.8 ms，最快一次是它的 10.8 倍；改写之后本用例在全量测试
+// （node --test 多文件并行）中的用例耗时（含构造载荷与断言，是计时区间的上界）9 次为 195.1–245.9 ms，同一载荷、同一
+// 计时区间的独立进程冷启动 3 次为 151.1–156.0 ms，冷启动且与全量测试并行 3 次为 160.6–200.6 ms，最慢一次 245.9 ms
+// 不到它的 1/6。直接调用 cleanNoise、计时区间只包这一次调用，片段载入在函数之内一并计时
+const NOISE_STRESS_BUDGET_MS = 1500;
+
+test('噪声清洗：顶层 8 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变', () => {
+    // Arrange：载荷在用例内现场构造，不与其他用例共用
+    const html = '<p>段</p>'.repeat(NOISE_STRESS_COUNT);
+
+    // Act：计时区间只包 cleanNoise 一次调用；片段载入在函数之内，属本节的修复对象，一并计时
+    const started = process.hrtime.bigint();
+    const result = cleanNoise(html);
+    const elapsedMs = elapsedMsSince(started);
+
+    // Assert：先验结果正确，以免「快」来自少做了事
+    assert.ok(result === html, '整段 HTML 应逐字不变');
+    assert.ok(elapsedMs < NOISE_STRESS_BUDGET_MS, `清洗实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${NOISE_STRESS_BUDGET_MS} ms`);
+});

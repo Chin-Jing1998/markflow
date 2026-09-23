@@ -1533,3 +1533,83 @@ test('相邻 strong 合并与改写之前的实现逐字等价：定种子随机
     assert.ok(stats.chainTrees > MERGE_DIFF_TREE_COUNT / 5, `连续并入两个以上后继的树应超过五分之一：${JSON.stringify(stats)}`);
     assert.ok(stats.movedTrees > MERGE_DIFF_TREE_COUNT / 10, `搬移后再合并的树应超过十分之一：${JSON.stringify(stats)}`);
 });
+
+// ============================================================
+// 片段载入与根级查询：顶层大量并列节点时的耗时上限
+// ============================================================
+
+const { listImages, preprocessHtml } = require('../converters/parsers/url');
+
+// 载荷为顶层 n 个并列的 <p>段</p>：不带 class、id、br 与样式，也没有图片，清单提取与预处理都不改动它，正确的输出
+// 就是原串；逐个删除、逐个替换等不在本节范围内的路径也就一条都不走，耗时只反映片段载入与根级查询
+const STRESS_PARAGRAPH = '<p>段</p>';
+const STRESS_PAGE_URL = 'https://example.com/article';
+
+// 改写之前有两处平方级，都随顶层节点数 n 增长：
+//   - 片段载入 cheerio.load(html, null, false)：parse5 的 parseFragment 在 getFragment 里经 _adoptNodes 把临时根的
+//     子节点逐个 detachNode（indexOf + splice(0, 1)）再 appendChild 迁入片段根，splice 每次挪动其余全部数组项。载入耗时
+//     随 n 并不单调（同一 n 下稳定，不同 n 之间折合的单价相差十余倍）——本机独立进程各实测 3 次：2 万 456–470 ms、
+//     4 万 120–123 ms、6 万 2428–2570 ms、8 万 1672–1881 ms、10 万 4284–4529 ms、12 万 8239–9828 ms、
+//     14 万 12422–13058 ms、16 万 11819–14816 ms、20 万 11159–13206 ms；
+//   - 根级查询 $(选择器)：以根的全部元素子节点作搜索根交给 css-select 的 prepareContext，其中 domutils 的
+//     removeSubsets 对这组根逐个做 lastIndexOf / includes，每次查询的耗时稳定地随 n 平方增长——本机实测 2 万 244–250 ms、
+//     4 万 965–974 ms、6 万 2213–2263 ms、8 万 3899–3903 ms、16 万 15706–15746 ms。
+// listImages 做一次载入、一次根级查询（$('img')）；preprocessHtml 做一次载入、七次根级查询（样式规则三次，
+// $('img')、段首缩进、相邻 strong 合并、空 span 清理各一次）。
+// 耗时上限取绝对值，理由同 BREAK_STRESS_BUDGET_MS；各用例直接调用被测函数、计时区间只包这一次调用，片段载入在函数之内
+// 一并计时。改写之前的实测为本用例 3 次（1 次单独运行本节用例、2 次运行整个文件）；改写之后的实测含三类：本用例在全量
+// 测试（node --test 多文件并行）中的用例耗时 9 次（含构造载荷与断言，是计时区间的上界），同一载荷、同一计时区间的独立
+// 进程冷启动 3 次，以及冷启动且与全量测试并行 3 次
+//
+// 10 万个段落：改写之前 12619.1、12515.7、10830.4 ms，最快一次是上限 1000 ms 的 10.8 倍；改写之后全量测试中
+// 84.4–124.3 ms，冷启动 93.3–98.8 ms，冷启动且并行 100.2–166.4 ms，最慢一次 166.4 ms 不到上限的 1/6
+const IMAGE_LIST_STRESS_COUNT = 100000;
+const IMAGE_LIST_STRESS_BUDGET_MS = 1000;
+// 16 万个段落：规模取到载入稳定落在慢态的区间。改写之前 34354.7、24957.4、26475.2 ms，最快一次是上限 1500 ms 的 16.6 倍；
+// 只把载入退回原生写法、根级查询保持线性时，同一步骤独立进程实测 12697.0、11988.9、11338.0 ms，最快一次仍是上限的
+// 7.6 倍，故只剩载入一处平方级时本用例同样失败。改写之后全量测试中 143.9–196.6 ms，冷启动 142.1–153.9 ms，冷启动且
+// 并行 147.8–186.6 ms，最慢一次 196.6 ms 不到上限的 1/7
+const FRAGMENT_LOAD_STRESS_COUNT = 160000;
+const FRAGMENT_LOAD_STRESS_BUDGET_MS = 1500;
+// 6 万个段落：改写之前 17031.7、18284.3、19399.0 ms，最快一次是上限 1500 ms 的 11.4 倍；改写之后全量测试中
+// 107.1–142.5 ms，冷启动 107.9–108.7 ms，冷启动且并行 115.1–143.2 ms，最慢一次 143.2 ms 不到上限的 1/10
+const PREPROCESS_STRESS_COUNT = 60000;
+const PREPROCESS_STRESS_BUDGET_MS = 1500;
+
+test('只读图片清单：顶层 10 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变、清单为空', async () => {
+    // Arrange：载荷在用例内现场构造，不与其他用例共用
+    const html = STRESS_PARAGRAPH.repeat(IMAGE_LIST_STRESS_COUNT);
+
+    // Act：计时区间只包 listImages 一次调用；片段载入在函数之内，属本节的修复对象，一并计时
+    const [result, ms] = await timed(() => listImages(html, STRESS_PAGE_URL));
+
+    // Assert：先验结果正确，以免「快」来自少做了事——没有图片，清单为空，HTML 原样返回
+    assert.deepEqual(result.images, [], '载荷里没有图片，清单应为空');
+    assert.ok(result.html === html, '整段 HTML 应逐字不变');
+    assert.ok(ms < IMAGE_LIST_STRESS_BUDGET_MS, `提取实测 ${ms.toFixed(1)} 毫秒，超出上限 ${IMAGE_LIST_STRESS_BUDGET_MS} 毫秒`);
+});
+
+test('只读图片清单：顶层 16 万个并列段落使片段载入落在慢态，改写后耗时在绝对上限内且 HTML 逐字不变、清单为空', async () => {
+    // Arrange
+    const html = STRESS_PARAGRAPH.repeat(FRAGMENT_LOAD_STRESS_COUNT);
+
+    // Act：计时区间只包 listImages 一次调用
+    const [result, ms] = await timed(() => listImages(html, STRESS_PAGE_URL));
+
+    // Assert：先验结果正确
+    assert.deepEqual(result.images, [], '载荷里没有图片，清单应为空');
+    assert.ok(result.html === html, '整段 HTML 应逐字不变');
+    assert.ok(ms < FRAGMENT_LOAD_STRESS_BUDGET_MS, `提取实测 ${ms.toFixed(1)} 毫秒，超出上限 ${FRAGMENT_LOAD_STRESS_BUDGET_MS} 毫秒`);
+});
+
+test('HTML 预处理：顶层 6 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变', async () => {
+    // Arrange
+    const html = STRESS_PARAGRAPH.repeat(PREPROCESS_STRESS_COUNT);
+
+    // Act：计时区间只包 preprocessHtml 一次调用
+    const [output, ms] = await timed(() => preprocessHtml(html));
+
+    // Assert：先验结果正确——段落无样式、无缩进空白，预处理不改动任何节点
+    assert.ok(output === html, '整段 HTML 应逐字不变');
+    assert.ok(ms < PREPROCESS_STRESS_BUDGET_MS, `预处理实测 ${ms.toFixed(1)} 毫秒，超出上限 ${PREPROCESS_STRESS_BUDGET_MS} 毫秒`);
+});

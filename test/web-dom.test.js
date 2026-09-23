@@ -486,3 +486,557 @@ test('createTreeEditor 与原生写法逐节点一致：同一批次混用 remov
     assert.ok(totals.changedTrees > EDITOR_TREE_COUNT / 2, `发生改动的树应过半：${JSON.stringify(totals)}`);
     assert.ok(totals.remove > 0 && totals.unwrap > 0 && totals.absorb > 0, `三种操作都应发生：${JSON.stringify(totals)}`);
 });
+
+// ============================================================
+// loadFragment：与 cheerio.load(html, null, false) 逐字等价
+// ============================================================
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { loadFragment, selectElements, selectByTags } = require('../converters/web/dom');
+const { hasClassOrId } = require('../converters/web/noise');
+const { LEAF_BLOCK_SELECTOR } = require('../converters/web/indent');
+
+// 以码点生成字符：BOM、NULL、不换行空格、代理项，以及换行、制表、回车之外的控制字符一律经此生成，源码不出现不可见字面量
+const ch = String.fromCharCode;
+
+// 节点的可比内容：类型、标签名、命名空间、属性（含键序）及其命名空间与前缀、文本与注释的内容、指令的各字段
+function describeNode(node) {
+    const stringified = (record) => (record ? Object.entries(record).map(([key, value]) => [key, String(value)]) : null);
+    switch (node.type) {
+        case 'tag':
+        case 'script':
+        case 'style':
+            return [node.type, node.name, node.namespace, Object.entries(node.attribs),
+                stringified(node['x-attribsNamespace']), stringified(node['x-attribsPrefix'])];
+        case 'text':
+        case 'comment':
+            return [node.type, node.data];
+        case 'directive':
+            return [node.type, node.name, node.data, node['x-name'], node['x-publicId'], node['x-systemId']];
+        case 'root':
+            return [node.type, String(node['x-mode'])];
+        default:
+            return [node.type];
+    }
+}
+
+// 规范化树转储：按前序逐节点记下可比内容、子节点数，以及 parent / prev / next 折成的前序编号（null 与 undefined 分记，
+// 指向树外的节点记为 outside），递归全部子节点（含 template 的内容片段）。两棵树的转储逐字相同，即逐节点同构、同值、同链接
+function treeSnapshot(root) {
+    const { ids, order } = indexNodes(root);
+    const idOf = (other) => {
+        if (other === null || other === undefined) return String(other);
+        return ids.has(other) ? ids.get(other) : 'outside';
+    };
+    return order.map((node) => JSON.stringify([
+        ...describeNode(node), node.children ? node.children.length : -1, idOf(node.parent), idOf(node.prev), idOf(node.next),
+    ])).join('\n');
+}
+
+/**
+ * 同一输入分别经 loadFragment 与 cheerio.load(html, null, false) 载入：比对规范化树转储与 $.html()，并核对 loadFragment
+ * 一侧整棵树的 parent / prev / next 链。原生载入抛错时 loadFragment 须抛出同一类型、同一消息的错误。
+ * 返回 true 表示两侧同样抛错
+ */
+function assertFragmentEquivalent(html, label) {
+    let expected = null;
+    let expectedError = null;
+    try {
+        expected = cheerio.load(html, null, false);
+    } catch (error) {
+        expectedError = error;
+    }
+    let actual = null;
+    let actualError = null;
+    try {
+        actual = loadFragment(html);
+    } catch (error) {
+        actualError = error;
+    }
+    if (expectedError) {
+        assert.ok(actualError, `${label}：原生载入抛错（${expectedError.message}），loadFragment 也应抛错`);
+        assert.equal(actualError.constructor, expectedError.constructor, `${label}：错误类型应相同`);
+        assert.equal(actualError.message, expectedError.message, `${label}：错误消息应相同`);
+        return true;
+    }
+    assert.ok(!actualError, `${label}：原生载入成功，loadFragment 不应抛错（${actualError && actualError.message}）`);
+    assert.equal(treeSnapshot(actual.root()[0]), treeSnapshot(expected.root()[0]), `${label}：树转储应逐字相同`);
+    assert.equal(actual.html(), expected.html(), `${label}：$.html() 应逐字相同`);
+    assertConsistent(actual.root()[0], label);
+    return false;
+}
+
+// 逐个比对一批输入，汇总用例数与两侧同样抛错的个数
+function assertFragmentCorpus(inputs, kind) {
+    const stats = { cases: 0, bothThrow: 0 };
+    inputs.forEach((html, index) => {
+        if (assertFragmentEquivalent(html, `${kind}第 ${index} 个：${JSON.stringify(html)}`)) stats.bothThrow += 1;
+        stats.cases += 1;
+    });
+    return stats;
+}
+
+// 外来内容回溯的四类反例，取自片段载入改写前的差分验证：当时比较过「给片段套一层包裹元素再载入」的方案，外来内容
+// （svg、math）中的结束标签回溯到包裹元素会造成四类不对称；loadFragment 不包裹，这些输入照样须逐字等价
+const FOREIGN_BACKTRACK_FRAGMENTS = Object.freeze([
+    // 其一：</form> 经外来内容回溯
+    '<div><form></div><svg></form></svg><form>',
+    '<div><form></div><svg><foreignObject></form></foreignObject></svg><form>x</form>',
+    '<table><form></table><svg></form></svg><form>x</form>',
+    '<div><form></div><math></form></math><form>x</form>',
+    // 其二：外来内容中的孤立结束标签，之后被 in body 忽略的记号插入外来元素
+    '<svg></markflow-fragment><td>',
+    '<b><svg></markflow-fragment>x',
+    '<svg></div><circle></svg>',
+    // 其三：格式化元素的结束标签经外来内容回溯后走收养代理算法
+    '<svg><foreignObject><div><b></div></foreignObject></b></svg>x',
+    '<svg><foreignObject><div><b></div></b>x',
+    '<svg><foreignObject><p><b><div>x</div></b></p></foreignObject></svg>y',
+    '<math><mi><div><b></div></mi></b></math>x',
+    '<svg><desc><div><i></div></desc></i></svg><p>z',
+    '<svg><foreignObject><div><font color=red></div></foreignObject></font></svg>x',
+    '<svg><foreignObject><div><nobr></div></foreignObject></nobr></svg>x',
+    // 其四：HTML 上下文中的结束标签弹栈时外来元素仍打开；form、a 从栈中间移除
+    '<span><svg></markflow-fragment><td>',
+    `<span><svg></markflow-fragment>${ch(0)}`,
+    '<b><svg></markflow-fragment><html>',
+    '<b><svg></s></div></applet><a><svg><foreignObject><a></a></foreignObject></markflow-fragment><td>',
+    '<form><svg></form><foreignObject><div><form></div></foreignObject></form></svg><form>x</form>',
+    '<a><svg><foreignObject><a></a><div><b></div></foreignObject></b></svg>x',
+    '<a><svg><foreignObject><a></a></foreignObject></markflow-fragment><td>',
+    '<form><svg></form></markflow-fragment><td>',
+    '<form><a><svg></form><foreignObject><a></a><div><b></div></foreignObject></b></svg>x',
+    '<a><math><mi><a></a><div><b></div></mi></b></math>x',
+    '<form><math></form><mi><div><form></div></mi></form></math><form>x</form>',
+]);
+
+// 对抗样例：上述四类反例，外加首记号、孤立结束标签、注释边角、特殊字符、plaintext、嵌套 template 与表格等解析器分支
+const ADVERSARIAL_FRAGMENTS = Object.freeze([
+    ...FOREIGN_BACKTRACK_FRAGMENTS,
+    // 以表格部件开头：片段上下文为 template，首个起始标签决定插入模式
+    '<td>x', '<tr><td>x', '<th>y</th>z', '<caption>c</caption>t', '<col><td>x', '<colgroup><col>', '<tbody><tr><td>x',
+    '<thead>', '<tfoot><td>', '<TD>x', '<td/>x', '<td></p>', '<tr></p>', '<caption></p>', '<colgroup></p>', '<col></p>',
+    // 以头部类元素、文档结构元素与 template 开头
+    '<base><p>x', '<basefont>x', '<bgsound>', '<link rel=x><p>y', '<meta charset=x><p>y', '<title>t</div></title>x',
+    '<style>a</p></style>b', '<script>x</div></script>y', '<noframes>n</noframes><p>', '<template>t</template></p>',
+    '<html lang=x><p>y', '<head><p>x', '<body class=b><p>y', '<frameset><frame>', '<frame>x',
+    '<template><td>x</template></p>', '<template></markflow-fragment></template><p>', '<b><template></markflow-fragment></template>x',
+    // 以孤立结束标签开头
+    '</p>x', '</br>y', '</div><p>x', '</template>x', '</markflow-fragment>x', '</td>x', '</form><form>x', '</>x', '</3>x', '</ >x',
+    // 注释、声明与处理指令的边角
+    '<!-->x', '<!--->x', '<!---->x', '<!--x--!>y', '--!>x', '<!--a--!->b-->c', '<!--a<!--b-->c', '<!--a<!-->b', '<!--a<!--->b',
+    '<!-- - -->x', '<!--x', '<!--', '<!-', '<!DOCTYPE html><p>x', '<!doctype>', '<?pi>x', '<![CDATA[x<y]]>z',
+    '<svg><![CDATA[a<b]]></svg>', '<!x>', '<!',
+    // BOM、NULL、CR 与代理项；末一个为低位代理项紧跟低位代理项，parse5 7.3.0 对它抛 RangeError，两侧须同样抛错
+    `${ch(0xfeff)}<p>x`, `${ch(0xfeff)}</p>`, `${ch(0)}<p>x${ch(0)}</p>`, `<div${ch(0)}>x`, 'a\r\nb\rc', '\r</p>',
+    '<pre>\r\nx</pre>', '<textarea>\r\n\r\nx</textarea>', `${ch(0xd83d)}${ch(0xde00)}`, ch(0xd83d), ch(0xde00),
+    `${ch(0xde00)}${ch(0xde00)}`,
+    // plaintext：其后全部是文本
+    '<plaintext></markflow-fragment><p>x', '<plaintext>', 'a<plaintext><b>',
+    // 嵌套 template 与表格
+    '<template><template><td>x</template></template>', '<template><tbody><tr><td>x</td></tr></tbody></template>',
+    '<table><template><tr><td>x</template></table>', '<table><tr><td><table><td>y</table>z',
+    '<template><table><template><col></template></table></template>', '<table>x<td>y</table>',
+    '<table><tr><td>x<template><td>y</template></td></tr></table>',
+    // 其余解析器分支：表单、选择框、收养代理、重建格式化元素、外来内容的属性调整
+    '<form><div></form><form>x</form>', '<table><form><tr><td>x</table><form>y</form>', '<select><option>1<option>2<select>',
+    '<table><tr><td><select><td>y', '<select><svg></select>', '<table><svg></table>', '<table><tr><svg><td>x',
+    '<a>1<a>2</a>3</a>', '<nobr><nobr>x</nobr>', '<b><i></b></i>', '<p><b></p>x', '<h1><h2>x', '<ruby><rt><rb>',
+    '<applet><b></applet></b>', '<button><button>x</button>', '<li><li></li></li>', '<dd><dt></dd>',
+    '<math><annotation-xml encoding="text/html"><p>x</p></annotation-xml></math>', '<svg><title><p>x</p></title></svg>',
+    '<svg viewbox="0 0 1 1"><g xlink:href=x xml:lang=y></g><foreignobject><p>z</p></foreignobject></svg>',
+    '<script id=s>x</script><style class=c>y</style><svg><script class=v>z</script></svg>',
+    // 空串与纯空白
+    '', ' \n\t',
+]);
+
+// 随机记号串的字母表（移植自片段载入改写前的模糊测试）：表格部件、头部类、文档结构、表单、列表、块级、行内与格式化、
+// 特殊元素、原始文本、外来内容、注释与声明、孤立结束标签、文本与字符引用、特殊字符、带属性的标签、标签名边角
+const FRAGMENT_TOKENS = Object.freeze([
+    '<table>', '</table>', '<caption>', '</caption>', '<colgroup>', '</colgroup>', '<col>', '<tbody>', '</tbody>', '<thead>',
+    '<tfoot>', '<tr>', '</tr>', '<td>', '</td>', '<th>', '</th>',
+    '<base>', '<basefont>', '<bgsound>', '<link rel=x>', '<meta charset=x>', '<title>', '</title>', '<title>t</div></title>',
+    '<style>', '</style>', '<style>a</markflow-fragment></style>', '<script>', '</script>', '<script>x</div></script>',
+    '<noframes>', '</noframes>', '<template>', '</template>',
+    '<html>', '</html>', '<html lang=x>', '<head>', '</head>', '<body>', '</body>', '<body class=b>', '<frameset>',
+    '</frameset>', '<frame>',
+    '<form>', '</form>', '<form id=f>', '<FORM>', '</FORM>', '<button>', '</button>', '<input>', '<input type=hidden>',
+    '<select>', '</select>', '<option>', '</option>', '<optgroup>', '</optgroup>', '<keygen>', '<textarea>', '</textarea>',
+    '<textarea>t</markflow-fragment></textarea>', '<label>', '</label>', '<fieldset>', '</fieldset>',
+    '<ul>', '</ul>', '<ol>', '</ol>', '<li>', '</li>', '<dl>', '</dl>', '<dd>', '</dd>', '<dt>', '</dt>',
+    '<p>', '</p>', '<div>', '</div>', '<div class=c>', '<div id=i>', '<section>', '</section>', '<article>', '</article>',
+    '<header>', '</header>', '<figure>', '</figure>', '<blockquote>', '</blockquote>', '<h1>', '</h1>', '<h2>', '</h2>',
+    '<address>', '</address>', '<pre>', '</pre>', '<pre>\n', '<listing>', '</listing>', '<center>', '<main>', '</main>',
+    '<hr>', '<br>', '</br>', '<img src=x>', '<image>', '<wbr>', '<embed>',
+    '<a>', '</a>', '<a href=x>', '<b>', '</b>', '<i>', '</i>', '<em>', '</em>', '<strong>', '</strong>', '<nobr>', '</nobr>',
+    '<span>', '</span>', '<span class=s>', '<font color=red>', '</font>', '<font size=1>', '<font>', '<code>', '</code>',
+    '<small>', '</small>', '<u>', '</u>', '<s>', '</s>', '<big>', '<tt>',
+    '<applet>', '</applet>', '<object>', '</object>', '<marquee>', '</marquee>', '<ruby>', '</ruby>', '<rt>', '<rb>', '<rp>',
+    '<rtc>',
+    '<plaintext>', '<xmp>', '</xmp>', '<xmp>a</p></xmp>', '<noscript>', '</noscript>', '<noscript>n</p></noscript>',
+    '<iframe>', '</iframe>', '<iframe>i</div></iframe>', '<noembed>', '</noembed>',
+    '<svg>', '</svg>', '<svg class=v>', '<SVG>', '<math>', '</math>', '<MATH>', '<foreignObject>', '</foreignObject>', '<mi>',
+    '</mi>', '<mo>', '<mtext>', '<annotation-xml encoding="text/html">', '<annotation-xml>', '</annotation-xml>',
+    '<circle/>', '<circle>', '</circle>', '<desc>', '</desc>', '<mglyph>', '<malignmark>', '<g xlink:href=x xml:lang=y>',
+    '</g>', '<svg viewbox="0 0 1 1">', '<path d=M0/>', '<svg><![CDATA[a<b]]></svg>',
+    '<!---->', '<!-->', '<!--->', '<!--x-->', '<!--x--!>', '<!--<!--x-->', '<!--x', '<!--a--!->', '<!--a<!-->',
+    '<!--a<!--->', '<!-- - -->', '<!--a<!--b-->', '<!DOCTYPE html>', '<!doctype>', '<!DOCTYPE x PUBLIC "y">',
+    '<![CDATA[x<y]]>', '<![CDATA[', '<?pi>', '<?', '<!x>', '<!', '</>', '</3>', '</ >',
+    '</markflow-fragment>', '</MARKFLOW-FRAGMENT>', '</markflow-fragment x>', '</markflow-fragmen>', '</unknown>', '</h3>',
+    '</h6>', '</x-el>', '<markflow-fragment>', '<markflow-fragment a=1>', '<MARKFLOW-FRAGMENT>',
+    'x', 'yy', ' ', '\n', '\t', ch(0x0c), '  \n ', 'a<b', '<', '< p>', '<1>', 'a<', '&amp;', '&lt;', '&#0;', '&#x41;',
+    '&notin;', '&', '"', "'", 'é', '中文',
+    ch(0xfeff), ch(0), '\r', '\r\n', '\n\r', ch(0xa0), `${ch(0xd83d)}${ch(0xde00)}`, ch(0xd83d), ch(0xde00), ch(0x0b), ch(0x1f),
+    '<div class="a b" id=z>', '<p class=x>', '<span id=q>', '<b class>', '<i id="">', '<img class=c src=x>', '<br class=b>',
+    '<strong id=s>', '<a xml:id=q>', '<x-el class=c>', '<section class=s>', '<a class=a>',
+    `<div${ch(0)}>`, '<TD>', '<Td>', '<svG>', '<td/>', '<td\t>', `<td${ch(0x0c)}>`, '<td\r>', '<div/>', '<p/>', '<br/>',
+    '<svg/>', '<math/>', '<template/>', '<script/>', '<td', '<div', '<td x', '<!--', '<!-', '<form', '<svg',
+]);
+
+// 结构化种子：解析器各分支的关键交互，随机拼接后插入零到四个随机记号
+const FRAGMENT_SEEDS = Object.freeze([
+    ...FOREIGN_BACKTRACK_FRAGMENTS,
+    '<div><form></div><svg></form></svg><form>x</form>', '<svg></markflow-fragment>',
+    '<form><div></form><form>x</form>', '<table><form><tr><td>x</table><form>y</form>', '<form><svg></form></svg><form>x</form>',
+    '<form><svg></svg></form><form>x</form>', '<svg><p></form></p></svg><form>x</form>', '<p><b></p><table><td><svg></b>',
+    '<a><svg><foreignObject><a></a></foreignObject></svg></a>', '<svg><b></svg>', '<svg><font color=red></svg>',
+    '<svg><font></svg>', '<math><annotation-xml encoding="text/html"><p>x</p></annotation-xml></math>',
+    '<math><mi><p>x</p></mi></math>', '<svg><title><p>x</p></title></svg>', '<svg><desc><b>x</b></desc></svg>',
+    '<template><td>x</template></p>', '<template><tbody><tr><td>x</td></tr></tbody></template>',
+    '<template></markflow-fragment></template><p>', '<b><template></markflow-fragment></template>x',
+    '<select><option>1<option>2<select>', '<table><tr><td><select><td>y', '<table><tr><td><select></td>y',
+    '<select><svg></select>', '<table><svg></table>', '<table><tr><svg><td>x', '<button><button>x</button>',
+    '<li><li></li></li>', '<dd><dt></dd>', '<a>1<a>2</a>3</a>', '<nobr><nobr>x</nobr>', '<b><i></b></i>', '<p><b></p>x',
+    '<h1><h2>x', '<ruby><rt><rb>', '<applet><b></applet></b>', '<plaintext></markflow-fragment>x', '<textarea>\nx</textarea>',
+    '<pre>\n\nx</pre>', '<table>x<td>y</table>', '<table><caption><td>x</caption></table>', '<table><colgroup><col><td>x</table>',
+    '<table><tbody><tr><td>x</td><tr>y</table>', '<div></p></div>', '<b></br></b>', '<span></markflow-fragment></span>',
+    '<b></markflow-fragment></b>', '<b>x</markflow-fragment>y', '<html class=x><p>y', '<body class=x><p>y', '<frameset><frame>',
+    '<head><p>x', '<script>a</script></p>', '<style>a</style></p>', '<title>a</title></p>', '<link><p></p>', '<meta></p>',
+    '<base></p>', '<noframes>x</noframes></p>', '<template>x</template></p>', '<noscript>x</noscript></p>', '<td></p>',
+    '<tr></p>', '<caption></p>', '<colgroup></p>', '<col></p>', '<tbody></p>', '<th></p>', '<!---->x</p>', '<!--x--></p>',
+    'x</p>', `${ch(0xfeff)}</p>`, `${ch(0)}</p>`, '\r</p>', '<!--a--!-></p>', '<!--a--!->x-->y</p>', '<!--a<!--></p>',
+    '<!--a<!---></p>',
+]);
+
+// 首记号专项：片段上下文为 template，首个记号决定插入模式；前缀为零到两个文本、注释或特殊字符
+const FIRST_TOKEN_PREFIXES = Object.freeze(['x', ' ', '\n', '<!--c-->', '<!---->', ch(0xfeff), ch(0), '\r']);
+const FIRST_TOKENS = Object.freeze([
+    '<td>', '<tr>', '<th>', '<caption>', '<col>', '<colgroup>', '<tbody>', '<script>', '<style>', '<title>', '<template>',
+    '<link>', '<meta>', '<base>', '<noframes>', '<html>', '<head>', '<body>', '<frameset>', '<frame>', '<!--x-->', '<!---->',
+    '<!-->', 'x', ' ', '\n', ch(0), ch(0xfeff), '\r', '<!DOCTYPE html>', '<?x>', '<!x>', '</p>', '</br>', '</div>',
+    '</template>', '<', 'a<', '<1>', '</>', '<div>', '<p>', '<svg>', '<math>', '<form>', '<select>', '<textarea>',
+    '<plaintext>', '<noscript>', '<iframe>', '<xmp>', '<pre>', '<listing>', '<table>', '<button>', '<li>', '<a>', '<b>',
+    '<span>', '<markflow-fragment>', '</markflow-fragment>', '<image>', '<input type=hidden>', '<hr>', '<br>', '<img>',
+    '<applet>', '<option>', '<optgroup>', '<ruby>', '<rt>', '<dd>', '<dt>', '<h1>', '<center>', '<address>', '<x-el>', '<TD>',
+    '<td/>', '<td', `<div${ch(0)}>`,
+]);
+
+// 主题分组：外来内容与表单、表格与 template、格式化元素与收养代理、原始文本与注释、外来内容与活动格式化元素，以及首记号表
+const FRAGMENT_GROUPS = Object.freeze([
+    ['<svg>', '</svg>', '<math>', '</math>', '<form>', '</form>', '<div>', '</div>', '<foreignObject>', '</foreignObject>',
+        '<table>', '</table>', 'x', '<b>', '</b>', '<mi>', '</mi>', '<annotation-xml encoding="text/html">', '</annotation-xml>',
+        '<p>', '</p>', '<template>', '</template>', '<font color=red>', '<circle/>', '</markflow-fragment>', '<a>', '</a>',
+        '<input type=hidden>', '<select>', '</select>'],
+    ['<table>', '</table>', '<tr>', '</tr>', '<td>', '</td>', '<tbody>', '<caption>', '</caption>', '<col>', '<colgroup>',
+        '<template>', '</template>', 'x', ' ', '<form>', '</form>', '<select>', '</select>', '<option>', '<input type=hidden>',
+        '<b>', '</b>', '<div>', '</div>', '</markflow-fragment>', '<svg>', '</svg>', '<p>', '<script>x</script>',
+        '<style>y</style>'],
+    ['<a>', '</a>', '<b>', '</b>', '<i>', '</i>', '<nobr>', '</nobr>', '<p>', '</p>', '<div>', '</div>', '<table>', '</table>',
+        '<td>', '<span>', '</span>', 'x', '<applet>', '</applet>', '<button>', '</button>', '<li>', '</li>', '<font color=red>',
+        '</font>', '</markflow-fragment>', '<svg>', '</svg>', '<h1>', '</h1>', '<br>', '</br>', '<em>', '</em>', '<strong>',
+        '</strong>'],
+    ['<script>', '</script>', '<style>', '</style>', '<textarea>', '</textarea>', '<title>', '</title>', '<plaintext>', '<xmp>',
+        '</xmp>', '<noscript>', '</noscript>', '<iframe>', '</iframe>', '<!--', '-->', '--!>', '<!-->', '<!--->', '<!---->', '-',
+        '--', '!', '<', '>', 'x', '</div>', '</p>', '</markflow-fragment>', '<p>', '<div>', '<!DOCTYPE html>', '<?pi>',
+        '<![CDATA[', ']]>', '<svg>', '</svg>', ch(0), '\r', ch(0xfeff)],
+    ['<svg>', '</svg>', '<math>', '</math>', '<foreignObject>', '</foreignObject>', '<mi>', '</mi>', '<desc>', '</desc>',
+        '<annotation-xml encoding="text/html">', '</annotation-xml>', '<div>', '</div>', '<p>', '</p>', '<b>', '</b>', '<a>',
+        '</a>', '<font color=red>', '</font>', '<nobr>', '</nobr>', '<i>', '</i>', '<form>', '</form>', 'x', '<td>', '<li>',
+        '</li>', '<span>', '</span>', '</markflow-fragment>', '<table>', '</table>', '<circle/>', '<button>', '</button>', '<br>',
+        '</br>', '</h1>', '</p>'],
+    FIRST_TOKENS,
+].map((group) => Object.freeze(group)));
+
+const RANDOM_FRAGMENT_SEED = 20261001;
+const RANDOM_FRAGMENT_COUNT = 20000;
+
+// 随机记号串，五种生成方式：全字母表、随机子字母表、主题分组、种子拼接、首记号专项
+function randomTokenString(random) {
+    const pickFrom = (list) => pick(random, list);
+    const between = (min, max) => min + Math.floor(random() * (max - min + 1));
+    const roll = random();
+    let tokens;
+    if (roll < 0.3) {
+        tokens = Array.from({ length: between(1, 14) }, () => pickFrom(FRAGMENT_TOKENS));
+    } else if (roll < 0.55) {
+        const subset = Array.from({ length: between(4, 10) }, () => pickFrom(FRAGMENT_TOKENS));
+        tokens = Array.from({ length: between(3, 16) }, () => pickFrom(subset));
+    } else if (roll < 0.75) {
+        const group = pickFrom(FRAGMENT_GROUPS);
+        tokens = Array.from({ length: between(3, 20) }, () => pickFrom(group));
+    } else if (roll < 0.92) {
+        tokens = Array.from({ length: between(1, 3) }, () => pickFrom(FRAGMENT_SEEDS));
+        const extra = between(0, 4);
+        for (let index = 0; index < extra; index += 1) {
+            tokens.splice(Math.floor(random() * (tokens.length + 1)), 0, pickFrom(FRAGMENT_TOKENS));
+        }
+    } else {
+        tokens = Array.from({ length: between(0, 2) }, () => pickFrom(FIRST_TOKEN_PREFIXES));
+        tokens.push(pickFrom(FIRST_TOKENS));
+        const tail = between(0, 7);
+        for (let index = 0; index < tail; index += 1) tokens.push(pickFrom(FRAGMENT_TOKENS));
+    }
+    return tokens.join('');
+}
+
+// 微信夹具：整份页面源码、body 与子节点不少于 FIXTURE_MIN_CHILDREN 个的容器的 innerHTML
+const WECHAT_FIXTURE_HTML = fs.readFileSync(path.join(__dirname, 'fixtures', 'web', 'wechat-collapse.html'), 'utf8');
+const FIXTURE_MIN_CHILDREN = 5;
+
+function fixtureFragments() {
+    const $ = cheerio.load(WECHAT_FIXTURE_HTML);
+    const containers = $('*').toArray().filter((el) => el.children.length >= FIXTURE_MIN_CHILDREN);
+    assert.ok(containers.some((el) => el.name === 'body'), '夹具的 body 应在容器之列');
+    return [WECHAT_FIXTURE_HTML, ...containers.map((el) => $(el).html())];
+}
+
+// 差分语料只构造一次，供 loadFragment 与根级查询两组用例共用：随机串的往返串为其 cheerio.load(串, null, false).html()，
+// 原生载入抛错的串没有往返串
+let fragmentCorpus = null;
+function getFragmentCorpus() {
+    if (fragmentCorpus) return fragmentCorpus;
+    const random = seededRandom(RANDOM_FRAGMENT_SEED);
+    const randomStrings = Array.from({ length: RANDOM_FRAGMENT_COUNT }, () => randomTokenString(random));
+    const roundTrips = [];
+    for (const html of randomStrings) {
+        try {
+            roundTrips.push(cheerio.load(html, null, false).html());
+        } catch {
+            // 原生载入抛错：该串的抛错一致性由随机串用例核对
+        }
+    }
+    fragmentCorpus = Object.freeze({
+        adversarial: ADVERSARIAL_FRAGMENTS,
+        random: randomStrings,
+        roundTrip: roundTrips,
+        fixture: fixtureFragments(),
+    });
+    return fragmentCorpus;
+}
+
+test('loadFragment 与 cheerio.load 逐字等价：对抗样例（外来内容回溯、首记号、孤立结束标签、注释边角、BOM／NULL／CR、plaintext、嵌套 template 与表格）', (t) => {
+    // Act & Assert：比对在 assertFragmentEquivalent 内
+    const stats = assertFragmentCorpus(getFragmentCorpus().adversarial, '对抗样例');
+    t.diagnostic(`对抗样例：${JSON.stringify(stats)}`);
+
+    // Assert：低位代理项紧跟低位代理项一例两侧同样抛错
+    assert.ok(stats.bothThrow >= 1, `对抗样例中应有两侧同样抛错的输入：${JSON.stringify(stats)}`);
+});
+
+test('loadFragment 与 cheerio.load 逐字等价：定种子随机记号串 2 万个，含两侧同样抛错的输入', (t) => {
+    // Act & Assert
+    const stats = assertFragmentCorpus(getFragmentCorpus().random, '随机记号串');
+    t.diagnostic(`随机记号串：${JSON.stringify(stats)}`);
+
+    // Assert：核对面确实铺开了——全部用例都比对过，抛错一致的分支也被覆盖
+    assert.equal(stats.cases, RANDOM_FRAGMENT_COUNT);
+    assert.ok(stats.bothThrow >= 1, `随机记号串中应有两侧同样抛错的输入：${JSON.stringify(stats)}`);
+});
+
+test('loadFragment 与 cheerio.load 逐字等价：随机记号串经原生载入与序列化得到的往返串', (t) => {
+    // Act & Assert
+    const { random, roundTrip } = getFragmentCorpus();
+    const stats = assertFragmentCorpus(roundTrip, '往返串');
+    t.diagnostic(`往返串：${JSON.stringify(stats)}`);
+
+    // Assert：原生载入抛错的随机串才没有往返串
+    assert.ok(stats.cases > random.length * 0.99, `往返串应覆盖绝大多数随机串：${JSON.stringify(stats)}`);
+});
+
+test('loadFragment 与 cheerio.load 逐字等价：微信夹具的整页源码、body 与子节点不少于 5 个的容器', (t) => {
+    // Act & Assert
+    const stats = assertFragmentCorpus(getFragmentCorpus().fixture, '微信夹具');
+    t.diagnostic(`微信夹具：${JSON.stringify(stats)}`);
+
+    // Assert：整页源码之外至少有 body 与一个正文容器
+    assert.ok(stats.cases >= 3, `夹具输入应不少于 3 个：${JSON.stringify(stats)}`);
+});
+
+test('loadFragment：非字符串输入原样交给 cheerio.load，结果与抛错都相同', () => {
+    // Arrange
+    const buffer = Buffer.from('<p>甲<b>乙</b></p>');
+    const $existing = cheerio.load('<i>丙</i>', null, false);
+
+    // Act & Assert：Buffer 按字符串解析；既有的根节点原样作根
+    assert.equal(loadFragment(buffer).html(), cheerio.load(buffer, null, false).html());
+    const $reloaded = loadFragment($existing.root()[0]);
+    assert.ok($reloaded.root()[0] === $existing.root()[0], '既有的根节点应原样作根');
+
+    // Act & Assert：null 与 undefined 两侧抛出同一错误
+    for (const input of [null, undefined]) {
+        assert.throws(() => cheerio.load(input, null, false), /expects a string/);
+        assert.throws(() => loadFragment(input), /expects a string/);
+    }
+});
+
+// ============================================================
+// selectElements／selectByTags：与根级 $(选择器) 逐节点同序
+// ============================================================
+
+// 管线里全部根级查询的选择器及其改写：web/noise 的属性规则、文案规则、连续 br 削减、空元素清理，parsers/url 的图片、
+// 样式规则（'span, b' 与 'span'）、段首缩进、相邻 strong 合并与空 span 清理。文案规则与空元素清理的标签串逐字照抄
+// web/noise 的 TEXT_RULE_TAGS 与 EMPTY_TAGS
+const PIPELINE_TEXT_RULE_TAGS = 'p, div, section, span, li, h1, h2, h3, h4, h5, h6, strong, em, blockquote';
+const PIPELINE_EMPTY_TAGS = 'p, div, section, span, li, blockquote, h1, h2, h3, h4, h5, h6, article, header, figure, a';
+const PIPELINE_SELECTIONS = Object.freeze([
+    ['[class], [id]', ($) => selectElements($, hasClassOrId)],
+    ...[PIPELINE_TEXT_RULE_TAGS, 'br', PIPELINE_EMPTY_TAGS, 'img', 'span, b', 'span', LEAF_BLOCK_SELECTOR, 'strong']
+        .map((selector) => [selector, ($) => selectByTags($, selector)]),
+]);
+
+// 元素是否位于某个 template 的内容片段之内（载入根之外另有 type 为 'root' 的祖先）
+function insideTemplateContent(el) {
+    for (let node = el.parent; node && node.parent; node = node.parent) {
+        if (node.type === 'root') return true;
+    }
+    return false;
+}
+
+// 对一份载入逐个比对管线选择器：结果逐节点为同一对象、同序；另按命中的元素统计覆盖面（bySelector 为各选择器的命中数）
+function assertPipelineSelections($, label, stats) {
+    for (const [selector, select] of PIPELINE_SELECTIONS) {
+        const expected = $(selector).toArray();
+        const actual = select($).toArray();
+        const same = actual.length === expected.length && actual.every((node, index) => node === expected[index]);
+        assert.ok(same, `${label}：「${selector}」应逐节点同一对象、同序（$() ${expected.length} 个，改写 ${actual.length} 个）`);
+        stats.queries += 1;
+        stats.matched += expected.length;
+        stats.bySelector[selector] = (stats.bySelector[selector] || 0) + expected.length;
+        for (const el of expected) {
+            if (insideTemplateContent(el)) stats.inTemplate += 1;
+            if (el.namespace !== 'http://www.w3.org/1999/xhtml') stats.foreign += 1;
+            if (el.type !== 'tag') stats.rawText += 1;
+        }
+    }
+}
+
+// 随机森林的标签：管线选择器涉及的全部标签，外加 template、svg、math、foreignObject、script、style、table 与未知元素；
+// 元素随机带或不带 class／id（含空值、无值与大写属性名）。svg、math 里不在 breakout 列表中的 section、article、header、
+// figure、a 等留在外来命名空间，与同名 HTML 元素一样按名字命中
+const SELECT_FOREST_TAGS = Object.freeze([
+    'p', 'div', 'section', 'span', 'li', 'h1', 'h2', 'h6', 'strong', 'em', 'blockquote', 'article', 'header', 'figure', 'a',
+    'b', 'br', 'img', 'i', 'template', 'svg', 'math', 'foreignObject', 'script', 'style', 'table', 'x-el',
+]);
+const SELECT_FOREST_ATTRIBUTES = Object.freeze([
+    '', '', '', ' class="a"', ' id="b"', ' class', ' id=""', ' class="x" id="y"', ' CLASS="u"', ' Id=q', ' data-k="v"',
+]);
+const SELECT_FOREST_SEED = 20261002;
+const SELECT_FOREST_COUNT = 6000;
+const SELECT_FOREST_MAX_DEPTH = 4;
+const SELECT_FOREST_MAX_CHILDREN = 4;
+
+// 随机森林的 HTML：顶层 1 到 3 个节点，每个元素 0 到 SELECT_FOREST_MAX_CHILDREN 个子节点、深度至多 SELECT_FOREST_MAX_DEPTH，
+// 文本、注释与元素混排
+function randomAttributedForest(random, depth = SELECT_FOREST_MAX_DEPTH) {
+    const count = depth === SELECT_FOREST_MAX_DEPTH
+        ? 1 + Math.floor(random() * 3)
+        : Math.floor(random() * (SELECT_FOREST_MAX_CHILDREN + 1));
+    let html = '';
+    for (let index = 0; index < count; index += 1) {
+        const roll = random();
+        if (depth <= 0 || roll < 0.2) {
+            html += pick(random, TEXTS);
+            continue;
+        }
+        if (roll < 0.25) {
+            html += pick(random, COMMENTS);
+            continue;
+        }
+        const tag = pick(random, SELECT_FOREST_TAGS);
+        const open = `<${tag}${pick(random, SELECT_FOREST_ATTRIBUTES)}>`;
+        if (VOID_TAGS.has(tag)) html += open;
+        else if (RAW_TEXT_TAGS.has(tag)) html += `${open}${pick(random, RAW_TEXTS)}</${tag}>`;
+        else html += `${open}${randomAttributedForest(random, depth - 1)}</${tag}>`;
+    }
+    return html;
+}
+
+test('selectElements／selectByTags 与根级 $(选择器) 逐节点同序：定种子随机森林上的全部管线选择器与随机标签串', (t) => {
+    // Arrange
+    const random = seededRandom(SELECT_FOREST_SEED);
+    const stats = { queries: 0, matched: 0, inTemplate: 0, foreign: 0, rawText: 0, randomLists: 0, bySelector: {} };
+    const tagPool = [...new Set(SELECT_FOREST_TAGS.map((tag) => tag.toLowerCase()))];
+
+    for (let index = 0; index < SELECT_FOREST_COUNT; index += 1) {
+        const html = randomAttributedForest(random);
+        const $ = cheerio.load(html, null, false);
+        const label = `第 ${index} 棵树：${html}`;
+
+        // Act & Assert：管线选择器
+        assertPipelineSelections($, label, stats);
+
+        // Act & Assert：随机抽取的标签串，含选择器一侧写成小写后不再命中的 foreignobject
+        const selector = Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick(random, tagPool)).join(', ');
+        const expected = $(selector).toArray();
+        const actual = selectByTags($, selector).toArray();
+        assert.ok(actual.length === expected.length && actual.every((node, at) => node === expected[at]),
+            `${label}：随机标签串「${selector}」应逐节点同一对象、同序`);
+        stats.randomLists += 1;
+    }
+    t.diagnostic(`随机森林：${JSON.stringify(stats)}`);
+
+    // Assert：核对面确实铺开了——每个管线选择器都有命中，命中里有 template 内容片段中的元素、外来命名空间的元素与
+    // script／style
+    for (const [selector] of PIPELINE_SELECTIONS) {
+        assert.ok(stats.bySelector[selector] > 0, `「${selector}」应有命中：${JSON.stringify(stats)}`);
+    }
+    for (const key of ['inTemplate', 'foreign', 'rawText']) {
+        assert.ok(stats[key] > 0, `统计项 ${key} 应大于 0：${JSON.stringify(stats)}`);
+    }
+});
+
+test('selectElements／selectByTags 与根级 $(选择器) 逐节点同序：loadFragment 差分用例的全部语料', (t) => {
+    // Arrange
+    const corpus = getFragmentCorpus();
+    const stats = { inputs: 0, skippedThrows: 0, queries: 0, matched: 0, inTemplate: 0, foreign: 0, rawText: 0, bySelector: {} };
+
+    for (const [kind, inputs] of Object.entries(corpus)) {
+        inputs.forEach((html, index) => {
+            let $;
+            try {
+                $ = cheerio.load(html, null, false);
+            } catch {
+                // 原生载入抛错的输入没有可查询的树，抛错一致性已由 loadFragment 的用例核对
+                stats.skippedThrows += 1;
+                return;
+            }
+
+            // Act & Assert
+            assertPipelineSelections($, `${kind} 第 ${index} 个：${JSON.stringify(html)}`, stats);
+            stats.inputs += 1;
+        });
+    }
+    t.diagnostic(`差分语料：${JSON.stringify(stats)}`);
+
+    // Assert
+    for (const key of ['matched', 'inTemplate', 'foreign', 'rawText']) {
+        assert.ok(stats[key] > 0, `统计项 ${key} 应大于 0：${JSON.stringify(stats)}`);
+    }
+});
+
+test('selectByTags：选择器不是逗号分隔的小写标签名串即抛错，不静默错配', () => {
+    // Arrange
+    const $ = cheerio.load('<p class="a" id="b"><span>甲</span></p>', null, false);
+    const rejected = ['[class]', 'p.a', '#b', 'p span', 'p > span', 'span:first-child', '*', 'P', 'span,', ', span',
+        'span,, p', 'span, [id]', '', ' '];
+
+    // Act & Assert
+    for (const selector of rejected) {
+        assert.throws(() => selectByTags($, selector), /只接受逗号分隔的小写标签名/, `应拒绝 ${JSON.stringify(selector)}`);
+    }
+    assert.throws(() => selectByTags($, undefined), TypeError);
+
+    // Assert：对照组——纯标签名串照常查询，结果按文档序
+    assert.deepEqual(selectByTags($, 'span, p').toArray().map((el) => el.name), ['p', 'span']);
+});

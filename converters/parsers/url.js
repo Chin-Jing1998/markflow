@@ -36,7 +36,7 @@ const { fetchText, fetchBinary } = require('../net/fetch-guard');
 const { getExtFromContentType, getExtFromUrl } = require('../ir/util');
 const { extractContent, matchesHost } = require('../web/extract');
 const { cleanNoise, isAttached } = require('../web/noise');
-const { hasDescendantTag, createTreeEditor } = require('../web/dom');
+const { hasDescendantTag, createTreeEditor, loadFragment, selectByTags } = require('../web/dom');
 const { normalizeMarkdown } = require('../web/normalize');
 const { capWhitespaceRuns } = require('../web/whitespace');
 const { extractMetadata, countWords } = require('../web/metadata');
@@ -166,9 +166,9 @@ function cleanTitle(text) {
  * data URL 截断保留类型前缀——完整 base64 对阅读没有价值，还会撑爆返回体积。
  */
 function listImages(html, pageUrl) {
-    const $ = cheerio.load(html, null, false);
+    const $ = loadFragment(html);
     const images = [];
-    $('img').each((_, el) => {
+    selectByTags($, 'img').each((_, el) => {
         const $img = $(el);
         const raw = pickImageSource($img);
         // 懒加载属性已取值，清掉以免渲染端再度覆盖 src
@@ -200,11 +200,11 @@ function toDisplayUrl(raw, pageUrl) {
  * 显示尺寸在改写 src 之前取得并写入 data-mf-display（下载成败都写）。
  */
 async function collectImages(html, pageUrl, { allowPrivateNetwork, assets, warnings }) {
-    const $ = cheerio.load(html, null, false);
+    const $ = loadFragment(html);
     const host = hostnameOf(pageUrl);
     const candidates = [];
 
-    $('img').each((_, el) => {
+    selectByTags($, 'img').each((_, el) => {
         const $img = $(el);
         const raw = pickImageSource($img);
         if (!raw) return;
@@ -318,17 +318,19 @@ const STYLE_TO_TAG_RULES = [
     { selector: 'span', re: STRIKE_STYLE_RE, tag: 'del' },
 ];
 
+// 载入与各步取元素改走 web/dom：cheerio.load(html, null, false) 与根级 $(选择器) 在顶层大量并列节点时平方级，
+// loadFragment 与之逐字等价，selectByTags 与根级 $(选择器) 逐节点同序，二者都线性
 function preprocessHtml(html) {
-    const $ = cheerio.load(html, null, false);
+    const $ = loadFragment(html);
     capWhitespaceRuns($, URL_REMOVED_TAGS);
     for (const { selector, re, tag } of STYLE_TO_TAG_RULES) {
-        $(selector).each((_, el) => {
+        selectByTags($, selector).each((_, el) => {
             if (re.test($(el).attr('style') || '')) {
                 $(el).replaceWith(`<${tag}>${$(el).html()}</${tag}>`);
             }
         });
     }
-    $('img').each((_, el) => {
+    selectByTags($, 'img').each((_, el) => {
         const dataSrc = $(el).attr('data-src');
         if (dataSrc && !$(el).attr('src')) $(el).attr('src', dataSrc);
     });
@@ -343,7 +345,7 @@ function preprocessHtml(html) {
  * 两者之和，原空白随之删除（留着的话 normalize 会把 NBSP 变成普通空格、remark 再当作缩进代码块或吞掉）
  */
 function markIndents($) {
-    $(LEAF_BLOCK_SELECTOR).each((_, el) => {
+    selectByTags($, LEAF_BLOCK_SELECTOR).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
         if (hasNestedBlock(el)) return;
@@ -418,7 +420,7 @@ function collectLeadingTexts(node, out) {
 // 渲染与后续判定（均按真假判断）不受影响
 function mergeAdjacentStrong($) {
     const editor = createTreeEditor();
-    $('strong').each((_, el) => {
+    selectByTags($, 'strong').each((_, el) => {
         if (!isAttached(el)) return;
         for (let next = el.next; next && next.type === 'tag' && next.name === 'strong'; next = el.next) {
             editor.absorb(el, next);
@@ -434,7 +436,7 @@ function mergeAdjacentStrong($) {
 // 故被拆包的 span 至少有一个子节点
 function tidyEmptySpans($) {
     const editor = createTreeEditor();
-    $('span').each((_, el) => {
+    selectByTags($, 'span').each((_, el) => {
         if (!isAttached(el)) return;
         if (hasDescendantTag(el, IMAGE_TAG_SET)) return;
         const text = $(el).text();
@@ -525,4 +527,4 @@ function isolateImageLines(markdown) {
     return out.join('\n');
 }
 
-module.exports = { parse, collapseBreakMarkers, markIndents, tidyEmptySpans, mergeAdjacentStrong };
+module.exports = { parse, collapseBreakMarkers, markIndents, tidyEmptySpans, mergeAdjacentStrong, listImages, preprocessHtml };
