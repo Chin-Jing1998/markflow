@@ -22,6 +22,7 @@
  *
  * 契约：
  *   isChemistryProgId(progId) → boolean
+ *   stripVersionSuffix(value) → string（去掉串尾的「.数字」版本后缀；isChemistryProgId 的一步，导出供测试逐字比对）
  *   collectChemistryRanges(documentXml) → [{ start, end }]（按 start 升序，区间之间可重叠）
  *   inChemistryRange(ranges, index) → boolean
  *   hasChemistryEmf(buffer, mime) → boolean
@@ -38,8 +39,9 @@ const CHEMISTRY_PROG_ID_LIST = Object.freeze([
     'FXChem.Equation', 'FXChemStruct.Structure', 'KingDrawObject.Document', 'KingDrawXObject.Document',
 ]);
 const CHEMISTRY_PROG_IDS = new Set(CHEMISTRY_PROG_ID_LIST.map((id) => id.toLowerCase()));
-// 版本后缀：ChemDraw.Document.6.0 的「.6.0」。Chem3D.Document 的「3」不在点号之后，不会被误剥
-const VERSION_SUFFIX_RE = /\.\d+(?:\.\d+)*$/;
+// 版本后缀：ChemDraw.Document.6.0 的「.6.0」，即串尾的一段或多段「点号 + 数字串」。Chem3D.Document 的「3」不在点号之后，
+// 不会被误剥。数字逐字符判定用的单字符正则：\d 只认 ASCII 0–9
+const VERSION_DIGIT_RE = /\d/;
 // 角色取值：chemistry 由本模块四条判据产出，formula / table 只来自显式标记
 const CHEMISTRY_ROLE = 'chemistry';
 const ROLE_MARKER_RE = /^markflow:role=(formula|table|chemistry)(?:;|$)/;
@@ -57,7 +59,19 @@ const MAX_EMF_SCAN_BYTES = 8 * 1024 * 1024;
 function isChemistryProgId(progId) {
     const value = String(progId == null ? '' : progId).trim().toLowerCase();
     if (!value) return false;
-    return CHEMISTRY_PROG_IDS.has(value) || CHEMISTRY_PROG_IDS.has(value.replace(VERSION_SUFFIX_RE, ''));
+    return CHEMISTRY_PROG_IDS.has(value) || CHEMISTRY_PROG_IDS.has(stripVersionSuffix(value));
+}
+
+// 自串尾向前逐段剥去「点号 + 极大数字串」，代替「量词 + 行尾锚」的 /\.\d+(?:\.\d+)*$/：该正则在不处于串尾的「.数字」长段上
+// 从每个点号起都贪婪吃到段尾再逐位回溯，耗时随段长平方增长。点号不是数字，后缀的分段方式唯一，剥到不能再剥处即该正则的最左匹配起点
+function stripVersionSuffix(value) {
+    let end = value.length;
+    for (;;) {
+        let start = end;
+        while (start > 0 && VERSION_DIGIT_RE.test(value[start - 1])) start -= 1;
+        if (start === end || start === 0 || value[start - 1] !== '.') return value.slice(0, end);
+        end = start - 1;
+    }
 }
 
 // ---------- (a) 与 (c)：document.xml 上的化学区间 ----------
@@ -147,5 +161,5 @@ function resolveImageRole({ alt = '', buffer = null, mime = '', ooxmlChemistry =
 
 module.exports = {
     CHEMISTRY_ROLE, CHEMISTRY_PROG_ID_LIST,
-    isChemistryProgId, collectChemistryRanges, inChemistryRange, hasChemistryEmf, resolveImageRole,
+    isChemistryProgId, stripVersionSuffix, collectChemistryRanges, inChemistryRange, hasChemistryEmf, resolveImageRole,
 };
