@@ -115,7 +115,9 @@ function trimRuns(runs) {
     const first = list.findIndex((run) => run.kind === 'text');
     if (first >= 0) list[first] = textRun(list[first].text.replace(/^\s+/, ''), list[first].marks);
     for (let i = list.length - 1; i >= 0; i -= 1) {
-        if (list[i].kind === 'text') { list[i] = textRun(list[i].text.replace(/\s+$/, ''), list[i].marks); break; }
+        // 尾部空白用 trimEnd 去除：它删的正是 \s 所指的 WhiteSpace 与 LineTerminator 两类字符，而 /\s+$/
+        // 在不处于串尾的长空白段上从每个起点都吃到段尾再逐位回溯，耗时随段长平方增长
+        if (list[i].kind === 'text') { list[i] = textRun(list[i].text.trimEnd(), list[i].marks); break; }
     }
     list = list.filter((run) => !(run.kind === 'text' && run.text === ''));
     while (list.length && list[0].kind === 'br') list = list.slice(1);
