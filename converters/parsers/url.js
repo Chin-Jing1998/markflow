@@ -36,7 +36,7 @@ const { normalizeMarkdown } = require('../web/normalize');
 const { extractMetadata, countWords } = require('../web/metadata');
 const { displaySizeOf, formatDisplayAttr } = require('../web/image-display');
 const {
-    indentFromStyleChain, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS,
+    createIndentResolver, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS,
 } = require('../web/indent');
 const { notify, errText, hostnameOf } = require('../util');
 
@@ -329,21 +329,25 @@ function preprocessHtml(html) {
  * 两者之和，原空白随之删除（留着的话 normalize 会把 NBSP 变成普通空格、remark 再当作缩进代码块或吞掉）
  */
 function markIndents($) {
+    const indentOf = createIndentResolver(CHEERIO_STYLE_ACCESS);
     $(LEAF_BLOCK_SELECTOR).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
         if ($el.find(NESTED_BLOCK_SELECTOR).length > 0) return;
         if (!VISIBLE_TEXT_RE.test($el.text())) return;
-        const count = indentFromStyleChain(styleChainOf(el)) + takeLeadingSpaces(el);
+        const count = indentOf(el) + takeLeadingSpaces(el);
         if (count > 0) $el.prepend(indentMarker(count));
     });
 }
 
-function styleChainOf(el) {
-    const styles = [];
-    for (let node = el; node && node.type === 'tag'; node = node.parent) styles.push((node.attribs && node.attribs.style) || '');
-    return styles;
-}
+// markIndents 的 style 链访问器：自叶子块起沿 parent 向上，遇到首个非 'tag' 节点即止，口径与原先逐叶建链的
+// styleChainOf 相同。逐元素缓存（web/indent 的 createIndentResolver）使祖先 style 只匹配一次，其前提在遍历中成立：
+// prepend 只插入标记文本节点，takeLeadingSpaces 只改文本节点的 data，都不改元素的 style 与父子关系
+const CHEERIO_STYLE_ACCESS = Object.freeze({
+    isElement: (node) => Boolean(node && node.type === 'tag'),
+    styleOf: (node) => (node.attribs && node.attribs.style) || '',
+    parentOf: (node) => node.parent,
+});
 
 // 删除段首的缩进空白并返回折算的字数；不构成缩进（不足两个可见空格）时不动文本、返回 0
 function takeLeadingSpaces(el) {
@@ -445,4 +449,4 @@ function isolateImageLines(markdown) {
     return out.join('\n');
 }
 
-module.exports = { parse, collapseBreakMarkers };
+module.exports = { parse, collapseBreakMarkers, markIndents };

@@ -17,7 +17,7 @@ const { parseHTML } = require('linkedom');
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
 const { hostnameOf } = require('../util');
 const { indentMarker } = require('../ir/markers');
-const { indentFromStyleChain, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR } = require('./indent');
+const { createIndentResolver, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR } = require('./indent');
 
 // Readability 预标注用：img 的 style 宽度（px 或 %）
 const STYLE_WIDTH_RE = /(?:^|;)\s*width\s*:\s*(\d{1,5}(?:\.\d+)?)\s*(px|%)/i;
@@ -118,10 +118,11 @@ function annotateLayout(document) {
             const matched = STYLE_WIDTH_RE.exec(img.getAttribute('style') || '');
             if (matched && !img.getAttribute('data-mf-width')) img.setAttribute('data-mf-width', `${matched[1]}${matched[2].toLowerCase()}`);
         }
+        const indentOf = createIndentResolver(DOM_STYLE_ACCESS);
         for (const el of Array.from(document.querySelectorAll(LEAF_BLOCK_SELECTOR))) {
             if (el.querySelector(NESTED_BLOCK_SELECTOR)) continue;
             if (!/[^\s]/.test(el.textContent || '')) continue;
-            const count = indentFromStyleChain(styleChainOf(el));
+            const count = indentOf(el);
             if (count > 0) el.insertBefore(document.createTextNode(indentMarker(count)), el.firstChild);
         }
     } catch (err) {
@@ -129,12 +130,14 @@ function annotateLayout(document) {
     }
 }
 
-// 自身到祖先（由近及远）的 style 串，供 text-indent 的继承查找
-function styleChainOf(el) {
-    const styles = [];
-    for (let node = el; node && node.nodeType === 1; node = node.parentElement) styles.push(node.getAttribute('style') || '');
-    return styles;
-}
+// annotateLayout 的 style 链访问器：自叶子块起沿 parentElement 向上，遇到首个非元素节点即止，口径与原先逐叶建链的
+// styleChainOf 相同。逐元素缓存（web/indent 的 createIndentResolver）使祖先 style 只匹配一次，其前提在遍历中成立：
+// 标注只在叶子块之首插入文本节点（图片宽度写的是 data-mf-width），不改元素的 style 与父子关系
+const DOM_STYLE_ACCESS = Object.freeze({
+    isElement: (node) => Boolean(node && node.nodeType === 1),
+    styleOf: (node) => node.getAttribute('style') || '',
+    parentOf: (node) => node.parentElement,
+});
 
 // isProbablyReaderable 内部依赖 matches/className 等 DOM 能力，异常时按不可读处理
 function isReaderable(document) {
@@ -175,6 +178,6 @@ function longestDiv($) {
 }
 
 module.exports = {
-    extractContent, matchesHost,
+    extractContent, matchesHost, annotateLayout,
     SITE_SELECTORS, MIN_READABILITY_TEXT_LENGTH, READERABLE_OPTIONS,
 };
