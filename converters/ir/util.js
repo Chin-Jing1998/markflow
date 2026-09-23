@@ -5,7 +5,7 @@
  *   - 名称处理：sanitizeFolderName（含 Windows 保留设备名规避）/ stripExt / normalizeAuthor
  *   - 文本收集：collectText
  *   - 扩展名推断：getExtFromContentType / getExtFromUrl
- *   - HTML 清洗：stripHtml
+ *   - HTML 清洗：stripHtml / removeHtmlTags
  *   - 目录：ensureDir
  *
  * Turndown 工厂与 HTML 表格转换已迁往 converters/ir/turndown.js；
@@ -131,10 +131,10 @@ async function ensureDir(dir) {
 
 // 去除 HTML 标签（连同 script/style 内容与注释），并还原常见实体
 function stripHtml(value) {
-    return String(value || '')
+    const withoutComments = String(value || '')
         .replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '')
-        .replace(/<!--[\s\S]*?-->/g, '')
-        .replace(/<[^>]*>/g, '')
+        .replace(/<!--[\s\S]*?-->/g, '');
+    return removeHtmlTags(withoutComments)
         .replace(/&nbsp;/g, ' ')
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
@@ -144,7 +144,21 @@ function stripHtml(value) {
         .trim();
 }
 
+// stripHtml 的去标签一步。旧式为 .replace(/<[^>]*>/g, '')：某个「<」之后再无「>」时，[^>]* 从该处扫到串尾再逐位回退、处处
+// 失配，其后每个「<」起点都重来一遍，耗时随这一段的长度平方增长。新式先求末个「>」的下一位 end，只对 [0, end) 执行原正则替换，
+// 再原样接上 [end, 串尾)。等价判据：起点 p 处能否匹配、止于何处，只取决于 p 处是否为「<」与 p 之后首个「>」的位置——p < end 且
+// p 处为「<」时，end - 1 处的「>」在其后，首个「>」落在 [0, end) 之内，截取前后相同；p ≥ end 时其后再无「>」，旧式在该处失配，
+// 截取后的前缀里也没有这样的起点。故全局替换逐轮取得的匹配序列相同，[end, 串尾) 在旧式里同样原样保留。线性：前缀里每个「<」
+// 之后都有「>」，[^>]* 止于首个「>」即一次成功、不回退，下一轮自该「>」之后起算，每个码元只被扫过常数次
+
+/** 自左向右删去「<」至其后首个「>」的每一段（含两端）；与 String(text).replace(/<[^>]*>/g, '') 逐字相同 */
+function removeHtmlTags(text) {
+    const value = String(text);
+    const end = value.lastIndexOf('>') + 1;
+    return value.slice(0, end).replace(/<[^>]*>/g, '') + value.slice(end);
+}
+
 module.exports = {
-    stripHtml, sanitizeFolderName, stripExt, normalizeAuthor, collectText,
+    stripHtml, removeHtmlTags, sanitizeFolderName, stripExt, normalizeAuthor, collectText,
     getExtFromContentType, getExtFromUrl, ensureDir,
 };
