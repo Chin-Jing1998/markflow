@@ -2,7 +2,8 @@
  * 附图与图片元素（patent profile）：说明书附图、摘要附图、段内 img 的构造
  *
  * isPureLabel(text)                  纯图号段：^\s*图\s*(\d+)\s*$
- * parseLabel(text, { allowCaption }) → { num, caption } | null；allowCaption 时接受「图1 结构示意图」「图1：…」
+ * parseLabel(text, { allowCaption }) → { num, caption } | null；allowCaption 时经 matchCaption 接受「图1 结构示意图」「图1：…」
+ * matchCaption(text)                 → [图号, 图注] | null：带图注图号段的匹配，线性扫描（导出供测试与旧正则逐字比对）
  * buildFigures(blocks, ctx) → { children: builderNode[], count }
  *   blocks 为附图区域的块序列（image 块与图号段交替，图号段可在图片之前或之后）。图注由
  *   figure/@figure-labels 承载（取值为原稿图号段的文本，缺图号段时回退为「图N」），官方产出不含
@@ -21,7 +22,12 @@ const { readImageInfo, pixelsToMm } = require('./image-info');
 const { padNumber } = require('./numbering');
 
 const LABEL_RE = /^\s*图\s*(\d+)\s*$/;
-const CAPTION_RE = /^\s*图\s*(\d+)(?:\s*[:：、.．\-—]\s*|\s+)(.*\S)\s*$/;
+// 带图注图号段的前缀「图 + 数字」：数字只能取极大——少取一位，紧随其后的数字既非空白也非分隔标点，旧式两个备选都接不住
+const CAPTION_HEAD_RE = /^\s*图\s*(\d+)/;
+const CAPTION_SEPARATORS = new Set([':', '：', '、', '.', '．', '-', '—']);
+// 「.」不匹配的四个行终止符 LF、CR、U+2028、U+2029，以码点构造；空白逐字符判定用单字符 \s，与旧式同一集合
+const LINE_TERMINATOR_RE = new RegExp(`[${[0x0a, 0x0d, 0x2028, 0x2029].map((code) => String.fromCharCode(code)).join('')}]`);
+const SPACE_RE = /\s/;
 const DEFAULT_DPI = 300;
 const IMG_FORMATS = new Set(['jpg', 'tif']);
 const DEFAULT_IMG_FORMAT = 'jpg';
@@ -38,8 +44,33 @@ function parseLabel(text, { allowCaption = false } = {}) {
     const pure = LABEL_RE.exec(value);
     if (pure) return { num: Number(pure[1]), caption: '' };
     if (!allowCaption) return null;
-    const captioned = CAPTION_RE.exec(value);
-    return captioned ? { num: Number(captioned[1]), caption: captioned[2].trim() } : null;
+    const captioned = matchCaption(value);
+    return captioned ? { num: Number(captioned[0]), caption: captioned[1].trim() } : null;
+}
+
+// 带图注图号段的匹配：返回旧式 /^\s*图\s*(\d+)(?:\s*[:：、.．\-—]\s*|\s+)(.*\S)\s*$/ 的第 1、2 组，不匹配为 null。
+// 旧式为平方级：分隔符的 \s+（或标点两侧的 \s*）与图注的 (.*\S) 都能吃下同一段空白，.* 又跨不过行终止符，图注含行终止符
+// 而失配时，对每一个分隔长度都把余下的空白重扫一遍。新式各段只扫一遍：前缀之后的首部空白、可选的分隔标点及其后的空白各取
+// 极大，末尾由 trimEnd 定位。等价的判据：两个备选合起来，图注起点恰可取 1 至 top（分隔片段的末尾）的每一个位置且由大到小
+// 尝试；起点 p 成功当且仅当 p < end（trimEnd 之后的长度）且 [p, end) 不含行终止符。p 越小区间越大，最大可取的起点
+// min(top, end - 1) 失败则更小的起点也都失败，故只需检验这一个
+function matchCaption(text) {
+    const head = CAPTION_HEAD_RE.exec(text);
+    if (!head) return null;
+    const rest = text.slice(head[0].length);
+    const lead = skipSpaces(rest, 0);
+    const top = CAPTION_SEPARATORS.has(rest[lead]) ? skipSpaces(rest, lead + 1) : lead;
+    const end = rest.trimEnd().length;
+    const start = Math.min(top, end - 1);
+    if (start < 1) return null;
+    const caption = rest.slice(start, end);
+    return LINE_TERMINATOR_RE.test(caption) ? null : [head[1], caption];
+}
+
+function skipSpaces(text, from) {
+    let at = from;
+    while (at < text.length && SPACE_RE.test(text[at])) at += 1;
+    return at;
 }
 
 function buildFigures(blocks, ctx) {
@@ -163,4 +194,4 @@ const preview = (text) => {
     return value.length > TEXT_PREVIEW ? `${value.slice(0, TEXT_PREVIEW)}…` : value;
 };
 
-module.exports = { isPureLabel, parseLabel, buildFigures, buildImg, assetNameOf, LABEL_RE };
+module.exports = { isPureLabel, parseLabel, matchCaption, buildFigures, buildImg, assetNameOf, LABEL_RE };

@@ -19,6 +19,8 @@
  *       top/left/orientation/inline 取值与属性顺序、BOM 与 DOCTYPE 的 []、附图部分杂散文字丢弃并告警
  *       另设「大图拆段的并回」一组：正文三书里同一原段落拆出的相邻块并回一个段落（段号不顺延、图片仍在段内），
  *       两本附图书维持拆开，并回后含文字的段落不再报「如为附图请移至…」。
+ *       另设「图号段的图注匹配」一组：parseLabel 带图注图号段的匹配在 8 万个半角空格长段上的耗时上限，与线性化之前的
+ *       实现逐字等价（差分）。
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -1290,5 +1292,201 @@ describe('patent profile：大图拆段的并回', () => {
         assert.deepEqual(abstract('cn-abstract > p > img').toArray().map((node) => node.attribs.file), ['100004_1.jpg'], '同段图片留在摘要段内');
         assert.deepEqual($of(result.files[ABSTRACT_FIGURE])('cn-abst-figure > figure > img').toArray().map((node) => node.attribs.file),
             ['100005_1.jpg'], '独立成段的图片仍推定为摘要附图');
+    });
+});
+
+// ============================================================
+// 图号段的图注匹配：线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+const { isDeepStrictEqual } = require('node:util');
+const { parseLabel, matchCaption } = require('../converters/renderers/xml/figures');
+
+// 耗时用例的输入规模：「图1」与图注之间夹 8 万个半角空格；图注「a + 行终止符 + b」含行终止符，「.」跨不过它，整段不匹配
+const CAPTION_STRESS_LENGTH = 80000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。200 ms 使两侧余量都不小于 5 倍——
+// 线性化之前的 CAPTION_RE 在这一规模上实测约 2.6 至 2.8 秒（回车形态经 parseLabel 为 2557 至 2720 ms；行分隔符形态直接
+// 执行正则为 2595 ms，经 parseLabel 为 2826 ms；2 万、4 万时约 0.16、0.66 秒，耗时随段长平方增长），是上限的 12 倍以上；
+// 线性化之后单次调用实测约 0.8 至 1.7 毫秒，不到上限的百分之一
+const CAPTION_STRESS_BUDGET_MS = 200;
+
+const elapsedMsSince = (started) => Number(process.hrtime.bigint() - started) / 1e6;
+
+// 线性化之前的实现，仅作短输入的差分参照：CAPTION_RE 的分隔符量词与图注的 (.*\S) 在同一段空白上互相回溯，不可用于
+// 耗时用例的输入规模。两个正则与 parseLabel 照录旧文件
+const LEGACY_LABEL_RE = /^\s*图\s*(\d+)\s*$/;
+const LEGACY_CAPTION_RE = /^\s*图\s*(\d+)(?:\s*[:：、.．\-—]\s*|\s+)(.*\S)\s*$/;
+
+function legacyParseLabel(text, { allowCaption = false } = {}) {
+    const value = String(text == null ? '' : text);
+    const pure = LEGACY_LABEL_RE.exec(value);
+    if (pure) return { num: Number(pure[1]), caption: '' };
+    if (!allowCaption) return null;
+    const captioned = LEGACY_CAPTION_RE.exec(value);
+    return captioned ? { num: Number(captioned[1]), caption: captioned[2].trim() } : null;
+}
+
+// 分支归类的判据一律由旧式的写法推得，不借用新实现：旧式先试标点备选，只留该备选的正则能匹配，即经标点分隔而匹配；
+// 令「.」兼容行终止符（s 标志）之后才能匹配，即失配只因图注区间含行终止符；前缀「图 + 数字」之后的首字既非空白也非
+// 分隔标点，则两个备选都接不住
+const LEGACY_CAPTION_PUNCTUATION_RE = /^\s*图\s*(\d+)\s*[:：、.．\-—]\s*(.*\S)\s*$/;
+const LEGACY_CAPTION_DOT_ALL_RE = new RegExp(LEGACY_CAPTION_RE.source, 's');
+const CAPTION_DIFF_PREFIX_RE = /^\s*图\s*\d+/;
+const CAPTION_DIFF_NO_SEPARATOR_RE = /^[^\s:：、.．\-—]/;
+const CAPTION_DIFF_SEPARATOR_RE = /^[:：、.．\-—]$/;
+
+// 按旧式结果与输入特征归类，legacy 为旧式的第 1、2 组（不匹配为 null）。前缀之后无可捕获的一类（如「图1」「图1：」
+// 「图1 」）只计数，不在六种情形之列
+function classifyCaptionSample(sample, legacy) {
+    if (legacy) {
+        if (LEGACY_CAPTION_PUNCTUATION_RE.test(sample)) return 'punctuation';
+        // 经空白备选匹配而图注只是一个分隔标点：它正是紧随空白、本可充当分隔符的那一个（如「图1 ：」）
+        return CAPTION_DIFF_SEPARATOR_RE.test(legacy[1]) ? 'separatorCaptured' : 'whitespace';
+    }
+    const prefix = CAPTION_DIFF_PREFIX_RE.exec(sample);
+    if (!prefix) return 'prefixMismatch';
+    if (CAPTION_DIFF_NO_SEPARATOR_RE.test(sample.slice(prefix[0].length))) return 'noSeparator';
+    return LEGACY_CAPTION_DOT_ALL_RE.test(sample) ? 'lineTerminator' : 'nothingToCapture';
+}
+
+// 差分字母表：旧式 \s 的十个代表成员——半角空格、制表符、U+3000、U+00A0、U+FEFF、U+000B，以及同为「.」所不匹配的
+// 行终止符 LF、CR、U+2028、U+2029；七个分隔标点；可见字符 a、「图」与数字 1。不可见字符一律以码点生成
+const CAPTION_DIFF_SPACES = [0x20, 0x09, 0x3000, 0x00a0, 0xfeff, 0x0b, 0x0a, 0x0d, 0x2028, 0x2029]
+    .map((code) => String.fromCharCode(code));
+const CAPTION_DIFF_SEPARATORS = [':', '：', '、', '.', '．', '-', '—'];
+const CAPTION_DIFF_ALPHABET = [...CAPTION_DIFF_SPACES, ...CAPTION_DIFF_SEPARATORS, 'a', '图', '1'];
+
+// 字母表上长度 0 到 maxLength 的全部字符串
+function everyStringUpTo(maxLength, alphabet) {
+    const all = [''];
+    let level = [''];
+    for (let length = 1; length <= maxLength; length += 1) {
+        level = level.flatMap((prefix) => alphabet.map((token) => prefix + token));
+        for (const text of level) all.push(text);
+    }
+    return all;
+}
+
+// 种子固定的 32 位伪随机数发生器（mulberry32）：每次运行抽到同一批样本，失败可原样复现
+function createSeededRandom(seed) {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let mixed = Math.imul(state ^ (state >>> 15), state | 1);
+        mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// 逐码点列出，失败输出里的不可见字符也能看清
+const toCodePoints = (text) => Array.from(text, (ch) => ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' ');
+
+// 图号段解析结果的摘要：图注可能长达 8 万字，只报图号、图注长度与首尾
+const describeLabel = (label) => (label === null
+    ? 'null'
+    : `图号 ${label.num}，图注长 ${label.caption.length}，首 3 字 [${toCodePoints(label.caption.slice(0, 3))}]，`
+        + `末 3 字 [${toCodePoints(label.caption.slice(-3))}]`);
+
+describe('patent profile：图号段的图注匹配', () => {
+    // [形态说明, 图注里的行终止符]：「.」跨不过行终止符，旧式在失配之前对每一个分隔长度都把余下的空白重扫一遍
+    const stressShapes = [
+        ['回车（CR）', '\r'],
+        ['行分隔符（U+2028）', String.fromCharCode(0x2028)],
+    ];
+
+    for (const [label, terminator] of stressShapes) {
+        test(`「图1」后夹 8 万个半角空格、图注含${label}不触发回溯：单次调用在绝对上限内，输出逐字正确`, (t) => {
+            // Arrange：在计时区间外新构造字符串
+            const spaces = ' '.repeat(CAPTION_STRESS_LENGTH);
+            const input = `图1${spaces}a${terminator}b`;
+
+            // Act：计时区间只包这一次调用
+            const started = process.hrtime.bigint();
+            const result = parseLabel(input, { allowCaption: true });
+            const elapsedMs = elapsedMsSince(started);
+            t.diagnostic(`parseLabel 实测 ${elapsedMs.toFixed(2)} ms`);
+
+            // Assert：先验输出正确，以免「快」来自少做了事——图注区间含行终止符，旧式同样判为不匹配；同一段长空白之后接
+            // 不含行终止符的图注则须匹配，且图注不带那段空白
+            assert.ok(result === null, `应不匹配，实得${describeLabel(result)}`);
+            const control = parseLabel(`图1${spaces}a b`, { allowCaption: true });
+            assert.ok(isDeepStrictEqual(control, { num: 1, caption: 'a b' }), `正对照应为图号 1、图注「a b」，实得${describeLabel(control)}`);
+            assert.ok(
+                elapsedMs < CAPTION_STRESS_BUDGET_MS,
+                `parseLabel 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${CAPTION_STRESS_BUDGET_MS} ms`,
+            );
+        });
+    }
+
+    test('与线性化之前的实现逐字等价：BMP 逐码元、穷举短串与种子固定的随机串，六种情形与纯图号段均有样本', (t) => {
+        // Arrange：BMP 逐码元 262144 个：每个码元放进四个位置——分隔符兼串尾空白「图1 c a c」、分隔标点之后「图1：c a」、
+        // 前缀之前「c 图1 a」、图注中间「图1 a c b」；新式的空白、行终止符与分隔标点三个集合比旧式多一个或少一个字符都会暴露
+        const samples = [];
+        for (let code = 0; code <= 0xffff; code += 1) {
+            const unit = String.fromCharCode(code);
+            samples.push(`图1${unit}a${unit}`, `图1：${unit}a`, `${unit}图1 a`, `图1 a${unit}b`);
+        }
+        // 穷举 16842 个：字母表 20 个记号上由 0 到 3 个记号拼成的 8421 个字符串，各取原样与前置「图1」两种
+        for (const text of everyStringUpTo(3, CAPTION_DIFF_ALPHABET)) samples.push(text, `图1${text}`);
+        assert.equal(samples.length, 278986);
+
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomTokens = (tokens, count) => Array.from({ length: count }, () => pick(tokens)).join('');
+        // 一般随机串 30000 个：字母表上 0 到 12 个记号
+        for (let i = 0; i < 30000; i += 1) samples.push(randomTokens(CAPTION_DIFF_ALPHABET, Math.floor(random() * 13)));
+        // 结构化随机串 40000 个：0 到 2 个空白 + 图 + 0 到 1 个空白 + 1 到 3 位数字 + 分隔片段 + 0 到 6 个记号，贴近
+        // 「图1：结构示意图」一类图号段。分隔片段三选一：无分隔、1 到 3 个空白、标点两侧各 0 到 2 个空白；空白含行终止符
+        const spaceRun = (max) => randomTokens(CAPTION_DIFF_SPACES, Math.floor(random() * (max + 1)));
+        const separatorFragments = [
+            () => '',
+            () => spaceRun(2) + pick(CAPTION_DIFF_SPACES),
+            () => spaceRun(2) + pick(CAPTION_DIFF_SEPARATORS) + spaceRun(2),
+        ];
+        for (let i = 0; i < 40000; i += 1) {
+            const digits = randomTokens(['0', '1', '9'], 1 + Math.floor(random() * 3));
+            samples.push(`${spaceRun(2)}图${spaceRun(1)}${digits}${pick(separatorFragments)()}`
+                + randomTokens(CAPTION_DIFF_ALPHABET, Math.floor(random() * 7)));
+        }
+        assert.equal(samples.length, 348986);
+
+        // Act & Assert
+        const counts = {
+            prefixMismatch: 0, punctuation: 0, whitespace: 0, noSeparator: 0, lineTerminator: 0, separatorCaptured: 0, nothingToCapture: 0,
+        };
+        let pureLabels = 0;
+        for (const sample of samples) {
+            // matchCaption 与旧式的第 1、2 组逐个比较；只在不一致时拼装诊断信息，免得三十余万次调用都付这笔开销
+            const legacyMatch = LEGACY_CAPTION_RE.exec(sample);
+            const legacy = legacyMatch && [legacyMatch[1], legacyMatch[2]];
+            const actual = matchCaption(sample);
+            const same = legacy === null
+                ? actual === null
+                : actual !== null && actual.length === 2 && actual[0] === legacy[0] && actual[1] === legacy[1];
+            if (!same) assert.deepEqual(actual, legacy, `matchCaption 输入 [${toCodePoints(sample)}]`);
+            // parseLabel 允许图注与只认纯图号段两种调用，各与照录的旧实现深度严格相等
+            const captioned = parseLabel(sample, { allowCaption: true });
+            const expectedCaptioned = legacyParseLabel(sample, { allowCaption: true });
+            if (!isDeepStrictEqual(captioned, expectedCaptioned)) {
+                assert.deepEqual(captioned, expectedCaptioned, `parseLabel（allowCaption）输入 [${toCodePoints(sample)}]`);
+            }
+            const pure = parseLabel(sample);
+            const expectedPure = legacyParseLabel(sample);
+            if (!isDeepStrictEqual(pure, expectedPure)) assert.deepEqual(pure, expectedPure, `parseLabel 输入 [${toCodePoints(sample)}]`);
+            counts[classifyCaptionSample(sample, legacy)] += 1;
+            if (expectedPure !== null) pureLabels += 1;
+        }
+        // 覆盖自证：六种情形与 parseLabel 的纯图号分支都须有样本，差分才不是对某一分支空转
+        t.diagnostic(`样本 ${samples.length} 个；前缀不符 ${counts.prefixMismatch}，经标点分隔而匹配 ${counts.punctuation}，`
+            + `仅以空白分隔而匹配 ${counts.whitespace}，数字后既无标点也无空白 ${counts.noSeparator}，`
+            + `图注区间含行终止符而不匹配 ${counts.lineTerminator}，图注即分隔标点本身 ${counts.separatorCaptured}，`
+            + `前缀之后无可捕获 ${counts.nothingToCapture}；parseLabel 走纯图号分支 ${pureLabels}`);
+        assert.ok(counts.prefixMismatch > 0, '没有前缀不符的样本');
+        assert.ok(counts.punctuation > 0, '没有经标点分隔而匹配的样本');
+        assert.ok(counts.whitespace > 0, '没有仅以空白分隔而匹配的样本');
+        assert.ok(counts.noSeparator > 0, '没有数字后既无标点也无空白而不匹配的样本');
+        assert.ok(counts.lineTerminator > 0, '没有图注区间含行终止符而不匹配的样本');
+        assert.ok(counts.separatorCaptured > 0, '没有图注即分隔标点本身的样本');
+        assert.ok(pureLabels > 0, '没有 parseLabel 走纯图号分支的样本');
     });
 });
