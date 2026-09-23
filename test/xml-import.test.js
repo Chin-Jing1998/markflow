@@ -342,7 +342,7 @@ describe('IR 映射', () => {
         assert.equal(doc.meta.title, long);
     });
 
-    test('XML 里的换行是排版而非内容：汉字之间与节点边界处删除，西文之间留一个空格；只含排版空白的文本节点丢弃', async () => {
+    test('XML 里的换行是排版而非内容：汉字之间删除，西文之间留一个空格，段尾换行不留空格；只含排版空白的文本节点丢弃', async () => {
         const doc = await importXml([
             '<description>',
             '  <p id="p0001" num="0001" Italic="0">前一行',
