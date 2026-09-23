@@ -13,7 +13,7 @@
  *
  * 清洗属常规行为，不写入 warnings。
  */
-const cheerio = require('cheerio');
+const { hasDescendantTag, createTreeEditor, loadFragment, selectElements, selectByTags } = require('./dom');
 
 // 属性规则的 match 为析取范式：外层任一组命中即判为噪声，组内令牌须全部出现。
 const NOISE_ATTR_RULES = Object.freeze([
@@ -49,8 +49,11 @@ const NOISE_TEXT_MAX_LENGTH = 60;
 
 // 空元素删除的标签白名单：不含 td/th/tr/table，避免破坏表格结构
 const EMPTY_TAGS = 'p, div, section, span, li, blockquote, h1, h2, h3, h4, h5, h6, article, header, figure, a';
-// 这些后代视为「有内容」，即便没有文本也不能删
-const CONTENT_DESCENDANTS = 'img, video, audio, iframe, table, embed, object, svg, canvas, picture, source';
+// 这些后代视为「有内容」，即便没有文本也不能删（按标签名比对，见 web/dom 的 hasDescendantTag）
+const CONTENT_DESCENDANT_TAGS = new Set([
+    'img', 'video', 'audio', 'iframe', 'table', 'embed', 'object', 'svg', 'canvas', 'picture', 'source',
+]);
+const LINE_BREAK_TAGS = new Set(['br']);
 const EMPTY_SWEEP_ROUNDS = 3;
 // 行内包装元素：只包着 <br> 时拆包、只含不换行空格或全角空格时保留（见 removeEmptyElements）
 const INLINE_WRAPPERS = new Set(['span', 'a']);
@@ -61,6 +64,9 @@ const MAX_CONSECUTIVE_BR = 2;
 const MAX_REMOVAL_TEXT_RATIO = 0.5;
 
 /**
+ * 载入与四条规则的取元素改走 web/dom：cheerio.load(html, null, false) 与根级 $(选择器) 在顶层大量并列节点时平方级，
+ * loadFragment 与之逐字等价，selectElements、selectByTags 与根级 $(选择器) 逐节点同序，三者都线性
+ *
  * @param {string} html 正文 HTML 片段
  * @returns {string} 清洗后的 HTML 片段
  */
@@ -68,7 +74,7 @@ function cleanNoise(html) {
     const source = String(html == null ? '' : html);
     if (!source.trim()) return source;
 
-    const $ = cheerio.load(source, null, false);
+    const $ = loadFragment(source);
     const totalLength = $.root().text().trim().length;
     removeByAttributes($, totalLength);
     removeByText($);
@@ -97,9 +103,17 @@ function matchNoiseRule(tokens) {
     return null;
 }
 
+// 属性规则的候选元素：自有属性 class 或 id 存在且值不为 null。对应 css-select 的 '[class], [id]'——属性存在选择器
+// 经 domutils 的 hasAttrib 判定（attribs 的自有属性、值非 null），供 selectElements 与之逐元素同值
+function hasClassOrId(el) {
+    const { attribs } = el;
+    return (Object.hasOwn(attribs, 'class') && attribs.class != null)
+        || (Object.hasOwn(attribs, 'id') && attribs.id != null);
+}
+
 function removeByAttributes($, totalLength) {
     // 文档序遍历：父元素先被删除时，其子元素随之消失，无需再判定
-    $('[class], [id]').each((_, el) => {
+    selectElements($, hasClassOrId).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
         const tokens = [...tokensOf($el.attr('class')), ...tokensOf($el.attr('id'))];
@@ -126,7 +140,7 @@ function exceedsRemovalBudget($el, totalLength) {
 // ---------- 规则二：引导文案 ----------
 
 function removeByText($) {
-    $(TEXT_RULE_TAGS).each((_, el) => {
+    selectByTags($, TEXT_RULE_TAGS).each((_, el) => {
         if (!isAttached(el)) return;
         const $el = $(el);
         const text = $el.text().replace(/\s+/g, ' ').trim();
@@ -140,7 +154,7 @@ function removeByText($) {
 
 // 连续的 <br> 超过 MAX_CONSECUTIVE_BR 个时，多余的删除（其间的空白文本节点一并清掉）
 function collapseLineBreaks($) {
-    $('br').each((_, el) => {
+    selectByTags($, 'br').each((_, el) => {
         let seen = 1;
         let node = el.nextSibling;
         const pending = [];
@@ -166,28 +180,32 @@ function collapseLineBreaks($) {
 // 迭代若干轮：删掉内层空元素后，外层容器可能随之变空。
 // 行内包装元素（span、a）区别对待：只包着 <br> 的拆包保留换行（微信把换行写成 <span leaf><br></span>），
 // 只含不换行空格或全角空格的保留（段首缩进与词间空格由它们承载，交 parsers/url 识别）；
-// 块级元素只剩 <br> 或空白时仍视为间隔段落整块删除
+// 块级元素只剩 <br> 或空白时仍视为间隔段落整块删除。
+// 后代判定与删除、拆包走 web/dom：cheerio 的 .find()、.remove()、.replaceWith() 在同一父元素下大量子节点时
+// 平方级；每轮按前序快照逐个处理、只改当前元素，符合批量改树的安全性前提，本轮结束即压实
 function removeEmptyElements($) {
     for (let round = 0; round < EMPTY_SWEEP_ROUNDS; round += 1) {
         let changed = 0;
-        $(EMPTY_TAGS).each((_, el) => {
+        const editor = createTreeEditor();
+        selectByTags($, EMPTY_TAGS).each((_, el) => {
             if (!isAttached(el)) return;
             const $el = $(el);
             if ($el.text().trim()) return;
-            if ($el.find(CONTENT_DESCENDANTS).length > 0) return;
+            if (hasDescendantTag(el, CONTENT_DESCENDANT_TAGS)) return;
             if (INLINE_WRAPPERS.has(el.tagName)) {
                 if (!ASCII_SPACE_ONLY_RE.test($el.text())) return;
-                if ($el.find('br').length > 0) {
-                    $el.replaceWith($el.contents());
+                if (hasDescendantTag(el, LINE_BREAK_TAGS)) {
+                    editor.unwrap(el);
                     changed += 1;
                     return;
                 }
             }
-            $el.remove();
+            editor.remove(el);
             changed += 1;
         });
+        editor.flush();
         if (changed === 0) return;
     }
 }
 
-module.exports = { cleanNoise, tokensOf, isAttached, NOISE_ATTR_RULES, NOISE_TEXT_RULES };
+module.exports = { cleanNoise, tokensOf, isAttached, removeEmptyElements, hasClassOrId, NOISE_ATTR_RULES, NOISE_TEXT_RULES };
