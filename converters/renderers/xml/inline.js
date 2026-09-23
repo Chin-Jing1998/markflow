@@ -20,7 +20,10 @@ const HTML_TAG_RE = /^<(\/?)\s*([a-zA-Z][a-zA-Z0-9]*)\b[^>]*?>$/;
 const HTML_MARKS = Object.freeze({ b: 'b', strong: 'b', i: 'i', em: 'i', u: 'u', sup: 'sup', sub: 'sub' });
 const SOFT_BREAK_RE = /[ \t]*\n[ \t]*/g;
 // 汉字、全角标点两侧的软换行直接删除，其余换成空格
-const CJK_RE = /[⺀-⿿　-〿㐀-䶿一-鿿豈-﫿＀-￯]/;
+// 汉字、全角标点：与 parsers/xml/inline.js 的 CJK_RANGES 同一范围。按码点声明——首个区间端点 U+3000 不可见，
+// 兼容表意字与常用字字形相同，写成字面量无从分辨
+const CJK_RANGES = Object.freeze([[0x2E80, 0x2FFF], [0x3000, 0x303F], [0x3400, 0x4DBF], [0x4E00, 0x9FFF], [0xF900, 0xFAFF], [0xFF00, 0xFFEF]]);
+const CJK_RE = new RegExp(`[${CJK_RANGES.map(([from, to]) => `${String.fromCharCode(from)}-${String.fromCharCode(to)}`).join('')}]`);
 
 const textRun = (text, marks) => ({ kind: 'text', text, marks: new Set(marks) });
 
