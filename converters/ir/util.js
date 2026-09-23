@@ -20,16 +20,16 @@ const MAX_FOLDER_NAME_LENGTH = 100;
 const ILLEGAL_FILENAME_CHARS_RE = /[\\/:*?"<>|]/g;
 // 控制字符（含 NUL 与 DEL）直接剔除
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/g;
-// 首尾的空白、点与下划线（前导点会生成隐藏目录，尾随点与空白在 Windows 上非法）
-const EDGE_TRIM_RE = /^[\s._]+|[\s._]+$/g;
+// 首尾须去掉的单个字符：空白、点与下划线（前导点会生成隐藏目录，尾随点与空白在 Windows 上非法）
+const EDGE_TRIM_CHAR_RE = /[\s._]/;
 // Windows 保留设备名（不分大小写；NUL.txt、NUL.tar.gz 等带扩展名的形式同样等价于 NUL）：CON、PRN、AUX、NUL、
 // COM1–COM9、LPT1–LPT9，以及 Windows 视同数字的上标 1、2、3（U+00B9、U+00B2、U+00B3，即 COM¹、LPT³ 等）。
 // 出处：Microsoft Learn「Naming Files, Paths, and Namespaces」
 const WINDOWS_RESERVED_NAME_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$/i;
 // 命中保留名时追加在主干之后的后缀
 const RESERVED_NAME_SUFFIX = '_';
-// 末尾的点与空白（Windows 不允许文件名以此结尾）
-const TRAILING_DOT_SPACE_RE = /[\s.]+$/;
+// 末尾须去掉的单个字符：点与空白（Windows 不允许文件名以此结尾）
+const TRAILING_DOT_SPACE_CHAR_RE = /[\s.]/;
 // 各方在没有真实作者时写入 docProps/core.xml 的占位名（小写形式，供不分大小写的精确匹配）：
 //   un-named  docx 库（node_modules/docx）生成文档时 creator 的缺省值
 //   unknown   exceljs 写出工作簿时 dc:creator 的缺省值（lib/doc/workbook.js）
@@ -46,17 +46,31 @@ const DEFAULT_CONTENT_TYPE_EXT = '.png';
 const KNOWN_URL_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'];
 const DEFAULT_URL_IMAGE_EXT = '.jpg';
 
+// 首尾修剪以逐字符扫描代替「量词 + 行尾锚」的正则：后者在不处于串尾的长段上从每个起点都贪婪吃到段尾再逐位回溯，
+// 耗时随段长平方增长。charRe 须为只匹配单个字符的非全局正则；按 UTF-16 码元逐个判定，与无 u 标志的正则同一口径
+function trimTrailingChars(text, charRe) {
+    let end = text.length;
+    while (end > 0 && charRe.test(text[end - 1])) end -= 1;
+    return text.slice(0, end);
+}
+
+function trimEdgeChars(text, charRe) {
+    let start = 0;
+    while (start < text.length && charRe.test(text[start])) start += 1;
+    return trimTrailingChars(text.slice(start), charRe);
+}
+
 // 把任意标题清洗为可安全落盘的文件夹名：非法字符替换为 "_"（保留分词边界，避免 "a/b" 与
 // "ab" 撞名），空白折叠为单个空格，去首尾空白与点，超长按码点截断，空结果回退到 fallback；
 // 最后避开 Windows 保留设备名（与平台无关一律处理，保证产物可移植）。
 function sanitizeFolderName(name, fallback = '未命名文档') {
-    const cleaned = String(name == null ? '' : name)
+    const collapsed = String(name == null ? '' : name)
         .replace(CONTROL_CHARS_RE, '')
         .replace(ILLEGAL_FILENAME_CHARS_RE, '_')
         .replace(/_+/g, '_')
-        .replace(/\s+/g, ' ')
-        .replace(EDGE_TRIM_RE, '');
-    const base = Array.from(cleaned).slice(0, MAX_FOLDER_NAME_LENGTH).join('').replace(EDGE_TRIM_RE, '') || fallback;
+        .replace(/\s+/g, ' ');
+    const cleaned = trimEdgeChars(collapsed, EDGE_TRIM_CHAR_RE);
+    const base = trimEdgeChars(Array.from(cleaned).slice(0, MAX_FOLDER_NAME_LENGTH).join(''), EDGE_TRIM_CHAR_RE) || fallback;
     return avoidWindowsReservedName(base);
 }
 
@@ -67,7 +81,7 @@ function avoidWindowsReservedName(name) {
     const stem = dot === -1 ? name : name.slice(0, dot);
     if (!WINDOWS_RESERVED_NAME_RE.test(stem.trimEnd())) return name;
     const fixed = `${stem}${RESERVED_NAME_SUFFIX}${dot === -1 ? '' : name.slice(dot)}`;
-    return Array.from(fixed).slice(0, MAX_FOLDER_NAME_LENGTH).join('').replace(TRAILING_DOT_SPACE_RE, '');
+    return trimTrailingChars(Array.from(fixed).slice(0, MAX_FOLDER_NAME_LENGTH).join(''), TRAILING_DOT_SPACE_CHAR_RE);
 }
 
 // 文档作者名归一，供 docx / pptx / xlsx 三个 parser 共用（网页来源的作者另由 parsers/url.js 提取，不走这里）：
