@@ -1,12 +1,23 @@
 /**
  * converters/web/indent.js 单元测试
  * 覆盖：indentFromStyleChain 的 text-indent 识别——数值之后的长段空白不触发回溯（耗时上限），
- *       以及改写后的正则与线性化之前的写法逐字等价（差分）
+ *       以及改写后的正则与线性化之前的写法逐字等价（差分）；
+ *       叶子块缩进的逐元素缓存（createIndentResolver）——url 解析器的 markIndents 与 web/extract 的
+ *       annotateLayout 在众多叶子块共享一个长空白 style 的祖先时，只匹配该 style 一次（耗时上限），
+ *       以及二者与逐叶重扫祖先 style 链的旧实现逐字等价（随机 HTML 差分，cheerio 与 linkedom 两条路径）
  */
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const cheerio = require('cheerio');
+const { parseHTML } = require('linkedom');
 
-const { indentFromStyleChain } = require('../converters/web/indent');
+const {
+    indentFromStyleChain, leadingIndentRun, LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, INDENT_SPACE_CLASS,
+} = require('../converters/web/indent');
+const { markIndents } = require('../converters/parsers/url');
+const { annotateLayout } = require('../converters/web/extract');
+const { isAttached } = require('../converters/web/noise');
+const { indentMarker } = require('../converters/ir/markers');
 
 // 制表符与换行写作转义序列，其余不可见字符以码点生成，源码里不出现看不见的字面量
 const NBSP = String.fromCharCode(0xa0);
@@ -245,5 +256,413 @@ describe('indentFromStyleChain：text-indent 识别线性于串长', () => {
             });
         }
         assert.ok(chainCoverage.hits.unmatched > 0, '随机 style 链中旧正则未命中的样本数为 0');
+    });
+});
+
+// ============================================================
+// 逐叶重扫祖先 style 链的实现（差分参照）
+// ============================================================
+
+// 仅作短输入的差分参照：每个叶子块都重建整条祖先 style 链，并对链上各 style 从头匹配，n 个叶子块共享一个长为 L 的
+// 祖先 style 时合计 O(n·L)，不可用于耗时用例的输入规模。以下照录缓存之前的 web/indent 的 indentFromStyleChain 与
+// textFontSize、url 解析器的 markIndents、styleChainOf、takeLeadingSpaces 与 collectLeadingTexts、web/extract 的
+// annotateLayout 与 styleChainOf；已导出且未改动者（isAttached、indentMarker、leadingIndentRun、两个选择器、
+// INDENT_SPACE_CLASS）直接引用。改动只有两类：在 hits 上记下各分支的命中数，以及把「缩进 + 段首空白」拆成
+// 先后两步求值以便分别计数（求值顺序不变）
+const UNCACHED_TEXT_INDENT_RE = /(?:^|;)\s*text-indent\s*:\s*(-?\d+(?:\.\d+)?)\s*(?:(em|rem|px)\s*)?(?:!important\s*)?(?=;|$)/i;
+const UNCACHED_FONT_SIZE_RE = /(?:^|;)\s*font-size\s*:\s*(\d+(?:\.\d+)?)px/i;
+const UNCACHED_DEFAULT_FONT_PX = 16;
+const UNCACHED_ROOT_FONT_PX = 16;
+const UNCACHED_MIN_INDENT = 1;
+const UNCACHED_MAX_INDENT = 4;
+const UNCACHED_INDENT_SPACE_ONLY_RE = new RegExp(`^[${INDENT_SPACE_CLASS}]*$`);
+const UNCACHED_VISIBLE_TEXT_RE = /[^\s]/;
+const UNCACHED_STYLE_WIDTH_RE = /(?:^|;)\s*width\s*:\s*(\d{1,5}(?:\.\d+)?)\s*(px|%)/i;
+// 仅供覆盖计数：同一 style 串里的全部 font-size（px）声明
+const EVERY_FONT_SIZE_RE = /(?:^|;)\s*font-size\s*:\s*(\d+(?:\.\d+)?)px/gi;
+// 仅供覆盖计数：两种 DOM 上「链是否延续」与「父节点」的取法，与各自的 styleChainOf 同一口径
+const CHEERIO_CHAIN = Object.freeze({ isElement: (node) => Boolean(node && node.type === 'tag'), parentOf: (node) => node.parent });
+const DOM_CHAIN = Object.freeze({ isElement: (node) => Boolean(node && node.nodeType === 1), parentOf: (node) => node.parentElement });
+
+function uncachedIndentFromStyleChain(styles, hits) {
+    const list = Array.isArray(styles) ? styles : [];
+    const at = list.findIndex((style) => UNCACHED_TEXT_INDENT_RE.test(String(style || '')));
+    if (at < 0) {
+        hits.noDeclaration += 1;
+        return 0;
+    }
+    const matched = UNCACHED_TEXT_INDENT_RE.exec(String(list[at]));
+    noteDeclaration(matched, at, hits);
+    const [, rawValue, rawUnit] = matched;
+    const value = Number(rawValue);
+    if (!Number.isFinite(value) || value <= 0) {
+        hits.nonPositive += 1;
+        return 0;
+    }
+    const unit = String(rawUnit || '').toLowerCase();
+    let chars;
+    if (unit === 'em') chars = value;
+    else if (unit === 'rem') chars = (value * UNCACHED_ROOT_FONT_PX) / uncachedTextFontSize(list, hits);
+    else if (unit === 'px') chars = value / uncachedTextFontSize(list, hits);
+    else {
+        hits.unitless += 1;
+        return 0;
+    }
+    hits[unit] += 1;
+    const rounded = Math.round(chars);
+    if (rounded < UNCACHED_MIN_INDENT) {
+        hits.belowOne += 1;
+        return 0;
+    }
+    if (rounded > UNCACHED_MAX_INDENT) hits.clamped += 1;
+    return Math.min(UNCACHED_MAX_INDENT, rounded);
+}
+
+function uncachedTextFontSize(styles, hits) {
+    for (const style of styles) {
+        const matched = UNCACHED_FONT_SIZE_RE.exec(String(style || ''));
+        const px = matched ? Number(matched[1]) : 0;
+        if (matched && !(px > 0)) noteZeroFontSize(String(style || ''), hits);
+        if (px > 0) {
+            hits.fontFromChain += 1;
+            return px;
+        }
+    }
+    hits.fontDefault += 1;
+    return UNCACHED_DEFAULT_FONT_PX;
+}
+
+function uncachedMarkIndents($, hits) {
+    const seen = new Set();
+    $(LEAF_BLOCK_SELECTOR).each((_, el) => {
+        if (!isAttached(el)) return;
+        const $el = $(el);
+        if ($el.find(NESTED_BLOCK_SELECTOR).length > 0) return;
+        if (!UNCACHED_VISIBLE_TEXT_RE.test($el.text())) return;
+        noteChainReuse(el, CHEERIO_CHAIN, seen, hits);
+        const indent = uncachedIndentFromStyleChain(uncachedCheerioStyleChainOf(el), hits);
+        const leading = uncachedTakeLeadingSpaces(el);
+        if (leading > 0) hits.leadingSpaces += 1;
+        if (indent > 0 && leading > 0) hits.indentAndLeading += 1;
+        const count = indent + leading;
+        noteResult(count, hits);
+        if (count > 0) $el.prepend(indentMarker(count));
+    });
+}
+
+function uncachedCheerioStyleChainOf(el) {
+    const styles = [];
+    for (let node = el; node && node.type === 'tag'; node = node.parent) styles.push((node.attribs && node.attribs.style) || '');
+    return styles;
+}
+
+function uncachedTakeLeadingSpaces(el) {
+    const texts = [];
+    uncachedCollectLeadingTexts(el, texts);
+    const run = leadingIndentRun(texts.map((node) => node.data || '').join(''));
+    if (!run) return 0;
+    let remaining = run.length;
+    for (const node of texts) {
+        if (remaining <= 0) break;
+        const data = node.data || '';
+        const take = Math.min(remaining, data.length);
+        node.data = data.slice(take);
+        remaining -= take;
+    }
+    return run.count;
+}
+
+function uncachedCollectLeadingTexts(node, out) {
+    for (const child of node.children || []) {
+        if (child.type === 'text') {
+            out.push(child);
+            if (!UNCACHED_INDENT_SPACE_ONLY_RE.test(child.data || '')) return true;
+            continue;
+        }
+        if (child.type === 'tag') {
+            if (child.name === 'img' || child.name === 'br') return true;
+            if (uncachedCollectLeadingTexts(child, out)) return true;
+        }
+    }
+    return false;
+}
+
+function uncachedAnnotateLayout(document, hits) {
+    const seen = new Set();
+    try {
+        for (const img of Array.from(document.querySelectorAll('img'))) {
+            const matched = UNCACHED_STYLE_WIDTH_RE.exec(img.getAttribute('style') || '');
+            if (matched && !img.getAttribute('data-mf-width')) img.setAttribute('data-mf-width', `${matched[1]}${matched[2].toLowerCase()}`);
+        }
+        for (const el of Array.from(document.querySelectorAll(LEAF_BLOCK_SELECTOR))) {
+            if (el.querySelector(NESTED_BLOCK_SELECTOR)) continue;
+            if (!/[^\s]/.test(el.textContent || '')) continue;
+            noteChainReuse(el, DOM_CHAIN, seen, hits);
+            const count = uncachedIndentFromStyleChain(uncachedDomStyleChainOf(el), hits);
+            noteResult(count, hits);
+            if (count > 0) el.insertBefore(document.createTextNode(indentMarker(count)), el.firstChild);
+        }
+    } catch (err) {
+        /* 预标注只为保真，DOM 能力不足时按未标注继续 */
+    }
+}
+
+function uncachedDomStyleChainOf(el) {
+    const styles = [];
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) styles.push(node.getAttribute('style') || '');
+    return styles;
+}
+
+// 覆盖计数：命中的声明在叶子块自身还是祖先上，以及其写法（大写单位、!important、小数）
+function noteDeclaration(matched, at, hits) {
+    hits[at === 0 ? 'onLeaf' : 'onAncestor'] += 1;
+    const [whole, rawValue, rawUnit] = matched;
+    if (rawUnit && rawUnit !== rawUnit.toLowerCase()) hits.upperUnit += 1;
+    // 正则里能消耗 ! 的只有 !important 一项，故匹配串含 ! 即说明该项参与了匹配
+    if (whole.includes('!')) hits.important += 1;
+    if (rawValue.includes('.')) hits.fraction += 1;
+}
+
+// 覆盖计数：首个 font-size（px）为 0 的元素被整体跳过；同一 style 里其后另有正值时另记一笔
+function noteZeroFontSize(style, hits) {
+    hits.zeroFontSkipped += 1;
+    if ([...style.matchAll(EVERY_FONT_SIZE_RE)].some((matched) => Number(matched[1]) > 0)) hits.zeroFontBeforePositive += 1;
+}
+
+// 覆盖计数：叶子块的父元素已出现在先前叶子块的链上时，逐元素缓存的实现只需求值叶子块自身，其余取自缓存
+function noteChainReuse(el, { isElement, parentOf }, seen, hits) {
+    const parent = parentOf(el);
+    if (isElement(parent) && seen.has(parent)) hits.cacheReuse += 1;
+    for (let node = el; isElement(node); node = parentOf(node)) seen.add(node);
+}
+
+// 覆盖计数：参与求值的叶子块数与其中得到缩进标记者
+function noteResult(count, hits) {
+    hits.leaves += 1;
+    if (count > 0) hits.marked += 1;
+}
+
+// ============================================================
+// 叶子块缩进的逐元素缓存：祖先 style 只匹配一次
+// ============================================================
+
+// 耗时用例的输入规模：外层 div 声明 text-indent:2em，中层 div 的 style 为 2 MB 空格（不含任何声明），其下是
+// 1000 个叶子块 p。逐叶重扫时，每个叶子块都要把中层那段 style 从头匹配一遍，才落到外层的声明。style 取 2 MB 而非
+// 1 MB：旧实现的耗时随「叶子块数 × style 长度」增长，新实现只多出一次约每 MB 5 毫秒的匹配，另有与本项无关、随叶子块数
+// 增长的 cheerio 逐叶开销（1000 个约 11 毫秒），故加长 style 能同时拉开两侧余量
+const SHARED_STYLE_MB = 2;
+const SHARED_STYLE_LENGTH = SHARED_STYLE_MB * 1024 * 1024;
+const SHARED_STYLE_LEAF_COUNT = 1000;
+// 耗时上限取绝对值而非「新旧耗时之比」：毫秒级测量噪声大，倍率断言不稳。300 ms 使两侧余量都不小于 5 倍——
+// 逐叶重扫的旧实现在这一规模上实测 markIndents 约 2.7 至 2.8 秒、annotateLayout 约 2.6 至 2.7 秒（二者都随叶子块数
+// 与 style 长度线性增长，合计 O(n·L)），是上限的 8.5 倍以上；逐元素缓存之后在本文件内单独运行 22 次，markIndents
+// 至多约 41 毫秒、annotateLayout 至多约 15 毫秒，不到上限的七分之一。18 个测试进程同时抢占 18 核时，二者至多约
+// 130 与 82 毫秒，仍在上限之内
+const SHARED_STYLE_BUDGET_MS = 300;
+
+// 差分样本：随机 HTML 页面的份数（每份在 cheerio 与 linkedom 上各跑新旧两遍），以及块元素的最大嵌套层数
+const RANDOM_PAGE_COUNT = 1500;
+const MAX_NESTING_DEPTH = 5;
+// style 的构件：text-indent 的属性名大小写、数值（负值、0、小数，小值使 em 的结果散布于 0 至 4 以上，大值配合字号
+// 使 px 与 rem 的折算结果同样散布）、单位（三种合法单位及其大写、无单位、不被接受的单位）与 !important；
+// font-size 的正值、0px、非 px 单位；声明内外的空白（含不换行空格）与分号的写法
+const INDENT_PROPERTY_NAMES = ['text-indent', 'text-indent', 'TEXT-INDENT'];
+const INDENT_VALUES = [
+    '-2', '-0.5', '0', '0.0', '0.3', '0.5', '1', '1.4', '1.5', '2', '2.5', '3', '4', '4.5', '6', '8',
+    '12', '16', '24', '32', '48', '64', '96',
+];
+const INDENT_UNITS = ['em', 'em', 'EM', 'Em', 'rem', 'REM', 'px', 'px', 'PX', '', '', 'pt', '%'];
+const IMPORTANT_SUFFIXES = ['', '', '', ' !important', '!IMPORTANT'];
+const FONT_SIZE_VALUES = ['0px', '0PX', '0.0px', '8px', '10px', '12px', '14px', '16px', '20px', '24px', '32px', '1.5em', '14pt', '120%', '0.5rem'];
+const STYLE_SPACES = ['', '', '', ' ', '  ', '\t', '\n', NBSP];
+const STYLE_SEPARATORS = [';', ';', '; ', ' ;', ';;'];
+// 元素与文本的构件：块元素（叶子块标签与只作嵌套块的标签）、行内元素、正文词语，以及段首空白——
+// 不换行空格与全角空格计入缩进，ASCII 空格与换行不计
+const BLOCK_TAGS = ['div', 'div', 'section', 'blockquote', 'p', 'p', 'p', 'ul', 'h2', 'pre', 'figure'];
+const PHRASING_BLOCK_TAGS = new Set(['p', 'h2', 'pre']);
+const INLINE_TAGS = ['span', 'span', 'strong', 'em', 'b'];
+const TEXT_WORDS = ['正文', '段落', 'text', '42', '甲乙丙'];
+const LEADING_SPACE_TOKENS = [NBSP, NBSP, IDEOGRAPHIC_SPACE, ' ', '\n'];
+// 覆盖自证的分支：键为 hits 上的计数名，值为诊断与断言信息里的说明
+const RESOLVER_BRANCHES = [
+    ['noDeclaration', '链上无 text-indent'],
+    ['onLeaf', 'text-indent 在叶子块自身'],
+    ['onAncestor', 'text-indent 在祖先上'],
+    ['nonPositive', '数值 ≤ 0'],
+    ['unitless', '无单位'],
+    ['em', 'em'],
+    ['rem', 'rem'],
+    ['px', 'px'],
+    ['upperUnit', '大写单位'],
+    ['important', '!important'],
+    ['fraction', '小数'],
+    ['belowOne', '四舍五入后不足 1'],
+    ['clamped', '钳制到 4'],
+    ['fontFromChain', '字号取自链上正值'],
+    ['fontDefault', '字号取缺省 16'],
+    ['zeroFontSkipped', 'font-size 为 0px 的元素被跳过'],
+    ['zeroFontBeforePositive', '同一 style 里 0px 在前、正值在后，仍整体跳过'],
+    ['cacheReuse', '父元素已在先前叶子块的链上（新实现命中缓存）'],
+    ['leaves', '参与求值的叶子块'],
+    ['marked', '得到缩进标记的叶子块'],
+];
+const CHEERIO_ONLY_BRANCHES = [
+    ['leadingSpaces', '段首空白折算出字数（takeLeadingSpaces 参与求和）'],
+    ['indentAndLeading', 'text-indent 与段首空白同时计入'],
+];
+
+const wrapDocument = (fragment) => `<!DOCTYPE html><html><head></head><body>${fragment}</body></html>`;
+const emptyHits = (branches) => Object.fromEntries(branches.map(([key]) => [key, 0]));
+
+// 耗时用例的片段与各叶子块的期望文本（段首 2 字缩进标记 + 原文）
+function sharedStyleFragment() {
+    const leaves = Array.from({ length: SHARED_STYLE_LEAF_COUNT }, (_, index) => `<p>第 ${index + 1} 段</p>`).join('');
+    return `<div style="text-indent:2em"><div style="${' '.repeat(SHARED_STYLE_LENGTH)}">${leaves}</div></div>`;
+}
+const expectedSharedStyleTexts = () => Array.from({ length: SHARED_STYLE_LEAF_COUNT }, (_, index) => `${indentMarker(2)}第 ${index + 1} 段`);
+
+// 随机 HTML 片段的生成器：块元素多层嵌套，块内混排行内元素、<br>、带宽度的 <img> 与段首空白；各元素的 style
+// 从上面的构件拼出，也可能缺省或为空串。p、h2、pre 只含行内内容，ul 只含 li，使两种解析器得到相近的树
+function createPageGenerator(random) {
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const upTo = (max) => Math.floor(random() * (max + 1));
+    const space = () => pick(STYLE_SPACES);
+    const indentDeclaration = () => `${space()}${pick(INDENT_PROPERTY_NAMES)}${space()}:${space()}`
+        + `${pick(INDENT_VALUES)}${space()}${pick(INDENT_UNITS)}${pick(IMPORTANT_SUFFIXES)}${space()}`;
+    const fontSizeDeclaration = () => `${space()}font-size${space()}:${space()}${pick(FONT_SIZE_VALUES)}${space()}`;
+    // 首个 font-size 为 0px、其后另有正值：该元素整体跳过，不取其后的正值
+    const zeroThenPositive = () => `font-size:0px;${space()}font-size:${pick(['12px', '20px', '32px'])}`;
+    const declaration = () => {
+        const roll = random();
+        if (roll < 0.35) return indentDeclaration();
+        if (roll < 0.6) return fontSizeDeclaration();
+        if (roll < 0.7) return zeroThenPositive();
+        return `${space()}${pick(OTHER_DECLARATIONS)}${space()}`;
+    };
+    const style = () => {
+        const declarations = Array.from({ length: 1 + upTo(2) }, declaration);
+        return `${random() < 0.1 ? ';' : ''}${declarations.join(pick(STYLE_SEPARATORS))}${random() < 0.3 ? ';' : ''}`;
+    };
+    const styleAttribute = () => {
+        const roll = random();
+        if (roll < 0.35) return '';
+        if (roll < 0.4) return ' style=""';
+        return ` style="${style()}"`;
+    };
+    const phrasing = (depth) => {
+        const pieces = [];
+        if (random() < 0.45) pieces.push(Array.from({ length: 1 + upTo(3) }, () => pick(LEADING_SPACE_TOKENS)).join(''));
+        const count = upTo(2);
+        for (let i = 0; i < count; i += 1) {
+            const roll = random();
+            if (roll < 0.55 || depth >= MAX_NESTING_DEPTH) {
+                pieces.push(pick(TEXT_WORDS));
+            } else if (roll < 0.85) {
+                const tag = pick(INLINE_TAGS);
+                pieces.push(`<${tag}${styleAttribute()}>${phrasing(depth + 1)}</${tag}>`);
+            } else if (roll < 0.93) {
+                pieces.push('<br>');
+            } else {
+                pieces.push(`<img src="a.png" style="width:${1 + upTo(400)}px">`);
+            }
+        }
+        return pieces.join('');
+    };
+    const block = (depth) => {
+        const tag = depth >= MAX_NESTING_DEPTH ? 'p' : pick(BLOCK_TAGS);
+        if (tag === 'ul') {
+            const items = Array.from({ length: 1 + upTo(2) }, () => `<li${styleAttribute()}>${flow(depth + 1)}</li>`);
+            return `<ul${styleAttribute()}>${items.join('')}</ul>`;
+        }
+        const content = PHRASING_BLOCK_TAGS.has(tag) ? phrasing(depth + 1) : flow(depth + 1);
+        return `<${tag}${styleAttribute()}>${content}</${tag}>`;
+    };
+    const flow = (depth) => Array.from({ length: 1 + upTo(2) },
+        () => (depth < MAX_NESTING_DEPTH && random() < 0.6 ? block(depth) : phrasing(depth))).join('');
+    return () => `<div${styleAttribute()}>${flow(1)}</div>`;
+}
+
+describe('叶子块缩进的逐元素缓存：祖先 style 只匹配一次', () => {
+    test(`markIndents：${SHARED_STYLE_LEAF_COUNT} 个叶子块共享一个 ${SHARED_STYLE_MB} MB 空白 style 的祖先时，单次调用在绝对上限内，每个叶子块都得到 2 字缩进标记`, (t) => {
+        // Arrange：在计时区间外新构造输入，载入方式与 url 解析器的 preprocessHtml 相同
+        const $ = cheerio.load(sharedStyleFragment(), null, false);
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        markIndents($);
+        const elapsedMs = elapsedMsSince(started);
+
+        // Assert：先验结果正确，以免「快」来自少做了事——外层的 2em 经中层继承到每个叶子块
+        assert.deepEqual($('p').map((_, el) => $(el).text()).get(), expectedSharedStyleTexts());
+        t.diagnostic(`markIndents 实测 ${elapsedMs.toFixed(1)} ms，上限 ${SHARED_STYLE_BUDGET_MS} ms`);
+        assert.ok(
+            elapsedMs < SHARED_STYLE_BUDGET_MS,
+            `markIndents 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${SHARED_STYLE_BUDGET_MS} ms`,
+        );
+    });
+
+    test(`annotateLayout：${SHARED_STYLE_LEAF_COUNT} 个叶子块共享一个 ${SHARED_STYLE_MB} MB 空白 style 的祖先时，单次调用在绝对上限内，每个叶子块都得到 2 字缩进标记`, (t) => {
+        // Arrange：在计时区间外新构造输入，载入方式与 web/extract 的 Readability 分支相同
+        const { document } = parseHTML(wrapDocument(sharedStyleFragment()));
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        annotateLayout(document);
+        const elapsedMs = elapsedMsSince(started);
+
+        // Assert：先验结果正确——标记作为文本节点插在每个叶子块之首
+        assert.deepEqual(Array.from(document.querySelectorAll('p'), (p) => p.textContent), expectedSharedStyleTexts());
+        t.diagnostic(`annotateLayout 实测 ${elapsedMs.toFixed(1)} ms，上限 ${SHARED_STYLE_BUDGET_MS} ms`);
+        assert.ok(
+            elapsedMs < SHARED_STYLE_BUDGET_MS,
+            `annotateLayout 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${SHARED_STYLE_BUDGET_MS} ms`,
+        );
+    });
+
+    test('与逐叶重扫祖先 style 链的旧实现逐字等价：随机 HTML 经 markIndents（cheerio）与 annotateLayout（linkedom）的序列化结果相同，各分支均有样本', (t) => {
+        // Arrange：种子固定的随机片段；两条路径各自的命中计数
+        const nextPage = createPageGenerator(createSeededRandom(20260924));
+        const cheerioHits = emptyHits([...RESOLVER_BRANCHES, ...CHEERIO_ONLY_BRANCHES]);
+        const domHits = emptyHits(RESOLVER_BRANCHES);
+
+        for (let index = 0; index < RANDOM_PAGE_COUNT; index += 1) {
+            const fragment = nextPage();
+
+            // Act ①：同一片段载入两次，一份跑逐叶重扫的旧实现，一份跑逐元素缓存的新实现
+            const $expected = cheerio.load(fragment, null, false);
+            uncachedMarkIndents($expected, cheerioHits);
+            const $actual = cheerio.load(fragment, null, false);
+            markIndents($actual);
+            // Assert ①：序列化结果逐字相同；只在不一致时拼装诊断信息
+            const expectedHtml = $expected.html();
+            const actualHtml = $actual.html();
+            if (actualHtml !== expectedHtml) {
+                assert.equal(actualHtml, expectedHtml, `cheerio 路径第 ${index} 份样本：${toVisible(fragment)}`);
+            }
+
+            // Act ②：linkedom 路径同理
+            const { document: expectedDocument } = parseHTML(wrapDocument(fragment));
+            uncachedAnnotateLayout(expectedDocument, domHits);
+            const { document: actualDocument } = parseHTML(wrapDocument(fragment));
+            annotateLayout(actualDocument);
+            // Assert ②
+            const expectedDom = expectedDocument.toString();
+            const actualDom = actualDocument.toString();
+            if (actualDom !== expectedDom) {
+                assert.equal(actualDom, expectedDom, `linkedom 路径第 ${index} 份样本：${toVisible(fragment)}`);
+            }
+        }
+
+        // 覆盖自证：两条路径各自的每个分支都须有命中样本，差分才不是对某一分支空转
+        for (const [label, hits, branches] of [
+            ['cheerio（markIndents）', cheerioHits, [...RESOLVER_BRANCHES, ...CHEERIO_ONLY_BRANCHES]],
+            ['linkedom（annotateLayout）', domHits, RESOLVER_BRANCHES],
+        ]) {
+            t.diagnostic(`${label} 路径 ${RANDOM_PAGE_COUNT} 份样本：`
+                + `${branches.map(([key, description]) => `${description} ${hits[key]}`).join('，')}`);
+            for (const [key, description] of branches) {
+                assert.ok(hits[key] > 0, `${label} 路径中「${description}」的样本数为 0`);
+            }
+        }
     });
 });
