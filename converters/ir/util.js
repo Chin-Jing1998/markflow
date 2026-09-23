@@ -5,7 +5,7 @@
  *   - 名称处理：sanitizeFolderName（含 Windows 保留设备名规避）/ stripExt / normalizeAuthor
  *   - 文本收集：collectText
  *   - 扩展名推断：getExtFromContentType / getExtFromUrl
- *   - HTML 清洗：stripHtml / removeHtmlTags
+ *   - HTML 清洗：stripHtml / removeHtmlComments / removeHtmlTags
  *   - 目录：ensureDir
  *
  * Turndown 工厂与 HTML 表格转换已迁往 converters/ir/turndown.js；
@@ -131,9 +131,8 @@ async function ensureDir(dir) {
 
 // 去除 HTML 标签（连同 script/style 内容与注释），并还原常见实体
 function stripHtml(value) {
-    const withoutComments = String(value || '')
-        .replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '')
-        .replace(/<!--[\s\S]*?-->/g, '');
+    const withoutComments = removeHtmlComments(String(value || '')
+        .replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, ''));
     return removeHtmlTags(withoutComments)
         .replace(/&nbsp;/g, ' ')
         .replace(/&lt;/g, '<')
@@ -142,6 +141,25 @@ function stripHtml(value) {
         .replace(/&#39;/g, "'")
         .replace(/&amp;/g, '&')
         .trim();
+}
+
+// stripHtml 的去注释一步。旧式为 .replace(/<!--[\s\S]*?-->/g, '')：某个「<!--」之后再无「-->」时，[\s\S]*? 从该处逐位扩展到
+// 串尾、处处失配，其后每个「<!--」起点都重来一遍，耗时随这一段的长度平方增长。新式先求末个「-->」的起点 last：没有时旧式无一处
+// 匹配，原样返回；否则令 end = last + 3，只对 [0, end) 执行原正则替换，再原样接上 [end, 串尾)。等价判据：起点 p 处能否匹配、
+// 止于何处，只取决于 p 处是否为「<!--」与 p + 4 及其后首个「-->」的位置——last ≥ p + 4 时首个这样的「-->」不晚于 last，整段匹配
+// 落在 [0, end) 之内，截取前后相同；last < p + 4 时 p + 4 及其后再无「-->」，两边都失配；p ≥ end 时其后再无「-->」，旧式在该处
+// 失配，截取后的前缀里也没有这样的起点。前缀之内失配的「<!--」只能与末个「-->」重叠：「<!-->」即 p = last - 2，「<!--->」即
+// p = last - 3，二者互斥；旧式在该处扫到串尾、新式扫到 end，都找不到 p + 4 及其后的「-->」，新式只多扫至多 2 个码元。故全局替换
+// 逐轮取得的匹配序列相同，[end, 串尾) 在旧式里同样原样保留。线性：前缀里除这至多一处重叠起点外，每个「<!--」都一次成功，
+// [\s\S]*? 只扫过自身的匹配区间，下一轮自匹配终点起算，每个码元只被扫过常数次
+
+/** 自左向右删去「<!--」起、至其后首个不与之重叠的「-->」止的每一段；与 String(text).replace(/<!--[\s\S]*?-->/g, '') 逐字相同 */
+function removeHtmlComments(text) {
+    const value = String(text);
+    const last = value.lastIndexOf('-->');
+    if (last < 0) return value;
+    const end = last + 3;
+    return value.slice(0, end).replace(/<!--[\s\S]*?-->/g, '') + value.slice(end);
 }
 
 // stripHtml 的去标签一步。旧式为 .replace(/<[^>]*>/g, '')：某个「<」之后再无「>」时，[^>]* 从该处扫到串尾再逐位回退、处处
@@ -159,6 +177,6 @@ function removeHtmlTags(text) {
 }
 
 module.exports = {
-    stripHtml, removeHtmlTags, sanitizeFolderName, stripExt, normalizeAuthor, collectText,
+    stripHtml, removeHtmlComments, removeHtmlTags, sanitizeFolderName, stripExt, normalizeAuthor, collectText,
     getExtFromContentType, getExtFromUrl, ensureDir,
 };

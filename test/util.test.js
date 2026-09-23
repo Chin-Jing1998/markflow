@@ -2,7 +2,8 @@
  * converters/ir/util.js 单元测试
  * 覆盖：sanitizeFolderName（含 Windows 保留名）、normalizeAuthor（占位作者名过滤）、stripExt、
  *       collectText、扩展名推断、ensureDir；
- *       stripHtml 的去标签在 8 万个未闭合「<」长段上的耗时上限，removeHtmlTags 与整条 stripHtml 同线性化之前的实现逐字等价（差分）
+ *       stripHtml 的去标签在 8 万个未闭合「<」长段上的耗时上限，removeHtmlTags 与整条 stripHtml 同线性化之前的实现逐字等价（差分）；
+ *       stripHtml 的去注释在 8 万个未闭合「<!--」长段上的耗时上限，removeHtmlComments 与整条 stripHtml 同线性化之前的实现逐字等价（差分）
  */
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -625,6 +626,201 @@ describe('stripHtml 去标签：线性于串长', () => {
         assert.ok(counts.strayClose > 0, '没有标签之外孤立「>」的样本');
         assert.ok(counts.strayCloseBeforeOpen > 0, '没有孤立「>」位于首个「<」之前的样本');
         assert.ok(counts.terminatorInTag > 0, '没有标签内含行终止符的样本');
+        assert.ok(steps.blocks > 0, '没有删去 script/style 块的样本');
+        assert.ok(steps.comments > 0, '没有删去注释的样本');
+        assert.ok(steps.tags > 0, '整条清洗中没有删去标签的样本');
+        assert.ok(steps.entities > 0, '没有还原实体的样本');
+        assert.ok(steps.trim > 0, '没有修剪首尾的样本');
+    });
+});
+
+// ============================================================
+// stripHtml 去注释：线性于串长（耗时上限与逐字等价）
+// ============================================================
+
+// 耗时用例的输入规模：<div> 之后是 8 万个「<!--」，其后直到串尾都没有「-->」
+const COMMENT_STRESS_COUNT = 80000;
+// 上限的取法同 EDGE_STRESS_BUDGET_MS。200 ms 使两侧余量都不小于 5 倍——线性化之前的 /<!--[\s\S]*?-->/g 经 stripHtml 在这一规模上，
+// 于本文件内（前一节已调用 stripHtml 数十万次）实测约 2.3 秒，在新进程里直接调用约 4.5 秒（新进程里 2 万、4 万时约 0.27、1.1 秒，
+// 耗时随「<!--」的个数平方增长），较小者也是上限的 11 倍以上；若只取 4 万个，前者约 0.57 秒，余量不足 5 倍，故取 8 万个。线性化
+// 之后单独运行时单次调用约 0.3 至 0.6 毫秒，全量并行运行时至多约 1.2 毫秒，仍不到上限的一百五十分之一
+const COMMENT_STRESS_BUDGET_MS = 200;
+
+// 去注释一步的单步参照：某个「<!--」之后再无「-->」时，[\s\S]*? 从该处逐位扩展到串尾、处处失配，其后每个「<!--」起点都重来
+// 一遍，耗时随这一段的长度平方增长
+const legacyRemoveHtmlComments = (text) => String(text).replace(/<!--[\s\S]*?-->/g, '');
+
+// 去注释差分的典型样本，逐一对应下文的分支：不含「-->」（新式提前返回，含未闭合的「<!--」）；含「<!--」与「-->」而零匹配
+// （「-->」在「<!--」之前，或只与之重叠）；含「-->」而不含「<!--」；恰一处匹配；两处及以上匹配（含两段之间夹正文者）；末个匹配
+// 之后仍余「<!--」；不属于任何匹配的孤立「-->」（含位于首个「<!--」之前者）；末个「-->」与「<!--」重叠的「<!-->」「<!--->」；
+// 空注释「<!---->」；注释内含第二个「<!--」；注释内含行终止符；末个「-->」之后仍有字符；与去 script/style 块、去标签两步的
+// 衔接；末两项为耗时用例输入的缩微形态及其闭合对照
+const COMMENT_TYPICAL_SAMPLES = [
+    '', '图 1 示意图', '<!--', '<!-- 未闭合', 'a -> b', '<!-', '--',
+    '--><!--', '<!-->', '<!--->',
+    '-->', 'a-->b',
+    '<!-- x -->', 'a<!-- b -->c', '<!--<b>-->',
+    '<!--a--><!--b-->', '<!--a-->x<!--b-->', '<!----><!---->',
+    '<!--a--><!--', '<!--a-->b<!--c',
+    '<!--a-->-->', '--><!--a-->',
+    'x<!-->', '<!--a--><!-->', '<!--a--><!--->',
+    '<!---->', 'a<!---->b',
+    '<!--<!---->', '<!-- a <!-- b -->',
+    '<!--\n-->', '<!--a\r\nb-->', `<!--${LINE_SEPARATOR}-->`, `<!--${PARAGRAPH_SEPARATOR}x-->`,
+    '<!--a-->b', '<!---->-->x',
+    '<script><!--</script>-->', '<!--<script>-->x</script>', '<b><!-- c --></b>', '<!-- a > b -->x',
+    `<div>${'<!--'.repeat(8)}`, `<div>${'<!--'.repeat(8)}-->`,
+];
+// 穷举短串的字母表：注释的起止记号、它们的零件「<」「!」「-」「>」与字母
+const COMMENT_DIFF_ALPHABET = ['<!--', '-->', '<', '!', '-', '>', 'a'];
+// 一般随机串的记号：注释的零件——「-」放三份，「<」「>」各两份，另有「<!」「--」「->」，以提高拼出「<!--」「-->」的
+// 机会；字母、中文、「&」「;」「/」；各类空白与行终止符
+const COMMENT_RANDOM_TOKENS = [
+    '<', '<', '!', '-', '-', '-', '>', '>', '<!', '--', '->', 'a', '图', '&', ';', '/',
+    ' ', '\t', '\n', '\r', NBSP, IDEOGRAPHIC_SPACE, BYTE_ORDER_MARK, LINE_SEPARATOR, PARAGRAPH_SEPARATOR,
+];
+// 结构化随机串的片段：完整注释（含空注释「<!---->」，以及内含「>」「<!--」、标签或行终止符者）、注释的两半（各放两份）、与末个
+// 「-->」重叠的「<!-->」「<!--->」；标签与注释的零件；script/style 块及其起止标签；实体（含还原之后才成「<!--」的「&lt;!--」）；
+// 正文与空白
+const COMMENT_RANDOM_FRAGMENTS = [
+    '<!-- x -->', '<!--a-->', '<!---->', '<!-- a>b -->', '<!--<!-- -->', '<!--<b>-->',
+    '<!--\n-->', `<!--${LINE_SEPARATOR}-->`, `<!--a${PARAGRAPH_SEPARATOR}-->`,
+    '<!--', '<!--', '-->', '-->', '<!-->', '<!--->',
+    '<b>', '</b>', '<a<b>', '<', '>', '-', '--', '!',
+    '<script>a</script>', '<style>p{}</style>', '<script>', '</script>', '<STYLE>', '</style >',
+    '&lt;!--', '&amp;', '&nbsp;', '&gt;',
+    '图 1', 'x', ' ', NBSP, IDEOGRAPHIC_SPACE, '\n', '\t',
+];
+
+describe('stripHtml 去注释：线性于串长', () => {
+    test('<div> 之后 8 万个「<!--」其后无「-->」，去注释不触发回溯：stripHtml 单次调用在绝对上限内，输出逐字正确', (t) => {
+        // Arrange：在计时区间外新构造字符串——V8 对「同一字符串对象 + 同一全局正则」的 replace 结果有缓存
+        const input = `<div>${'<!--'.repeat(COMMENT_STRESS_COUNT)}`;
+        const expected = '<!--'.repeat(COMMENT_STRESS_COUNT);
+
+        // Act：计时区间只包这一次调用
+        const started = process.hrtime.bigint();
+        const result = util.stripHtml(input);
+        const elapsedMs = elapsedMsSince(started);
+        t.diagnostic(`stripHtml 实测 ${elapsedMs.toFixed(2)} ms`);
+
+        // Assert：先验输出正确，以免「快」来自少做了事——<div> 被删去，其后的「<!--」无一闭合、逐个保留。不一致时只报长度与首尾
+        // 各 8 个码点，免得断言信息被 32 万字的整串淹没
+        if (result !== expected) {
+            assert.fail(`stripHtml 输出不符：长 ${result.length}，首 [${toCodePoints(result.slice(0, 8))}]，`
+                + `尾 [${toCodePoints(result.slice(-8))}]`);
+        }
+        assert.ok(
+            elapsedMs < COMMENT_STRESS_BUDGET_MS,
+            `stripHtml 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${COMMENT_STRESS_BUDGET_MS} ms`,
+        );
+    });
+
+    test('removeHtmlComments 与 stripHtml 同线性化之前的实现逐字等价：BMP 逐码元、穷举短串与随机串，各分支与各步均有样本', (t) => {
+        // Arrange：典型样本在前
+        const samples = [...COMMENT_TYPICAL_SAMPLES, ...STRIP_HTML_CHAIN_SAMPLES];
+        // BMP 逐码元 262144 个：每个码元放进四个位置——完整注释之内，考察 [\s\S] 对任意码元的匹配；「<!-」与「-->」之间、
+        // 「<!--x-」与「>」之间，码元为「-」时才拼出注释的起记号或止记号；空注释与其后未闭合的「<!--」之间，即紧接末个「-->」的
+        // 余部首个码元
+        for (let code = 0; code <= 0xffff; code += 1) {
+            const unit = String.fromCharCode(code);
+            samples.push(`<!--${unit}-->`, `<!-${unit}-->`, `<!--x-${unit}>`, `<!---->${unit}<!--`);
+        }
+        // 穷举 137257 个：字母表上由 0 到 6 个记号拼成的全部字符串
+        for (const text of everyStringUpTo(6, COMMENT_DIFF_ALPHABET)) samples.push(text);
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const randomTokens = (tokens, count) => Array.from({ length: count }, () => pick(tokens)).join('');
+        // 一般随机串 30000 个：0 到 24 个随机记号
+        for (let i = 0; i < 30000; i += 1) samples.push(randomTokens(COMMENT_RANDOM_TOKENS, Math.floor(random() * 25)));
+        // 结构化随机串 30000 个：0 到 8 个片段，注释、标签、script/style 块、实体与空白交错，使整条清洗各步之间的衔接也有样本
+        for (let i = 0; i < 30000; i += 1) samples.push(randomTokens(COMMENT_RANDOM_FRAGMENTS, Math.floor(random() * 9)));
+        assert.equal(samples.length, COMMENT_TYPICAL_SAMPLES.length + STRIP_HTML_CHAIN_SAMPLES.length + 459401);
+
+        // Act & Assert：去注释一步的逐字比较，只在不一致时拼装诊断信息，免得数十万次调用都付这笔开销
+        const assertCommentStepMatchesLegacy = (value) => {
+            const expected = legacyRemoveHtmlComments(value);
+            const actual = util.removeHtmlComments(value);
+            if (actual !== expected) {
+                assert.fail(`输入 ${describeInput(value)}：removeHtmlComments 新式 ${describeInput(actual)}，`
+                    + `旧式 ${describeInput(expected)}`);
+            }
+        };
+        // 非字符串入参先比较去注释一步，再比较整条清洗
+        for (const value of STRIP_HTML_NON_STRING_INPUTS) {
+            assertCommentStepMatchesLegacy(value);
+            assertStripHtmlMatchesLegacy(value);
+        }
+        const counts = {
+            noClose: 0, zeroMatch: 0, closeWithoutOpen: 0, oneMatch: 0, multiMatch: 0, trailingOpen: 0,
+            strayClose: 0, strayCloseBeforeOpen: 0, overlapLastClose: 0, emptyComment: 0, nestedOpen: 0,
+            terminatorInComment: 0, tailAfterLastClose: 0,
+        };
+        const steps = { blocks: 0, comments: 0, tags: 0, entities: 0, trim: 0 };
+        for (const sample of samples) {
+            assertCommentStepMatchesLegacy(sample);
+            assertStripHtmlMatchesLegacy(sample, steps);
+            // 分支归类只用旧式的结果与测试内独立求得的输入特征：comments 为旧式正则在该样本上的全部匹配（带位置）
+            const comments = Array.from(sample.matchAll(/<!--[\s\S]*?-->/g));
+            const firstOpen = sample.indexOf('<!--');
+            const lastClose = sample.lastIndexOf('-->');
+            if (lastClose < 0) counts.noClose += 1;
+            else if (comments.length === 0 && firstOpen >= 0) counts.zeroMatch += 1;
+            else if (comments.length === 0) counts.closeWithoutOpen += 1;
+            else if (comments.length === 1) counts.oneMatch += 1;
+            else counts.multiMatch += 1;
+            if (comments.length > 0) {
+                const lastComment = comments[comments.length - 1];
+                if (sample.includes('<!--', lastComment.index + lastComment[0].length)) counts.trailingOpen += 1;
+            }
+            // 「-->」不与自身重叠，也不会跨在匹配的边界上：每个「-->」要么整个落在某处匹配之内，要么在一切匹配之外，后者即孤立者
+            let stray = false;
+            let strayBeforeOpen = false;
+            for (let at = sample.indexOf('-->'); at >= 0; at = sample.indexOf('-->', at + 1)) {
+                if (!comments.some((comment) => at >= comment.index && at + 3 <= comment.index + comment[0].length)) {
+                    stray = true;
+                    if (firstOpen >= 0 && at < firstOpen) strayBeforeOpen = true;
+                }
+            }
+            if (stray) counts.strayClose += 1;
+            if (strayBeforeOpen) counts.strayCloseBeforeOpen += 1;
+            // 末个「-->」与一个「<!--」重叠：「<!-->」的起点在它之前 2 位，「<!--->」的起点在它之前 3 位
+            if (lastClose >= 2
+                && (sample.startsWith('<!--', lastClose - 2) || (lastClose >= 3 && sample.startsWith('<!--', lastClose - 3)))) {
+                counts.overlapLastClose += 1;
+            }
+            if (comments.some((comment) => comment[0] === '<!---->')) counts.emptyComment += 1;
+            if (comments.some((comment) => comment[0].indexOf('<!--', 1) > 0)) counts.nestedOpen += 1;
+            if (comments.some((comment) => TAG_LINE_TERMINATORS.some((terminator) => comment[0].includes(terminator)))) {
+                counts.terminatorInComment += 1;
+            }
+            if (lastClose >= 0 && lastClose + 3 < sample.length) counts.tailAfterLastClose += 1;
+        }
+        // 覆盖自证：去注释十二类分支都须有样本（前五类按判断链互斥），孤立的「-->」另须有位于首个「<!--」之前者；整条清洗的五步
+        // 都须有样本确有作用。差分才不是对某一分支空转
+        t.diagnostic(`样本 ${samples.length} 个，另有非字符串入参 ${STRIP_HTML_NON_STRING_INPUTS.length} 个；`
+            + `去注释：不含「-->」${counts.noClose}，含「<!--」与「-->」而零匹配 ${counts.zeroMatch}，`
+            + `含「-->」而不含「<!--」${counts.closeWithoutOpen}，恰一处匹配 ${counts.oneMatch}，`
+            + `两处及以上匹配 ${counts.multiMatch}，末个匹配之后仍余「<!--」${counts.trailingOpen}，`
+            + `孤立的「-->」${counts.strayClose}（位于首个「<!--」之前 ${counts.strayCloseBeforeOpen}），`
+            + `末个「-->」与「<!--」重叠 ${counts.overlapLastClose}，`
+            + `空注释「<!---->」${counts.emptyComment}，注释内含第二个「<!--」${counts.nestedOpen}，`
+            + `注释内含行终止符 ${counts.terminatorInComment}，末个「-->」之后仍有字符 ${counts.tailAfterLastClose}`);
+        t.diagnostic(`整条清洗各步确有作用的样本数：删去 script/style 块 ${steps.blocks}，删去注释 ${steps.comments}，`
+            + `删去标签 ${steps.tags}，还原实体 ${steps.entities}，修剪首尾 ${steps.trim}`);
+        assert.ok(counts.noClose > 0, '没有不含「-->」的样本');
+        assert.ok(counts.zeroMatch > 0, '没有含「<!--」与「-->」而零匹配的样本');
+        assert.ok(counts.closeWithoutOpen > 0, '没有含「-->」而不含「<!--」的样本');
+        assert.ok(counts.oneMatch > 0, '没有恰一处匹配的样本');
+        assert.ok(counts.multiMatch > 0, '没有两处及以上匹配的样本');
+        assert.ok(counts.trailingOpen > 0, '没有末个匹配之后仍余「<!--」的样本');
+        assert.ok(counts.strayClose > 0, '没有孤立「-->」的样本');
+        assert.ok(counts.strayCloseBeforeOpen > 0, '没有孤立「-->」位于首个「<!--」之前的样本');
+        assert.ok(counts.overlapLastClose > 0, '没有末个「-->」与「<!--」重叠的样本');
+        assert.ok(counts.emptyComment > 0, '没有空注释「<!---->」的样本');
+        assert.ok(counts.nestedOpen > 0, '没有注释内含第二个「<!--」的样本');
+        assert.ok(counts.terminatorInComment > 0, '没有注释内含行终止符的样本');
+        assert.ok(counts.tailAfterLastClose > 0, '没有末个「-->」之后仍有字符的样本');
         assert.ok(steps.blocks > 0, '没有删去 script/style 块的样本');
         assert.ok(steps.comments > 0, '没有删去注释的样本');
         assert.ok(steps.tags > 0, '整条清洗中没有删去标签的样本');
