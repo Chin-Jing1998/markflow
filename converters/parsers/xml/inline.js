@@ -31,10 +31,19 @@ const LINE_BREAK_RE = /\r?\n[ \t\r\n]*/g;
 const EDGE_SPACE_START_RE = /^[ \t\r\n]+/;
 // 末尾修剪逐字符判定用的单字符正则，字符集与 EDGE_SPACE_START_RE 相同
 const EDGE_SPACE_CHAR_RE = /[ \t\r\n]/;
-// 汉字、全角标点：与 renderers/xml/inline.js 的 CJK_RE 同一范围。按码点声明——区间端点里的兼容表意字与常用字字形相同，
-// 写成字面量无从分辨
-const CJK_RANGES = Object.freeze([[0x2E80, 0x2FFF], [0x3000, 0x303F], [0x3400, 0x4DBF], [0x4E00, 0x9FFF], [0xF900, 0xFAFF], [0xFF00, 0xFFEF]]);
-const CJK_RE = new RegExp(`[${CJK_RANGES.map(([from, to]) => `${String.fromCharCode(from)}-${String.fromCharCode(to)}`).join('')}]`);
+// 汉字、全角标点：与 renderers/xml/inline.js 的 CJK_RANGES 同一范围，两份须同步修改。按码点声明——区间端点里的兼容表意字与
+// 常用字字形相同，写成字面量无从分辨。
+// 末项 U+20000–U+3FFFF 为第 2、3 平面整段，据 Unicode 官方路线图（2026 年版）整段计为汉字：第 2 平面 SIP 专收中日韩统一表意文字
+// 扩展 B、C、D、E、F、I，兼容表意文字补充与统一表意文字部件 A、B（https://www.unicode.org/roadmaps/sip/）；第 3 平面 TIP 专收
+// 扩展 G、H、J 与篆书（https://www.unicode.org/roadmaps/tip/）；两个平面都不收其他文字。第 1 平面的西夏文、女书、表情符号等不计入
+const CJK_RANGES = Object.freeze([
+    [0x2E80, 0x2FFF], [0x3000, 0x303F], [0x3400, 0x4DBF], [0x4E00, 0x9FFF], [0xF900, 0xFAFF], [0xFF00, 0xFFEF], [0x20000, 0x3FFFF],
+]);
+// 按码点做数值判定。原先由 String.fromCharCode 拼成的字符类不带 u 标志、逐个 UTF-16 码元比对，写不出增补平面的区间；
+// BMP 码点的判定与原字符类逐一相同——前六项未变，末项只含大于 0xFFFF 的码点
+const isCjkCodePoint = (codePoint) => CJK_RANGES.some(([from, to]) => codePoint >= from && codePoint <= to);
+// 一个完整字符（单个码元或一对代理）是否为汉字、全角标点；空串（串首、串尾，即没有字符）不是
+const isCjkChar = (char) => char !== '' && isCjkCodePoint(char.codePointAt(0));
 
 const textNode = (value) => ({ type: 'text', value });
 const missingImageText = (file) => `［缺图：${file || '未注明文件名'}］`;
@@ -126,7 +135,12 @@ const hasCodedContent = (node) => node.children.some((child) => child.type === '
  * 回车或换行矛盾，故 r = q，p 取可行起点中最左者，即 max(cursor, 紧邻 q 之前的极大空格制表符段的起点)，恰为回看所得。换行部分
  * 二者都在 q 处以同样的贪婪方式匹配「\r?\n」，尾部 [ \t\r\n]* 同为极大匹配，故段终点相同，传给判定的 before、after 逐字一致。
  * 尾部字符集含空格与制表符，上一段结束位置上的字符不可能是空格或制表符（除非已到串尾），故回看实际总是先止于别的字符或串首，
- * 「不越过 cursor」只起防御作用
+ * 「不越过 cursor」只起防御作用。
+ *
+ * 两侧字符按完整码点取（charEndingAt、charStartingAt）。增补平面的汉字在 UTF-16 串里是一对代理，原先按码元取 whole[start - 1]
+ * 与 whole[cursor]，换行前只取到低代理、换行后只取到高代理，都判为非汉字，于是多出一个空格。新取法只在一侧是成对代理时与按
+ * 码元取不同，而成对代理的码点不在 U+20000–U+3FFFF 时仍判为非汉字；BMP 字符与孤立代理照旧取该码元，判定与改动前逐一相同。
+ * 因此结果只在一侧是增补平面汉字时改变；上段所证的逐字等价就段的划分与回看而言依然成立
  */
 function joinLineBreaks(value) {
     const whole = String(value == null ? '' : value);
@@ -137,21 +151,38 @@ function joinLineBreaks(value) {
         while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
         pieces.push(whole.slice(cursor, start));
         cursor = match.index + match[0].length;
-        pieces.push(joinOneLineBreak(whole[start - 1] || '', whole[cursor] || ''));
+        pieces.push(joinOneLineBreak(charEndingAt(whole, start), charStartingAt(whole, cursor)));
     }
     pieces.push(whole.slice(cursor));
     return pieces.join('');
 }
 
-// 单段的替换判定，与改写前的回调相同：任一侧为空即落在文本节点边界上，交 edgeJoin；两侧皆有字符时，任一侧为汉字或全角标点
-// 即删除，否则换成一个空格
+// 单段的替换判定，与改写前的回调相同：before、after 为段两侧的完整字符（成对代理合为一个，串首、串尾为空串）。任一侧为空即落在
+// 文本节点边界上，交 edgeJoin；两侧皆有字符时，任一侧为汉字或全角标点即删除，否则换成一个空格
 function joinOneLineBreak(before, after) {
     if (!before || !after) return edgeJoin(before || after);
-    return CJK_RE.test(before) || CJK_RE.test(after) ? '' : ' ';
+    return isCjkChar(before) || isCjkChar(after) ? '' : ' ';
 }
 
 // 换行落在文本节点的边界上：另一侧是汉字或同样为空（整个节点只有排版空白）即删除，西文留一个空格
-const edgeJoin = (neighbor) => (!neighbor || CJK_RE.test(neighbor) ? '' : ' ');
+const edgeJoin = (neighbor) => (!neighbor || isCjkChar(neighbor) ? '' : ' ');
+
+// 段两侧的完整字符，串首、串尾为空串，与 renderers/xml/inline.js 的同名函数相同。charEndingAt 取止于下标 index 的字符：前一位是
+// 低代理、再前一位是高代理时二者合为一个码点，否则取前一位的码元；charStartingAt 取始于 index 的字符：codePointAt 在高代理后接
+// 低代理处得整个码点，否则得该码元。孤立代理因而照旧按单个码元判定，不算汉字
+function charEndingAt(whole, index) {
+    if (index <= 0) return '';
+    const paired = index >= 2 && isLowSurrogate(whole.charCodeAt(index - 1)) && isHighSurrogate(whole.charCodeAt(index - 2));
+    return whole.slice(paired ? index - 2 : index - 1, index);
+}
+
+function charStartingAt(whole, index) {
+    if (index >= whole.length) return '';
+    return whole.slice(index, index + (whole.codePointAt(index) > 0xFFFF ? 2 : 1));
+}
+
+const isHighSurrogate = (unit) => unit >= 0xD800 && unit <= 0xDBFF;
+const isLowSurrogate = (unit) => unit >= 0xDC00 && unit <= 0xDFFF;
 
 function mergeText(nodes) {
     const out = [];

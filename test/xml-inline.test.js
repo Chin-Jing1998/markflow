@@ -7,7 +7,9 @@
  *       flattenInline 的软换行合并（joinSoftBreaks）在 8 万个不以换行结尾的 ASCII 空格长段上的耗时上限，
  *       与改为自换行起匹配之前的实现逐字等价（差分，BMP 逐码元与随机串，各分支设命中计数）；
  *       trimRuns 删除首尾软换行在首尾各 4 万个软换行上的耗时上限，与改为下标定界之前的实现逐项等价
- *       （差分，结构穷举与随机片段列表，各分支设命中计数，并验返回新数组、不改动入参）
+ *       （差分，结构穷举与随机片段列表，各分支设命中计数，并验返回新数组、不改动入参）；
+ *       软换行合并把两侧的增补平面汉字（U+20000–U+3FFFF，扩展 B、G）按汉字判定，第 1 平面字符、孤立代理与串首串尾
+ *       行为不变（对照组）；与占位替换参照逐字相同（差分，种子固定的随机串，各分支设命中计数）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -521,4 +523,227 @@ test('与改为下标定界之前的实现逐项等价：结构穷举与种子�
     t.diagnostic(`样本 ${samples.length} 个；各分支命中样本数：`
         + Object.entries(EDGE_BREAK_BRANCHES).map(([key, label]) => `${label} ${hits[key]}`).join('；'));
     for (const [key, label] of Object.entries(EDGE_BREAK_BRANCHES)) assert.ok(hits[key] > 0, `分支「${label}」没有样本命中`);
+});
+
+// ============================================================
+// joinSoftBreaks：增补平面汉字按汉字判定（确定性用例与占位替换差分）
+// ============================================================
+
+// 增补平面的字符一律以码点生成，源码里不出现代理对字面量。扩展 B 取 U+20000 与 U+2A6D6，扩展 G 取 U+30000；对照组取第 1 平面的
+// 表情 U+1F600 与西夏文 U+17000，以及孤立的高代理 U+D840 与低代理 U+DC00——二者恰是 U+20000 的前后两半，相连即成该字
+const EXT_B_FIRST = String.fromCodePoint(0x20000);
+const EXT_B_LATE = String.fromCodePoint(0x2A6D6);
+const EXT_G_FIRST = String.fromCodePoint(0x30000);
+const EMOJI_GRINNING = String.fromCodePoint(0x1F600);
+const TANGUT_FIRST = String.fromCodePoint(0x17000);
+const LONE_HIGH_SURROGATE = String.fromCharCode(0xD840);
+const LONE_LOW_SURROGATE = String.fromCharCode(0xDC00);
+
+// 单个 text 节点经 flattenInline 摊平后的文字，即软换行合并的结果
+const softBreakJoined = (value) => runsText(flattenInline([text(value)]));
+
+// 逐行比对 [说明, 输入, 应得]，返回不符的行：逐码点列出输入、实际与应得，一次报全所有不符的行
+function mismatchedRows(rows, join) {
+    return rows.flatMap(([label, input, expected]) => {
+        const actual = join(input);
+        if (actual === expected) return [];
+        return [`${label}：输入 [${toCodePoints(input)}]，实际 [${toCodePoints(actual)}]，应为 [${toCodePoints(expected)}]`];
+    });
+}
+
+test('增补平面汉字按汉字判定：扩展 B、G 与汉字或全角标点相邻时删除软换行，与西文相邻或落在串首串尾时照旧换成一个空格', () => {
+    // Arrange：两侧都是汉字或全角标点才删除，其余情形（含串首、串尾）一律换成一个空格
+    const rows = [
+        ['两侧皆为扩展 B', `${EXT_B_FIRST}\n${EXT_B_FIRST}`, `${EXT_B_FIRST}${EXT_B_FIRST}`],
+        ['扩展 B 接扩展 G', `${EXT_B_LATE}\n${EXT_G_FIRST}`, `${EXT_B_LATE}${EXT_G_FIRST}`],
+        ['BMP 汉字接扩展 G', `甲\n${EXT_G_FIRST}`, `甲${EXT_G_FIRST}`],
+        ['扩展 B 接全角标点', `${EXT_B_FIRST}\n，`, `${EXT_B_FIRST}，`],
+        ['回看并入空格制表符', `${EXT_G_FIRST} \t\n\t ${EXT_B_LATE}`, `${EXT_G_FIRST}${EXT_B_LATE}`],
+        ['同一串两段', `${EXT_B_FIRST}\n${EXT_B_LATE}\n${EXT_G_FIRST}`, `${EXT_B_FIRST}${EXT_B_LATE}${EXT_G_FIRST}`],
+        ['扩展 B 之前另有孤立高代理', `${LONE_HIGH_SURROGATE}${EXT_B_FIRST}\n乙`, `${LONE_HIGH_SURROGATE}${EXT_B_FIRST}乙`],
+        ['扩展 B 接西文：照旧换成空格', `${EXT_B_FIRST}\nabc`, `${EXT_B_FIRST} abc`],
+        ['西文接扩展 G：照旧换成空格', `abc\n${EXT_G_FIRST}`, `abc ${EXT_G_FIRST}`],
+        ['串首的软换行、后邻扩展 B：照旧换成空格', `\n${EXT_B_FIRST}`, ` ${EXT_B_FIRST}`],
+        ['串尾的软换行、前邻扩展 G：照旧换成空格', `${EXT_G_FIRST}\n`, `${EXT_G_FIRST} `],
+    ];
+
+    // Act & Assert
+    assert.deepEqual(mismatchedRows(rows, softBreakJoined), []);
+});
+
+test('对照组：第 1 平面字符（表情、西夏文）与孤立代理不算汉字，与汉字相邻时照旧换成一个空格', () => {
+    // Arrange：孤立代理按单个码元判定；低代理只与紧邻其前的高代理合为一个码点，高代理只与紧随其后的低代理合为一个码点
+    const rows = [
+        ['BMP 汉字接表情', `甲\n${EMOJI_GRINNING}`, `甲 ${EMOJI_GRINNING}`],
+        ['西夏文接 BMP 汉字', `${TANGUT_FIRST}\n乙`, `${TANGUT_FIRST} 乙`],
+        ['扩展 B 接西夏文', `${EXT_B_FIRST}\n${TANGUT_FIRST}`, `${EXT_B_FIRST} ${TANGUT_FIRST}`],
+        ['U+20000 的前后两半被软换行隔开、各自孤立', `甲${LONE_HIGH_SURROGATE}\n${LONE_LOW_SURROGATE}乙`, `甲${LONE_HIGH_SURROGATE} ${LONE_LOW_SURROGATE}乙`],
+        ['孤立低代理之前是扩展 B 的后半（低代理），不合为一个码点', `${EXT_B_FIRST}${LONE_LOW_SURROGATE}\n乙`, `${EXT_B_FIRST}${LONE_LOW_SURROGATE} 乙`],
+        ['孤立低代理之前是 BMP 汉字，不合为一个码点', `文${LONE_LOW_SURROGATE}\n乙`, `文${LONE_LOW_SURROGATE} 乙`],
+        ['孤立高代理之后是表情的前半（高代理），不合为一个码点', `甲\n${LONE_HIGH_SURROGATE}${EMOJI_GRINNING}`, `甲 ${LONE_HIGH_SURROGATE}${EMOJI_GRINNING}`],
+        ['扩展 G 接孤立低代理', `${EXT_G_FIRST}\n${LONE_LOW_SURROGATE}`, `${EXT_G_FIRST} ${LONE_LOW_SURROGATE}`],
+        ['孤立高代理接扩展 B', `${LONE_HIGH_SURROGATE}\n${EXT_B_FIRST}`, `${LONE_HIGH_SURROGATE} ${EXT_B_FIRST}`],
+    ];
+
+    // Act & Assert
+    assert.deepEqual(mismatchedRows(rows, softBreakJoined), []);
+});
+
+// 本次修改前的软换行合并（增补平面汉字尚不计入），仅作短输入的差分参照：joinSoftBreaks 与 SOFT_BREAK_RE 照录修改前的文件，只改名
+// 以免与上文冲突；其所用的 CJK_RE 与上文的 LEGACY_CJK_RE 逐字相同（只含 BMP 六个区间、由 fromCharCode 拼成的字符类），直接复用。
+// 两侧字符按 UTF-16 码元取，增补平面汉字在换行之前取到其低代理、在换行之后取到其高代理
+const BMP_ONLY_SOFT_BREAK_RE = /\n[ \t]*/g;
+
+function bmpOnlyJoinSoftBreaks(value) {
+    const whole = String(value == null ? '' : value);
+    const pieces = [];
+    let cursor = 0;
+    for (const match of whole.matchAll(BMP_ONLY_SOFT_BREAK_RE)) {
+        let start = match.index;
+        while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
+        const end = match.index + match[0].length;
+        const before = whole[start - 1] || '';
+        const after = whole[end] || '';
+        pieces.push(whole.slice(cursor, start), LEGACY_CJK_RE.test(before) && LEGACY_CJK_RE.test(after) ? '' : ' ');
+        cursor = end;
+    }
+    pieces.push(whole.slice(cursor));
+    return pieces.join('');
+}
+
+// 占位符：BMP 汉字「汉」（U+6C49），落在修改前的 CJK_RE 之内，且不在差分字母表中——输出里的每个「汉」都来自占位
+const SUPPLEMENTARY_PLACEHOLDER = '汉';
+const isSupplementaryCjkChar = (char) => char.length === 2 && char.codePointAt(0) >= 0x20000 && char.codePointAt(0) <= 0x3FFFF;
+
+// 占位替换参照：按字符串迭代器切分 value（成对代理合为一项，孤立代理单独一项），把每个增补平面汉字依次换成占位符，交给修改前的
+// 实现 joinBmpOnly，再按出现次序把占位符依次换回原字符。修改前的实现只增删空白与换行——软换行连同其前后的空格制表符删去或换成
+// 一个空格，段外的字符原样拼回——不重排、不改动非空白字符，占位符在输出里的个数与次序都同输入，故依次换回可逆（个数不符即判
+// 失败）。占位符是 BMP 汉字、旧实现按汉字判定它，参照值因而正是「增补平面汉字按汉字判定、其余与修改前相同」
+function supplementaryPlaceholderReference(value, joinBmpOnly) {
+    const originals = [];
+    const masked = Array.from(value, (char) => {
+        if (!isSupplementaryCjkChar(char)) return char;
+        originals.push(char);
+        return SUPPLEMENTARY_PLACEHOLDER;
+    }).join('');
+    const parts = joinBmpOnly(masked).split(SUPPLEMENTARY_PLACEHOLDER);
+    if (parts.length !== originals.length + 1) assert.fail(`占位符个数不符：输入 [${toCodePoints(value)}]`);
+    return parts.map((part, index) => (index === 0 ? part : originals[index - 1] + part)).join('');
+}
+
+// 含代理码元（无论成对与否）即不是纯 BMP 样本
+function hasSurrogate(value) {
+    for (let i = 0; i < value.length; i += 1) {
+        const unit = value.charCodeAt(i);
+        if (unit >= 0xD800 && unit <= 0xDFFF) return true;
+    }
+    return false;
+}
+
+// 各段两侧的完整字符 [前, 后]：段取自 segmentRe 的各次匹配（整段，含向前回看并入的空格制表符）；两侧按字符串迭代器的切分取整个
+// 码点，串首、串尾为空串。取法与被测实现相互独立，只供分支统计
+function sidesOfSegments(value, segmentRe) {
+    const startingAt = new Map();
+    const endingAt = new Map();
+    let offset = 0;
+    for (const char of value) {
+        startingAt.set(offset, char);
+        offset += char.length;
+        endingAt.set(offset, char);
+    }
+    return Array.from(value.matchAll(segmentRe), (match) => [endingAt.get(match.index) || '', startingAt.get(match.index + match[0].length) || '']);
+}
+
+// 段一侧字符的类别：none 为串首串尾；supplementaryCjk 为增补平面汉字；plane1 为其余成对代理（字母表里只有第 1 平面的表情与
+// 西夏文）；loneHigh、loneLow 为孤立代理；BMP 字符按修改前的 CJK_RE 分为 bmpCjk 与 bmp
+function sideKind(char) {
+    if (char === '') return 'none';
+    if (char.length === 2) return isSupplementaryCjkChar(char) ? 'supplementaryCjk' : 'plane1';
+    const unit = char.charCodeAt(0);
+    if (unit >= 0xD800 && unit <= 0xDBFF) return 'loneHigh';
+    if (unit >= 0xDC00 && unit <= 0xDFFF) return 'loneLow';
+    return LEGACY_CJK_RE.test(char) ? 'bmpCjk' : 'bmp';
+}
+
+// 差分用例须有样本命中的分支（键 → 失败信息与诊断输出里的说明）。计数以样本为单位，同一样本内多段命中同一分支只计一次
+const SUPPLEMENTARY_SOFT_BREAK_BRANCHES = Object.freeze({
+    supplementaryBefore: '两侧皆有字符、换行前为增补平面汉字',
+    supplementaryAfter: '两侧皆有字符、换行后为增补平面汉字',
+    supplementaryBoth: '两侧皆为增补平面汉字而删除',
+    mixedWithBmpCjk: '一侧为增补平面汉字、另一侧为 BMP 汉字或全角标点而删除',
+    supplementaryWithOther: '一侧为增补平面汉字、另一侧不是汉字或全角标点而照旧换成空格',
+    edgeSupplementary: '段起于串首或止于串尾、邻字为增补平面汉字而照旧换成空格',
+    plane1Before: '换行前为第 1 平面字符',
+    plane1After: '换行后为第 1 平面字符',
+    loneHighBefore: '换行前为孤立高代理',
+    loneLowBefore: '换行前为孤立低代理（其前一位不是高代理，不合为一个码点）',
+    loneHighAfter: '换行后为孤立高代理（其后一位不是低代理，不合为一个码点）',
+    loneLowAfter: '换行后为孤立低代理',
+    pureBmp: '不含任何代理且含软换行的纯 BMP 样本（与修改前的实现直接比对）',
+    changed: '参照值与修改前的实现直接所得不同（行为确有变更）',
+});
+
+// 其余类别在换行前、换行后各记一个分支
+const SIDE_KIND_BRANCHES = Object.freeze({
+    plane1: ['plane1Before', 'plane1After'],
+    loneHigh: ['loneHighBefore', 'loneHighAfter'],
+    loneLow: ['loneLowBefore', 'loneLowAfter'],
+});
+
+// 记下一段软换行命中的分支：before、after 为段两侧的完整字符（串首、串尾为空串）
+function recordSupplementarySoftBreakBranches(seen, before, after) {
+    const beforeKind = sideKind(before);
+    const afterKind = sideKind(after);
+    const beforeSupplementary = beforeKind === 'supplementaryCjk';
+    const afterSupplementary = afterKind === 'supplementaryCjk';
+    if (beforeKind === 'none' || afterKind === 'none') {
+        if (beforeSupplementary || afterSupplementary) seen.add('edgeSupplementary');
+    } else {
+        if (beforeSupplementary) seen.add('supplementaryBefore');
+        if (afterSupplementary) seen.add('supplementaryAfter');
+        if (beforeSupplementary && afterSupplementary) seen.add('supplementaryBoth');
+        else if (beforeSupplementary || afterSupplementary) {
+            seen.add((beforeSupplementary ? afterKind : beforeKind) === 'bmpCjk' ? 'mixedWithBmpCjk' : 'supplementaryWithOther');
+        }
+    }
+    if (SIDE_KIND_BRANCHES[beforeKind]) seen.add(SIDE_KIND_BRANCHES[beforeKind][0]);
+    if (SIDE_KIND_BRANCHES[afterKind]) seen.add(SIDE_KIND_BRANCHES[afterKind][1]);
+}
+
+test('与占位替换参照逐字相同：种子固定的随机串覆盖增补平面汉字、第 1 平面字符、孤立代理与纯 BMP 各分支', (t) => {
+    // Arrange：BMP 逐码元的比对已由上文「与改为自换行起匹配之前的软换行合并逐字等价」一例覆盖（全部 65536 个码元置于换行两侧），
+    // 此处不重复。随机串 60000 个：长 0 到 12 个字元，每个字元以一半概率取自空格、制表符与换行，否则取自其余 13 个——回车、ASCII
+    // 字母、BMP 汉字、全角标点、U+00A0、U+3000、扩展 B 两字与扩展 G 一字、表情与西夏文（成对代理整对插入），以及孤立的高代理与低代理
+    const random = createSeededRandom(20260923);
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const blanks = [' ', '\t', '\n'];
+    const others = [
+        '\r', 'a', '文', '，', NO_BREAK_SPACE, IDEOGRAPHIC_SPACE, EXT_B_FIRST, EXT_B_LATE, EXT_G_FIRST, EMOJI_GRINNING, TANGUT_FIRST,
+        LONE_HIGH_SURROGATE, LONE_LOW_SURROGATE,
+    ];
+    const randomToken = () => (random() < 0.5 ? pick(blanks) : pick(others));
+    const samples = Array.from({ length: 60000 }, () => Array.from({ length: Math.floor(random() * 13) }, randomToken).join(''));
+    assert.equal(samples.length, 60000);
+
+    // Act & Assert：纯 BMP 样本与修改前的实现直接比对，不经占位替换；其余与占位替换参照比对。只在不一致时拼装诊断信息
+    const hits = Object.fromEntries(Object.keys(SUPPLEMENTARY_SOFT_BREAK_BRANCHES).map((key) => [key, 0]));
+    for (const value of samples) {
+        const bmpOnly = bmpOnlyJoinSoftBreaks(value);
+        const pureBmp = !hasSurrogate(value);
+        const expected = pureBmp ? bmpOnly : supplementaryPlaceholderReference(value, bmpOnlyJoinSoftBreaks);
+        const actual = softBreakJoined(value);
+        if (actual !== expected) {
+            assert.equal(actual, expected, `输入 [${toCodePoints(value)}]；实际 [${toCodePoints(actual)}]；应为 [${toCodePoints(expected)}]`);
+        }
+        const seen = new Set();
+        const sides = sidesOfSegments(value, LEGACY_SOFT_BREAK_RE);
+        for (const [before, after] of sides) recordSupplementarySoftBreakBranches(seen, before, after);
+        if (pureBmp && sides.length > 0) seen.add('pureBmp');
+        if (expected !== bmpOnly) seen.add('changed');
+        for (const key of seen) hits[key] += 1;
+    }
+    // 覆盖自证：各分支都须有样本命中，差分才不是空转
+    t.diagnostic(`样本 ${samples.length} 个；各分支命中样本数：`
+        + Object.entries(SUPPLEMENTARY_SOFT_BREAK_BRANCHES).map(([key, label]) => `${label} ${hits[key]}`).join('；'));
+    for (const [key, label] of Object.entries(SUPPLEMENTARY_SOFT_BREAK_BRANCHES)) assert.ok(hits[key] > 0, `分支「${label}」没有样本命中`);
 });

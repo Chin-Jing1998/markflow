@@ -14,6 +14,8 @@
  *     之前的实现逐字等价（差分）；
  *   首尾空白节点剥离——trimInline 在段首、段尾各 6 万个空白节点（换行与空白文本交替）上的耗时上限，与一次切片之前的
  *     实现逐项等价、不改动入参（差分）；
+ *   增补平面汉字——joinLineBreaks 把换行两侧的 U+20000–U+3FFFF（扩展 B、G）按汉字判定，含文本节点边界；第 1 平面字符与孤立
+ *     代理不算汉字、行为不变（对照组）；BMP 逐码元与修改前的实现逐字相同，随机串与占位替换参照逐字相同（差分，各分支设命中计数）；
  *   问题清单——全部带「导入：」前缀，人工参照夹具的丢失项清单不多不少。
  * 夹具一律程序化合成（test/fixtures/patent/roundtrip/build-roundtrip-fixtures.js），正文为虚构示例。
  */
@@ -1250,5 +1252,239 @@ describe('trimInline：首尾空白节点的剥离线性于节点数', () => {
         // 覆盖自证：各可达分支须有样本命中，差分才不是只对「无事可做」的输入空转
         t.diagnostic(`样本 ${samples.length} 个；各分支命中样本数 ${Object.entries(hits).map(([key, count]) => `${key}=${count}`).join('，')}`);
         for (const [key, label] of Object.entries(STRIP_HIT_LABELS)) assert.ok(hits[key] > 0, `没有样本命中：${label}`);
+    });
+});
+
+// ============================================================
+// joinLineBreaks：增补平面汉字按汉字判定（确定性用例与占位替换差分）
+// ============================================================
+
+// 增补平面的字符一律以码点生成，源码里不出现代理对字面量。扩展 B 取 U+20000 与 U+2A6D6，扩展 G 取 U+30000；对照组取第 1 平面的
+// 表情 U+1F600 与西夏文 U+17000，以及孤立的高代理 U+D840 与低代理 U+DC00——二者恰是 U+20000 的前后两半，相连即成该字
+const EXT_B_FIRST = String.fromCodePoint(0x20000);
+const EXT_B_LATE = String.fromCodePoint(0x2A6D6);
+const EXT_G_FIRST = String.fromCodePoint(0x30000);
+const EMOJI_GRINNING = String.fromCodePoint(0x1F600);
+const TANGUT_FIRST = String.fromCodePoint(0x17000);
+const LONE_HIGH_SURROGATE = String.fromCharCode(0xD840);
+const LONE_LOW_SURROGATE = String.fromCharCode(0xDC00);
+
+// 逐行比对 [说明, 输入, 应得]，返回不符的行：逐码点列出输入、实际与应得，一次报全所有不符的行
+function mismatchedRows(rows, join) {
+    return rows.flatMap(([label, input, expected]) => {
+        const actual = join(input);
+        if (actual === expected) return [];
+        return [`${label}：输入 [${toCodePoints(input)}]，实际 [${toCodePoints(actual)}]，应为 [${toCodePoints(expected)}]`];
+    });
+}
+
+// 本次修改前的实现（增补平面汉字尚不计入），仅作短输入的差分参照：joinLineBreaks、joinOneLineBreak、edgeJoin 与 LINE_BREAK_RE
+// 照录修改前的文件，只改名以免与上文冲突；其所用的 CJK_RE 与上文的 LEGACY_CJK_RE 逐字相同（只含 BMP 六个区间、由 fromCharCode
+// 拼成的字符类），直接复用。两侧字符按 UTF-16 码元取，增补平面汉字在换行之前取到其低代理、在换行之后取到其高代理
+const BMP_ONLY_LINE_BREAK_RE = /\r?\n[ \t\r\n]*/g;
+
+function bmpOnlyJoinLineBreaks(value) {
+    const whole = String(value == null ? '' : value);
+    const pieces = [];
+    let cursor = 0;
+    for (const match of whole.matchAll(BMP_ONLY_LINE_BREAK_RE)) {
+        let start = match.index;
+        while (start > cursor && (whole[start - 1] === ' ' || whole[start - 1] === '\t')) start -= 1;
+        pieces.push(whole.slice(cursor, start));
+        cursor = match.index + match[0].length;
+        pieces.push(bmpOnlyJoinOneLineBreak(whole[start - 1] || '', whole[cursor] || ''));
+    }
+    pieces.push(whole.slice(cursor));
+    return pieces.join('');
+}
+
+function bmpOnlyJoinOneLineBreak(before, after) {
+    if (!before || !after) return bmpOnlyEdgeJoin(before || after);
+    return LEGACY_CJK_RE.test(before) || LEGACY_CJK_RE.test(after) ? '' : ' ';
+}
+
+const bmpOnlyEdgeJoin = (neighbor) => (!neighbor || LEGACY_CJK_RE.test(neighbor) ? '' : ' ');
+
+// 占位符：BMP 汉字「汉」（U+6C49），落在修改前的 CJK_RE 之内，且不在差分字母表中——输出里的每个「汉」都来自占位
+const SUPPLEMENTARY_PLACEHOLDER = '汉';
+const isSupplementaryCjkChar = (char) => char.length === 2 && char.codePointAt(0) >= 0x20000 && char.codePointAt(0) <= 0x3FFFF;
+
+// 占位替换参照：按字符串迭代器切分 value（成对代理合为一项，孤立代理单独一项），把每个增补平面汉字依次换成占位符，交给修改前的
+// 实现 joinBmpOnly，再按出现次序把占位符依次换回原字符。修改前的实现只增删空白与换行——含换行的空白段删去或换成一个空格，段外的
+// 字符原样拼回——不重排、不改动非空白字符，占位符在输出里的个数与次序都同输入，故依次换回可逆（个数不符即判失败）。占位符是
+// BMP 汉字、旧实现按汉字判定它，参照值因而正是「增补平面汉字按汉字判定、其余与修改前相同」
+function supplementaryPlaceholderReference(value, joinBmpOnly) {
+    const originals = [];
+    const masked = Array.from(value, (char) => {
+        if (!isSupplementaryCjkChar(char)) return char;
+        originals.push(char);
+        return SUPPLEMENTARY_PLACEHOLDER;
+    }).join('');
+    const parts = joinBmpOnly(masked).split(SUPPLEMENTARY_PLACEHOLDER);
+    if (parts.length !== originals.length + 1) assert.fail(`占位符个数不符：输入 [${toCodePoints(value)}]`);
+    return parts.map((part, index) => (index === 0 ? part : originals[index - 1] + part)).join('');
+}
+
+// 含代理码元（无论成对与否）即不是纯 BMP 样本
+function hasSurrogate(value) {
+    for (let i = 0; i < value.length; i += 1) {
+        const unit = value.charCodeAt(i);
+        if (unit >= 0xD800 && unit <= 0xDFFF) return true;
+    }
+    return false;
+}
+
+// 各段两侧的完整字符 [前, 后]：段取自 segmentRe 的各次匹配（整段，含向前回看并入的空格制表符）；两侧按字符串迭代器的切分取整个
+// 码点，串首、串尾为空串。取法与被测实现相互独立，只供分支统计
+function sidesOfSegments(value, segmentRe) {
+    const startingAt = new Map();
+    const endingAt = new Map();
+    let offset = 0;
+    for (const char of value) {
+        startingAt.set(offset, char);
+        offset += char.length;
+        endingAt.set(offset, char);
+    }
+    return Array.from(value.matchAll(segmentRe), (match) => [endingAt.get(match.index) || '', startingAt.get(match.index + match[0].length) || '']);
+}
+
+// 段一侧字符的类别：none 为串首串尾；supplementaryCjk 为增补平面汉字；plane1 为其余成对代理（字母表里只有第 1 平面的表情与
+// 西夏文）；loneHigh、loneLow 为孤立代理；其余为 bmp
+function sideKind(char) {
+    if (char === '') return 'none';
+    if (char.length === 2) return isSupplementaryCjkChar(char) ? 'supplementaryCjk' : 'plane1';
+    const unit = char.charCodeAt(0);
+    if (unit >= 0xD800 && unit <= 0xDBFF) return 'loneHigh';
+    if (unit >= 0xDC00 && unit <= 0xDFFF) return 'loneLow';
+    return 'bmp';
+}
+
+// 差分用例须有样本命中的分支：键为计数名，值为未命中时的说明。计数以样本为单位，同一样本内多段命中同一分支只计一次
+const SUPPLEMENTARY_LINE_BREAK_HIT_LABELS = Object.freeze({
+    supplementaryBefore: '两侧皆有字符、换行前为增补平面汉字',
+    supplementaryAfter: '两侧皆有字符、换行后为增补平面汉字',
+    supplementaryBoth: '两侧皆为增补平面汉字',
+    edgeStartSupplementary: '串首边界段（文本节点边界）、后邻增补平面汉字',
+    edgeEndSupplementary: '串尾边界段（文本节点边界）、前邻增补平面汉字',
+    plane1Before: '换行前为第 1 平面字符',
+    plane1After: '换行后为第 1 平面字符',
+    loneHighBefore: '换行前为孤立高代理',
+    loneLowBefore: '换行前为孤立低代理（其前一位不是高代理，不合为一个码点）',
+    loneHighAfter: '换行后为孤立高代理（其后一位不是低代理，不合为一个码点）',
+    loneLowAfter: '换行后为孤立低代理',
+    pureBmp: '不含任何代理且含换行段的纯 BMP 样本（与修改前的实现直接比对）',
+    changed: '参照值与修改前的实现直接所得不同（行为确有变更）',
+});
+
+// 其余类别在换行前、换行后各记一个分支
+const SIDE_KIND_BRANCHES = Object.freeze({
+    plane1: ['plane1Before', 'plane1After'],
+    loneHigh: ['loneHighBefore', 'loneHighAfter'],
+    loneLow: ['loneLowBefore', 'loneLowAfter'],
+});
+
+// 记下一段命中的分支：before、after 为段两侧的完整字符（串首、串尾为空串）
+function noteSupplementaryLineBreakBranches(branches, before, after) {
+    const beforeKind = sideKind(before);
+    const afterKind = sideKind(after);
+    if (beforeKind === 'none' || afterKind === 'none') {
+        if (afterKind === 'supplementaryCjk') branches.add('edgeStartSupplementary');
+        if (beforeKind === 'supplementaryCjk') branches.add('edgeEndSupplementary');
+    } else {
+        if (beforeKind === 'supplementaryCjk') branches.add('supplementaryBefore');
+        if (afterKind === 'supplementaryCjk') branches.add('supplementaryAfter');
+        if (beforeKind === 'supplementaryCjk' && afterKind === 'supplementaryCjk') branches.add('supplementaryBoth');
+    }
+    if (SIDE_KIND_BRANCHES[beforeKind]) branches.add(SIDE_KIND_BRANCHES[beforeKind][0]);
+    if (SIDE_KIND_BRANCHES[afterKind]) branches.add(SIDE_KIND_BRANCHES[afterKind][1]);
+}
+
+describe('joinLineBreaks：增补平面汉字按汉字判定', () => {
+    test('扩展 B、G 位于换行一侧或两侧时删除换行，落在文本节点边界上时同样删除', () => {
+        // Arrange：两侧皆有字符时任一侧是汉字即删除；落在节点边界上时由 edgeJoin 只看另一侧，另一侧是汉字即删除
+        const rows = [
+            ['两侧皆为扩展 B', `${EXT_B_FIRST}\n${EXT_B_FIRST}`, `${EXT_B_FIRST}${EXT_B_FIRST}`],
+            ['扩展 B 接扩展 G', `${EXT_B_LATE}\n${EXT_G_FIRST}`, `${EXT_B_LATE}${EXT_G_FIRST}`],
+            ['换行前为西文、后为扩展 B', `abc\n${EXT_B_FIRST}`, `abc${EXT_B_FIRST}`],
+            ['换行前为扩展 G、后为西文', `${EXT_G_FIRST}\nabc`, `${EXT_G_FIRST}abc`],
+            ['回看并入空格制表符，CRLF 与多行空白', `x \t\r\n\t \n ${EXT_B_LATE}y`, `x${EXT_B_LATE}y`],
+            ['同一串两段', `${EXT_B_FIRST}\na\n${EXT_G_FIRST}`, `${EXT_B_FIRST}a${EXT_G_FIRST}`],
+            ['扩展 B 之前另有孤立高代理', `${LONE_HIGH_SURROGATE}${EXT_B_FIRST}\na`, `${LONE_HIGH_SURROGATE}${EXT_B_FIRST}a`],
+            ['串首边界段、后邻扩展 B', `\n  ${EXT_B_FIRST}a`, `${EXT_B_FIRST}a`],
+            ['串尾边界段、前邻扩展 G', `a${EXT_G_FIRST} \t\n`, `a${EXT_G_FIRST}`],
+            ['首尾皆为边界段', `\r\n${EXT_B_LATE}\n`, EXT_B_LATE],
+        ];
+
+        // Act & Assert
+        assert.deepEqual(mismatchedRows(rows, joinLineBreaks), []);
+    });
+
+    test('对照组：第 1 平面字符（表情、西夏文）与孤立代理不算汉字，与西文相邻或落在文本节点边界上时照旧换成一个空格', () => {
+        // Arrange：孤立代理按单个码元判定；低代理只与紧邻其前的高代理合为一个码点，高代理只与紧随其后的低代理合为一个码点
+        const rows = [
+            ['两侧皆为表情', `${EMOJI_GRINNING}\n${EMOJI_GRINNING}`, `${EMOJI_GRINNING} ${EMOJI_GRINNING}`],
+            ['西文接西夏文', `a\n${TANGUT_FIRST}`, `a ${TANGUT_FIRST}`],
+            ['西夏文接西文', `${TANGUT_FIRST}\na`, `${TANGUT_FIRST} a`],
+            ['串首边界段、后邻表情', `\n${EMOJI_GRINNING}`, ` ${EMOJI_GRINNING}`],
+            ['串尾边界段、前邻西夏文', `${TANGUT_FIRST}\n`, `${TANGUT_FIRST} `],
+            ['U+20000 的前后两半被换行隔开、各自孤立', `a${LONE_HIGH_SURROGATE}\n${LONE_LOW_SURROGATE}b`, `a${LONE_HIGH_SURROGATE} ${LONE_LOW_SURROGATE}b`],
+            ['孤立低代理之前是扩展 B 的后半（低代理），不合为一个码点', `${EXT_B_FIRST}${LONE_LOW_SURROGATE}\na`, `${EXT_B_FIRST}${LONE_LOW_SURROGATE} a`],
+            ['孤立低代理之前是 BMP 汉字，不合为一个码点', `文${LONE_LOW_SURROGATE}\na`, `文${LONE_LOW_SURROGATE} a`],
+            ['孤立高代理之后是表情的前半（高代理），不合为一个码点', `a\n${LONE_HIGH_SURROGATE}${EMOJI_GRINNING}`, `a ${LONE_HIGH_SURROGATE}${EMOJI_GRINNING}`],
+            ['串首边界段、后邻孤立低代理', `\n${LONE_LOW_SURROGATE}`, ` ${LONE_LOW_SURROGATE}`],
+            ['串尾边界段、前邻孤立高代理', `${LONE_HIGH_SURROGATE}\n`, `${LONE_HIGH_SURROGATE} `],
+        ];
+
+        // Act & Assert
+        assert.deepEqual(mismatchedRows(rows, joinLineBreaks), []);
+    });
+
+    test('与占位替换参照逐字相同：BMP 逐码元与修改前直接相等，种子固定的随机串覆盖增补平面汉字、第 1 平面字符、孤立代理与纯 BMP 各分支', (t) => {
+        // Arrange：BMP 逐码元 65536 个——每个码元 c 组成「换行 c 换行 a 换行 c 换行」，c 依次紧邻串首边界段之后、换行之前、换行之后与
+        // 串尾边界段之前；串里没有成对的代理，结果须与修改前的实现直接相等，汉字判定对任一 BMP 码元多认或少认都会暴露
+        const sweep = [];
+        for (let code = 0; code <= 0xffff; code += 1) {
+            const unit = String.fromCharCode(code);
+            sweep.push(`\n${unit}\na\n${unit}\n`);
+        }
+        // 随机串 60000 个：长 0 到 12 个字元，每个字元以一半概率取自空格、制表符、回车与换行，否则取自其余 12 个——ASCII 字母、
+        // BMP 汉字、全角标点、U+00A0、U+3000、扩展 B 两字与扩展 G 一字、表情与西夏文（成对代理整对插入），以及孤立的高代理与低代理
+        const random = createSeededRandom(20260923);
+        const pick = (items) => items[Math.floor(random() * items.length)];
+        const blanks = [' ', '\t', '\r', '\n'];
+        const others = [
+            'a', '文', '，', NBSP, IDEOGRAPHIC_SPACE, EXT_B_FIRST, EXT_B_LATE, EXT_G_FIRST, EMOJI_GRINNING, TANGUT_FIRST,
+            LONE_HIGH_SURROGATE, LONE_LOW_SURROGATE,
+        ];
+        const randomToken = () => (random() < 0.5 ? pick(blanks) : pick(others));
+        const samples = Array.from({ length: 60000 }, () => Array.from({ length: Math.floor(random() * 13) }, randomToken).join(''));
+        assert.equal(samples.length, 60000);
+        const mismatch = (value, actual, expected) => `输入 [${toCodePoints(value)}]；实际 [${toCodePoints(actual)}]；应为 [${toCodePoints(expected)}]`;
+
+        // Act & Assert：BMP 逐码元直接比对。只在不一致时拼装诊断信息，免得十余万次调用都付这笔开销
+        for (const value of sweep) {
+            const expected = bmpOnlyJoinLineBreaks(value);
+            const actual = joinLineBreaks(value);
+            if (actual !== expected) assert.equal(actual, expected, mismatch(value, actual, expected));
+        }
+        // 随机串：纯 BMP 样本与修改前的实现直接比对，不经占位替换；其余与占位替换参照比对
+        const hits = Object.fromEntries(Object.keys(SUPPLEMENTARY_LINE_BREAK_HIT_LABELS).map((key) => [key, 0]));
+        for (const value of samples) {
+            const bmpOnly = bmpOnlyJoinLineBreaks(value);
+            const pureBmp = !hasSurrogate(value);
+            const expected = pureBmp ? bmpOnly : supplementaryPlaceholderReference(value, bmpOnlyJoinLineBreaks);
+            const actual = joinLineBreaks(value);
+            if (actual !== expected) assert.equal(actual, expected, mismatch(value, actual, expected));
+            const branches = new Set();
+            const sides = sidesOfSegments(value, LEGACY_LINE_BREAK_RE);
+            for (const [before, after] of sides) noteSupplementaryLineBreakBranches(branches, before, after);
+            if (pureBmp && sides.length > 0) branches.add('pureBmp');
+            if (expected !== bmpOnly) branches.add('changed');
+            for (const key of branches) hits[key] += 1;
+        }
+        // 覆盖自证：各分支须有样本命中，差分才不是只对「无事可做」的输入空转
+        t.diagnostic(`BMP 逐码元 ${sweep.length} 个；随机串 ${samples.length} 个；各分支命中样本数 `
+            + `${Object.entries(hits).map(([key, count]) => `${key}=${count}`).join('，')}`);
+        for (const [key, label] of Object.entries(SUPPLEMENTARY_LINE_BREAK_HIT_LABELS)) assert.ok(hits[key] > 0, `没有样本命中：${label}`);
     });
 });
