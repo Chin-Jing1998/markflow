@@ -9,6 +9,12 @@
  *       逐元素等价（随机属性差分，含 svg 子树内的元素）；
  *       随机短页面经 extractContent 与替换之前的 Readability 链路逐字等价（全链路差分），以及 style 原值进入输出的
  *       三处固定用例（svg 子树的 style、noscript 替换时的 data-old-style、懒加载从 style 复制出的 src）
+ *       Readability 的懒加载修正 _fixLazyImages 改为照录实现 fixLazyImages，其中判定「属性值为单个图片地址」的正则换成线性的
+ *       等价判定 isSingleImageToken：病态属性值（a.jpg 重复后接空格与 b，128 KB）位于正文 <p> 内无 src 的 img、正文中的
+ *       figure 与四轮重试的短正文页时，extractContent 全链路在绝对上限内（耗时），且结果与短值页的输出换回长值后逐字相同；
+ *       isSingleImageToken 与原正则逐值同真假（随机串与结构化串差分）；fixLazyImages 与库自身的 _fixLazyImages 逐字等价
+ *       （随机懒加载元素差分，含 picture、figure 与 svg 内的 img）；随机懒加载页面经 extractContent 与替换之前的 Readability
+ *       链路逐字等价（全链路差分，含多轮重试的短正文页）
  */
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
@@ -17,10 +23,12 @@ const cheerio = require('cheerio');
 const { parseHTML } = require('linkedom');
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
 
-// 以解构导入：未修复的实现没有后三个导出，此时它们只是 undefined，依赖它们的用例各自报错，不致在导入时整体崩溃
+// 以解构导入：可见性判定的三个导出（第二行）与懒加载修正的两个导出（第三行）在各自修复之前都不存在，此时它们只是 undefined，
+// 依赖它们的用例各自报错，不致在导入时整体崩溃
 const {
     extractContent, annotateLayout, READERABLE_OPTIONS, MIN_READABILITY_TEXT_LENGTH,
     inlineStyleValue, isNodeVisible, isProbablyVisible,
+    isSingleImageToken, fixLazyImages,
 } = require('../converters/web/extract');
 
 // 制表符、换行、回车、换页与垂直制表符写作转义序列，其余不可见字符以码点生成，源码里不出现看不见的字面量
@@ -676,4 +684,525 @@ describe('全链路：随机短页面经 extractContent 与替换之前的 Reada
             assert.ok(actual.html.includes(fragment), `输出应含 ${fragment}：${toVisible(actual.html)}`);
         });
     }
+});
+
+// ============================================================
+// 懒加载修正：病态属性值上 extractContent 全链路线性于页面长度
+// ============================================================
+
+// 病态属性值：a.jpg 重复后接空格与 b，共 128 KB（131072 个字符）。首条正则 /\.(jpg|jpeg|png|webp)\s+\d/ 因空格后不是数字而不命中，
+// 于是求值决定 copyTo = 'src' 的原正则：它在首段内每一处「.jpg」都让 \S* 吞到段尾、\s* 吞下空格，遇 b 失败后逐位回溯，耗时随长度
+// 平方增长。两条正则都不命中，该值原样进入输出；值中含 .jpg，_unwrapNoscriptImages 不删这个没有 src 的 img。参照一侧的
+// legacyExtractByReadability 用库缺省的 _fixLazyImages，病态值上同样平方级，故只用于短值页
+const LAZY_VALUE_UNIT = 'a.jpg';
+const LAZY_VALUE_TAIL = ' b';
+const LAZY_VALUE_LENGTH = 128 * 1024;
+const longLazyValue = () => LAZY_VALUE_UNIT.repeat((LAZY_VALUE_LENGTH - LAZY_VALUE_TAIL.length) / LAZY_VALUE_UNIT.length)
+    + LAZY_VALUE_TAIL;
+// 短值页用同一形状只重复一次的值，其原样片段在参照输出中换回长值
+const SHORT_LAZY_VALUE = `${LAZY_VALUE_UNIT}${LAZY_VALUE_TAIL}`;
+const SHORT_LAZY_ATTRIBUTE = `data-x="${SHORT_LAZY_VALUE}"`;
+// 耗时上限同样取绝对值（理由见 LONG_WHITESPACE_BUDGET_MS），300 ms 使两侧余量都不小于 5 倍——未修复的实现在这一规模上，新起进程
+// 只跑单个用例各实测 3 次，三例依次约 3.60 至 3.66、3.62 至 3.77、14.3 至 14.9 秒（整份文件运行 3 次时约 3.6 至 3.8、3.6 至 3.8、
+// 14.0 至 14.8 秒；四轮重试页的 _fixLazyImages 执行四次），最小值也是上限的 11.9 倍；修复之后单独运行本文件三批各 10 次，三例至多约
+// 2.6、1.7、6.0 毫秒，新起进程只跑单个用例各 6 次至多约 3.5、6.4、7.2 毫秒；18 核上三个全量进程并发五轮（与同机其他测试进程并发时）
+// 至多约 2.4、2.1、41.8 毫秒（末者为一次离群值，其余 14 次至多 6.6 毫秒），仍不到上限的七分之一
+const LAZY_IMAGE_BUDGET_MS = 300;
+
+// 正文 <p> 内无 src 的 img：没有 src 与 srcset，_fixLazyImages 逐个检查它的属性
+const lazyImagePage = (value) => wrapPage(
+    `<article><h1>标题</h1><p>${LEAD_PARAGRAPH}</p><p>前文<img data-x="${value}">后文。${TAIL_PARAGRAPH}</p></article>`,
+);
+// 正文中的 figure：linkedom 的 figure 没有 src 与 srcset 取值器，必定逐个检查属性；两条正则都不命中，不新建 img
+const lazyFigurePage = (value) => wrapPage(
+    `<article><h1>标题</h1><p>${LEAD_PARAGRAPH}</p><figure data-x="${value}"><figcaption>图注</figcaption></figure>`
+    + `<p>${TAIL_PARAGRAPH}</p></article>`,
+);
+// 四轮重试的短正文页：Hello 与 world 之间隔 200 个空格。可读性预判按 trim 后的 210 个字符判为可读；Readability 按压缩空白后的
+// 11 个字符计，每轮都不足 charThreshold，逐个去掉三个标志各重试一轮，_grabArticle 共执行四轮，_fixLazyImages 随之执行四次；
+// 最终取正文最长的一轮，其 textContent 不压缩空白，达到 MIN_READABILITY_TEXT_LENGTH，extraction 仍为 readability
+const lazyRetryPage = (value) => '<!DOCTYPE html><html><head><title>t</title></head><body>'
+    + `<p>Hello${' '.repeat(200)}world</p><img data-x="${value}"></body></html>`;
+// 三例：名称、页面构造与参照一侧 _fixLazyImages 的执行次数
+const LAZY_TIMING_CASES = [
+    ['正文 <p> 内无 src 的 img', lazyImagePage, 1],
+    ['正文中的 figure', lazyFigurePage, 1],
+    ['四轮重试的短正文页', lazyRetryPage, 4],
+];
+
+// 统计 run 期间库原型上 _fixLazyImages 的执行次数：临时换成计数包装，用完即恢复。只包住参照链路的调用，extractContent 不受影响
+function countLibraryFixLazyImages(run) {
+    const original = Readability.prototype._fixLazyImages;
+    let calls = 0;
+    Readability.prototype._fixLazyImages = function countedFixLazyImages(root) {
+        calls += 1;
+        return original.call(this, root);
+    };
+    try {
+        const value = run();
+        return { value, calls };
+    } finally {
+        Readability.prototype._fixLazyImages = original;
+    }
+}
+
+function assertWithinLazyImageBudget(t, elapsedMs) {
+    t.diagnostic(`extractContent 实测 ${elapsedMs.toFixed(1)} ms，上限 ${LAZY_IMAGE_BUDGET_MS} ms`);
+    assert.ok(
+        elapsedMs < LAZY_IMAGE_BUDGET_MS,
+        `extractContent 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${LAZY_IMAGE_BUDGET_MS} ms`,
+    );
+}
+
+// 去掉结果中的两处正文串（html 与 article.content），其余字段留作深比较；article 为 null 时照样保留，差异由深比较报出
+const withoutMarkup = ({ article, ...rest }) => ({ ...rest, html: null, article: article && { ...article, content: null } });
+
+describe('懒加载修正：病态属性值上 extractContent 全链路线性于页面长度', () => {
+    for (const [label, buildPage, rounds] of LAZY_TIMING_CASES) {
+        test(`${label}：data-x 为 ${LAZY_VALUE_LENGTH} 个字符的病态值时，单次调用在绝对上限内，结果与短值页的输出换回长值后逐字相同`, (t) => {
+            // Arrange ①：短值页的参照取自替换之前的 Readability 链路，并核对其中 _fixLazyImages 的执行次数；短值片段须恰出现一次，
+            // 才能无歧义地换回长值
+            const shortHtml = buildPage(SHORT_LAZY_VALUE);
+            const { value: expected, calls } = countLibraryFixLazyImages(() => legacyExtractByReadability(shortHtml));
+            assert.ok(expected, '短值页应经 Readability 取得正文');
+            assert.equal(calls, rounds, `参照一侧 _fixLazyImages 应执行 ${rounds} 次`);
+            assert.equal(expected.html.split(SHORT_LAZY_ATTRIBUTE).length - 1, 1, `参照中 ${SHORT_LAZY_ATTRIBUTE} 应恰出现一次`);
+            // Arrange ②：在计时区间外新构造长值页
+            const value = longLazyValue();
+            const html = buildPage(value);
+
+            // Act
+            const { result, elapsedMs } = timedExtract(html);
+
+            // Assert：先验结果正确——其余字段深相等，html 与 article.content 等于把参照中那一处短值换回长值后的串
+            assert.deepEqual(withoutMarkup(result), withoutMarkup(expected));
+            const expectedHtml = expected.html.replace(SHORT_LAZY_ATTRIBUTE, () => `data-x="${value}"`);
+            assertSameText(result.html, expectedHtml, 'html');
+            assertSameText(result.article.content, expectedHtml, 'article.content');
+            assertWithinLazyImageBudget(t, elapsedMs);
+        });
+    }
+});
+
+// ============================================================
+// isSingleImageToken：与原正则逐值同真假
+// ============================================================
+
+// 差分参照：与 Readability 0.6.0 _fixLazyImages 中决定 copyTo = 'src' 的正则字面量逐字相同，用例先核对库源码中确有此字面量
+const SINGLE_IMAGE_TOKEN_RE = /^\s*\S+\.(jpg|jpeg|png|webp)\S*\s*$/;
+// 正则空白类的各类成员：空格、制表符、换行、回车、垂直制表符、换页、U+00A0、U+1680、U+2000、U+200A、U+2028、U+2029、U+202F、
+// U+205F、U+3000、U+FEFF；以及不属于该类的易混字符 U+180E（蒙古文元音分隔符）与 U+200B（零宽空格）。一律以码点生成
+const TOKEN_WHITESPACE = [0x20, 0x09, 0x0a, 0x0d, 0x0b, 0x0c, 0xa0, 0x1680, 0x2000, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]
+    .map((code) => String.fromCharCode(code));
+const TOKEN_CONFUSABLES = [0x180e, 0x200b].map((code) => String.fromCharCode(code));
+// 非空白字符：拼得出四个扩展名的小写字母、点号、大写的 J、P、G 与易混字符
+const TOKEN_NON_WHITESPACE = ['a', 'b', 'j', 'p', 'g', 'e', 'n', 'w', '.', 'J', 'P', 'G', ...TOKEN_CONFUSABLES];
+const TOKEN_ALPHABET = [...TOKEN_NON_WHITESPACE, ...TOKEN_WHITESPACE];
+// 扩展名片段：四个扩展名、大写者，以及近似而不成立者（.jpe、缺点号、.pn）；结构化串另加单个点号、空串与连写
+const TOKEN_EXTENSION_PARTS = ['.jpg', '.jpeg', '.png', '.webp', '.JPG', '.jpe', 'jpg', '.pn'];
+const STRUCTURED_EXTENSION_PARTS = [...TOKEN_EXTENSION_PARTS, '.', '', '.jpg.png'];
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp'];
+const RANDOM_TOKEN_COUNT = 200000;
+const STRUCTURED_TOKEN_COUNT = 100000;
+const IMAGE_TOKEN_BRANCHES = [
+    ['matchBare', '原正则为真、无首尾空白'],
+    ['matchPadded', '原正则为真、带首尾空白'],
+    ['noExtension', '原正则为假：无扩展名'],
+    ['extensionAtStart', '原正则为假：扩展名居段首'],
+    ['multiSegment', '原正则为假：多段（首段后的空白之后仍有非空白）'],
+    ['upperCaseOnly', '原正则为假：扩展名只以大写或大小写混写出现'],
+    ['blank', '原正则为假：空串或全空白'],
+];
+const IMAGE_TOKEN_MATCH_KINDS = new Set(['matchBare', 'matchPadded']);
+
+// 随机串：逐个取片段，四分之一取扩展名片段、五分之一取空白、其余取非空白字符，再截到 0 至 30 的随机长度
+function createRandomTokenGenerator(random) {
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    return () => {
+        const length = Math.floor(random() * 31);
+        let text = '';
+        while (text.length < length) {
+            const roll = random();
+            if (roll < 0.25) text += pick(TOKEN_EXTENSION_PARTS);
+            else if (roll < 0.45) text += pick(TOKEN_WHITESPACE);
+            else text += pick(TOKEN_NON_WHITESPACE);
+        }
+        return text.slice(0, length);
+    };
+}
+
+// 结构化串：前导空白 + 段 + 扩展名片段 + 段 + 尾随空白，半数另接尾巴（段与空白），十分之一再在首字符之后任一处插入一个空白
+function createStructuredTokenGenerator(random) {
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const run = (items, max) => Array.from({ length: Math.floor(random() * (max + 1)) }, () => pick(items)).join('');
+    return () => {
+        let text = run(TOKEN_WHITESPACE, 3) + run(TOKEN_NON_WHITESPACE, 5) + pick(STRUCTURED_EXTENSION_PARTS)
+            + run(TOKEN_NON_WHITESPACE, 4) + run(TOKEN_WHITESPACE, 3);
+        if (random() < 0.5) text += run(TOKEN_NON_WHITESPACE, 3) + run(TOKEN_WHITESPACE, 2);
+        if (random() < 0.1 && text.length > 2) {
+            const at = 1 + Math.floor(random() * (text.length - 1));
+            text = text.slice(0, at) + pick(TOKEN_WHITESPACE) + text.slice(at);
+        }
+        return text;
+    };
+}
+
+// 覆盖归类：只用 trim、indexOf 等字符串运算，不经被测函数，也不用正则。trim 去除的字符集与正则空白类相同，故逐个码元以 trim
+// 判空白；原正则为真，当且仅当去掉首尾空白后是单独一段，且下标 1 及之后有小写的「.扩展名」
+function classifyImageToken(value) {
+    const core = value.trim();
+    if (core === '') return 'blank';
+    for (let at = 0; at < core.length; at += 1) {
+        if (core[at].trim() === '') return 'multiSegment';
+    }
+    if (IMAGE_EXTENSIONS.some((extension) => core.indexOf(extension, 1) >= 0)) return core === value ? 'matchBare' : 'matchPadded';
+    if (IMAGE_EXTENSIONS.some((extension) => core.startsWith(extension))) return 'extensionAtStart';
+    if (IMAGE_EXTENSIONS.some((extension) => core.toLowerCase().includes(extension))) return 'upperCaseOnly';
+    return 'noExtension';
+}
+
+describe('isSingleImageToken：与原正则逐值同真假', () => {
+    test('随机串与结构化串差分：与原正则逐值相同，覆盖归类与原正则一致，各分支均有样本，字母表的每个字符都出现过', (t) => {
+        // Arrange ①：参照正则即库源码中的字面量；字母表中的空白都属正则空白类，易混字符都不属
+        assert.ok(
+            Readability.prototype._fixLazyImages.toString().includes(`/${SINGLE_IMAGE_TOKEN_RE.source}/.test(attr.value)`),
+            '库源码中应有与参照相同的正则字面量',
+        );
+        assert.ok(TOKEN_WHITESPACE.every((unit) => /^\s$/.test(unit)), '字母表中的空白应都属正则空白类');
+        assert.ok(TOKEN_CONFUSABLES.every((unit) => !/\s/.test(unit)), '易混字符应都不属正则空白类');
+        // Arrange ②：两个生成器共用一个固定种子的随机源
+        const random = createSeededRandom(20260927);
+        const generators = [
+            ['随机串', createRandomTokenGenerator(random), RANDOM_TOKEN_COUNT],
+            ['结构化串', createStructuredTokenGenerator(random), STRUCTURED_TOKEN_COUNT],
+        ];
+        const hits = emptyHits(IMAGE_TOKEN_BRANCHES);
+        const seen = new Set();
+
+        for (const [source, nextToken, count] of generators) {
+            for (let index = 0; index < count; index += 1) {
+                const value = nextToken();
+                // Act
+                const expected = SINGLE_IMAGE_TOKEN_RE.test(value);
+                const actual = isSingleImageToken(value);
+                // Assert：只在不一致时拼装诊断信息；归类须与原正则的真假一致，分支名才名副其实
+                if (actual !== expected) assert.equal(actual, expected, `${source}第 ${index} 个：${toVisible(value)}`);
+                const kind = classifyImageToken(value);
+                if (IMAGE_TOKEN_MATCH_KINDS.has(kind) !== expected) {
+                    assert.fail(`${source}第 ${index} 个归为 ${kind}，与原正则的结果 ${expected} 不符：${toVisible(value)}`);
+                }
+                hits[kind] += 1;
+                for (let at = 0; at < value.length; at += 1) seen.add(value[at]);
+            }
+        }
+
+        assertBranchesCovered(t, `随机串 ${RANDOM_TOKEN_COUNT} 个、结构化串 ${STRUCTURED_TOKEN_COUNT} 个`, hits, IMAGE_TOKEN_BRANCHES);
+        const missing = TOKEN_ALPHABET.filter((unit) => !seen.has(unit));
+        assert.equal(missing.length, 0, `字母表中未出现的字符：${missing.map((unit) => toVisible(unit)).join(' ')}`);
+    });
+});
+
+// ============================================================
+// fixLazyImages：与库自身的 _fixLazyImages 逐字等价
+// ============================================================
+
+// 覆盖归类用：库中决定 copyTo = 'srcset' 的首条正则（字面量相同），与 SINGLE_IMAGE_TOKEN_RE 合用即库对「属性值会被复制」的判定
+const SRCSET_TOKEN_RE = /\.(jpg|jpeg|png|webp)\s+\d/;
+const isCopyableValue = (value) => SRCSET_TOKEN_RE.test(value) || SINGLE_IMAGE_TOKEN_RE.test(value);
+// 第二个属性循环按名跳过的三个属性
+const LOOP_SKIPPED_NAMES = new Set(['src', 'srcset', 'alt']);
+const LAZY_ELEMENT_COUNT = 4000;
+// 样本元素：img（权重加倍）、picture、figure 与 svg 内的 img
+const LAZY_ELEMENT_KINDS = ['img', 'img', 'picture', 'figure', 'svgImg'];
+// src 的取法：缺、空串、普通地址、短 base64 占位、长 base64、前缀各处带空格且 BASE64 大写者、MIME 段含 .png 的短 base64（首段
+// 循环须按名跳过 src 本身，否则它自己就使 src 可删）、svg 的 data URL
+const LAZY_SRC_KINDS = ['none', 'empty', 'url', 'base64Short', 'base64Long', 'base64Spaced', 'base64DottedMime', 'svgData'];
+const BASE64_SRC_KINDS = new Set(['base64Short', 'base64Long', 'base64Spaced', 'base64DottedMime']);
+const LAZY_ELEMENT_BRANCHES = [
+    ['earlyReturn', '提前返回（有 src 或有效 srcset，class 不含 lazy）'],
+    ['svgBase64', 'src 为 svg 的 base64 时返回'],
+    ['placeholderRemoved', 'base64 占位图的 src 被删'],
+    ['base64Kept', 'base64 的 src 保留'],
+    ['copiedSrcset', '复制进 srcset'],
+    ['copiedSrc', '复制进 src'],
+    ['figureCreated', 'figure 新建 img'],
+    ['figureHasMedia', 'figure 已含 img 或 picture 而不新建'],
+    ['pictureSet', 'picture 直接设置'],
+    ['svgImageSet', 'svg 内的 img 被处理'],
+    ['altSkipped', 'alt 本可命中而被跳过'],
+];
+
+// base64 载荷：库以编码后不足 133 个字符为占位图，长度取阈值两侧的边界值与更远的值
+const base64Payload = (length) => 'R0lGODlh'.repeat(Math.ceil(length / 8)).slice(0, length);
+
+function lazySrcOf(kind, pick) {
+    switch (kind) {
+        case 'none': return null;
+        case 'empty': return '';
+        case 'url': return 'https://example.com/real.png';
+        case 'base64Short': return `data:image/gif;base64,${base64Payload(pick([40, 132]))}`;
+        case 'base64Long': return `data:image/png;base64,${base64Payload(pick([133, 200]))}`;
+        case 'base64Spaced': return `data: image/png ; BASE64 ,${base64Payload(pick([60, 140]))}`;
+        case 'base64DottedMime': return `data:image/x.png;base64,${base64Payload(40)}`;
+        default: return `data:image/svg+xml;base64,${base64Payload(pick([40, 200]))}`;
+    }
+}
+
+// 属性值池：单个地址、带首尾空白的地址、扩展名后紧接数字的地址（首条正则要求扩展名与数字之间至少一个空白，故此值复制进 src 而非
+// srcset）、srcset 写法（a.jpg 1x, b.jpg 2x 与同形的带序号地址）、两段（病态值的短形）、扩展名居首、仅大写扩展名、普通文字、空串，
+// 以及单个或成串的空白（取自 TOKEN_WHITESPACE）。地址带序号，同一元素上先后复制的值可以区分
+function createLazyValueGenerator(random) {
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const whitespace = () => Array.from({ length: 1 + Math.floor(random() * 3) }, () => pick(TOKEN_WHITESPACE)).join('');
+    let serial = 0;
+    const address = (extension) => {
+        serial += 1;
+        return `https://cdn.example.com/p${serial}.${extension}`;
+    };
+    const makers = [
+        () => address(pick(['jpg', 'jpeg', 'png', 'webp'])),
+        () => `${whitespace()}${address('png')}${whitespace()}`,
+        () => `${address('png')}2`,
+        () => 'a.jpg 1x, b.jpg 2x',
+        () => `${address('jpg')} 1x, ${address('jpg')} 2x`,
+        () => 'a.jpg b',
+        () => '.jpg',
+        () => 'x.JPG',
+        () => '普通文字',
+        () => '',
+        () => whitespace(),
+    ];
+    return () => pick(makers)();
+}
+
+// 随机懒加载元素：src、srcset、class 与 alt、data-src、data-srcset、data-x、title 各自随机出现，属性次序随机打乱；figure 有时
+// 内含 img（带真实 src，自身提前返回）、picture 或图注
+function createLazyElementGenerator(random) {
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const nextValue = createLazyValueGenerator(random);
+    return () => {
+        const kind = pick(LAZY_ELEMENT_KINDS);
+        const srcKind = pick(LAZY_SRC_KINDS);
+        const attributes = [];
+        const src = lazySrcOf(srcKind, pick);
+        if (src !== null) attributes.push(['src', src]);
+        const srcset = pick([null, null, 'null', 'x.jpg 1x']);
+        if (srcset !== null) attributes.push(['srcset', srcset]);
+        const className = pick([null, null, 'lazy', 'LAZY-load', 'photo']);
+        if (className !== null) attributes.push(['class', className]);
+        for (const name of ['alt', 'data-src', 'data-srcset', 'data-x', 'title']) {
+            if (random() < 0.35) attributes.push([name, nextValue()]);
+        }
+        for (let at = attributes.length - 1; at > 0; at -= 1) {
+            const other = Math.floor(random() * (at + 1));
+            [attributes[at], attributes[other]] = [attributes[other], attributes[at]];
+        }
+        const markup = attributes.map(([name, value]) => ` ${name}="${value}"`).join('');
+        let html;
+        if (kind === 'img') html = `<img${markup}>`;
+        else if (kind === 'picture') html = `<picture${markup}></picture>`;
+        else if (kind === 'figure') {
+            const inner = pick(['', '<figcaption>图注</figcaption>', '<img src="https://example.com/inner.png">', '<picture></picture>']);
+            html = `<figure${markup}>${inner}</figure>`;
+        } else html = `<svg><img${markup}></svg>`;
+        return { kind, srcKind, html };
+    };
+}
+
+// 样本元素当时的属性表与 img、picture 后代数：svg 样本取 svg 内的 img，其余取容器的首个子元素
+function snapshotLazySample(container, kind) {
+    const element = kind === 'svgImg' ? container.firstElementChild.firstElementChild : container.firstElementChild;
+    return {
+        attributes: new Map(Array.from(element.attributes, (attr) => [attr.name, attr.value])),
+        media: element.querySelectorAll('img, picture').length,
+    };
+}
+
+const sameAttributeMaps = (left, right) => left.size === right.size
+    && Array.from(left).every(([name, value]) => right.get(name) === value);
+
+// 覆盖归类：只看输入的属性与参照输出相对输入的差异，不插桩被测函数。第二个循环只写不删，故参照输出缺 src 即首段删去了它；提前
+// 返回的条件按首段之后的状态、照库的表达式求值，只在 src 与 srcset 都未被复制时成立
+function noteLazyElementBranches({ kind, srcKind }, before, after, hits) {
+    const srcBefore = before.attributes.get('src');
+    const srcAfter = after.attributes.get('src');
+    const srcsetBefore = before.attributes.get('srcset');
+    const copiedSrc = srcAfter !== undefined && srcAfter !== srcBefore;
+    const copiedSrcset = after.attributes.get('srcset') !== srcsetBefore;
+    const returnedOnSvg = kind === 'img' && srcKind === 'svgData';
+    const srcState = srcAfter === undefined ? '' : srcAfter;
+    const lazy = (before.attributes.get('class') || '').toLowerCase().includes('lazy');
+    const earlyReturn = kind === 'img' && !returnedOnSvg && !copiedSrc && !copiedSrcset
+        && Boolean((srcState || (srcsetBefore && srcsetBefore !== 'null')) && !lazy);
+    const enteredLoop = !returnedOnSvg && !earlyReturn;
+    const copyableOther = Array.from(before.attributes)
+        .some(([name, value]) => !LOOP_SKIPPED_NAMES.has(name) && isCopyableValue(value));
+
+    if (earlyReturn) hits.earlyReturn += 1;
+    if (returnedOnSvg && sameAttributeMaps(before.attributes, after.attributes)) hits.svgBase64 += 1;
+    if (kind === 'img' && BASE64_SRC_KINDS.has(srcKind)) {
+        if (srcAfter === undefined) hits.placeholderRemoved += 1;
+        else if (srcAfter === srcBefore) hits.base64Kept += 1;
+    }
+    if (kind !== 'figure' && copiedSrcset) hits.copiedSrcset += 1;
+    if (kind !== 'figure' && copiedSrc) hits.copiedSrc += 1;
+    if (kind === 'picture' && (copiedSrc || copiedSrcset)) hits.pictureSet += 1;
+    if (kind === 'svgImg' && (copiedSrc || copiedSrcset)) hits.svgImageSet += 1;
+    if (kind === 'figure' && after.media > before.media) hits.figureCreated += 1;
+    if (kind === 'figure' && before.media > 0 && copyableOther && after.media === before.media) hits.figureHasMedia += 1;
+    // alt 的值本可复制、别的属性都不可复制，而元素进入了第二个循环：若不跳过 alt，其值必写进 src 或 srcset（figure 则新建 img）
+    const alt = before.attributes.get('alt');
+    if (enteredLoop && alt !== undefined && isCopyableValue(alt) && !copyableOther) {
+        const skipped = kind === 'figure'
+            ? before.media === 0 && after.media === 0
+            : after.attributes.get(SRCSET_TOKEN_RE.test(alt) ? 'srcset' : 'src') !== alt;
+        if (skipped) hits.altSkipped += 1;
+    }
+}
+
+describe('fixLazyImages：与库自身的 _fixLazyImages 逐字等价', () => {
+    test('随机懒加载元素差分：同一 HTML 解析两份，分别经库实现与照录实现，序列化结果逐字相同，各分支均有样本', (t) => {
+        // Arrange：每个样本各占一个 <div>，比对与归类都按下标对应；两份文档各配一个 Readability 实例作 this
+        const nextElement = createLazyElementGenerator(createSeededRandom(20260928));
+        const samples = Array.from({ length: LAZY_ELEMENT_COUNT }, () => nextElement());
+        const html = wrapPage(samples.map((sample) => `<div>${sample.html}</div>`).join(''));
+        const { document: expectedDocument } = parseHTML(html);
+        const { document: actualDocument } = parseHTML(html);
+        const containersOf = (document) => Array.from(document.body.children);
+        const before = containersOf(expectedDocument).map((container, index) => snapshotLazySample(container, samples[index].kind));
+
+        // Act
+        Readability.prototype._fixLazyImages.call(new Readability(expectedDocument), expectedDocument.body);
+        fixLazyImages.call(new Readability(actualDocument), actualDocument.body);
+
+        // Assert ①：整份文档的序列化逐字相同；不同时报出首个不同的样本
+        if (actualDocument.toString() !== expectedDocument.toString()) {
+            const expectedContainers = containersOf(expectedDocument);
+            const actualContainers = containersOf(actualDocument);
+            const at = expectedContainers.findIndex((container, index) => String(container) !== String(actualContainers[index]));
+            if (at < 0) assert.fail('序列化结果不同，但各样本容器逐个相同');
+            assert.fail(`第 ${at} 个样本不同：输入 ${toVisible(samples[at].html)}，库实现 ${toVisible(String(expectedContainers[at]))}，`
+                + `照录实现 ${toVisible(String(actualContainers[at]))}`);
+        }
+        // Assert ②：覆盖归类
+        const hits = emptyHits(LAZY_ELEMENT_BRANCHES);
+        containersOf(expectedDocument).forEach((container, index) => {
+            noteLazyElementBranches(samples[index], before[index], snapshotLazySample(container, samples[index].kind), hits);
+        });
+        assertBranchesCovered(t, `随机懒加载元素 ${LAZY_ELEMENT_COUNT} 个`, hits, LAZY_ELEMENT_BRANCHES);
+    });
+});
+
+// ============================================================
+// 全链路：随机懒加载页面经 extractContent 与替换之前的 Readability 链路逐字等价
+// ============================================================
+
+const LAZY_PAGE_COUNT = 1000;
+const LAZY_PAGE_BRANCHES = [
+    ['readability', 'Readability 取得结果'],
+    ['fallback', '落入兜底链路'],
+    ['copiedSrc', '输出含从 data-* 复制出的 src'],
+    ['copiedSrcset', '输出含复制出的 srcset'],
+    ['figureImg', '输出含 figure 新建的 img'],
+    ['multiRound', '参照一侧 _fixLazyImages 执行两次以上'],
+    ['multiRoundReadability', '多轮重试后 Readability 取得结果'],
+];
+// 输出中据主机名认出复制结果：img、picture 与 svg 内 img 的懒加载值以 lazy.example.com 为主机，figure 的以 fig.example.com 为
+// 主机；页面中的 src 与 srcset 从不直接写这两个主机
+const COPIED_SRC_RE = /\ssrc="[^"]*lazy\.example\.com\//;
+const COPIED_SRCSET_RE = /\ssrcset="[^"]*lazy\.example\.com\//;
+const FIGURE_IMAGE_RE = /<img\b[^>]*\ssrc(?:set)?="[^"]*fig\.example\.com\//;
+
+// 随机懒加载页面：约三成是短正文页，Hello 与 world 之间隔 0 至 260 个空格——超过 140 个时预判为可读，Readability 按压缩空白后的
+// 长度计而每轮都不足 charThreshold，重试四轮；超过 189 个时 textContent 达到 MIN_READABILITY_TEXT_LENGTH 而取得结果，否则落入
+// 兜底。其余是段落与懒加载元素交错的文章页
+function createLazyPageGenerator(random) {
+    const pick = (items) => items[Math.floor(random() * items.length)];
+    const upTo = (max) => Math.floor(random() * (max + 1));
+    let serial = 0;
+    const address = (host, extension) => {
+        serial += 1;
+        return `https://${host}.example.com/${serial}.${extension}`;
+    };
+    const lazyValue = (host) => pick([
+        () => address(host, pick(['jpg', 'jpeg', 'png', 'webp'])),
+        () => `${pick(TOKEN_WHITESPACE)}${address(host, 'jpg')}${pick(TOKEN_WHITESPACE)}`,
+        () => `${address(host, 'jpg')} 1x, ${address(host, 'png')} 2x`,
+        () => 'a.jpg b',
+        () => 'x.JPG',
+        () => '说明文字',
+    ])();
+    // 一至两个懒加载属性，属性名互不相同
+    const lazyAttributes = (host) => {
+        const names = ['data-src', 'data-srcset', 'data-original'];
+        let markup = '';
+        for (let count = 1 + upTo(1); count > 0; count -= 1) {
+            const [name] = names.splice(Math.floor(random() * names.length), 1);
+            markup += ` ${name}="${lazyValue(host)}"`;
+        }
+        return markup;
+    };
+    // 懒加载元素：img 的五种开头（无 src；lazy 类加占位 src；base64 占位图；srcset 为 "null"；已有真实 src 而提前返回），figure
+    // （空、带图注或已含 img），picture 与 svg 内的 img
+    const media = () => {
+        const roll = random();
+        if (roll < 0.45) {
+            const lead = pick([
+                '', ' class="lazy" src="https://example.com/placeholder.gif"', ` src="data:image/gif;base64,${base64Payload(40)}"`,
+                ' srcset="null"', ' src="https://example.com/real.png"',
+            ]);
+            return `<img${lead}${lazyAttributes('lazy')}>`;
+        }
+        if (roll < 0.7) {
+            const inner = pick(['', '<figcaption>图注</figcaption>', '<img src="https://example.com/inner.png">']);
+            return `<figure${lazyAttributes('fig')}>${inner}</figure>`;
+        }
+        if (roll < 0.85) return `<picture${lazyAttributes('lazy')}></picture>`;
+        return `<svg><img${lazyAttributes('lazy')}></svg>`;
+    };
+    const paragraph = () => `<p>${Array.from({ length: 4 + upTo(4) }, () => pick(ARTICLE_SENTENCES)).join('')}</p>`;
+    return () => {
+        if (random() < 0.3) {
+            const extra = random() < 0.5 ? media() : '';
+            return '<!DOCTYPE html><html><head><title>t</title></head><body>'
+                + `<p>Hello${' '.repeat(upTo(260))}world</p>${media()}${extra}</body></html>`;
+        }
+        const parts = Array.from({ length: 2 + upTo(4) }, () => (random() < 0.5 ? paragraph() : media()));
+        const container = pick(['article', 'div', 'section']);
+        return wrapPage(`<${container}><h1>标题</h1>${parts.join('')}</${container}>`);
+    };
+}
+
+describe('全链路：随机懒加载页面经 extractContent 与替换之前的 Readability 链路逐字等价', () => {
+    test('随机懒加载页面差分：Readability 取得结果时二者深相等，否则都落入兜底链路；各分支均有样本', (t) => {
+        // Arrange
+        const nextPage = createLazyPageGenerator(createSeededRandom(20260929));
+        const hits = emptyHits(LAZY_PAGE_BRANCHES);
+
+        for (let index = 0; index < LAZY_PAGE_COUNT; index += 1) {
+            const html = nextPage();
+
+            // Act：参照取自替换之前的链路，并记下其中 _fixLazyImages 的执行次数；新实现每次用新载入的 cheerio 实例
+            const { value: expected, calls } = countLibraryFixLazyImages(() => legacyExtractByReadability(html));
+            const actual = extractContent({ $: cheerio.load(html), html, url: PAGE_URL });
+
+            // Assert：只在不一致时拼装诊断信息
+            if (expected) {
+                if (!isDeepStrictEqual(actual, expected)) assert.deepEqual(actual, expected, `第 ${index} 份页面：${toVisible(html)}`);
+                hits.readability += 1;
+                if (COPIED_SRC_RE.test(expected.html)) hits.copiedSrc += 1;
+                if (COPIED_SRCSET_RE.test(expected.html)) hits.copiedSrcset += 1;
+                if (FIGURE_IMAGE_RE.test(expected.html)) hits.figureImg += 1;
+                if (calls >= 2) hits.multiRoundReadability += 1;
+            } else {
+                if (!actual.extraction.startsWith('fallback:')) {
+                    assert.fail(`第 ${index} 份页面：旧链路未取得结果，新实现的 extraction 却为 ${actual.extraction}：${toVisible(html)}`);
+                }
+                hits.fallback += 1;
+            }
+            if (calls >= 2) hits.multiRound += 1;
+        }
+
+        assertBranchesCovered(t, `随机懒加载页面 ${LAZY_PAGE_COUNT} 份`, hits, LAZY_PAGE_BRANCHES);
+    });
 });

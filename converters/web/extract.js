@@ -100,6 +100,8 @@ function extractByReadability(html) {
         const reader = new Readability(document, { ...READABILITY_OPTIONS });
         // 可见性判定换成不经 linkedom 的 el.style 取值的等价实现，理由与前提见 isProbablyVisible
         reader._isProbablyVisible = isProbablyVisible;
+        // 懒加载修正换成判定单个图片地址时线性的等价实现，理由与前提见 fixLazyImages
+        reader._fixLazyImages = fixLazyImages;
         article = reader.parse();
     } catch (err) {
         return null;
@@ -246,6 +248,138 @@ function isProbablyVisible(node) {
     );
 }
 
+// 判定「属性值为单个图片地址」的两条正则：前者判定恰含一段非空白，后者判定有非空白字符紧接「.扩展名」。合用即与 Readability 0.6.0
+// _fixLazyImages 中的原正则逐值同真假，且都线性，理由见 isSingleImageToken
+const SINGLE_SEGMENT_RE = /^\s*\S+\s*$/;
+const EXTENSION_AFTER_NON_SPACE_RE = /\S\.(jpg|jpeg|png|webp)/;
+
+/**
+ * 属性值是否为「单个图片地址」：与 Readability 0.6.0 的 _fixLazyImages 中决定 copyTo = 'src' 的原正则
+ * /^\s*\S+\.(jpg|jpeg|png|webp)\S*\s*$/ 逐值同真假，而耗时线性于值的长度。扩展名区分大小写，与原正则相同。
+ *
+ * 旧写法为何超线性：原正则锚定串首，\S+ 先吞下首段的全部非空白，再逐位退让以寻找「.扩展名」；每找到一处，\S* 又吞到段尾、\s*
+ * 吞下其后的空白，若随后不是串尾（首段之后另有非空白），\s* 与 \S* 要逐位退让至全部失败，\S+ 才退到上一处「.扩展名」。首段长 n、
+ * 含 k 处扩展名时，失败前的回溯合计约 O(k·n)，病态值上即 O(n²)。值为 a.jpg 重复后接空格与 b 时，纯正则在 8／16／32／64／128／256 KB
+ * 上依次约 14.8／67.7／241／939／3843／16246 ms；64 KB 时 extractContent 全链路约 939 ms（同长度而不触发回溯的对照值约 1.2 ms），
+ * 该正则占 99.9%；页面使 Readability 重试四轮时 _fixLazyImages 随之执行四次，64 KB 约 3786 ms。按平方律外推，1 MB 约 4 分钟，
+ * 20 MB 约 27 小时。
+ *
+ * 新写法为何线性：前一条正则锚定串首，\s 与 \S 两类不相交，失败时每退一位只做 O(1) 的检查；后一条对每个起点只查定长片段（一个
+ * 非空白、点号与至多四个字母）。20 MB 的病态值实测约 46 ms；替换后 64 KB 的文章页约 0.78 ms，四轮重试页约 2.25 ms。
+ *
+ * 为何逐值等价（记 v 为属性值，「段」指 v 中非空白码元的极大连续片段，扩展名指 jpg、jpeg、png、webp 之一）：
+ *   (a) 原正则成立 ⇔ v 恰含一段 R，且 R 中下标 ≥ 1 处有「.扩展名」：\S+\.(扩展名)\S* 只含非空白码元，两侧的 \s* 只含空白，故它
+ *       就是 v 唯一的段，\S+ 非空保证「.」的下标 ≥ 1；反之，在 R 中该处切开，前后两部分分别交给 \S+ 与 \S*，即得一次匹配
+ *   (b) /^\s*\S+\s*$/ 成立 ⇔ v 恰含一段：不带 u 标志时 \s 与 \S 按 UTF-16 码元互补；不带 m 标志时 $ 只匹配串尾
+ *   (c) 在 (b) 成立时，v 的非空白码元全在 R 内，/\S\.(扩展名)/ 的匹配全由非空白码元组成，只能落在 R 内，其首个 \S 保证「.」在 R
+ *       中的下标 ≥ 1；反之，R 中下标 ≥ 1 处的「.扩展名」前一个码元非空白，该正则必能匹配。故两条正则同时成立 ⇔ (a) 的右端
+ *   (d) test 只报有无匹配：三条正则都不带 g、y 标志，没有 lastIndex 状态，求值先后互不影响；attr.value 在 linkedom 中恒为字符串
+ *   (e) 唯一可观察的差别是 RegExp.$1、RegExp.lastMatch 等遗留静态属性，本仓库与 Readability、linkedom、turndown 均不读取
+ * 另以随机 40 万个与穷举 3835 万个样本核对，不一致 0；在链路中替换后，1510 份页面的输出逐字相同（一次性补验，不进仓库）。
+ */
+function isSingleImageToken(value) {
+    return SINGLE_SEGMENT_RE.test(value) && EXTENSION_AFTER_NON_SPACE_RE.test(value);
+}
+
+/**
+ * Readability 的懒加载图片修正：照录 Readability 0.6.0 的 _fixLazyImages，只把决定 copyTo = 'src' 的原正则换成
+ * isSingleImageToken(attr.value)，由 extractByReadability 覆盖到 Readability 实例上。img 的 src 为空且没有有效 srcset（缺失、空串
+ * 或 "null"），或 class 含 lazy（不区分大小写）时，以及 picture、figure 与 svg 内的 img（linkedom 中三者没有 src 与 srcset 取值器），
+ * 都会逐个检查属性值，故默认网页转换（未命中站点选择器时）即经此判定：_prepArticle 在每轮 _grabArticle 中调用本函数一次，
+ * Readability 重试时至多四次。
+ *
+ * 照录的约定：
+ *   - 其余语句与库逐字对应：base64 占位图一段对 this.REGEXPS.b64DataUrl 的两次调用（先 test 后 exec）、与 'image/svg+xml' 的全等
+ *     比较、/\.(jpg|jpeg|png|webp)/i 的字面量、133 的阈值与 removeAttribute；提前返回的表达式、短路次序与 != 的松散比较（svg 内的
+ *     img 是 SVGElement，没有 src 与 srcset 取值器，className 是不带 toLowerCase 的对象，全靠短路才不求值）；按名跳过 src、srcset
+ *     与 alt；首条正则 /\.(jpg|jpeg|png|webp)\s+\d/ 的字面量与两条判定的先后；tagName 的全等比较、this._doc.createElement('img')
+ *     与 figure 分支的 _getAllNodesWithTag 判定；经 this._forEachNode 以 function 表达式遍历，其 this 即 Readability 实例
+ *   - 只改写法、不改语义之处：var 改为 let 与 const，双引号改为单引号。库中两个循环共用一个函数作用域的 attr，此处各自声明，因两个
+ *     循环都先赋值后读取，结果不变
+ *   - 每轮重读 elem.attributes.length 与 elem.attributes[j]，不取快照：linkedom 的 setAttribute 把新增的属性插到属性表之首
+ *     （shared/attributes.js 的 knownSiblings），复制之后下标后移一位，库的循环会重访当前属性并再写一次同一个值。照录保持与库相同的
+ *     访问与写入序列
+ *   - 覆盖 _fixLazyImages 依赖 Readability 0.6.0 的私有方法名，库内仅 _prepArticle 一处（Readability.js 第 790 行）经 this 调用它。
+ *     package.json 以 ^0.6.0 允许升级到 0.6.x：若方法名或语义改变，test/web-extract.test.js 中以库自身实现为参照的差分用例会报出
+ */
+function fixLazyImages(root) {
+    this._forEachNode(
+        this._getAllNodesWithTag(root, ['img', 'picture', 'figure']),
+        function (elem) {
+            // 有的站点（如 Kotaku）在 src 中放 1 像素见方的 base64 占位图，过短的 data URI 不如删去（库注释之意）
+            if (elem.src && this.REGEXPS.b64DataUrl.test(elem.src)) {
+                // 不删 SVG：SVG 在 133 字节以内也可能是有意义的图（库注释之意）
+                const parts = this.REGEXPS.b64DataUrl.exec(elem.src);
+                if (parts[1] === 'image/svg+xml') {
+                    return;
+                }
+
+                // 别的属性里另有图片地址，src 才可删；否则该 src 是要紧的图（库注释之意）
+                let srcCouldBeRemoved = false;
+                for (let i = 0; i < elem.attributes.length; i++) {
+                    const attr = elem.attributes[i];
+                    if (attr.name === 'src') {
+                        continue;
+                    }
+
+                    if (/\.(jpg|jpeg|png|webp)/i.test(attr.value)) {
+                        srcCouldBeRemoved = true;
+                        break;
+                    }
+                }
+
+                // 编码前不足 100 字节（base64 编码后不足 133 个字符）的图视为占位图（库注释之意）
+                if (srcCouldBeRemoved) {
+                    const b64starts = parts[0].length;
+                    const b64length = elem.src.length - b64starts;
+                    if (b64length < 133) {
+                        elem.removeAttribute('src');
+                    }
+                }
+            }
+
+            // 另判 "null"，以绕过 jsdom 的缺陷 https://github.com/jsdom/jsdom/issues/2580（库注释之意）
+            if (
+                (elem.src || (elem.srcset && elem.srcset != 'null'))
+                && !elem.className.toLowerCase().includes('lazy')
+            ) {
+                return;
+            }
+
+            for (let j = 0; j < elem.attributes.length; j++) {
+                const attr = elem.attributes[j];
+                if (
+                    attr.name === 'src'
+                    || attr.name === 'srcset'
+                    || attr.name === 'alt'
+                ) {
+                    continue;
+                }
+                let copyTo = null;
+                if (/\.(jpg|jpeg|png|webp)\s+\d/.test(attr.value)) {
+                    copyTo = 'srcset';
+                } else if (isSingleImageToken(attr.value)) {
+                    copyTo = 'src';
+                }
+                if (copyTo) {
+                    // img 与 picture 直接设置该属性（库注释之意）
+                    if (elem.tagName === 'IMG' || elem.tagName === 'PICTURE') {
+                        elem.setAttribute(copyTo, attr.value);
+                    } else if (
+                        elem.tagName === 'FIGURE'
+                        && !this._getAllNodesWithTag(elem, ['img', 'picture']).length
+                    ) {
+                        // 不含 img 与 picture 的 figure：新建一个 img 放进去，例见库的 nytimes-3 用例（库注释之意）
+                        const img = this._doc.createElement('img');
+                        img.setAttribute(copyTo, attr.value);
+                        elem.appendChild(img);
+                    }
+                }
+            }
+        },
+    );
+}
+
 // ---------- 三级：旧兜底链路 ----------
 
 function extractByFallback($) {
@@ -279,4 +413,5 @@ module.exports = {
     extractContent, matchesHost, annotateLayout,
     SITE_SELECTORS, MIN_READABILITY_TEXT_LENGTH, READERABLE_OPTIONS,
     inlineStyleValue, isNodeVisible, isProbablyVisible,
+    isSingleImageToken, fixLazyImages,
 };
