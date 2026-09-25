@@ -2,7 +2,8 @@
  * DOCX → IR
  *
  * 流程：读入 buffer → inspectOoxml（OOXML 预检信息）→ extractMath（OMML 换成哨兵 run）
- *       → prepareLayout（首行缩进、制表符、题注换成标记 run，图片 alt 前写序号并记下显示尺寸）
+ *       → prepareLayout（首行缩进、制表符、题注换成标记 run，图片 alt 前写序号并记下显示尺寸，
+ *         正文、脚注与尾注中开启的双删除线改写为单删除线）
  *       → markSections（多分节且页眉有文字时，每节起点插入一个哨兵段）
  *       → mammoth（docx → HTML，图片经 convertImage 截获为 Buffer，下划线经 styleMap 'u => u' 保留）
  *       → collectTableGrids（顶层表格另存为结构化 grid，首个单元格注入表格标记）
@@ -177,12 +178,12 @@ async function extractSafely(buffer, warnings) {
     }
 }
 
-// 版面预处理失败时按原样交给 mammoth：缩进、制表符与图片尺寸缺失，但正文不受影响
+// 版面预处理失败时按原样交给 mammoth：缩进、制表符、图片尺寸与双删除线缺失，但正文不受影响
 async function layoutSafely(buffer, warnings) {
     try {
         return await prepareLayout(buffer);
     } catch (err) {
-        warnings.push(`版面信息（缩进、制表符、题注、图片尺寸）读取失败，已按原样转换（${errText(err)}）`);
+        warnings.push(`版面信息（缩进、制表符、题注、图片尺寸、双删除线）读取失败，已按原样转换（${errText(err)}）`);
         return { buffer, displays: new Map(), roles: new Map() };
     }
 }

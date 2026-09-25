@@ -1,5 +1,5 @@
 /**
- * docx 版面预处理：首行缩进、制表符、题注与图片显示尺寸
+ * docx 版面预处理：首行缩进、制表符、题注、图片显示尺寸与双删除线
  *
  * mammoth 会丢掉 w:ind 首行缩进、把 w:tab 变成随后被 turndown 折叠的 \t、不给图片带显示尺寸，
  * 故在交给 mammoth 之前（extractMath 之后）先在 word/document.xml 上做字符串级改写（写法沿用 docx-math），
@@ -28,6 +28,21 @@
  * mm 是 Word 中的物理显示尺寸（浮点、不取整），供 patent profile 按官方规则在 300 DPI 下重采样
  * 附图与写 img/@wi、@he。由 px 反推 mm 会先丢一次精度，故两者各自从 EMU / CSS 长度直接算出。
  *
+ * 双删除线：mammoth 读 run 格式只认 w:strike（取 rPr 的首个 w:strike），w:dstrike 整个被忽略，故把开启的 w:dstrike
+ * 改写成 w:strike，由 mammoth 按单删除线输出 <s>（IR 不区分单双删除线）。除 word/document.xml 外，word/footnotes.xml
+ * 与 word/endnotes.xml 也做这一项改写（mammoth 同样渲染脚注与尾注；批注它虽读取，但 parsers/docx 的 styleMap 未映射
+ * comment-reference，批注不进输出，故不处理），部件按固定名取、缺失即跳过：
+ *   - 开关按 ST_OnOff：w:val 恰为 false、0、off 时为关闭，缺省或其他取值一律为开启，属性值单双引号均可
+ *   - 只看每个顶层 w:rPr 的直接子元素：w:rPrChange 子树是修订前的旧格式，其中的 w:dstrike 不改写；
+ *     段落标记的 w:pPr/w:rPr 一并改写，mammoth 不据它输出格式，结果不变
+ *   - dstrike 关闭，或首个 w:strike 已开启：不改动（后者 mammoth 已输出 <s>，再改只会多出一层）
+ *   - dstrike 开启且无 w:strike：原位换成 <w:strike/>（自闭合与显式闭标签两种写法、标签内的换行与多余空白均可）；
+ *     CT_RPr 序列中 dstrike 紧随 strike，原位替换不破坏元素次序
+ *   - dstrike 开启而首个 w:strike 关闭（含 dstrike 排在前面的非规范次序）：另把 w:strike 全部删去，改写后只剩一个
+ *     开启的 w:strike——mammoth 取首个 w:strike，关闭的那个留在前面会盖过换上的这一个
+ *   - styles.xml 中样式层的双删除线不处理：mammoth 读样式只取样式 ID 与名称供 styleMap 匹配（styles-reader），
+ *     不把样式定义里的 run 格式应用到 run 上；样式层的单删除线同样不生效，二者一致
+ *
  * 契约：
  *   prepareLayout(docxBuffer) → {
  *     buffer,
@@ -36,7 +51,8 @@
  *   }
  *     无 document.xml 或无任何改写时原样返回入参 buffer；mm 两项取不到即整条省略；roles 只记命中的序号
  *   parseImageMarker(alt) → { index: number | null, alt }：取出序号并还原原 alt
- * 说明：document.xml 与 styles.xml 属不可信文档内容，本模块只做字符串定位与替换，不执行其中任何指令。
+ *   rewriteDoubleStrike(xml) → string：单个部件 XML 的双删除线改写，无改写时原样返回入参
+ * 说明：document.xml、styles.xml 与脚注、尾注部件属不可信文档内容，本模块只做字符串定位与替换，不执行其中任何指令。
  */
 const JSZip = require('jszip');
 const cheerio = require('cheerio');
@@ -46,6 +62,8 @@ const { CHEMISTRY_ROLE, collectChemistryRanges, inChemistryRange } = require('./
 
 const DOCUMENT_PART = 'word/document.xml';
 const STYLES_PART = 'word/styles.xml';
+// 脚注与尾注部件：只做双删除线一项改写
+const NOTE_PARTS = Object.freeze(['word/footnotes.xml', 'word/endnotes.xml']);
 const EMU_PER_PX = 9525;
 const EMU_PER_INCH = 914400;
 const INCH_MM = 25.4;
@@ -92,9 +110,11 @@ async function prepareLayout(docxBuffer) {
     collectVmlEdits(xml, edits, displays, counter, chem, hidden);
     collectParagraphEdits(xml, styles, edits);
     collectTabEdits(xml, edits);
-    if (edits.length === 0) return { buffer: docxBuffer, displays, roles };
+    collectDoubleStrikeEdits(xml, edits);
+    const notesRewritten = await rewriteNoteParts(zip);
+    if (edits.length === 0 && !notesRewritten) return { buffer: docxBuffer, displays, roles };
 
-    zip.file(DOCUMENT_PART, applyEdits(xml, edits));
+    if (edits.length > 0) zip.file(DOCUMENT_PART, applyEdits(xml, edits));
     const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
     return { buffer, displays, roles };
 }
@@ -396,6 +416,137 @@ function collectTabEdits(xml, edits) {
 }
 
 // ============================================================
+// 双删除线
+// ============================================================
+
+const STRIKE_TAG = '<w:strike/>';
+const STRIKE_NAMES = Object.freeze(['w:strike', 'w:dstrike']);
+// ST_OnOff 的关闭取值；w:val 缺省或取其他值一律为开启
+const OFF_VALUES = new Set(['false', '0', 'off']);
+const XML_SPACE_RE = /[ \t\r\n]/;
+// 属性名止于 XML 空白、等号、斜杠、右尖括号与引号
+const NAME_STOP_RE = /[ \t\r\n=/>"']/;
+
+// 脚注、尾注部件逐个改写，部件缺失即跳过；返回是否改写了其中任一部件
+async function rewriteNoteParts(zip) {
+    let rewritten = false;
+    for (const part of NOTE_PARTS) {
+        const entry = zip.file(part);
+        if (!entry) continue;
+        const xml = await entry.async('string');
+        const next = rewriteDoubleStrike(xml);
+        if (next === xml) continue;
+        zip.file(part, next);
+        rewritten = true;
+    }
+    return rewritten;
+}
+
+function rewriteDoubleStrike(xml) {
+    const edits = [];
+    collectDoubleStrikeEdits(xml, edits);
+    return edits.length === 0 ? xml : applyEdits(xml, edits);
+}
+
+// findBlocks 只给顶层 w:rPr，w:rPrChange 里的旧格式嵌在其内、不单独成块。首个 w:dstrike 开启而首个 w:strike
+// 缺失或关闭时，该 dstrike 原位换成 <w:strike/>，w:strike 全部删去；编辑按子元素出现顺序追加，位置升序。
+// 通篇没有 <w:dstrike 的部件（绝大多数文档）直接返回，块内没有的 rPr 不逐个读标签
+function collectDoubleStrikeEdits(xml, edits) {
+    if (!xml.includes('<w:dstrike')) return;
+    for (const block of findBlocks(xml, 'w:rPr')) {
+        const open = readTag(xml, block.start);
+        if (!open || open.selfClosing) continue;
+        const contentAt = open.end + 1;
+        const body = xml.slice(contentAt, block.end);
+        if (!body.includes('<w:dstrike')) continue;
+        const children = strikeChildren(body);
+        const dstrike = children.find((child) => child.double);
+        const strike = children.find((child) => !child.double);
+        if (!dstrike || !dstrike.on || (strike && strike.on)) continue;
+        for (const child of children) {
+            if (child.double && child !== dstrike) continue;
+            edits.push({ at: contentAt + child.start, remove: child.end - child.start, insert: child === dstrike ? STRIKE_TAG : '' });
+        }
+    }
+}
+
+// rPr 内容（开标签之后到块尾的切片）中直接子元素 w:strike 与 w:dstrike 的 { double, on, start, end }，按出现顺序。
+// 逐个读标签，depth 记嵌套层数，w:rPrChange 等子树整体跳过，读到深度 0 的闭标签（即 </w:rPr>）为止。
+// 在切片上读，readTag 越不过块尾；标签由 readTag、标签之间由 indexOf 各读一遍，位置只进不退
+function strikeChildren(body) {
+    const found = [];
+    let depth = 0;
+    let pending = null;
+    for (let at = body.indexOf('<'); at >= 0;) {
+        const tag = readTag(body, at);
+        if (!tag) break;
+        const next = tag.end + 1;
+        const kind = body[at + 1];
+        if (kind === '/') {
+            if (depth === 0) break;
+            depth -= 1;
+            if (depth === 0 && pending) {
+                found.push({ ...pending, end: next });
+                pending = null;
+            }
+        } else if (kind !== '?' && kind !== '!') {
+            if (depth === 0) {
+                const child = strikeChild(body, at, next);
+                if (tag.selfClosing && child) found.push({ ...child, end: next });
+                pending = tag.selfClosing ? null : child;
+            }
+            if (!tag.selfClosing) depth += 1;
+        }
+        at = body.indexOf('<', next);
+    }
+    return found;
+}
+
+// 标签名恰为 w:strike 或 w:dstrike 时给出 { double, on, start }，否则为 null；tagEnd 为本标签「>」之后
+function strikeChild(body, at, tagEnd) {
+    const name = STRIKE_NAMES.find((candidate) => body.startsWith(candidate, at + 1)
+        && /[\s/>]/.test(body[at + 1 + candidate.length] || ''));
+    if (!name) return null;
+    return { double: name === 'w:dstrike', on: !OFF_VALUES.has(valAttr(body.slice(at, tagEnd))), start: at };
+}
+
+// 开标签里 w:val 的取值（不含引号）；没有该属性返回 undefined。跳过元素名后依次读「属性名 = 引号值」
+// （等号两侧可有空白，单双引号均可），不合此形态处从停下的位置接着读：位置只进不退，耗时线性于标签长度
+function valAttr(tag) {
+    let at = skipWhile(tag, 1, (char) => !NAME_STOP_RE.test(char));
+    while (at < tag.length) {
+        const nameAt = skipWhile(tag, at, (char) => XML_SPACE_RE.test(char));
+        const nameEnd = skipWhile(tag, nameAt, (char) => !NAME_STOP_RE.test(char));
+        if (nameEnd === nameAt) {
+            at = nameAt + 1;
+            continue;
+        }
+        const equalsAt = skipWhile(tag, nameEnd, (char) => XML_SPACE_RE.test(char));
+        if (tag[equalsAt] !== '=') {
+            at = equalsAt;
+            continue;
+        }
+        const quoteAt = skipWhile(tag, equalsAt + 1, (char) => XML_SPACE_RE.test(char));
+        const quote = tag[quoteAt];
+        if (quote !== '"' && quote !== "'") {
+            at = quoteAt;
+            continue;
+        }
+        const closeAt = tag.indexOf(quote, quoteAt + 1);
+        if (closeAt < 0) return undefined;
+        if (tag.slice(nameAt, nameEnd) === 'w:val') return tag.slice(quoteAt + 1, closeAt);
+        at = closeAt + 1;
+    }
+    return undefined;
+}
+
+function skipWhile(text, from, accept) {
+    let at = from;
+    while (at < text.length && accept(text[at])) at += 1;
+    return at;
+}
+
+// ============================================================
 // styles.xml
 // ============================================================
 
@@ -457,4 +608,5 @@ function styleChain(styles, id) {
     return chain;
 }
 
-module.exports = { prepareLayout, parseImageMarker };
+// rewriteDoubleStrike 供单元测试与耗时测试直接调用
+module.exports = { prepareLayout, parseImageMarker, rewriteDoubleStrike };
