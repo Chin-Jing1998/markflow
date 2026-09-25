@@ -14,8 +14,10 @@
  * plainText(node) → 元素内全部文字（不含图片），供图号段、发明名称长度等判定使用
  *
  * 文本归一：XML 里的换行是排版而非内容（本工具的序列化器会把只含元素的 p 缩进成多行，手写 XML 也常折行）。
- * 含换行的空白串按两侧字符处理：任一侧是汉字、全角标点或节点边界即删除，否则换成一个空格——与正向链路
- * renderers/xml/inline.js 的 joinSoftBreaks 同一口径。
+ * 含换行的空白串按两侧字符处理：两侧皆有字符时，任一侧是汉字或全角标点即删除，否则换成一个空格；落在文本节点边界上时
+ * 只看另一侧，另一侧是汉字、全角标点或同样落在边界上（整个节点只有排版空白）即删除，是西文等其余字符则换成一个空格。
+ * 正向链路 renderers/xml/inline.js 的 joinSoftBreaks 口径与此不同：只在两侧都是汉字或全角标点时删除，
+ * 其余情形（含节点边界处）一律换成一个空格。
  */
 const ROLE_BY_WRAPPER = Object.freeze({ maths: 'formula', tables: 'table', chemistry: 'chemistry' });
 const MARK_NODE_TYPES = Object.freeze({ b: 'strong', i: 'emphasis', u: 'underline', sup: 'superscript', sub: 'subscript' });
