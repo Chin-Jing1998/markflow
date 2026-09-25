@@ -12,9 +12,11 @@
  *   - 带 data.display 的图片输出 <img src="…" width="W" alt="…">（只写宽度，属性值转义）；无 display 仍为 ![]()
  *   - underline / superscript / subscript → <u>…</u> / <sup>…</sup> / <sub>…</sub>（Markdown 无对应语法，
  *     行内 HTML 经 ir/inline-html 再解析后仍是同一节点）
- *   - strong / emphasis / delete：定界符两侧按 CommonMark flanking 规则（标点含 \p{P}\p{S}）判定安全时写
- *     ** / * / ~~，否则回退 <strong> / <em> / <del>——中文标点旁的字面星号会被转义成 \*\*，默认处理器
- *     还会把相邻汉字写成 &#x…; 字符引用
+ *   - strong / emphasis / delete：定界符两侧按 CommonMark flanking 规则（标点含 \p{P}\p{S}）判定安全、且不与相邻
+ *     兄弟的同一定界符字符首尾相接时写 ** / * / ~~，否则回退 <strong> / <em> / <del>——中文标点旁的字面星号会被
+ *     转义成 \*\*，默认处理器还会把相邻汉字写成 &#x…; 字符引用；两对同字符定界符首尾相接会并成一个定界符串，
+ *     重新解析时配对错位、残留字面星号或波浪号。处在同类型格式节点之内的格式节点一律写标签，免得内层定界符
+ *     与外层配对；相邻兄弟产物为空（外侧字符为空串、看不到真实邻居）时同样保守写标签
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -95,23 +97,78 @@ function escapeAttr(value) {
 // 行内格式处理器
 // ============================================================
 
+// 定界符式格式按 construct 计的祖先层数：以 state 为键存于模块级 WeakMap，不给 state 挂新属性，随 state 一并回收
+const ATTENTION_DEPTHS = new WeakMap();
+
 /**
- * 定界符式格式（** / * / ~~）：两侧 flanking 安全时写定界符，否则写 HTML 标签。
+ * 定界符式格式（** / * / ~~）：两侧 flanking 安全、不与相邻兄弟粘连且不处在同类型祖先之内时写定界符，
+ * 否则写 HTML 标签。
  * 安全条件：内容首尾不是空白、不是定界符字符；首字是标点时前一字须为空白或标点（或行首），
  * 尾字是标点时后一字须为空白或标点（或行尾）。
+ * 粘连：外侧字符来自相邻兄弟且与本定界符是同一字符（前一兄弟的产物以它收尾，或后一兄弟的 peek 报出它）时，
+ * 两对定界符会并成一个定界符串：合并后的星号串按整串两侧字符判定能否开合，并按剩余长度套用「3 的倍数」规则，
+ * 配对因而错位；波浪号串长于两个即不算定界符。重新解析都会残留字面字符，故同样写标签。
+ * peek 恒报定界符字符，因此相邻两对中先出现的一方回退标签，后一方的前一字变为「>」，仍可写定界符。
+ * 相邻兄弟的产物为空时外侧字符为空串，containerPhrasing 看不到更远的真实邻居，粘连与 flanking 都无从判定，
+ * 同样写标签。
+ * 不同定界符字符（* 与 ~）不会并成同一串，不作粘连判定；首个子节点的前侧与末个子节点的后侧来自父级，
+ * 父级已按内容首末字符是否为自身定界符字符自行回退，同样不作粘连判定。
+ * 同类型嵌套：同类定界符嵌套时，内层定界符两侧都不是空白即可能兼具左右 flanking，从而与外层配对
+ * （如 *甲*乙*丙* 重新解析为 emphasis(甲)、乙、emphasis(丙)），故处在同类型祖先之内的节点一律写标签。
+ * 按 construct 判定，strong 与 emphasis 互相嵌套不在此列；祖先层数在 containerPhrasing 之前加一、之后恢复。
  */
 function attention(marker, tag, construct) {
-    const handler = (node, _parent, state, info) => {
+    const handler = (node, parent, state, info) => {
+        // 下标取自 state.indexStack 栈顶，须在 containerPhrasing 压栈之前读取
+        const glued = isGluedToSibling(node, parent, state, info, marker[0]);
+        const depths = attentionDepths(state);
+        const depth = depths.get(construct) || 0;
         const exit = state.enter(construct);
-        const inner = state.containerPhrasing(node, { ...info, before: marker[0], after: marker[0] });
+        depths.set(construct, depth + 1);
+        let inner;
+        try {
+            inner = state.containerPhrasing(node, { ...info, before: marker[0], after: marker[0] });
+        } finally {
+            depths.set(construct, depth);
+        }
         exit();
         if (!inner) return '';
-        return isDelimiterSafe(info.before, inner, info.after, marker[0])
+        return !glued && depth === 0 && isDelimiterSafe(info.before, inner, info.after, marker[0])
             ? `${marker}${inner}${marker}`
             : `<${tag}>${inner}</${tag}>`;
     };
     handler.peek = () => marker[0];
     return handler;
+}
+
+/** 本次序列化（以 state 区分）的祖先层数表：construct → 层数，首次访问时建立 */
+function attentionDepths(state) {
+    let depths = ATTENTION_DEPTHS.get(state);
+    if (!depths) {
+        depths = new Map();
+        ATTENTION_DEPTHS.set(state, depths);
+    }
+    return depths;
+}
+
+/**
+ * 外侧字符是否来自相邻兄弟且等于本定界符字符：非首个子节点比 info.before 的末字（前一兄弟产物的末个码元），
+ * 非末个子节点比 info.after 的首字（后一兄弟 peek 结果的首个码元，无 peek 的节点取其处理器产物）。
+ * 两者为空串时同样视为粘连：空串表示相邻兄弟的产物为空（before 侧含空文本、无内容的格式节点与空 html；after 侧
+ * 只有无 peek 的空文本，格式节点与 html 的 peek 恒报非空字符），containerPhrasing 看不到更远的真实邻居，
+ * 粘连与 flanking 都无从判定，故保守回退。
+ * 下标取 state.indexStack 栈顶（containerPhrasing 调用子节点处理器前写入）；parent 缺失或栈顶不指向本节点时
+ * 两侧都不判定。
+ */
+function isGluedToSibling(node, parent, state, info, markerChar) {
+    const siblings = parent && Array.isArray(parent.children) ? parent.children : null;
+    const stack = state.indexStack;
+    const index = Array.isArray(stack) ? stack[stack.length - 1] : -1;
+    if (!siblings || siblings[index] !== node) return false;
+    const before = String(info.before || '');
+    const after = String(info.after || '');
+    if (index > 0 && (before === '' || before.slice(-1) === markerChar)) return true;
+    return index < siblings.length - 1 && (after === '' || after.charAt(0) === markerChar);
 }
 
 function isDelimiterSafe(before, inner, after, markerChar) {

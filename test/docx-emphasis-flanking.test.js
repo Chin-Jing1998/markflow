@@ -391,13 +391,11 @@ async function reparseMarkdown(markdown) {
     return tree.children.map(brief);
 }
 
-// roundTrip 为 false 的形态：IR 正确，但 renderers/md 自身在两对定界符相邻时同样会把星号串合并（「**加粗***。*」），
-// 属该渲染器的独立缺陷、不在本次范围，故只断言 md 产物无转义星号，不做重新解析比对
 const E2E_CASES = [
     { name: 'U1', runs: [plain('依据'), bold('《专利法》'), plain('的规定')], text: '依据《专利法》的规定', b: ['《专利法》'], i: [], roundTrip: true },
     { name: 'U2', runs: [plain('前文'), run(text('加粗'), BOLD + UNDERLINE), plain('后文')], text: '前文加粗后文', b: ['加粗'], i: [], roundTrip: true },
     { name: 'U3', runs: [boldItalic('甲'), italic('乙')], text: '甲乙', b: ['甲'], i: ['甲', '乙'], roundTrip: true },
-    { name: 'U4', runs: [bold('加粗'), italic('。')], text: '加粗。', b: ['加粗'], i: ['。'], roundTrip: false },
+    { name: 'U4', runs: [bold('加粗'), italic('。')], text: '加粗。', b: ['加粗'], i: ['。'], roundTrip: true },
     { name: 'U5', runs: [bold('注意：'), plain('本发明')], text: '注意：本发明', b: ['注意：'], i: [], roundTrip: true },
 ];
 // generic XML 对只含元素的容器按缩进排版，比对文字时去掉全部空白
