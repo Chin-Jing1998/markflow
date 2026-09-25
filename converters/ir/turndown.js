@@ -30,11 +30,16 @@
  *   - <br> 输出 BR 标记，由 parsers/url 的 collapseBreakMarkers 折叠：双 BR 分段、单 BR 转硬换行
  *   - 图注（figcaption、微信小字图注）输出 CAPTION 标记开头的独立段落，由 ir/markers 还原为 data.role
  *   - 带 data-mf-display 的 <img> 输出 <img src alt width>，由 ir/inline-html 还原为带 data.display 的 image 节点
+ *   - 两段行内代码在输出中相邻（含只隔着产物为空的元素、注释或零宽字符）时，两段之间写入空 HTML 注释 <!---->，
+ *     与 renderers/md 分隔相邻 inlineCode 的写法相同：两段的反引号围栏首尾相接会并成一个更长的反引号串，remark
+ *     重新解析时配对错位；注释解析为 html 节点，由各渲染器剥除（见下方「相邻行内代码段的分隔」块注释）
  *
  * 表格规则 convertTableToMarkdown 为本文件内部函数，不再在其他文件重复实现。
  */
 const TurndownService = require('turndown');
 const { MARKERS } = require('./markers');
+// 零宽字符码点：web/normalize 不依赖本模块，引入不成环
+const { ZERO_WIDTH_CODE_POINTS } = require('../web/normalize');
 
 const BASE_OPTIONS = {
     headingStyle: 'atx',
@@ -661,6 +666,93 @@ function codePointBefore(text, at) {
     return low;
 }
 
+// ---------- url profile：相邻行内代码段的分隔 ----------
+
+/*
+ * 成因：turndown 的 code 规则按值内的反引号串选定围栏长度，产物为「围栏 + 值 + 围栏」（值以反引号开头或结尾、或首尾都是
+ * 空格时首尾各补一个空格），process 把相邻节点的产物首尾直接拼接。两段行内代码在输出中相邻时，前一段的闭围栏与后一段的
+ * 开围栏并成一个更长的反引号串，其长度不等于前一段的开围栏、不能闭合前一段：「前<code>a</code><code>b</code>后」输出
+ * 「前`a``b`后」，remark 解析为单个代码段「a``b」；值含反引号时（「``a`b```c`」）前一段的一部分还会成为字面文本。
+ * 相邻不限于直接相邻的兄弟：两段之间的空元素（<b></b>、无 src 的 <img>）与注释产物为空，外层的 <span> 等无规则元素原样
+ * 透传内容，零宽字符则由 parsers/url 的 normalizeMarkdown 删除，这些情形在最终交给 remark 的文本中同样相邻。
+ *
+ * 写法：与 renderers/md 分隔相邻 inlineCode 的做法相同，在两段之间写入空 HTML 注释 <!---->（各版 CommonMark 都认作 HTML
+ * 注释的最短写法），重新解析为代码段、html 节点、代码段，各段的值与段数不变；html、docx、xml、content-list 渲染器均剥除
+ * 该注释。规则内看不到此前已拼出的输出，按 DOM 判定相邻须复刻 turndown 的空白折叠、空产物与透传判定，故分两步：
+ * inlineCode 规则接管内置 code 规则，产物逐字不变，只把闭围栏的末一个反引号换成哨兵；configureUrl 包装 service.turndown，
+ * 由 separateAdjacentCode 在整篇输出上把每个哨兵换回反引号，哨兵之后隔着零宽字符若干紧跟反引号的，在换回的反引号之后
+ * 写入注释。
+ *   - 哨兵之后紧跟的反引号只能是下一段行内代码的开围栏：turndown 把文本中的反引号转义为「\`」（反斜杠在前）；代码块的
+ *     围栏前有空行；链接、图片与表格的产物分别以「[」「![」「|」开头，URL_WRAP_RULES、imgDisplay 与 keep 的产物以「<」
+ *     开头（被样式规则接管的 code 其内的反引号不转义，但处在开标签之后）；其余规则的产物不含未转义的反引号。
+ *   - 哨兵取 U+0000，一律以码点生成：HTML 解析器（turndown 的 domino 与 parsers/url 的 parse5 同）在正文中忽略 NUL，在
+ *     属性值、RCDATA、RAWTEXT 与外来内容中换成 U+FFFD，字符引用 &#0; 同样换成 U+FFFD，因此 turndown 的输入里不存在
+ *     U+0000，输出中的每个 U+0000 都是本规则写出的哨兵，不必为输入混入的同码点字符另作规定。word profile 的强调哨兵取
+ *     U+001C–U+001F，依据是 XML 1.0 不允许这些字符出现；HTML 正文允许 NUL 之外的 C0 控制字符，故本规则不沿用。
+ *   - 替换围栏的末一个反引号而不追加，且取单字节字符：turndown 的 join 每拼接一个子节点都把累积的输出扁平化一次
+ *     （trimTrailingNewlines 按下标取尾字符，V8 为此把拼接串复制成平坦串），同一父节点下 n 个子节点的拼接耗时随累积输出的
+ *     字节数平方增长。每段多写字符会按比例放大这一项，私用区码点更会把整篇 ASCII 输出从单字节表示变成双字节表示、再放大
+ *     一倍：以 U+EF05／U+EF06 两个哨兵追加的原型在 8 万段相邻单字符代码上耗时为修复前的 3.2 倍，改用 Latin-1 哨兵降到
+ *     1.8 倍（与字符数之比 5/3 相当），替换而不追加则与修复前相同。
+ *   - 处在另一段 code 之内的 code 不写哨兵：其产物是外层代码段的原文，外层按内容里的反引号选定围栏并判定是否补空格，
+ *     换掉的反引号会使外层的围栏选错。
+ *   - 注释紧随前一段的闭围栏，前面必是反引号，不会落在行首而开启 HTML 块。
+ * 耗时线性于输出长度：indexOf 逐个找哨兵，哨兵之后的零宽字符段由否定字符类的正则（单个字符类、无量词）定位首个非零宽
+ * 字符，每个字符至多被看一次；不含哨兵的输出只扫一遍即返回。
+ */
+
+const CODE_SEPARATOR = '<!---->';
+const CODE_END = fromCode(0);
+const BACKTICK = '`';
+// 在 parsers/url 的 normalizeMarkdown 中被删除的零宽字符：两段代码之间只隔着它们时，交给 remark 的文本中两段相邻
+const CODE_GAP_CODES = new Set(ZERO_WIDTH_CODE_POINTS);
+// 定位哨兵之后首个非零宽字符：否定字符类，无量词；配合 lastIndex 从哨兵之后起找
+const NOT_CODE_GAP_RE = new RegExp(`[^${ZERO_WIDTH_CODE_POINTS.map(fromCode).join('')}]`, 'g');
+
+/** 接管内置 code 规则：产物逐字不变，只把闭围栏的末一个反引号换成哨兵（说明见上方块注释） */
+function addInlineCodeRule(service) {
+    const builtinCode = service.options.rules.code;
+    service.addRule('inlineCode', {
+        filter: builtinCode.filter,
+        replacement: (content, node, options) => {
+            const code = builtinCode.replacement(content, node, options);
+            if (!code || isInsideCode(node)) return code;
+            return `${code.slice(0, -1)}${CODE_END}`;
+        },
+    });
+}
+
+/** 父节点是 code 或处在 code 之内（turndown 在处理子节点之前已给父节点记下 isCode） */
+function isInsideCode(node) {
+    return Boolean(node.parentNode && node.parentNode.isCode);
+}
+
+/**
+ * 把每个哨兵换回闭围栏的末一个反引号；哨兵之后隔着零宽字符若干紧跟反引号的，在反引号之后写入 CODE_SEPARATOR。
+ * 不含哨兵时原样返回。parts 按原序收集哨兵之间的文本段与各哨兵的写法，最后一次拼接
+ */
+function separateAdjacentCode(markdown) {
+    const raw = String(markdown);
+    let at = raw.indexOf(CODE_END);
+    if (at < 0) return raw;
+    const parts = [];
+    let copied = 0;
+    while (at >= 0) {
+        parts.push(raw.slice(copied, at));
+        let next = at + 1;
+        if (CODE_GAP_CODES.has(raw.charCodeAt(next))) {
+            NOT_CODE_GAP_RE.lastIndex = next;
+            const found = NOT_CODE_GAP_RE.exec(raw);
+            next = found ? found.index : raw.length;
+        }
+        parts.push(raw[next] === BACKTICK ? `${BACKTICK}${CODE_SEPARATOR}` : BACKTICK);
+        copied = at + 1;
+        at = raw.indexOf(CODE_END, next);
+    }
+    parts.push(raw.slice(copied));
+    return parts.join('');
+}
+
 // ---------- 各 profile 配置 ----------
 
 function configureBasic(service) {
@@ -726,6 +818,11 @@ function configureUrl(service) {
     // 最先注册、优先级最低：带样式的 section（加粗、图注）由后注册的规则接管
     service.addRule('sectionBlock', { filter: 'section', replacement: (content) => `\n\n${content}\n\n` });
     service.addRule('lineBreak', { filter: 'br', replacement: () => MARKERS.BR });
+    // 先于样式规则注册、优先级低于它们，与内置 code 规则的相对次序一致：带删除线样式的 code 仍归 inlineStrikethrough。
+    // 规则写出的哨兵在整篇输出上换回反引号并按需写入分隔注释（见 separateAdjacentCode），哨兵不外泄
+    addInlineCodeRule(service);
+    const turndown = service.turndown.bind(service);
+    service.turndown = (input) => separateAdjacentCode(turndown(input));
     for (const [name, filter, open, close] of URL_WRAP_RULES) {
         service.addRule(name, {
             filter,
