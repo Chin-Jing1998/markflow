@@ -7,7 +7,8 @@
  *   - 块级的 <p|div|figure> 只包着 img / br（与 figcaption）→ 图片段落 + 图注段落（data.role = 'caption'）
  *   - 同级兄弟中成对的 <u> / <strong|b> / <em|i> / <del|s> / <sup> / <sub>
  *     → underline / strong / emphasis / delete / superscript / subscript，<br> → break；
- *     按栈配对，配不上的标签删除、保留其间内容；只包着图片的格式标签直接拆除（图片不承载粗斜体）
+ *     按栈配对，配不上的标签删除、保留其间内容；只包着图片或换行（可夹空白）的格式标签直接拆除（图片与换行
+ *     不承载粗斜体），只含空白的格式标签保留（空白承载下划线与删除线，如填空横线）
  *   - 其余 HTML 维持 html 节点，仍由各渲染器剥离
  *   - 发生过提升的兄弟序列里，相邻同类格式节点与相邻文本合并，同类嵌套拍平
  *
@@ -216,14 +217,15 @@ function closeFrame(stack, type) {
 function wrapFrame(frame) {
     const nodes = frame.nodes;
     if (nodes.length === 0) return [];
-    // 只包着图片（与换行、空白）的格式标签直接拆除
-    if (nodes.every(isImageLike)) return nodes;
+    // 只包着图片或换行（可夹空白）的格式标签直接拆除：图片与换行不承载格式。只含空白的格式标签不拆：空白承载下划线
+    // 与删除线（docx 的填空横线即带下划线的空格），md 渲染器也把这类节点写成标签，拆除后重新解析即丢失格式
+    if (nodes.some(isImageOrBreak) && nodes.every(isImageLike)) return nodes;
     const children = nodes.flatMap((node) => (node.type === frame.type && Array.isArray(node.children) ? node.children : [node]));
     return [{ type: frame.type, children: mergeAdjacent(children) }];
 }
 
-const isImageLike = (node) => node.type === 'image' || node.type === 'break'
-    || (node.type === 'text' && !/\S/.test(String(node.value || '')));
+const isImageOrBreak = (node) => node.type === 'image' || node.type === 'break';
+const isImageLike = (node) => isImageOrBreak(node) || (node.type === 'text' && !/\S/.test(String(node.value || '')));
 
 function mergeAdjacent(nodes) {
     const out = [];
