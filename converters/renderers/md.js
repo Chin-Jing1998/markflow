@@ -26,6 +26,12 @@
  *     两段的闭围栏与开围栏会并成一个更长的反引号串，重新解析时配对错位，只调围栏长度无法分开；注释重新解析为 html
  *     节点，html、docx、xml、content-list 渲染器均将其剥除。插入与剔除在同一趟遍历中进行，只在剔除空节点之后、父节点
  *     属 PHRASING_PARENTS（即上条所列父类型）时插入，因此两段之间原有的空节点先被剔除，剔除后相邻的两段同样分隔
+ *   - 同一趟遍历中、同样只在 PHRASING_PARENTS 各类型中，剔除之后相邻的两个 text 在数字边界处合并：前一段以 ASCII
+ *     数字结尾、后一段以 ASCII 数字或「.」「)」开头时并为一个节点。有序列表记号模式要求「换行 + 可选空白 + 数字 +
+ *     记号」同在一个 value 之内，safe() 只在单个节点的 before + 文本 + after 中匹配、只转义本节点文本，数字与记号分属
+ *     相邻 text 时两侧都不转义，位于行首时可能重新解析为有序列表。只在数字边界合并而不合并全部相邻 text：全部合并会
+ *     把切在换行处的两行记号并入同一 value，「.」「-」「+」模式的 after 吞掉行尾换行，下一行的记号不再转义；也会把
+ *     任意相邻 text 中的转义位置集中到一次 safe() 调用，而 safe() 对转义位置的去重为平方级
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -73,7 +79,7 @@ function wrapMath(node) {
 }
 
 // ============================================================
-// 行内语境：剔除产物为空的节点，分隔相邻的 inlineCode
+// 行内语境：剔除产物为空的节点，在数字边界合并相邻 text，分隔相邻的 inlineCode
 // ============================================================
 
 // 可含行内子节点的父类型：paragraph / heading / tableCell / link / linkReference 与六种行内格式
@@ -83,10 +89,15 @@ const PHRASING_PARENTS = new Set([
 ]);
 // 相邻 inlineCode 之间插入的分隔注释：各版 CommonMark 都认作 HTML 注释的最短写法（<!--> 与 <!---> 自 0.31 起才算）
 const CODE_SEPARATOR = '<!---->';
+// 有序列表记号的组成字符的 charCode：ASCII 数字「0」–「9」与记号「.」「)」
+const CHAR_ZERO = '0'.charCodeAt(0);
+const CHAR_NINE = '9'.charCodeAt(0);
+const CHAR_DOT = '.'.charCodeAt(0);
+const CHAR_RIGHT_PAREN = ')'.charCodeAt(0);
 
 /**
- * 剔除行内语境中产物为空的节点，并在剔除后仍相邻的两个 inlineCode 之间插入分隔注释，返回新树；子树未变时返回原对象，
- * 不修改入参。
+ * 剔除行内语境中产物为空的节点，在数字边界合并剔除后相邻的 text，并在仍相邻的两个 inlineCode 之间插入分隔注释，
+ * 返回新树；子树未变时返回原对象，不修改入参。
  * 对象与范围：PHRASING_PARENTS 各类型的子节点中，value 为空串的 text 与 html，以及子节点剔除完毕后已无子节点的
  * 六种行内格式（EMPTY_CAPABLE_TYPES）；link / linkReference 只剔除其子节点、不剔除自身（产物含地址，不为空）；
  * root、list 等块级父节点的子节点不在范围内。
@@ -95,6 +106,19 @@ const CODE_SEPARATOR = '<!---->';
  * 报出的「*」「~」或「<」；紧接 html 节点之前的行尾换行还会改为空格，html 值为空时同样如此。safe() 据此决定行首
  * 记号、首尾空白、「&」「<」「!」与末尾反斜杠的转义，定界符式格式据此判定能否写定界符，空节点使这些判定落空。
  * 剔除后各节点看到的都是真实邻居，含空节点的 IR 与去掉空节点后的 IR 产物逐字相同。
+ * 为何在数字边界合并相邻 text：有序列表记号模式要求「换行 + 可选空白 + 数字 + 记号」同在一个 value 之内，而 safe()
+ * 以 before + 本节点文本 + after 为 value 匹配、只转义本节点文本所在区间，containerPhrasing 给 text 的 before 又只有
+ * 前一兄弟产物的末字。数字与其后的「.」「)」分属相邻 text 时，前一节点只在 after 里看到记号，记号不在其转义区间内；
+ * 后一节点的 before 只有一个数字、没有换行，模式匹配不上；两侧都不转义，位于段首、换行后或硬换行之后时可能重新解析
+ * 为有序列表。数字与记号须同处一个节点，safe() 才能匹配到记号前的数字串（模式的 before 为 \d+），故剔除之后，前一段
+ * 以 ASCII 数字结尾、后一段以 ASCII 数字或「.」「)」开头时并为一个节点，多段组成的数字串逐段并入；其余转义模式的
+ * 前文只需一个字符，containerPhrasing 已能给出。不合并全部相邻 text 的理由有二。其一，切在换行处的两行记号（如
+ * [text('1.'), text(换行 + '1. 项')]）两个节点各自转义，往返正确；并入同一 value 后，「.」「-」「+」模式的 after
+ * 把行尾换行吃进前一次匹配，safe() 逐模式做不重叠匹配，下一行缺少 atBreak 所需的换行，记号不再转义。其二，safe()
+ * 以 positions.includes 对转义位置去重，单个 value 内有 p 个转义位置时耗时为 O(p²)；全部合并会把任意相邻 text 中
+ * 的转义位置集中到一次调用，如 n 个相邻 text('*') 由线性变为平方级。只在数字边界合并时，切在换行处的切分点一侧是
+ * 换行，不在数字边界上，两行仍分属两个节点；只有每个切分点都在数字边界上的文本才会并成一个 value，耗时与同一文本
+ * 放在单个节点中相同。合并同样只在 PHRASING_PARENTS 各类型的子节点中进行。
  * 为何插入分隔注释：inlineCode 处理器按值内的反引号串选定围栏长度，containerPhrasing 把相邻产物首尾直接拼接，前一段
  * 的闭围栏与后一段的开围栏并成一个更长的反引号串，不能闭合前一段，重新解析时配对错位，如 [code(x), code(y)] 输出
  * 「`x``y`」、重新解析为单个代码段「x``y」。相邻的反引号总会并成同一串，只调围栏长度分不开，故在两段之间插入值为
@@ -103,13 +127,14 @@ const CODE_SEPARATOR = '<!---->';
  * 的范围相同。分隔节点只处在两个 inlineCode 之间，inlineCode 与 html 的处理器都不读 before / after，前一段的产物
  * 以反引号收尾，也不会触发 html 之前的换行改写，故插入不改变其余节点的转义与定界符判定。
  * 线性：先递归剔除子节点、再过滤本层，格式节点是否为空只看剔除后的 children 是否为空数组，判定为 O(1)，无须再向
- * 下遍历；每个节点只访问一次。分隔注释在过滤后的本层子节点上单趟插入。
+ * 下遍历；每个节点只访问一次。合并相邻 text 与插入分隔注释都在过滤后的本层子节点上单趟进行，先合并、后分隔：合并
+ * 只改 text，分隔只在两个 inlineCode 之间插入 html，两者互不制造对方的相邻。
  */
 function pruneEmptyInline(node) {
     if (!node || typeof node !== 'object' || !Array.isArray(node.children)) return node;
     let children = node.children.map(pruneEmptyInline);
     if (PHRASING_PARENTS.has(node.type)) {
-        children = separateAdjacentInlineCode(children.filter((child) => !isPrunedEmpty(child)));
+        children = separateAdjacentInlineCode(mergeListMarkerText(children.filter((child) => !isPrunedEmpty(child))));
     }
     const changed = children.length !== node.children.length || children.some((child, i) => child !== node.children[i]);
     return changed ? { ...node, children } : node;
@@ -121,6 +146,50 @@ function isPrunedEmpty(node) {
     if (node.type === 'text' || node.type === 'html') return !node.value;
     return EMPTY_CAPABLE_TYPES.has(node.type) && (!Array.isArray(node.children) || node.children.length === 0);
 }
+
+/**
+ * 在数字边界合并相邻的 text 节点，返回新数组；未发生合并时返回原数组，不修改入参。当前一串的末段以 ASCII 数字结尾、
+ * 下一个 text 以 ASCII 数字或「.」「)」开头时并入同一串（见 joinsListMarker），多段组成的数字串因而逐段并入；每串以
+ * 其中首个节点为底、各段 value 按原次序拼接为新值，其余节点原样保留。理由见 pruneEmptyInline，只由它对
+ * PHRASING_PARENTS 各类型剔除空节点后的子节点调用。线性：单趟扫描，首次合并时才建立新数组，每串的各段 value 收集后
+ * 一次 join。
+ */
+function mergeListMarkerText(children) {
+    let out = null;
+    // 当前一串首个 text 的下标（无则为 -1），以及该串多于一段时的各段 value
+    let head = -1;
+    let values = null;
+    const flush = () => {
+        if (out && head >= 0) out.push(values ? { ...children[head], value: values.join('') } : children[head]);
+        values = null;
+    };
+    for (let i = 0; i < children.length; i += 1) {
+        const child = children[i];
+        // head >= 0 时 children[i - 1] 即当前一串的末段
+        if (head >= 0 && isText(child) && joinsListMarker(children[i - 1].value, child.value)) {
+            if (!out) out = children.slice(0, head);
+            if (!values) values = [children[head].value];
+            values.push(child.value);
+            continue;
+        }
+        flush();
+        head = isText(child) ? i : -1;
+        if (out && head < 0) out.push(child);
+    }
+    flush();
+    return out || children;
+}
+
+/** 前一段以 ASCII 数字结尾、后一段以 ASCII 数字或「.」「)」开头：两段拼接后才可能在同一 value 内构成有序列表记号 */
+function joinsListMarker(prev, next) {
+    if (typeof prev !== 'string' || typeof next !== 'string' || !prev || !next) return false;
+    if (!isAsciiDigit(prev.charCodeAt(prev.length - 1))) return false;
+    const first = next.charCodeAt(0);
+    return isAsciiDigit(first) || first === CHAR_DOT || first === CHAR_RIGHT_PAREN;
+}
+
+const isAsciiDigit = (code) => code >= CHAR_ZERO && code <= CHAR_NINE;
+const isText = (node) => Boolean(node) && node.type === 'text';
 
 /**
  * 在相邻的两个 inlineCode 之间插入值为 CODE_SEPARATOR 的 html 节点，返回新数组；无相邻时返回原数组，不修改入参。
