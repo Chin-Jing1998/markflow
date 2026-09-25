@@ -43,6 +43,11 @@
  *     标题）：处在块末格式节点或链接末尾的硬换行，其后紧随闭标签或「](」，仍是硬换行；heading 段中与 tableCell 内的硬换行
  *     由上游另行处理（见 pruneEmptyInline）。并为一个节点而不逐个改写：上游对 heading 的 setext 判定按子节点个数呈平方级
  *     （见 rewriteTrailingBreaks）
+ *   - root 的子节点含上游 phrasing 类型时，先把 root 的全部子节点包进一个 paragraph 再剔除与渲染：上游 root 处理器以
+ *     containerPhrasing 拼接这类子节点，却不进入 phrasing 语境，只在该语境中转义的写法照原样写出；root 也不在上述剔除、
+ *     合并、分隔与块末硬换行改写的范围内。包进 paragraph 后，这组子节点的产物与放在段落中逐字相同。块级子节点仍与行内
+ *     内容直接拼接、不另起一块，但随之处在 phrasing 语境中，其处理器经 safe() 写出的部分多出该语境的转义，涉及围栏代码
+ *     的信息串、定义的标签、地址与标题，以及脚注定义的标签（见 wrapPhrasingRoot）
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -86,7 +91,7 @@ const LINE_MARKER_UNSAFE = [
 async function render(doc) {
     const { unified, remarkStringify, remarkGfm } = await loadUnified();
     const prepared = displayImagesToHtml(applyTextLayout(stripMarkersTree(doc.ir)));
-    const downgraded = pruneEmptyInline(downgradeCustomNodes(wrapMath(prepared)));
+    const downgraded = pruneEmptyInline(wrapPhrasingRoot(downgradeCustomNodes(wrapMath(prepared))));
     const result = unified()
         .use(remarkGfm)
         .use(remarkStringify, { ...MD_OPTIONS, handlers: HANDLERS, unsafe: LINE_MARKER_UNSAFE })
@@ -107,6 +112,49 @@ function wrapMath(node) {
     if (Array.isArray(node.children)) return { ...node, children: node.children.map(wrapMath) };
     return node;
 }
+
+// ============================================================
+// root 的子节点含上游 phrasing 类型：包进段落
+// ============================================================
+
+// 上游 root 处理器据以改用 containerPhrasing 的节点类型：照录 mdast-util-phrasing 4.1.0 的 lib/index.js
+// （mdast-util-to-markdown 2.1.2 的 lib/handle/root.js 以其 phrasing() 判定），不含 html 与本项目自定义的 underline、
+// superscript、subscript
+const UPSTREAM_PHRASING_TYPES = new Set([
+    'break', 'delete', 'emphasis', 'footnote', 'footnoteReference', 'image', 'imageReference', 'inlineCode',
+    'inlineMath', 'link', 'linkReference', 'mdxJsxTextElement', 'mdxTextExpression', 'strong', 'text', 'textDirective',
+]);
+
+/**
+ * root 的子节点含上游 phrasing 类型时，把全部子节点包进一个 paragraph，返回新树；无须包装时返回原对象，不修改入参。
+ * 为何包装：上游 root 处理器（lib/handle/root.js）在子节点含 phrasing 类型时改用 containerPhrasing，把全部子节点当作
+ * 一段行内内容拼接，却不进入 paragraph 与 phrasing 语境，「*」「_」「`」「~」「&」「<」、「!」加「[」、行首行尾空白、
+ * 反斜杠加换行等只在 phrasing 语境中转义的写法照原样写出，如 [text('*甲*')] 输出「*甲*」、重新解析为强调。root 又不在
+ * pruneEmptyInline 的处理范围内，空节点遮住转义语境、数字与记号分属相邻 text、相邻代码段粘连、值为空的代码段写作「``」、
+ * 块末硬换行写作「\ + 换行」等问题照样出现，如 [strong(), text('# 标题')] 输出「# 标题」、重新解析为标题，
+ * [text('甲'), break] 输出「甲\」加换行、重新解析为文本「甲\」。paragraph 处理器进入 paragraph 与 phrasing 语境、同样
+ * 以 containerPhrasing 拼接子节点，包装后的产物与这组子节点放在段落中逐字相同，pruneEmptyInline 也照 paragraph 处理
+ * 它们。
+ * 对块级子节点的影响：它们仍与行内内容直接拼接、不另起一块（包装前后都如此），但构造栈多出 paragraph 与 phrasing 两层，
+ * 处理器经 safe() 写出的部分随之多出只在 phrasing 语境中生效的转义。上游块级处理器中直接调用 safe() 的只有围栏代码
+ * （信息串的 lang 与 meta）、定义（标签、地址与标题）与脚注定义（标签）三种，如 [text(甲), code(lang: a*b_c)] 的信息串
+ * 由「a*b_c」变为「a\*b\_c」，[text(甲), definition(url: http://x.com)] 的地址由「http://x.com」变为「http\://x.com」；
+ * 标题、列表、引用块与表格的内容本就由各自的处理器放进 phrasing 语境，html 块与分隔线不经 safe()，产物不变。
+ * 为何在剔除之前包装：是否含 phrasing 类型按剔除前的子节点判定，与修复前上游看到的子节点一致；剔除之后才判定，剔除掉
+ * 仅有的 phrasing 节点（如 [paragraph(甲), text(''), paragraph(乙)] 中的空文本）会使 root 改按 containerFlow 渲染，
+ * 两个段落由直接拼接改为以空行分隔。phrasing 类型照录上游列表（UPSTREAM_PHRASING_TYPES），子节点不含这些类型的 root
+ * 上游按 containerFlow 渲染，不包装。
+ * 线性：只对 root 的直属子节点做一次 some()，包装时新建两个对象。
+ */
+function wrapPhrasingRoot(node) {
+    if (!node || node.type !== 'root' || !Array.isArray(node.children) || !node.children.some(isUpstreamPhrasing)) {
+        return node;
+    }
+    return { ...node, children: [{ type: 'paragraph', children: node.children }] };
+}
+
+/** 上游 root 处理器是否把该节点认作行内内容（phrasing 类型，见 UPSTREAM_PHRASING_TYPES） */
+const isUpstreamPhrasing = (node) => Boolean(node) && UPSTREAM_PHRASING_TYPES.has(node.type);
 
 // ============================================================
 // 行内语境：剔除产物为空的节点与值为空的 inlineCode，在数字边界合并相邻 text，分隔相邻的 inlineCode，改写块末硬换行
@@ -133,7 +181,8 @@ const CHAR_RIGHT_PAREN = ')'.charCodeAt(0);
  * 不修改入参。
  * 对象与范围：PHRASING_PARENTS 各类型的子节点中，value 为空串的 text 与 html，值为空的 inlineCode，以及子节点剔除
  * 完毕后已无子节点的六种行内格式（EMPTY_CAPABLE_TYPES）；link / linkReference 只剔除其子节点、不剔除自身（产物含
- * 地址，不为空）；root、list 等块级父节点的子节点不在范围内。
+ * 地址，不为空）。子节点含上游 phrasing 类型的 root 已由 wrapPhrasingRoot 把全部子节点包进 paragraph，照 paragraph
+ * 处理；其余 root 与 list 等块级父节点的子节点不在范围内。
  * 为何在 stringify 之前剔除：containerPhrasing 只凭紧邻兄弟给出 before / after。前一兄弟产物为空时 before 为空串，
  * 看不到更前的真实字符与段首换行；后一兄弟为空文本时 after 为空串，为无内容的格式节点或空 html 时 after 取其 peek
  * 报出的「*」「~」或「<」；紧接 html 节点之前的行尾换行还会改为空格，html 值为空时同样如此。safe() 据此决定行首
@@ -398,11 +447,12 @@ function attentionDepths(state) {
  * 回退。before 侧的空文本、无内容的格式节点与空 html 都使 before 为空串；after 侧只有无 peek 的空文本使 after
  * 为空串，无内容的格式节点与空 html 的 peek 仍报非空字符，故在两项字符比较之后再以 isEmptyOutput 直接判定
  * 后一兄弟的产物是否为空。
- * render() 已先行剔除 paragraph、heading、tableCell、行内格式与链接中产物为空的子节点（pruneEmptyInline），这两侧
- * 的空邻居判定在常规 IR 中不再触发，保留作兜底。仍可达的情形有二：其一，表格单元格中前一字为空白的硬换行产物为
- * 空串，不属剔除对象，其后格式节点的 before 为空串，由前侧回退，如单元格 [text(甲 ), break, strong(乙)] 输出
- * 「甲 <strong>乙</strong>」；其二，root 直接挂行内节点时不在剔除范围内，[strong(甲), text('')] 由 after 为空串
- * 回退，[strong(甲), delete()] 由 isEmptyOutput 回退，均输出「<strong>甲</strong>」。
+ * render() 已先行剔除 paragraph、heading、tableCell、行内格式与链接中产物为空的子节点（pruneEmptyInline），子节点
+ * 含上游 phrasing 类型的 root 也已把全部子节点包进 paragraph（wrapPhrasingRoot），这两侧的空邻居判定在常规 IR 中不再
+ * 触发，保留作兜底。仍可达的情形有二：其一，表格单元格中前一字为空白的硬换行产物为空串，不属剔除对象，其后格式节点的
+ * before 为空串，由前侧回退，如单元格 [text(甲 ), break, strong(乙)] 输出「甲 <strong>乙</strong>」；其二，列表项、
+ * 引用块等以 containerFlow 渲染子节点的块级容器直接挂行内节点时不在剔除范围内，其子节点的 before / after 恒为换行，
+ * 后一兄弟产物为空时由 isEmptyOutput 回退，如列表项 [strong(甲), text('')] 输出「- <strong>甲</strong>」。
  * 下标取 state.indexStack 栈顶（containerPhrasing 调用子节点处理器前写入）；parent 缺失或栈顶不指向本节点时
  * 两侧都不判定。
  */
@@ -422,7 +472,7 @@ function isGluedToSibling(node, parent, state, info, markerChar) {
  * 行内节点的产物是否为空：text 与 html 以 value 是否为空串判定；strong / emphasis / delete / underline /
  * superscript / subscript 在全部子节点产物为空时为空（无 children 视同为空），与各自处理器在内容为空时返回空串
  * 一致；其余类型一律视为非空。常规 IR 中产物为空的行内节点已由 pruneEmptyInline 剔除，本函数只在剔除范围之外
- * （如 root 直接挂行内节点）才会判为空，保留作 isGluedToSibling 后侧的兜底。
+ * （如列表项、引用块直接挂行内节点）才会判为空，保留作 isGluedToSibling 后侧的兜底。
  * 格式节点的判定结果按 state 分表记忆化：一次序列化中每个格式节点至多判定一次，每次只遍历直属子节点，整体线性于
  * 节点数。不记忆化时，若深链的每层都是「产物为空的定界符式格式节点 + 下一层」，每层都要沿链下探到首个非空节点，
  * 耗时随深度平方增长。

@@ -42,8 +42,9 @@
  *   - 可见内容只有空白的格式节点（如 delete(" ")）：内容首尾是空白，只能写 HTML 标签，liftInlineHtml 原先把只包着空白的
  *     格式标签直接拆除（converters/ir/inline-html.js 的 wrapFrame），格式丢失；属另一缺陷，已由后续修复在提升时保留这类
  *     标签处理，专测见 test/md-whitespace-format.test.js；本文件的随机文本仍均含非空白字符，测试数据不变；
- *   - root 直接挂行内节点：render() 的剔除与分隔只作用于 paragraph、heading、tableCell、行内格式与链接的子节点，root 下
- *     相邻的代码段仍粘连，与 d332ef0 的剔除范围一致。
+ *   - root 直接挂行内节点：原先 render() 的剔除与分隔只作用于 paragraph、heading、tableCell、行内格式与链接的子节点，
+ *     root 下相邻的代码段仍粘连，与 d332ef0 的剔除范围一致；已由后续修复在 root 的子节点含上游 phrasing 类型时把全部
+ *     子节点先包进段落处理，专测见 test/md-root-phrasing.test.js；本文件只渲染段落、标题与表格单元格，测试数据不变。
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
