@@ -18,6 +18,7 @@ const { markIndents } = require('../converters/parsers/url');
 const { annotateLayout } = require('../converters/web/extract');
 const { isAttached } = require('../converters/web/noise');
 const { indentMarker } = require('../converters/ir/markers');
+const { BUDGET_FACTOR, budgetMs } = require('./helpers/timing-budget');
 
 // 制表符与换行写作转义序列，其余不可见字符以码点生成，源码里不出现看不见的字面量
 const NBSP = String.fromCharCode(0xa0);
@@ -458,6 +459,8 @@ const SHARED_STYLE_LEAF_COUNT = 1000;
 // 与 style 长度线性增长，合计 O(n·L)），是上限的 8.5 倍以上；逐元素缓存之后在本文件内单独运行 22 次，markIndents
 // 至多约 41 毫秒、annotateLayout 至多约 15 毫秒，不到上限的七分之一。18 个测试进程同时抢占 18 核时，二者至多约
 // 130 与 82 毫秒，仍在上限之内
+// CI 上按 test/helpers/timing-budget.js 的系数放宽：CI 三平台上诊断行实测的最大值为 markIndents 194 毫秒（ubuntu）、
+// annotateLayout 132 毫秒（Windows），放宽后余量分别为 6.2、9.1 倍
 const SHARED_STYLE_BUDGET_MS = 300;
 
 // 差分样本：随机 HTML 页面的份数（每份在 cheerio 与 linkedom 上各跑新旧两遍），以及块元素的最大嵌套层数
@@ -594,10 +597,11 @@ describe('叶子块缩进的逐元素缓存：祖先 style 只匹配一次', () 
 
         // Assert：先验结果正确，以免「快」来自少做了事——外层的 2em 经中层继承到每个叶子块
         assert.deepEqual($('p').map((_, el) => $(el).text()).get(), expectedSharedStyleTexts());
-        t.diagnostic(`markIndents 实测 ${elapsedMs.toFixed(1)} ms，上限 ${SHARED_STYLE_BUDGET_MS} ms`);
+        const budget = budgetMs(SHARED_STYLE_BUDGET_MS);
+        t.diagnostic(`markIndents 实测 ${elapsedMs.toFixed(1)} ms，上限 ${budget} ms`);
         assert.ok(
-            elapsedMs < SHARED_STYLE_BUDGET_MS,
-            `markIndents 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${SHARED_STYLE_BUDGET_MS} ms`,
+            elapsedMs < budget,
+            `markIndents 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${budget} ms（${SHARED_STYLE_BUDGET_MS} ms × 系数 ${BUDGET_FACTOR}）`,
         );
     });
 
@@ -612,10 +616,11 @@ describe('叶子块缩进的逐元素缓存：祖先 style 只匹配一次', () 
 
         // Assert：先验结果正确——标记作为文本节点插在每个叶子块之首
         assert.deepEqual(Array.from(document.querySelectorAll('p'), (p) => p.textContent), expectedSharedStyleTexts());
-        t.diagnostic(`annotateLayout 实测 ${elapsedMs.toFixed(1)} ms，上限 ${SHARED_STYLE_BUDGET_MS} ms`);
+        const budget = budgetMs(SHARED_STYLE_BUDGET_MS);
+        t.diagnostic(`annotateLayout 实测 ${elapsedMs.toFixed(1)} ms，上限 ${budget} ms`);
         assert.ok(
-            elapsedMs < SHARED_STYLE_BUDGET_MS,
-            `annotateLayout 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${SHARED_STYLE_BUDGET_MS} ms`,
+            elapsedMs < budget,
+            `annotateLayout 实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${budget} ms（${SHARED_STYLE_BUDGET_MS} ms × 系数 ${BUDGET_FACTOR}）`,
         );
     });
 
