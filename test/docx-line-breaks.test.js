@@ -392,11 +392,8 @@ describe('turndown word profile：换行写法与强调规则', () => {
     test('尾部剥离 <br> 前核对反斜杠奇偶：偶数个是字面反斜杠加真换行，奇数个说明「<」是被转义的字面文字', () => {
         // 文本末尾的字面反斜杠被 turndown 加倍为两个，其后的 <br> 是真换行，照常剥出定界符
         assert.equal(toMarkdown('<p>前文<strong>加粗\\<br /></strong>后文</p>'), '前文**加粗\\\\**<br>后文');
-        // 模拟把文本里的「<」转义为 \< 的上游转义（未合并分支 fix/turndown-escape-lt-amp 的做法）：字面的「<br>」不得剥出
-        const service = createTurndownService('word');
-        const upstream = service.escape.bind(service);
-        service.escape = (value) => upstream(value).replace(/</g, '\\<');
-        // 旧期望「前文**加粗\<br>**后文」本身即 flanking 失效（闭定界符前是「>」、后是汉字），现按定界符后处理改写为标签
-        assert.equal(toMarkdown('<p>前文<strong>加粗&lt;br&gt;</strong>后文</p>', service), '前文<strong>加粗\\<br></strong>后文');
+        // 文本里的「<」由工厂层的 escapeHtmlSyntax 转义为 \<，字面的「<br>」前恰有一个反斜杠，不得剥出。
+        // 期望「前文**加粗\<br>**后文」本身即 flanking 失效（闭定界符前是「>」、后是汉字），按定界符后处理改写为标签
+        assert.equal(toMarkdown('<p>前文<strong>加粗&lt;br&gt;</strong>后文</p>'), '前文<strong>加粗\\<br></strong>后文');
     });
 });

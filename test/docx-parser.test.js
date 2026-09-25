@@ -11,7 +11,7 @@ const path = require('node:path');
 const zlib = require('node:zlib');
 
 const {
-    Document, Packer, Paragraph, TextRun, HeadingLevel, ImageRun, Table, TableRow, TableCell,
+    Document, Packer, Paragraph, TextRun, HeadingLevel, ImageRun, Table, TableRow, TableCell, UnderlineType,
 } = require('docx');
 
 const { parse } = require('../converters/parsers/docx');
@@ -565,4 +565,72 @@ test('表格单元格与图片替代文字中的「~」与星号逐字进入 IR�
     // Assert：两条通道都未误生成 delete 与 emphasis 节点
     assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete'), []);
     assert.deepEqual(collect(doc.ir, (n) => n.type === 'emphasis'), []);
+});
+
+test('字面尖括号与字符引用写法逐字进入 IR：正文、表格单元格、图片替代文字三条通道都不产生 html 节点', async () => {
+    // Arrange：正文段落、表格单元格、图片 alt 三条通道同时混入字面「<...>」标签与字符引用写法
+    const ALT = '见&lt;与&amp; 及 a<b>c';
+    const buffer = await Packer.toBuffer(new Document({
+        sections: [{ children: [
+            new Paragraph('当a<b>c时成立'),
+            new Paragraph('见&lt;与&amp;，另有 &#60; 与 AT&T'),
+            new Paragraph('<div>块级开头</div>'),
+            new Paragraph({ children: [
+                new TextRun('R'),
+                new TextRun({ text: 'a<b', superScript: true }),
+                new TextRun('、'),
+                new TextRun({ text: '下&lt;线', underline: { type: UnderlineType.SINGLE } }),
+                new TextRun('、C'),
+                new TextRun({ text: 'x<y', subScript: true }),
+            ] }),
+            new Table({
+                rows: [
+                    new TableRow({ children: [cell('项'), cell('值')] }),
+                    new TableRow({ children: [cell('a<b>c'), cell('见&lt;与&amp;')] }),
+                ],
+            }),
+            new Paragraph({ children: [new ImageRun({
+                type: 'png',
+                data: PNG,
+                transformation: { width: 8, height: 8 },
+                altText: { title: ALT, description: ALT, name: ALT },
+            })] }),
+        ] }],
+    }));
+
+    // Act
+    const doc = await parse({ buffer }, { sourceName: '尖括号写法.docx' });
+
+    // Assert：正文段落逐字保留，字面的标签与字符引用写法均未被解析
+    const paragraphs = doc.ir.children.filter((n) => n.type === 'paragraph' && plainText(n));
+    assert.deepEqual(paragraphs.map(plainText), [
+        '当a<b>c时成立',
+        '见&lt;与&amp;，另有 &#60; 与 AT&T',
+        '<div>块级开头</div>',
+        'Ra<b、下&lt;线、Cx<y',
+    ]);
+
+    // Assert：表格单元格文本逐字保留
+    const rows = collect(doc.ir, (n) => n.type === 'tableRow');
+    assert.deepEqual(rows.map((r) => r.children.map(plainText)), [['项', '值'], ['a<b>c', '见&lt;与&amp;']]);
+
+    // Assert：图片替代文字逐字保留
+    const images = collect(doc.ir, (n) => n.type === 'image');
+    assert.equal(images.length, 1);
+    assert.equal(images[0].alt, ALT);
+
+    // Assert：三条通道都未产生 html 节点，上标／下划线／下标各自成节点且文字不被转义
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'html'), []);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'superscript').map(plainText), ['a<b']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'underline').map(plainText), ['下&lt;线']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'subscript').map(plainText), ['x<y']);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'strong'), []);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'emphasis'), []);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete'), []);
+
+    // Assert：md 产物中「<」与「&」经转义，不被解释成标签或字符引用
+    const markdown = await mdRenderer.render(doc);
+    assert.ok(markdown.includes('当a\\<b>c时成立'), markdown);
+    assert.ok(markdown.includes('\\<div>块级开头\\</div>'), markdown);
+    assert.ok(markdown.includes('<u>下\\&lt;线</u>'), markdown);
 });

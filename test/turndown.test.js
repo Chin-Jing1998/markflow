@@ -4,6 +4,8 @@
  *       各 profile 的「~」转义（含超长反斜杠串上的线性耗时、与线性化之前实现的差分等价）、
  *       url profile 的保真约定（HTML 标签、标记、图注、上下标），
  *       表格单元格与图片 alt 接入 service.escape（转义顺序、换行折叠、src 与 title 沿用内置规则），
+ *       「<」一律转义与「&」选择性转义（正文、表格单元格、图片 alt 三条通道，含跨文本节点、
+ *       零宽字符穿插、裸网址查询串不受影响与线性耗时），
  *       以及 turndown → remark-gfm → ir/inline-html 的全链路结果
  */
 const { test } = require('node:test');
@@ -14,6 +16,7 @@ const { createTurndownService } = require('../converters/ir/turndown');
 const { MARKERS } = require('../converters/ir/markers');
 const { loadUnified } = require('../converters/ir/unified-loader');
 const { liftInlineHtml } = require('../converters/ir/inline-html');
+const { normalizeMarkdown } = require('../converters/web/normalize');
 
 // 表格规则在 word 与 url 两个 profile 上都挂着，两者行为应一致
 const PROFILES_WITH_TABLE = ['word', 'url'];
@@ -468,5 +471,263 @@ test('escape：反斜杠串位于串首、串尾与「~」两侧时，奇偶判�
         for (const [input, expected] of cases) {
             assert.equal(service.escape(input), expected, `${profile}: ${JSON.stringify(input)}`);
         }
+    }
+});
+
+// ============================================================
+// 「<」与「&」的转义（正文、表格单元格、图片 alt 三条通道共用 service.escape）
+// ============================================================
+
+// parsers/url 的链路顺序：turndown → normalizeMarkdown（删零宽字符）→ remark-parse + remark-gfm → liftInlineHtml
+async function toIrNormalized(html) {
+    const md = normalizeMarkdown(toMarkdown(html, 'url'));
+    const { unified, remarkParse, remarkGfm } = await loadUnified();
+    return { md, ir: liftInlineHtml(unified().use(remarkParse).use(remarkGfm).parse(md), { source: SOURCE_OF.url }) };
+}
+
+const htmlNodes = (ir) => collect(ir, (n) => n.type === 'html');
+
+// 零宽空格 U+200B：以码点生成，测试源码里不出现看不见的字面量
+const ZERO_WIDTH_SPACE = String.fromCharCode(0x200B);
+// 对抗性输入的长度与单次转义的耗时上限：转义须随长度线性增长
+const STRESS_LENGTH = 200000;
+const STRESS_LIMIT_MS = 1000;
+
+test('各 profile 全链路：正文中的「<」一律转义，标签与注释写法逐字进入 IR', async () => {
+    // Act & Assert：「<」是否构成标签取决于后随字符，而 escape 逐文本节点调用、看不到下一个节点，故一律转义
+    for (const profile of ALL_PROFILES) {
+        const tag = await toIr('<p>当a&lt;b&gt;c时成立</p>', profile);
+        assert.equal(tag.md, '当a\\<b>c时成立', profile);
+        assert.equal(plainText(tag.ir), '当a<b>c时成立', profile);
+        assert.deepEqual(htmlNodes(tag.ir), [], profile);
+        assert.deepEqual(textsOfType(tag.ir, 'strong'), [], profile);
+
+        // Assert：块级标签写在段首时整段会被当成 html 块，转义后仍是普通段落文本
+        const block = await toIr('<p>&lt;div&gt;块级开头&lt;/div&gt;</p>', profile);
+        assert.equal(plainText(block.ir), '<div>块级开头</div>', profile);
+        assert.deepEqual(htmlNodes(block.ir), [], profile);
+
+        // Assert：注释写法同理
+        const comment = await toIr('<p>&lt;!-- 注释 --&gt;之后</p>', profile);
+        assert.equal(plainText(comment.ir), '<!-- 注释 -->之后', profile);
+        assert.deepEqual(htmlNodes(comment.ir), [], profile);
+
+        // Assert：后随空白、汉字或另一个「<」时看似无害，同样转义——不按后随字符放行，IR 文本不受多转义影响
+        const harmless = await toIr('<p>x &lt; y 且 温度&lt;中值 且 a&lt;&lt;b</p>', profile);
+        assert.equal(harmless.md, 'x \\< y 且 温度\\<中值 且 a\\<\\<b', profile);
+        assert.equal(plainText(harmless.ir), 'x < y 且 温度<中值 且 a<<b', profile);
+    }
+});
+
+test('各 profile 全链路：尖括号包起来的邮箱与网址不再被自动链接吞掉尖括号', async () => {
+    // Act & Assert：micromark 的邮箱自动链接首字符可为数字与多种标点，无法按后随字符放行
+    for (const profile of ALL_PROFILES) {
+        const { ir } = await toIr('<p>邮箱 &lt;12345@qq.com&gt; 与 &lt;http://example.com/a&gt;</p>', profile);
+
+        // 只断言文本：GFM 仍会把其中的裸邮箱与裸网址另行识别为 link 节点，尖括号本身须逐字保留
+        assert.equal(plainText(ir), '邮箱 <12345@qq.com> 与 <http://example.com/a>', profile);
+    }
+});
+
+test('各 profile 全链路：可构成字符引用的「&」转义为 \\&，实体写法逐字进入 IR', async () => {
+    // Act & Assert：命名引用与数值引用（十进制、十六进制）都会被 micromark 解码，须先转义
+    for (const profile of ALL_PROFILES) {
+        const named = await toIr('<p>见&amp;lt;与&amp;amp;</p>', profile);
+        assert.equal(named.md, '见\\&lt;与\\&amp;', profile);
+        assert.equal(plainText(named.ir), '见&lt;与&amp;', profile);
+
+        const numeric = await toIr('<p>&amp;#60; 与 &amp;#x3C; 与 &amp;copy;</p>', profile);
+        assert.equal(plainText(numeric.ir), '&#60; 与 &#x3C; 与 &copy;', profile);
+    }
+});
+
+test('各 profile 全链路：不构成字符引用的「&」不转义，裸网址的查询串不多出反斜杠', async () => {
+    // Act & Assert：GFM autolink literal 内部的反斜杠是字面量，一律转义会把它写进链接地址与文本
+    for (const profile of ALL_PROFILES) {
+        const source = 'AT&T 与 R&D，网址 http://example.com/?a=1&b=2 结束';
+        const plain = await toIr('<p>AT&amp;T 与 R&amp;D，网址 http://example.com/?a=1&amp;b=2 结束</p>', profile);
+        assert.equal(plain.md, source, profile);
+        assert.ok(!plain.md.includes('\\'), `${profile}: ${plain.md}`);
+        assert.equal(collect(plain.ir, (n) => n.type === 'link')[0].url, 'http://example.com/?a=1&b=2', profile);
+
+        // Assert：「&」后随空白时不可能构成字符引用
+        assert.equal(toMarkdown('<p>甲 &amp; 乙</p>', profile), '甲 & 乙', profile);
+
+        // Assert：引用名长度以 micromark 的 characterReferenceNamedSizeMax 为界，31 个字母数字转义、32 个不转义
+        const atLimit = await toIr('<p>&amp;CounterClockwiseContourIntegral;</p>', profile);
+        assert.equal(atLimit.md, '\\&CounterClockwiseContourIntegral;', profile);
+        assert.equal(plainText(atLimit.ir), '&CounterClockwiseContourIntegral;', profile);
+        assert.equal(toMarkdown('<p>&amp;CounterClockwiseContourIntegralX;</p>', profile), '&CounterClockwiseContourIntegralX;', profile);
+
+        // Assert：分号可能落在下一个文本节点里，故文本节点末尾的「&」从严按可能构成处理
+        const tail = await toIr('<p>Q&amp;A</p>', profile);
+        assert.equal(tail.md, 'Q\\&A', profile);
+        assert.equal(plainText(tail.ir), 'Q&A', profile);
+    }
+});
+
+test('各 profile 全链路：字面反斜杠已被加倍时不重复转义「<」与「&」', async () => {
+    // Arrange：HTML 文本为「甲\<b>乙\&lt;丙」，turndown 自身会先把字面反斜杠加倍
+    for (const profile of ALL_PROFILES) {
+        // Act
+        const { md, ir } = await toIr('<p>甲\\&lt;b&gt;乙\\&amp;lt;丙</p>', profile);
+
+        // Assert：前导反斜杠为偶数个（已加倍），仍须补一个转义反斜杠
+        assert.equal(md, '甲\\\\\\<b>乙\\\\\\&lt;丙', profile);
+        assert.equal(plainText(ir), '甲\\<b>乙\\&lt;丙', profile);
+    }
+});
+
+test('各 profile 全链路：「&」与「<」按文本节点边界从严转义，跨节点拼出的实体与标签不成立', async () => {
+    // Act & Assert：escape 逐文本节点调用，「&」与其后的「lt;」分处两个节点时仍须转义
+    for (const profile of ALL_PROFILES) {
+        const { ir } = await toIr('<p>&amp;<span>lt;</span> 与 a&lt;<span>b&gt;c</span> 与 &amp;am<span>p;</span></p>', profile);
+
+        assert.equal(plainText(ir), '&lt; 与 a<b>c 与 &amp;', profile);
+    }
+});
+
+test('url profile 全链路：零宽字符被 normalizeMarkdown 删除后，跨零宽拼出的实体与标签仍不成立', async () => {
+    // Arrange：parsers/url 在 turndown 之后、remark 之前删零宽字符，判定时须视零宽字符为不存在
+    const cases = [
+        [`<p>&amp;${ZERO_WIDTH_SPACE}lt;</p>`, '&lt;'],
+        [`<p>&amp;l${ZERO_WIDTH_SPACE}t;</p>`, '&lt;'],
+        [`<p>&lt;${ZERO_WIDTH_SPACE}b&gt;粗&lt;/b&gt;</p>`, '<b>粗</b>'],
+    ];
+
+    // Act & Assert
+    for (const [html, expected] of cases) {
+        const { ir } = await toIrNormalized(html);
+        assert.equal(plainText(ir), expected, html);
+        assert.deepEqual(htmlNodes(ir), [], html);
+    }
+});
+
+test('表格单元格：「<」与「&」被转义，标签与实体写法逐字进入 IR', async () => {
+    // Arrange：标签写法、实体写法，以及与竖线转义相邻的标签写法
+    const html = tableOf('a&lt;b&gt;c', '见&amp;lt;与&amp;amp;', '&lt;b&gt;|&lt;/b&gt;');
+
+    // Act & Assert：表格规则挂在 word 与 url 两个 profile 上，行为应一致
+    for (const profile of PROFILES_WITH_TABLE) {
+        const { md, ir } = await toIr(html, profile);
+        const lines = md.split('\n');
+
+        // Assert：Markdown 数据行逐字符相符（竖线转义补在 escape 之后，反斜杠不互相吞并）
+        assert.equal(lines[2], '| a\\<b>c |', profile);
+        assert.equal(lines[3], '| 见\\&lt;与\\&amp; |', profile);
+        assert.equal(lines[4], '| \\<b>\\|\\</b> |', profile);
+
+        // Assert：全链路后各单元格文本与源文本逐字相等
+        assert.deepEqual(
+            rowCells(ir),
+            [['项'], ['a<b>c'], ['见&lt;与&amp;'], ['<b>|</b>']],
+            profile,
+        );
+
+        // Assert：既不生成 html 节点，也不被误解析出行内节点
+        assert.deepEqual(htmlNodes(ir), [], profile);
+        for (const type of INLINE_TYPES) {
+            assert.deepEqual(textsOfType(ir, type), [], `${profile} 不应出现 ${type} 节点`);
+        }
+    }
+});
+
+test('图片 alt：「<」与「&」被转义，标签与实体写法逐字进入 IR', async () => {
+    // Act & Assert：内置 image 规则为三个 profile 共用，alt 规则同样覆盖三者
+    for (const profile of ALL_PROFILES) {
+        const entity = await toIr('<p><img src="a.png" alt="见&amp;lt;与&amp;amp;"></p>', profile);
+        assert.equal(entity.md, '![见\\&lt;与\\&amp;](a.png)', profile);
+        assert.equal(firstImage(entity.ir).alt, '见&lt;与&amp;', profile);
+
+        // Assert：alt 内的尖括号网址不再被当作自动链接、尖括号不丢
+        const autolink = await toIr('<p><img src="a.png" alt="&lt;http://a.com/x&gt;"></p>', profile);
+        assert.equal(firstImage(autolink.ir).alt, '<http://a.com/x>', profile);
+
+        // Assert：alt 内的半截标签原本会吃掉后文、整张图片随之丢失
+        const halfTag = await toIr('<p><img src="a.png" alt="a &lt;b title=&quot;"> 之后 "&gt; 末尾</p>', profile);
+        const images = collect(halfTag.ir, (n) => n.type === 'image');
+        assert.equal(images.length, 1, profile);
+        assert.equal(images[0].alt, 'a <b title="', profile);
+
+        // Assert：回归防护，mdast 取 alt 时本就保留 html 片段原文，转义后仍逐字相等
+        const tag = await toIr('<p><img src="a.png" alt="a&lt;b&gt;c"></p>', profile);
+        assert.equal(firstImage(tag.ir).alt, 'a<b>c', profile);
+    }
+});
+
+test('word profile 全链路：有意输出的 <u>/<sup>/<sub> 仍被提升，其中文本的「<」「&」照常转义', async () => {
+    // Act
+    const { md, ir } = await toIr('<p>R<sup>a&lt;b</sup>、<u>下&amp;lt;线</u>、C<sub>x&lt;y</sub></p>', 'word');
+
+    // Assert：规则 replacement 拼出的标签不经 escape，标签内的文本经 escape
+    assert.equal(md, 'R<sup>a\\<b</sup>、<u>下\\&lt;线</u>、C<sub>x\\<y</sub>');
+    assert.deepEqual(textsOfType(ir, 'superscript'), ['a<b']);
+    assert.deepEqual(textsOfType(ir, 'underline'), ['下&lt;线']);
+    assert.deepEqual(textsOfType(ir, 'subscript'), ['x<y']);
+    assert.deepEqual(htmlNodes(ir), []);
+});
+
+test('url profile 全链路：有意输出的行内 HTML 仍被提升，其中文本的「<」「&」照常转义', async () => {
+    // Act
+    const { ir } = await toIr('<p><strong>粗&lt;em&gt;</strong>、<em>斜&amp;amp;</em>、<del>删&lt;s&gt;</del>、R<sup>a&lt;b</sup>、C<sub>x&lt;y</sub></p>', 'url');
+
+    // Assert：文本中的标签写法不再与规则拼出的真标签混淆，配对关系不被打乱
+    assert.deepEqual(textsOfType(ir, 'strong'), ['粗<em>']);
+    assert.deepEqual(textsOfType(ir, 'emphasis'), ['斜&amp;']);
+    assert.deepEqual(textsOfType(ir, 'delete'), ['删<s>']);
+    assert.deepEqual(textsOfType(ir, 'superscript'), ['a<b']);
+    assert.deepEqual(textsOfType(ir, 'subscript'), ['x<y']);
+    assert.deepEqual(htmlNodes(ir), []);
+
+    // Assert：回归防护，imgDisplay 规则的属性值走 escapeAttr，不受转义链影响
+    const display = await toIr('<p><img src="a.png" alt="a&lt;b&amp;lt;" data-mf-display="320"></p>', 'url');
+    assert.equal(display.md, '<img src="a.png" alt="a&lt;b&amp;lt;" width="320">');
+    assert.equal(firstImage(display.ir).alt, 'a<b&lt;');
+});
+
+test('代码内的「<」与「&」不转义（回归防护：turndown 不对 code 调 escape）', async () => {
+    // Act
+    const { md, ir } = await toIr('<p><code>&lt;b&gt; &amp;amp;</code></p>');
+
+    // Assert
+    assert.equal(md, '`<b> &amp;`');
+    assert.deepEqual(textsOfType(ir, 'inlineCode'), ['<b> &amp;']);
+});
+
+test('上游已转义的「<」与「&」不重复转义：按前导反斜杠的奇偶判定', () => {
+    // Arrange：把 turndown 自身的 escape 换成「只转义 < 与 &」的版本，模拟上游已转义的情形
+    const original = TurndownService.prototype.escape;
+    try {
+        TurndownService.prototype.escape = (text) => text.replace(/[<&]/g, '\\$&');
+        const service = createTurndownService('url');
+
+        // Act & Assert：前导反斜杠为奇数个即视为已转义，原样保留；不判奇偶会得到 a\\<b，反斜杠自成一对、「<」重新裸露
+        assert.equal(service.escape('a<b 与 &lt;'), 'a\\<b 与 \\&lt;');
+    } finally {
+        TurndownService.prototype.escape = original;
+    }
+});
+
+test('「<」与「&」的转义耗时随长度线性增长，对抗性输入不触发回溯', () => {
+    // Arrange：字符引用判定最易退化的几类输入（连续起点、超长扫描区间、零宽字符穿插），以及只由反斜杠组成的串
+    //（内置转义先把它加倍为 40 万个，分词正则须把整段一次取走，不逐位回溯）
+    const zeroWidthRun = `&${ZERO_WIDTH_SPACE.repeat(100)}`;
+    const inputs = [
+        '\\'.repeat(STRESS_LENGTH),
+        '<'.repeat(STRESS_LENGTH),
+        '&'.repeat(STRESS_LENGTH),
+        '&a'.repeat(STRESS_LENGTH / 2),
+        `&${'a'.repeat(STRESS_LENGTH)}`,
+        `&${ZERO_WIDTH_SPACE.repeat(STRESS_LENGTH)}`,
+        zeroWidthRun.repeat(Math.floor(STRESS_LENGTH / zeroWidthRun.length)),
+    ];
+    const service = createTurndownService('url');
+
+    // Act & Assert
+    for (const input of inputs) {
+        const startedAt = Date.now();
+        service.escape(input);
+        const elapsed = Date.now() - startedAt;
+        assert.ok(elapsed < STRESS_LIMIT_MS, `长度 ${input.length} 的输入耗时 ${elapsed}ms`);
     }
 });
