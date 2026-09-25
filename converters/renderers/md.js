@@ -22,6 +22,10 @@
  *   - 产物为空的行内节点（空文本、空 html、内容为空的六种行内格式）在 stringify 之前从 paragraph、heading、
  *     tableCell、行内格式与链接的子节点中剔除：空节点会遮住相邻节点的 before / after 与 peek 语境，使行首记号、
  *     首尾空白、末尾反斜杠等的转义与定界符的判定落空；剔除后含空节点的 IR 与去掉空节点后的 IR 产物逐字相同
+ *   - 剔除之后仍相邻的两个 inlineCode 之间插入空 HTML 注释 <!---->：inlineCode 按值内的反引号串选定围栏长度，相邻
+ *     两段的闭围栏与开围栏会并成一个更长的反引号串，重新解析时配对错位，只调围栏长度无法分开；注释重新解析为 html
+ *     节点，html、docx、xml、content-list 渲染器均将其剥除。插入与剔除在同一趟遍历中进行，只在剔除空节点之后、父节点
+ *     属 PHRASING_PARENTS（即上条所列父类型）时插入，因此两段之间原有的空节点先被剔除，剔除后相邻的两段同样分隔
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -69,7 +73,7 @@ function wrapMath(node) {
 }
 
 // ============================================================
-// 行内语境：剔除产物为空的节点
+// 行内语境：剔除产物为空的节点，分隔相邻的 inlineCode
 // ============================================================
 
 // 可含行内子节点的父类型：paragraph / heading / tableCell / link / linkReference 与六种行内格式
@@ -77,9 +81,12 @@ const PHRASING_PARENTS = new Set([
     'paragraph', 'heading', 'tableCell', 'strong', 'emphasis', 'delete', 'underline', 'superscript', 'subscript',
     'link', 'linkReference',
 ]);
+// 相邻 inlineCode 之间插入的分隔注释：各版 CommonMark 都认作 HTML 注释的最短写法（<!--> 与 <!---> 自 0.31 起才算）
+const CODE_SEPARATOR = '<!---->';
 
 /**
- * 剔除行内语境中产物为空的节点，返回新树；子树未变时返回原对象，不修改入参。
+ * 剔除行内语境中产物为空的节点，并在剔除后仍相邻的两个 inlineCode 之间插入分隔注释，返回新树；子树未变时返回原对象，
+ * 不修改入参。
  * 对象与范围：PHRASING_PARENTS 各类型的子节点中，value 为空串的 text 与 html，以及子节点剔除完毕后已无子节点的
  * 六种行内格式（EMPTY_CAPABLE_TYPES）；link / linkReference 只剔除其子节点、不剔除自身（产物含地址，不为空）；
  * root、list 等块级父节点的子节点不在范围内。
@@ -88,13 +95,22 @@ const PHRASING_PARENTS = new Set([
  * 报出的「*」「~」或「<」；紧接 html 节点之前的行尾换行还会改为空格，html 值为空时同样如此。safe() 据此决定行首
  * 记号、首尾空白、「&」「<」「!」与末尾反斜杠的转义，定界符式格式据此判定能否写定界符，空节点使这些判定落空。
  * 剔除后各节点看到的都是真实邻居，含空节点的 IR 与去掉空节点后的 IR 产物逐字相同。
+ * 为何插入分隔注释：inlineCode 处理器按值内的反引号串选定围栏长度，containerPhrasing 把相邻产物首尾直接拼接，前一段
+ * 的闭围栏与后一段的开围栏并成一个更长的反引号串，不能闭合前一段，重新解析时配对错位，如 [code(x), code(y)] 输出
+ * 「`x``y`」、重新解析为单个代码段「x``y」。相邻的反引号总会并成同一串，只调围栏长度分不开，故在两段之间插入值为
+ * CODE_SEPARATOR 的 html 节点，输出「`x`<!---->`y`」，重新解析为代码段、html 节点、代码段。插入的位置：只在本层剔除
+ * 空节点之后，因此两段之间原有的空节点先被剔除，剔除后相邻的两段同样分隔；只在父节点属 PHRASING_PARENTS 时，与剔除
+ * 的范围相同。分隔节点只处在两个 inlineCode 之间，inlineCode 与 html 的处理器都不读 before / after，前一段的产物
+ * 以反引号收尾，也不会触发 html 之前的换行改写，故插入不改变其余节点的转义与定界符判定。
  * 线性：先递归剔除子节点、再过滤本层，格式节点是否为空只看剔除后的 children 是否为空数组，判定为 O(1)，无须再向
- * 下遍历；每个节点只访问一次。
+ * 下遍历；每个节点只访问一次。分隔注释在过滤后的本层子节点上单趟插入。
  */
 function pruneEmptyInline(node) {
     if (!node || typeof node !== 'object' || !Array.isArray(node.children)) return node;
     let children = node.children.map(pruneEmptyInline);
-    if (PHRASING_PARENTS.has(node.type)) children = children.filter((child) => !isPrunedEmpty(child));
+    if (PHRASING_PARENTS.has(node.type)) {
+        children = separateAdjacentInlineCode(children.filter((child) => !isPrunedEmpty(child)));
+    }
     const changed = children.length !== node.children.length || children.some((child, i) => child !== node.children[i]);
     return changed ? { ...node, children } : node;
 }
@@ -105,6 +121,24 @@ function isPrunedEmpty(node) {
     if (node.type === 'text' || node.type === 'html') return !node.value;
     return EMPTY_CAPABLE_TYPES.has(node.type) && (!Array.isArray(node.children) || node.children.length === 0);
 }
+
+/**
+ * 在相邻的两个 inlineCode 之间插入值为 CODE_SEPARATOR 的 html 节点，返回新数组；无相邻时返回原数组，不修改入参。
+ * 只由 pruneEmptyInline 对 PHRASING_PARENTS 各类型剔除空节点后的子节点调用。线性：单趟扫描，逐对比较相邻两项。
+ */
+function separateAdjacentInlineCode(children) {
+    let out = null;
+    for (let i = 1; i < children.length; i += 1) {
+        if (isInlineCode(children[i - 1]) && isInlineCode(children[i])) {
+            if (!out) out = children.slice(0, i);
+            out.push({ type: 'html', value: CODE_SEPARATOR });
+        }
+        if (out) out.push(children[i]);
+    }
+    return out || children;
+}
+
+const isInlineCode = (node) => Boolean(node) && node.type === 'inlineCode';
 
 // ============================================================
 // 图片：带显示尺寸的输出为 <img>
