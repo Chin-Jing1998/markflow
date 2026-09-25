@@ -14,8 +14,22 @@ const path = require('node:path');
 const converters = require('../converters');
 
 // 懒加载断言必须在任何 parser/renderer 被触达前执行，故紧跟 require 之后
+//
+// HEAVY_MODULE_RE 只应命中模块自身的路径片段，不该命中仓库检出位置的绝对路径前缀——
+// 仓库若被检出到路径含这些关键词的目录（如以 turndown 命名的草稿区、worktree），
+// 入口自身与任意轻量模块都会因绝对路径带有该前缀而被误判命中，产生假失败。
+// 故先把 require.cache 的键归一化：落在 node_modules 内的第三方包只取该包自身起的
+// 相对路径，其余模块取相对项目根的路径；仅用于匹配，数组中仍保留原始绝对路径以便定位。
+const PROJECT_ROOT = path.join(__dirname, '..');
+const NODE_MODULES_MARKER = `${path.sep}node_modules${path.sep}`;
+function toMatchableModuleId(absolutePath) {
+    const nodeModulesIndex = absolutePath.lastIndexOf(NODE_MODULES_MARKER);
+    if (nodeModulesIndex !== -1) return absolutePath.slice(nodeModulesIndex + NODE_MODULES_MARKER.length);
+    const relative = path.relative(PROJECT_ROOT, absolutePath);
+    return relative.startsWith('..') ? absolutePath : relative;
+}
 const HEAVY_MODULE_RE = /parsers|renderers|legacy|mammoth|exceljs|pdfjs|docx\/|pptxgenjs|cheerio|turndown/;
-const loadedAtStartup = Object.keys(require.cache).filter((k) => HEAVY_MODULE_RE.test(k));
+const loadedAtStartup = Object.keys(require.cache).filter((k) => HEAVY_MODULE_RE.test(toMatchableModuleId(k)));
 
 const { createDocument, createRoot, createHeading, createParagraph } = require('../converters/ir/schema');
 
