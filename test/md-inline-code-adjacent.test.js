@@ -38,8 +38,9 @@
  *   - 以数字结尾或以「.」「)」开头的文本：数字与其后的「.」「)」分属两个文本节点时行首记号的判定落空，属另一缺陷，
  *     已由后续修复在数字边界合并相邻 text 处理，专测见 test/md-list-marker-split.test.js；本文件的随机文本仍避开这类
  *     文本；
- *   - 可见内容只有空白的格式节点（如 delete(" ")）：内容首尾是空白，只能写 HTML 标签，而 liftInlineHtml 把只包着空白的
- *     格式标签直接拆除（converters/ir/inline-html.js 的 wrapFrame），格式丢失；随机文本因此均含非空白字符；
+ *   - 可见内容只有空白的格式节点（如 delete(" ")）：内容首尾是空白，只能写 HTML 标签，liftInlineHtml 原先把只包着空白的
+ *     格式标签直接拆除（converters/ir/inline-html.js 的 wrapFrame），格式丢失；属另一缺陷，已由后续修复在提升时保留这类
+ *     标签处理，专测见 test/md-whitespace-format.test.js；本文件的随机文本仍均含非空白字符，测试数据不变；
  *   - root 直接挂行内节点：render() 的剔除与分隔只作用于 paragraph、heading、tableCell、行内格式与链接的子节点，root 下
  *     相邻的代码段仍粘连，与 d332ef0 的剔除范围一致。
  */
