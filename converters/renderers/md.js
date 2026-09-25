@@ -17,7 +17,11 @@
  *     转义成 \*\*，默认处理器还会把相邻汉字写成 &#x…; 字符引用；两对同字符定界符首尾相接会并成一个定界符串，
  *     重新解析时配对错位、残留字面星号或波浪号。处在同类型格式节点之内的格式节点一律写标签，免得内层定界符
  *     与外层配对；相邻兄弟产物为空（看不到真实邻居）时同样保守写标签：前侧以外侧字符为空串识别，后侧另须直接
- *     判定后一兄弟的产物是否为空，因为无内容的格式节点与空 html 的 peek 仍报「*」「~」或「<」，外侧字符并不为空串
+ *     判定后一兄弟的产物是否为空，因为无内容的格式节点与空 html 的 peek 仍报「*」「~」或「<」，外侧字符并不为空串。
+ *     render() 已先行剔除行内语境中产物为空的节点（见下条），这两条回退规则在常规 IR 中不再触发，保留作兜底
+ *   - 产物为空的行内节点（空文本、空 html、内容为空的六种行内格式）在 stringify 之前从 paragraph、heading、
+ *     tableCell、行内格式与链接的子节点中剔除：空节点会遮住相邻节点的 before / after 与 peek 语境，使行首记号、
+ *     首尾空白、末尾反斜杠等的转义与定界符的判定落空；剔除后含空节点的 IR 与去掉空节点后的 IR 产物逐字相同
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -42,7 +46,7 @@ const MAX_PERCENT = 100;
 async function render(doc) {
     const { unified, remarkStringify, remarkGfm } = await loadUnified();
     const prepared = displayImagesToHtml(applyTextLayout(stripMarkersTree(doc.ir)));
-    const downgraded = downgradeCustomNodes(wrapMath(prepared));
+    const downgraded = pruneEmptyInline(downgradeCustomNodes(wrapMath(prepared)));
     const result = unified()
         .use(remarkGfm)
         .use(remarkStringify, { ...MD_OPTIONS, handlers: HANDLERS })
@@ -62,6 +66,44 @@ function wrapMath(node) {
     }
     if (Array.isArray(node.children)) return { ...node, children: node.children.map(wrapMath) };
     return node;
+}
+
+// ============================================================
+// 行内语境：剔除产物为空的节点
+// ============================================================
+
+// 可含行内子节点的父类型：paragraph / heading / tableCell / link / linkReference 与六种行内格式
+const PHRASING_PARENTS = new Set([
+    'paragraph', 'heading', 'tableCell', 'strong', 'emphasis', 'delete', 'underline', 'superscript', 'subscript',
+    'link', 'linkReference',
+]);
+
+/**
+ * 剔除行内语境中产物为空的节点，返回新树；子树未变时返回原对象，不修改入参。
+ * 对象与范围：PHRASING_PARENTS 各类型的子节点中，value 为空串的 text 与 html，以及子节点剔除完毕后已无子节点的
+ * 六种行内格式（EMPTY_CAPABLE_TYPES）；link / linkReference 只剔除其子节点、不剔除自身（产物含地址，不为空）；
+ * root、list 等块级父节点的子节点不在范围内。
+ * 为何在 stringify 之前剔除：containerPhrasing 只凭紧邻兄弟给出 before / after。前一兄弟产物为空时 before 为空串，
+ * 看不到更前的真实字符与段首换行；后一兄弟为空文本时 after 为空串，为无内容的格式节点或空 html 时 after 取其 peek
+ * 报出的「*」「~」或「<」；紧接 html 节点之前的行尾换行还会改为空格，html 值为空时同样如此。safe() 据此决定行首
+ * 记号、首尾空白、「&」「<」「!」与末尾反斜杠的转义，定界符式格式据此判定能否写定界符，空节点使这些判定落空。
+ * 剔除后各节点看到的都是真实邻居，含空节点的 IR 与去掉空节点后的 IR 产物逐字相同。
+ * 线性：先递归剔除子节点、再过滤本层，格式节点是否为空只看剔除后的 children 是否为空数组，判定为 O(1)，无须再向
+ * 下遍历；每个节点只访问一次。
+ */
+function pruneEmptyInline(node) {
+    if (!node || typeof node !== 'object' || !Array.isArray(node.children)) return node;
+    let children = node.children.map(pruneEmptyInline);
+    if (PHRASING_PARENTS.has(node.type)) children = children.filter((child) => !isPrunedEmpty(child));
+    const changed = children.length !== node.children.length || children.some((child, i) => child !== node.children[i]);
+    return changed ? { ...node, children } : node;
+}
+
+/** 子节点已剔除完毕的行内节点是否产物为空：text 与 html 看 value 是否为空串，六种行内格式看是否已无子节点 */
+function isPrunedEmpty(node) {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'text' || node.type === 'html') return !node.value;
+    return EMPTY_CAPABLE_TYPES.has(node.type) && (!Array.isArray(node.children) || node.children.length === 0);
 }
 
 // ============================================================
@@ -102,7 +144,7 @@ function escapeAttr(value) {
 const ATTENTION_DEPTHS = new WeakMap();
 // 行内节点产物是否为空的记忆表：同样以 state 为键，值为「节点 → 布尔值」的 WeakMap
 const EMPTY_OUTPUTS = new WeakMap();
-// 内容为空时处理器返回空串的行内格式节点类型（即 HANDLERS 中的六种）
+// 内容为空时处理器返回空串的行内格式节点类型（即 HANDLERS 中的六种）；isPrunedEmpty 与 isEmptyOutput 共用
 const EMPTY_CAPABLE_TYPES = new Set(['strong', 'emphasis', 'delete', 'underline', 'superscript', 'subscript']);
 
 /**
@@ -116,8 +158,9 @@ const EMPTY_CAPABLE_TYPES = new Set(['strong', 'emphasis', 'delete', 'underline'
  * peek 恒报定界符字符，因此相邻两对中先出现的一方回退标签，后一方的前一字变为「>」，仍可写定界符。
  * 相邻兄弟的产物为空时，containerPhrasing 看不到更远的真实邻居，粘连与 flanking 都无从判定，同样写标签：
  * 前侧以 before 为空串识别；后侧的空文本使 after 为空串，无内容的格式节点与空 html 的 peek 却仍报非空字符，
- * 故直接判定后一兄弟的产物是否为空。peek 不改报空串：peek 同时充当前一兄弟文本节点的 after，safe() 据此
- * 决定末尾反斜杠是否转义，改报空串会使以反斜杠结尾的文本失去转义。
+ * 故直接判定后一兄弟的产物是否为空。render() 已先行剔除行内语境中产物为空的节点（pruneEmptyInline），这两条
+ * 规则在常规 IR 中不再触发，保留作兜底，仍可达的情形见 isGluedToSibling。peek 不改报空串：peek 同时充当前一
+ * 兄弟文本节点的 after，safe() 据此决定末尾反斜杠是否转义，改报空串会使以反斜杠结尾的文本失去转义。
  * 不同定界符字符（* 与 ~）不会并成同一串，不作粘连判定；首个子节点的前侧与末个子节点的后侧来自父级，
  * 父级已按内容首末字符是否为自身定界符字符自行回退，同样不作粘连判定。
  * 同类型嵌套：同类定界符嵌套时，内层定界符两侧都不是空白即可能兼具左右 flanking，从而与外层配对
@@ -165,6 +208,11 @@ function attentionDepths(state) {
  * 回退。before 侧的空文本、无内容的格式节点与空 html 都使 before 为空串；after 侧只有无 peek 的空文本使 after
  * 为空串，无内容的格式节点与空 html 的 peek 仍报非空字符，故在两项字符比较之后再以 isEmptyOutput 直接判定
  * 后一兄弟的产物是否为空。
+ * render() 已先行剔除 paragraph、heading、tableCell、行内格式与链接中产物为空的子节点（pruneEmptyInline），这两侧
+ * 的空邻居判定在常规 IR 中不再触发，保留作兜底。仍可达的情形有二：其一，表格单元格中前一字为空白的硬换行产物为
+ * 空串，不属剔除对象，其后格式节点的 before 为空串，由前侧回退，如单元格 [text(甲 ), break, strong(乙)] 输出
+ * 「甲 <strong>乙</strong>」；其二，root 直接挂行内节点时不在剔除范围内，[strong(甲), text('')] 由 after 为空串
+ * 回退，[strong(甲), delete()] 由 isEmptyOutput 回退，均输出「<strong>甲</strong>」。
  * 下标取 state.indexStack 栈顶（containerPhrasing 调用子节点处理器前写入）；parent 缺失或栈顶不指向本节点时
  * 两侧都不判定。
  */
@@ -183,7 +231,8 @@ function isGluedToSibling(node, parent, state, info, markerChar) {
 /**
  * 行内节点的产物是否为空：text 与 html 以 value 是否为空串判定；strong / emphasis / delete / underline /
  * superscript / subscript 在全部子节点产物为空时为空（无 children 视同为空），与各自处理器在内容为空时返回空串
- * 一致；其余类型一律视为非空。
+ * 一致；其余类型一律视为非空。常规 IR 中产物为空的行内节点已由 pruneEmptyInline 剔除，本函数只在剔除范围之外
+ * （如 root 直接挂行内节点）才会判为空，保留作 isGluedToSibling 后侧的兜底。
  * 格式节点的判定结果按 state 分表记忆化：一次序列化中每个格式节点至多判定一次，每次只遍历直属子节点，整体线性于
  * 节点数。不记忆化时，若深链的每层都是「产物为空的定界符式格式节点 + 下一层」，每层都要沿链下探到首个非空节点，
  * 耗时随深度平方增长。
