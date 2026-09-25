@@ -19,9 +19,10 @@
  *     与外层配对；相邻兄弟产物为空（看不到真实邻居）时同样保守写标签：前侧以外侧字符为空串识别，后侧另须直接
  *     判定后一兄弟的产物是否为空，因为无内容的格式节点与空 html 的 peek 仍报「*」「~」或「<」，外侧字符并不为空串。
  *     render() 已先行剔除行内语境中产物为空的节点（见下条），这两条回退规则在常规 IR 中不再触发，保留作兜底
- *   - 产物为空的行内节点（空文本、空 html、内容为空的六种行内格式）在 stringify 之前从 paragraph、heading、
- *     tableCell、行内格式与链接的子节点中剔除：空节点会遮住相邻节点的 before / after 与 peek 语境，使行首记号、
- *     首尾空白、末尾反斜杠等的转义与定界符的判定落空；剔除后含空节点的 IR 与去掉空节点后的 IR 产物逐字相同
+ *   - 产物为空的行内节点（空文本、空 html、内容为空的六种行内格式）与值为空的行内代码段在 stringify 之前从 paragraph、
+ *     heading、tableCell、行内格式与链接的子节点中剔除：空节点会遮住相邻节点的 before / after 与 peek 语境，使行首
+ *     记号、首尾空白、末尾反斜杠等的转义与定界符的判定落空；值为空的行内代码段由上游写作「``」，CommonMark 没有空代码段
+ *     的写法，重新解析为字面文本。剔除后含这些节点的 IR 与去掉它们后的 IR 产物逐字相同
  *   - 剔除之后仍相邻的两个 inlineCode 之间插入空 HTML 注释 <!---->：inlineCode 按值内的反引号串选定围栏长度，相邻
  *     两段的闭围栏与开围栏会并成一个更长的反引号串，重新解析时配对错位，只调围栏长度无法分开；注释重新解析为 html
  *     节点，html、docx、xml、content-list 渲染器均将其剥除。插入与剔除在同一趟遍历中进行，只在剔除空节点之后、父节点
@@ -108,7 +109,7 @@ function wrapMath(node) {
 }
 
 // ============================================================
-// 行内语境：剔除产物为空的节点，在数字边界合并相邻 text，分隔相邻的 inlineCode，改写块末硬换行
+// 行内语境：剔除产物为空的节点与值为空的 inlineCode，在数字边界合并相邻 text，分隔相邻的 inlineCode，改写块末硬换行
 // ============================================================
 
 // 可含行内子节点的父类型：paragraph / heading / tableCell / link / linkReference 与六种行内格式
@@ -127,16 +128,24 @@ const CHAR_DOT = '.'.charCodeAt(0);
 const CHAR_RIGHT_PAREN = ')'.charCodeAt(0);
 
 /**
- * 剔除行内语境中产物为空的节点，在数字边界合并剔除后相邻的 text，在仍相邻的两个 inlineCode 之间插入分隔注释，并把
- * paragraph 与 heading 末尾连续的 break 并为一个 html 节点，返回新树；子树未变时返回原对象，不修改入参。
- * 对象与范围：PHRASING_PARENTS 各类型的子节点中，value 为空串的 text 与 html，以及子节点剔除完毕后已无子节点的
- * 六种行内格式（EMPTY_CAPABLE_TYPES）；link / linkReference 只剔除其子节点、不剔除自身（产物含地址，不为空）；
- * root、list 等块级父节点的子节点不在范围内。
+ * 剔除行内语境中产物为空的节点与值为空的 inlineCode，在数字边界合并剔除后相邻的 text，在仍相邻的两个 inlineCode
+ * 之间插入分隔注释，并把 paragraph 与 heading 末尾连续的 break 并为一个 html 节点，返回新树；子树未变时返回原对象，
+ * 不修改入参。
+ * 对象与范围：PHRASING_PARENTS 各类型的子节点中，value 为空串的 text 与 html，值为空的 inlineCode，以及子节点剔除
+ * 完毕后已无子节点的六种行内格式（EMPTY_CAPABLE_TYPES）；link / linkReference 只剔除其子节点、不剔除自身（产物含
+ * 地址，不为空）；root、list 等块级父节点的子节点不在范围内。
  * 为何在 stringify 之前剔除：containerPhrasing 只凭紧邻兄弟给出 before / after。前一兄弟产物为空时 before 为空串，
  * 看不到更前的真实字符与段首换行；后一兄弟为空文本时 after 为空串，为无内容的格式节点或空 html 时 after 取其 peek
  * 报出的「*」「~」或「<」；紧接 html 节点之前的行尾换行还会改为空格，html 值为空时同样如此。safe() 据此决定行首
  * 记号、首尾空白、「&」「<」「!」与末尾反斜杠的转义，定界符式格式据此判定能否写定界符，空节点使这些判定落空。
  * 剔除后各节点看到的都是真实邻居，含空节点的 IR 与去掉空节点后的 IR 产物逐字相同。
+ * 为何剔除值为空的 inlineCode：其产物并不为空。上游处理器（lib/handle/inline-code.js）以 node.value || '' 取值、以单个
+ * 反引号起选围栏，值为空时写出两个反引号「``」；CommonMark 没有空代码段的写法，找不到等长闭围栏的反引号串按字面文本
+ * 处理，「``」因而重新解析为文本，原文没有的两个反引号成为可见内容，如 [text(甲), code(''), text(乙)] 输出「甲``乙」；
+ * 它还夹在两侧节点之间，使 [text('1'), code(''), text('. 项')] 这类数字与记号不能在数字边界合并。值缺失、为 null 或为
+ * 0 时上游同样只写出「``」，剔除只去掉这两个反引号，不丢失 md 产物原有的可见内容。其他渲染器中空代码段也无可见内容，
+ * 只限于值为空串：html、docx、xml 渲染器输出无内容的元素或 run，content-list 不产生文本；值缺失、为 null 或为 0 时
+ * html 渲染器抛错，值为 0 时 xml 与 content-list 写出「0」。
  * 为何在数字边界合并相邻 text：有序列表记号模式要求「换行 + 可选空白 + 数字 + 记号」同在一个 value 之内，而 safe()
  * 以 before + 本节点文本 + after 为 value 匹配、只转义本节点文本所在区间，containerPhrasing 给 text 的 before 又只有
  * 前一兄弟产物的末字。数字与其后的「.」「)」分属相邻 text 时，前一节点只在 after 里看到记号，记号不在其转义区间内；
@@ -195,10 +204,14 @@ function pruneEmptyInline(node) {
     return changed ? { ...node, children } : node;
 }
 
-/** 子节点已剔除完毕的行内节点是否产物为空：text 与 html 看 value 是否为空串，六种行内格式看是否已无子节点 */
+/**
+ * 子节点已剔除完毕的行内节点是否应剔除：text 与 html 看 value 是否为空（产物为空），inlineCode 看 value 是否为空（产物
+ * 为「``」，理由见 pruneEmptyInline），六种行内格式看是否已无子节点。三类值节点都以 value 为假判定，与上游 text、html、
+ * inlineCode 处理器把缺失或为假的 value 当作空串一致；非字符串的真值由上游转为字符串写出，不在剔除之列
+ */
 function isPrunedEmpty(node) {
     if (!node || typeof node !== 'object') return false;
-    if (node.type === 'text' || node.type === 'html') return !node.value;
+    if (node.type === 'text' || node.type === 'html' || node.type === 'inlineCode') return !node.value;
     return EMPTY_CAPABLE_TYPES.has(node.type) && (!Array.isArray(node.children) || node.children.length === 0);
 }
 
