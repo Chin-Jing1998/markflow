@@ -34,6 +34,14 @@
  *   - 经 remark-stringify 的 unsafe 选项补入「+」「-」「数字 + .」三条行首记号模式的前瞻版（LINE_MARKER_UNSAFE）：默认
  *     模式的 after 吃掉行尾换行，同一个 text 内一行只有记号、下一行又以同种记号开头时第二行不转义，重新解析为列表或
  *     setext 标题；inlineCode 处理器把值内「换行 + 记号」的换行改为空格时同样漏掉第二行
+ *   - paragraph 与 heading 末尾的连续硬换行在同一趟遍历中并为一个 html 节点、写作同样个数的 <br>：CommonMark 只认块内
+ *     两行之间的硬换行，段尾的「\ + 换行」重新解析为字面反斜杠、「两个空格 + 换行」被删去，上游 break 处理器一律写
+ *     「\ + 换行」，段尾的硬换行因而丢失并留下反斜杠；heading 含 break 时 1–2 级被上游改走 setext 形式、末尾的「\ + 换行」
+ *     使下划线长度为 0 而整个丢失，3 级起在 ATX 形式中写成空格而被丢弃。写作 <br> 后重新解析为 html 节点，由 ir/inline-html
+ *     提升为 break；html、docx、xml、content-list 渲染器都把 break 写成各自的换行。只改块末（含列表项与引用块内的段落与
+ *     标题）：处在块末格式节点或链接末尾的硬换行，其后紧随闭标签或「](」，仍是硬换行；heading 段中与 tableCell 内的硬换行
+ *     由上游另行处理（见 pruneEmptyInline）。并为一个节点而不逐个改写：上游对 heading 的 setext 判定按子节点个数呈平方级
+ *     （见 rewriteTrailingBreaks）
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -100,7 +108,7 @@ function wrapMath(node) {
 }
 
 // ============================================================
-// 行内语境：剔除产物为空的节点，在数字边界合并相邻 text，分隔相邻的 inlineCode
+// 行内语境：剔除产物为空的节点，在数字边界合并相邻 text，分隔相邻的 inlineCode，改写块末硬换行
 // ============================================================
 
 // 可含行内子节点的父类型：paragraph / heading / tableCell / link / linkReference 与六种行内格式
@@ -110,6 +118,8 @@ const PHRASING_PARENTS = new Set([
 ]);
 // 相邻 inlineCode 之间插入的分隔注释：各版 CommonMark 都认作 HTML 注释的最短写法（<!--> 与 <!---> 自 0.31 起才算）
 const CODE_SEPARATOR = '<!---->';
+// paragraph 与 heading 末尾的硬换行改写成的行内 HTML：ir/inline-html 把 <br>（不分大小写、可自闭合、可带属性）提升为 break
+const HTML_BREAK = '<br>';
 // 有序列表记号的组成字符的 charCode：ASCII 数字「0」–「9」与记号「.」「)」
 const CHAR_ZERO = '0'.charCodeAt(0);
 const CHAR_NINE = '9'.charCodeAt(0);
@@ -117,8 +127,8 @@ const CHAR_DOT = '.'.charCodeAt(0);
 const CHAR_RIGHT_PAREN = ')'.charCodeAt(0);
 
 /**
- * 剔除行内语境中产物为空的节点，在数字边界合并剔除后相邻的 text，并在仍相邻的两个 inlineCode 之间插入分隔注释，
- * 返回新树；子树未变时返回原对象，不修改入参。
+ * 剔除行内语境中产物为空的节点，在数字边界合并剔除后相邻的 text，在仍相邻的两个 inlineCode 之间插入分隔注释，并把
+ * paragraph 与 heading 末尾连续的 break 并为一个 html 节点，返回新树；子树未变时返回原对象，不修改入参。
  * 对象与范围：PHRASING_PARENTS 各类型的子节点中，value 为空串的 text 与 html，以及子节点剔除完毕后已无子节点的
  * 六种行内格式（EMPTY_CAPABLE_TYPES）；link / linkReference 只剔除其子节点、不剔除自身（产物含地址，不为空）；
  * root、list 等块级父节点的子节点不在范围内。
@@ -146,15 +156,40 @@ const CHAR_RIGHT_PAREN = ')'.charCodeAt(0);
  * 空节点之后，因此两段之间原有的空节点先被剔除，剔除后相邻的两段同样分隔；只在父节点属 PHRASING_PARENTS 时，与剔除
  * 的范围相同。分隔节点只处在两个 inlineCode 之间，inlineCode 与 html 的处理器都不读 before / after，前一段的产物
  * 以反引号收尾，也不会触发 html 之前的换行改写，故插入不改变其余节点的转义与定界符判定。
+ * 为何改写块末硬换行：上游 break 处理器（lib/handle/break.js）在 headingAtx 与 tableCell 等不能含换行的构造中写空格或
+ * 空串，其余一律写「\ + 换行」；而 CommonMark 只认块内两行之间的硬换行，段尾的「\ + 换行」重新解析为字面反斜杠（「两个
+ * 空格 + 换行」则被删去），如 [text('甲'), break] 输出「甲\」加换行、重新解析为文本「甲\」，[text('甲'), break, break]
+ * 只剩一个硬换行加字面反斜杠。heading 末尾的硬换行另有两种丢法：1–2 级标题含 break 时 formatHeadingAsSetext 改走 setext
+ * 形式，末尾的「\ + 换行」使下划线长度为 0，[heading2(text('甲'), break)] 输出「甲\」加换行再加空行，标题整个变成带
+ * 反斜杠的段落；3 级起走 ATX 形式，break 处理器写空格或空串，[heading3(text('甲'), break)] 输出「### 甲 」，硬换行被
+ * 丢弃。块末的硬换行没有 Markdown 写法，故与 underline 等一样写行内 HTML：paragraph 与 heading 的子节点剔除空节点之后，
+ * 末尾连续的 k 个 break 并为一个 html 节点，值为 k 个 HTML_BREAK 的拼接（并为一个而不逐个改写的理由见
+ * rewriteTrailingBreaks），重新解析为 html 节点后由 ir/inline-html 提升为 break，html、docx、xml、content-list 渲染器都把
+ * break 写成各自的换行；改写后 heading 内不再有 break 节点，1–2 级标题只要文本不含换行就回到 ATX 形式。html 的 peek 为
+ * 「<」：段落与 setext 形式的标题中，上游 break 产物的首字为「\」，与「<」同属 ASCII 标点，前一兄弟据 after 所作的末尾
+ * 反斜杠转义与定界符判定不变；3 级起的标题走 ATX 形式，break 产物为空格或空串，after 改为「<」后定界符判定不变（空格、
+ * 空串与「<」都满足 isDelimiterSafe 对后一字的要求，且都不是「*」「~」），末尾的反斜杠则由不转义改为转义，如
+ * [heading3(text('甲\'), break)] 由「### 甲\ 」改为「### 甲\\<br>」，不转义时「\<」会使 <br> 成为字面文本。
+ * containerPhrasing 在 html 之前把前一兄弟产物末尾的换行改为空格，块末硬换行之前的产物以换行结尾时即触发该规则：
+ * [text('甲' + 换行), break] 由「甲」换行「\」换行（重新解析为文本「甲」换行「\」，硬换行丢失）改为「甲 <br>」（重新解
+ * 析为文本「甲 」与硬换行），硬换行保住、换行变为空格；前一兄弟为格式节点、链接或行内代码时产物不以换行结尾，不触发该规
+ * 则，如 [strong(text('甲' + 换行)), break] 输出「<strong>甲」换行「</strong><br>」。不改的范围：处在块末格式节点或链接
+ * 末尾的硬换行，其后紧随闭标签或「](」，重新解析时仍是硬换行（定界符式格式的内容以换行结尾时已由 isDelimiterSafe 回退为
+ * 标签）；heading 段中的硬换行仍由上游处理（1–2 级保留 setext 形式，3 级起改为空格）；tableCell 内改为空格。已知限制：
+ * 只由一个硬换行构成的段落输出「<br>」独占一行，按 CommonMark 属第 7 类 HTML 块，重新解析为块级 html 节点而非 break；两
+ * 个及以上时（「<br><br>」）一行内有两个标签，不构成 HTML 块，仍为段落；heading 有「#」前缀，只由硬换行构成时输出
+ * 「## <br>」，仍为标题；块末硬换行之前的产物以换行结尾时，该换行改为空格（见上）。
  * 线性：先递归剔除子节点、再过滤本层，格式节点是否为空只看剔除后的 children 是否为空数组，判定为 O(1)，无须再向
- * 下遍历；每个节点只访问一次。合并相邻 text 与插入分隔注释都在过滤后的本层子节点上单趟进行，先合并、后分隔：合并
- * 只改 text，分隔只在两个 inlineCode 之间插入 html，两者互不制造对方的相邻。
+ * 下遍历；每个节点只访问一次。合并相邻 text、插入分隔注释与改写块末硬换行都在过滤后的本层子节点上单趟进行，先合并、
+ * 后分隔、再改写：合并只改 text，分隔只在两个 inlineCode 之间插入 html，改写只把末尾的 break 并成一个 html，三者互不
+ * 制造对方的处理对象。
  */
 function pruneEmptyInline(node) {
     if (!node || typeof node !== 'object' || !Array.isArray(node.children)) return node;
     let children = node.children.map(pruneEmptyInline);
     if (PHRASING_PARENTS.has(node.type)) {
         children = separateAdjacentInlineCode(mergeListMarkerText(children.filter((child) => !isPrunedEmpty(child))));
+        if (node.type === 'paragraph' || node.type === 'heading') children = rewriteTrailingBreaks(children);
     }
     const changed = children.length !== node.children.length || children.some((child, i) => child !== node.children[i]);
     return changed ? { ...node, children } : node;
@@ -228,6 +263,25 @@ function separateAdjacentInlineCode(children) {
 }
 
 const isInlineCode = (node) => Boolean(node) && node.type === 'inlineCode';
+
+/**
+ * 把块末连续的 k 个 break 并为一个 html 节点（值为 k 个 HTML_BREAK 的拼接），返回新数组；末尾没有 break 时返回原数组，
+ * 不修改入参。只由 pruneEmptyInline 对 paragraph 与 heading 剔除空节点后的子节点调用。
+ * 为何并为一个节点而不逐个改写：上游 heading 处理器先经 formatHeadingAsSetext 判定是否改走 setext 形式，该函数用
+ * unist-util-visit 遍历标题的子节点，遇到 break 或 value 含换行的节点即退出；unist-util-visit 的 overload 对每个访问到的
+ * 节点调用 parent.children.indexOf(node) 取下标，遍历 k 个不含换行的子节点耗时为 O(k²)。逐个改写会把末尾 k 个 break
+ * （遍历原本在首个 break 处退出）换成 k 个 html 节点，遍历不再提前退出，标题末尾硬换行的耗时因而成平方级；并为一个节点
+ * 后标题只多一个子节点，耗时线性于换行个数。段落不经此判定，两种写法都线性。产物逐字相同：html 处理器直出 value，peek
+ * 恒报「<」，一个节点与 k 个节点拼接出的字符串一样。线性：自末尾回扫到首个非 break 节点，复制一次，值由 repeat 一次生成。
+ */
+function rewriteTrailingBreaks(children) {
+    let end = children.length;
+    while (end > 0 && isBreak(children[end - 1])) end -= 1;
+    if (end === children.length) return children;
+    return [...children.slice(0, end), { type: 'html', value: HTML_BREAK.repeat(children.length - end) }];
+}
+
+const isBreak = (node) => Boolean(node) && node.type === 'break';
 
 // ============================================================
 // 图片：带显示尺寸的输出为 <img>
