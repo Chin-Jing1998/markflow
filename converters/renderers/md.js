@@ -30,8 +30,10 @@
  *     数字结尾、后一段以 ASCII 数字或「.」「)」开头时并为一个节点。有序列表记号模式要求「换行 + 可选空白 + 数字 +
  *     记号」同在一个 value 之内，safe() 只在单个节点的 before + 文本 + after 中匹配、只转义本节点文本，数字与记号分属
  *     相邻 text 时两侧都不转义，位于行首时可能重新解析为有序列表。只在数字边界合并而不合并全部相邻 text：全部合并会
- *     把切在换行处的两行记号并入同一 value，「.」「-」「+」模式的 after 吞掉行尾换行，下一行的记号不再转义；也会把
- *     任意相邻 text 中的转义位置集中到一次 safe() 调用，而 safe() 对转义位置的去重为平方级
+ *     把任意相邻 text 中的转义位置集中到一次 safe() 调用，而 safe() 对转义位置的去重为平方级
+ *   - 经 remark-stringify 的 unsafe 选项补入「+」「-」「数字 + .」三条行首记号模式的前瞻版（LINE_MARKER_UNSAFE）：默认
+ *     模式的 after 吃掉行尾换行，同一个 text 内一行只有记号、下一行又以同种记号开头时第二行不转义，重新解析为列表或
+ *     setext 标题；inlineCode 处理器把值内「换行 + 记号」的换行改为空格时同样漏掉第二行
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -53,13 +55,32 @@ const WHITESPACE_RE = /[\s\p{Zs}]/u;
 const PX_RE = /^\d{1,5}$/;
 const MAX_PERCENT = 100;
 
+/**
+ * 补入的行首记号转义模式：与 mdast-util-to-markdown 2.1.2 lib/unsafe.js 中「+」「-」「数字 + .」三条 atBreak 模式同构，
+ * 只把 after 由消耗性的 (?:…) 改为前瞻 (?=…)。
+ * 为何补入：默认三条模式的 after 可含换行，safe() 对每条模式各做一次全局 exec 循环，前一次匹配把行尾换行吃进 after，
+ * 下一行开头缺少 atBreak 所需的换行，同一模式在下一行的记号不再匹配。同一个 text 内一行只有「1.」「-」或「+」、下一行
+ * 又以同种记号开头时（如「0.」加换行加「1. 项」），第二行的记号不转义，重新解析为列表或 setext 标题；inlineCode 处理器
+ * 用同一组 atBreak 模式把值内「换行 + 记号」的换行改为空格，同样漏掉第二行。前瞻不消耗换行，下一次匹配仍能从该换行
+ * 起步；三条模式所匹配的位置是默认模式的超集，多出的位置只有被吃掉换行的那些，其余位置与默认模式重复，safe() 以
+ * positions.includes 去重且 before / after 两项标记与默认模式相同，产物只在缺陷形态上改变。configure 把 unsafe 追加到
+ * 默认列表之后，无 inConstruct 限制，与默认模式的适用范围相同。
+ * 线性：编译后的正则以 [\r\n] 起步，每个换行之后只沿其后的空白与数字串扫描一次，前瞻为常数时间，整体线性于文本长度。
+ * 不冻结这些对象：compilePattern 把编译结果缓存在模式对象的 _compiled 属性上。
+ */
+const LINE_MARKER_UNSAFE = [
+    { atBreak: true, character: '+', after: '(?=[ \\t\\r\\n])' },
+    { atBreak: true, character: '-', after: '(?=[ \\t\\r\\n-])' },
+    { atBreak: true, before: '\\d+', character: '.', after: '(?=[ \\t\\r\\n]|$)' },
+];
+
 async function render(doc) {
     const { unified, remarkStringify, remarkGfm } = await loadUnified();
     const prepared = displayImagesToHtml(applyTextLayout(stripMarkersTree(doc.ir)));
     const downgraded = pruneEmptyInline(downgradeCustomNodes(wrapMath(prepared)));
     const result = unified()
         .use(remarkGfm)
-        .use(remarkStringify, { ...MD_OPTIONS, handlers: HANDLERS })
+        .use(remarkStringify, { ...MD_OPTIONS, handlers: HANDLERS, unsafe: LINE_MARKER_UNSAFE })
         .stringify(downgraded);
     return String(result);
 }
@@ -112,13 +133,12 @@ const CHAR_RIGHT_PAREN = ')'.charCodeAt(0);
  * 后一节点的 before 只有一个数字、没有换行，模式匹配不上；两侧都不转义，位于段首、换行后或硬换行之后时可能重新解析
  * 为有序列表。数字与记号须同处一个节点，safe() 才能匹配到记号前的数字串（模式的 before 为 \d+），故剔除之后，前一段
  * 以 ASCII 数字结尾、后一段以 ASCII 数字或「.」「)」开头时并为一个节点，多段组成的数字串逐段并入；其余转义模式的
- * 前文只需一个字符，containerPhrasing 已能给出。不合并全部相邻 text 的理由有二。其一，切在换行处的两行记号（如
- * [text('1.'), text(换行 + '1. 项')]）两个节点各自转义，往返正确；并入同一 value 后，「.」「-」「+」模式的 after
- * 把行尾换行吃进前一次匹配，safe() 逐模式做不重叠匹配，下一行缺少 atBreak 所需的换行，记号不再转义。其二，safe()
- * 以 positions.includes 对转义位置去重，单个 value 内有 p 个转义位置时耗时为 O(p²)；全部合并会把任意相邻 text 中
- * 的转义位置集中到一次调用，如 n 个相邻 text('*') 由线性变为平方级。只在数字边界合并时，切在换行处的切分点一侧是
- * 换行，不在数字边界上，两行仍分属两个节点；只有每个切分点都在数字边界上的文本才会并成一个 value，耗时与同一文本
- * 放在单个节点中相同。合并同样只在 PHRASING_PARENTS 各类型的子节点中进行。
+ * 前文只需一个字符，containerPhrasing 已能给出。不合并全部相邻 text 的理由：safe() 以 positions.includes 对转义位置
+ * 去重，单个 value 内有 p 个转义位置时耗时为 O(p²)；全部合并会把任意相邻 text 中的转义位置集中到一次调用，如 n 个相邻
+ * text('*') 由线性变为平方级。只有每个切分点都在数字边界上的文本才会并成一个 value，耗时与同一文本放在单个节点中相同。
+ * 切在换行处的两行记号（如 [text('1.'), text(换行 + '1. 项')]）并入同一 value 后，默认「.」「-」「+」模式的 after 会把
+ * 行尾换行吃进前一次匹配、下一行的记号不再转义，这曾是另一条理由；LINE_MARKER_UNSAFE 补入前瞻版模式后（见 render），该
+ * 形态无论切在何处都转义。合并同样只在 PHRASING_PARENTS 各类型的子节点中进行。
  * 为何插入分隔注释：inlineCode 处理器按值内的反引号串选定围栏长度，containerPhrasing 把相邻产物首尾直接拼接，前一段
  * 的闭围栏与后一段的开围栏并成一个更长的反引号串，不能闭合前一段，重新解析时配对错位，如 [code(x), code(y)] 输出
  * 「`x``y`」、重新解析为单个代码段「x``y」。相邻的反引号总会并成同一串，只调围栏长度分不开，故在两段之间插入值为
