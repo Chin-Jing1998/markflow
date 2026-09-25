@@ -16,7 +16,8 @@
  *     兄弟的同一定界符字符首尾相接时写 ** / * / ~~，否则回退 <strong> / <em> / <del>——中文标点旁的字面星号会被
  *     转义成 \*\*，默认处理器还会把相邻汉字写成 &#x…; 字符引用；两对同字符定界符首尾相接会并成一个定界符串，
  *     重新解析时配对错位、残留字面星号或波浪号。处在同类型格式节点之内的格式节点一律写标签，免得内层定界符
- *     与外层配对；相邻兄弟产物为空（外侧字符为空串、看不到真实邻居）时同样保守写标签
+ *     与外层配对；相邻兄弟产物为空（看不到真实邻居）时同样保守写标签：前侧以外侧字符为空串识别，后侧另须直接
+ *     判定后一兄弟的产物是否为空，因为无内容的格式节点与空 html 的 peek 仍报「*」「~」或「<」，外侧字符并不为空串
  */
 const { loadUnified } = require('../ir/unified-loader');
 const { downgradeCustomNodes, mathToText } = require('../ir/schema');
@@ -99,6 +100,10 @@ function escapeAttr(value) {
 
 // 定界符式格式按 construct 计的祖先层数：以 state 为键存于模块级 WeakMap，不给 state 挂新属性，随 state 一并回收
 const ATTENTION_DEPTHS = new WeakMap();
+// 行内节点产物是否为空的记忆表：同样以 state 为键，值为「节点 → 布尔值」的 WeakMap
+const EMPTY_OUTPUTS = new WeakMap();
+// 内容为空时处理器返回空串的行内格式节点类型（即 HANDLERS 中的六种）
+const EMPTY_CAPABLE_TYPES = new Set(['strong', 'emphasis', 'delete', 'underline', 'superscript', 'subscript']);
 
 /**
  * 定界符式格式（** / * / ~~）：两侧 flanking 安全、不与相邻兄弟粘连且不处在同类型祖先之内时写定界符，
@@ -109,8 +114,10 @@ const ATTENTION_DEPTHS = new WeakMap();
  * 两对定界符会并成一个定界符串：合并后的星号串按整串两侧字符判定能否开合，并按剩余长度套用「3 的倍数」规则，
  * 配对因而错位；波浪号串长于两个即不算定界符。重新解析都会残留字面字符，故同样写标签。
  * peek 恒报定界符字符，因此相邻两对中先出现的一方回退标签，后一方的前一字变为「>」，仍可写定界符。
- * 相邻兄弟的产物为空时外侧字符为空串，containerPhrasing 看不到更远的真实邻居，粘连与 flanking 都无从判定，
- * 同样写标签。
+ * 相邻兄弟的产物为空时，containerPhrasing 看不到更远的真实邻居，粘连与 flanking 都无从判定，同样写标签：
+ * 前侧以 before 为空串识别；后侧的空文本使 after 为空串，无内容的格式节点与空 html 的 peek 却仍报非空字符，
+ * 故直接判定后一兄弟的产物是否为空。peek 不改报空串：peek 同时充当前一兄弟文本节点的 after，safe() 据此
+ * 决定末尾反斜杠是否转义，改报空串会使以反斜杠结尾的文本失去转义。
  * 不同定界符字符（* 与 ~）不会并成同一串，不作粘连判定；首个子节点的前侧与末个子节点的后侧来自父级，
  * 父级已按内容首末字符是否为自身定界符字符自行回退，同样不作粘连判定。
  * 同类型嵌套：同类定界符嵌套时，内层定界符两侧都不是空白即可能兼具左右 flanking，从而与外层配对
@@ -154,9 +161,10 @@ function attentionDepths(state) {
 /**
  * 外侧字符是否来自相邻兄弟且等于本定界符字符：非首个子节点比 info.before 的末字（前一兄弟产物的末个码元），
  * 非末个子节点比 info.after 的首字（后一兄弟 peek 结果的首个码元，无 peek 的节点取其处理器产物）。
- * 两者为空串时同样视为粘连：空串表示相邻兄弟的产物为空（before 侧含空文本、无内容的格式节点与空 html；after 侧
- * 只有无 peek 的空文本，格式节点与 html 的 peek 恒报非空字符），containerPhrasing 看不到更远的真实邻居，
- * 粘连与 flanking 都无从判定，故保守回退。
+ * 相邻兄弟的产物为空时同样视为粘连：containerPhrasing 看不到更远的真实邻居，粘连与 flanking 都无从判定，故保守
+ * 回退。before 侧的空文本、无内容的格式节点与空 html 都使 before 为空串；after 侧只有无 peek 的空文本使 after
+ * 为空串，无内容的格式节点与空 html 的 peek 仍报非空字符，故在两项字符比较之后再以 isEmptyOutput 直接判定
+ * 后一兄弟的产物是否为空。
  * 下标取 state.indexStack 栈顶（containerPhrasing 调用子节点处理器前写入）；parent 缺失或栈顶不指向本节点时
  * 两侧都不判定。
  */
@@ -168,7 +176,37 @@ function isGluedToSibling(node, parent, state, info, markerChar) {
     const before = String(info.before || '');
     const after = String(info.after || '');
     if (index > 0 && (before === '' || before.slice(-1) === markerChar)) return true;
-    return index < siblings.length - 1 && (after === '' || after.charAt(0) === markerChar);
+    if (index >= siblings.length - 1) return false;
+    return after === '' || after.charAt(0) === markerChar || isEmptyOutput(siblings[index + 1], state);
+}
+
+/**
+ * 行内节点的产物是否为空：text 与 html 以 value 是否为空串判定；strong / emphasis / delete / underline /
+ * superscript / subscript 在全部子节点产物为空时为空（无 children 视同为空），与各自处理器在内容为空时返回空串
+ * 一致；其余类型一律视为非空。
+ * 格式节点的判定结果按 state 分表记忆化：一次序列化中每个格式节点至多判定一次，每次只遍历直属子节点，整体线性于
+ * 节点数。不记忆化时，若深链的每层都是「产物为空的定界符式格式节点 + 下一层」，每层都要沿链下探到首个非空节点，
+ * 耗时随深度平方增长。
+ */
+function isEmptyOutput(node, state) {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'text' || node.type === 'html') return !node.value;
+    if (!EMPTY_CAPABLE_TYPES.has(node.type)) return false;
+    const memo = emptyOutputs(state);
+    if (memo.has(node)) return memo.get(node);
+    const empty = !Array.isArray(node.children) || node.children.every((child) => isEmptyOutput(child, state));
+    memo.set(node, empty);
+    return empty;
+}
+
+/** 本次序列化（以 state 区分）的产物为空记忆表：节点 → 布尔值，首次访问时建立 */
+function emptyOutputs(state) {
+    let memo = EMPTY_OUTPUTS.get(state);
+    if (!memo) {
+        memo = new WeakMap();
+        EMPTY_OUTPUTS.set(state, memo);
+    }
+    return memo;
 }
 
 function isDelimiterSafe(before, inner, after, markerChar) {

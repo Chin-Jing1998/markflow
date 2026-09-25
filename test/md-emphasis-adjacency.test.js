@@ -383,13 +383,15 @@ test('同类型嵌套矩阵：T(前缀?, T(核心), 后缀?) 与 T 内部相邻�
 // 用例：邻居产物为空
 // ============================================================
 
-test('邻居产物为空：格式节点之间或之前夹着空文本、无内容的格式节点时，外侧字符为空串的一方回退标签，重新解析后格式不变', async () => {
-    // Arrange：修复前依次为「**A***B*」「甲**《乙》**」「**加粗***。*」「**A****B**」，后三例重新解析残留字面星号
+test('邻居产物为空：格式节点之间或之前夹着空文本、无内容的格式节点时，外侧字符为空串或后一兄弟产物为空的一方回退标签，重新解析后格式不变', async () => {
+    // Arrange：修复前依次为「**A***B*」「甲**《乙》**」「**加粗***。*」「**A****B**」，后三例重新解析残留字面星号。
+    // 第 4 例的前一个 strong 在只按外侧字符判定时写定界符（「**A**<strong>B</strong>」）：后一兄弟为无内容的删除线，
+    // 其 peek 报「~」，外侧字符不为空串；加入后一兄弟产物为空的判定后同样回退标签
     const cases = [
         { children: [strong('A'), text(''), emphasis('B')], md: '<strong>A</strong><em>B</em>\n' },
         { children: [text('甲'), text(''), strong('《乙》')], md: '甲<strong>《乙》</strong>\n' },
         { children: [strong('加粗'), text(''), emphasis('。')], md: '<strong>加粗</strong><em>。</em>\n' },
-        { children: [strong('A'), del(), strong('B')], md: '**A**<strong>B</strong>\n' },
+        { children: [strong('A'), del(), strong('B')], md: '<strong>A</strong><strong>B</strong>\n' },
     ];
 
     for (const { children, md: expected } of cases) {
