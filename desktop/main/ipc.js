@@ -18,6 +18,7 @@
  *       事件形状：{ runId, taskId, status: 'queued'|'running'|'done'|'failed'|'cancelled', phase, pct, result?, libraryId?, error? }
  *       整批结束：{ runId, taskId: null, status: 'finished', summary }；菜单「打开文件…」：{ runId: null, type: 'enqueue', files, unsupported }
  *       并发 2；MinerU 令牌由主进程解密后注入 options.mineru.token，渲染进程提供的 options 不接受 mineruToken
+ *       整轮共用一张产物名登记表：派生出同名产物的任务依次改名为 name、name (2)，与 CLI 一致
  *   mf:convert:cancel { runId }              → 未开始的任务标记 cancelled；进行中的任务跑完
  *   mf:preview:open { path|url, target?, options? } → 建预览会话（解析一次并缓存），回包含来源视图与产物视图
  *   mf:preview:render { sessionId, target?, options? } → 只重渲染；命中重解析项时会话内重新解析并回 reparsed
@@ -389,7 +390,9 @@ function createIpcHandlers(deps = {}) {
             const raw = item.path || item.url;
             const type = isBundle(raw) ? BUNDLE_DIR_TYPE : detectInputType(raw);
             const [task] = service.planTasks([raw], pickTarget(type, item.target, current.defaultTargets), process.cwd(), { bundles });
-            return { ...task, taskId: item.id || `task-${index + 1}`, type, name: item.path ? path.basename(item.path) : hostnameOf(raw) || raw };
+            const name = item.path ? path.basename(item.path) : hostnameOf(raw) || raw;
+            // order 为批内序号：产物名登记按它排队，故最终名只由入队顺序决定，与并发下谁先解析完无关
+            return { ...task, taskId: item.id || `task-${index + 1}`, type, name, order: index };
         });
         // 扁平选项按本批目标校验：只作用于其它目标的段，取值越界时跳过写入而不是让整批失败
         const normalized = service.buildOptions(flat, { targets: tasks.map((task) => task.target) });
@@ -399,6 +402,9 @@ function createIpcHandlers(deps = {}) {
         const sender = event.sender;
         const run = {
             id: runId, cancelled: false, outputDir: dir, options: normalized, managed: useManaged,
+            // 整轮共用一张产物名登记表：本轮逐个任务各调一次 service.runConversion，若每次新建登记表，
+            // 不同子目录下的同名文件就会落进同一个产物目录并互相覆盖（CLI 单次调用不会）
+            nameRegistry: service.createNameRegistry(),
             summary: { total: tasks.length, succeeded: 0, failed: 0, cancelled: 0 },
             send: (data) => { if (!sender.isDestroyed()) sender.send(CHANNELS.convertEvent, { runId, ...data }); },
         };
@@ -415,7 +421,17 @@ function createIpcHandlers(deps = {}) {
         return { runId, outputDir: dir, tasks: tasks.map((task) => ({ taskId: task.taskId, input: task.raw, target: task.target, type: task.type, name: task.name })) };
     }
 
+    /** 池内工作函数；任务无论成功、失败还是取消都要放行其批内序号，否则后续任务会一直卡在登记排队上 */
     async function executeTask(run, task) {
+        try {
+            await convertTask(run, task);
+        } finally {
+            // 已登记的名字不因放行被撤销，重复放行也是空操作，故此处无条件放行是安全的
+            run.nameRegistry.release(task.order);
+        }
+    }
+
+    async function convertTask(run, task) {
         const { taskId } = task;
         if (run.cancelled) {
             run.summary.cancelled += 1;
@@ -427,6 +443,7 @@ function createIpcHandlers(deps = {}) {
         try {
             outcome = await service.runConversion({
                 tasks: [task], outputDir: run.outputDir, concurrency: 1, options: run.options,
+                nameRegistry: run.nameRegistry, orderBase: task.order,
                 onEvent: (ev) => { if (ev && ev.type === 'progress') run.send({ taskId, status: 'running', phase: ev.phase, pct: ev.pct }); },
             });
         } catch (err) {
