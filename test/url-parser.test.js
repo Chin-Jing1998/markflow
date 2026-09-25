@@ -17,6 +17,7 @@ const { MARKERS, indentMarker } = require('../converters/ir/markers');
 const { LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, NESTED_BLOCK_TAGS } = require('../converters/web/indent');
 const { _setLookup } = require('../converters/net/fetch-guard');
 const mdRenderer = require('../converters/renderers/md');
+const { BUDGET_FACTOR, budgetMs } = require('./helpers/timing-budget');
 
 // 按真实公众号文章裁剪的结构夹具（section 嵌套、小字图注、相邻 strong、单双 br、text-indent、段首 NBSP）
 const WECHAT_FIXTURE = fs.readFileSync(path.join(__dirname, 'fixtures', 'web', 'wechat-collapse.html'));
@@ -1230,6 +1231,7 @@ const STRONG_MOVE_CHILDREN = 100000;
 // 强制；默认参数下 9 万、11.5 万也时常落入此态，约 0.5、0.8 s）；已晋升老生代时逐项过写屏障，默认参数下独立运行
 // 3.7–6.9 s，本用例 3 次实测 5843.1、5779.9、6804.6 ms。120 ms 使快态最快的 616.5 ms 仍是它的 5.1 倍；改写之后实测
 // 18 次（其中 3 次与全量测试并行）最慢 23.0 ms，余量 5.2 倍。规模已贴近展开上限，两侧余量无法同时再放宽
+// CI 上按 test/helpers/timing-budget.js 的系数放宽：CI 三平台上计时区间的估计最大值为 66 ms，放宽后余量 7.3 倍
 const STRONG_MOVE_BUDGET_MS = 120;
 
 test('空 span 清理：含可见字的 span 下 10 万个并列子元素不触发平方级扫描，耗时在绝对上限内且 span 原样保留', async () => {
@@ -1313,7 +1315,7 @@ test('相邻 strong 合并：同一段落下 6 万段两两相邻的 strong 各�
     assert.ok(ms < STRONG_STRESS_BUDGET_MS, `合并实测 ${ms.toFixed(1)} 毫秒，超出上限 ${STRONG_STRESS_BUDGET_MS} 毫秒`);
 });
 
-test('相邻 strong 合并：后继 strong 下 10 万个子元素并入不触发平方级搬移，耗时在绝对上限内且子元素按原序接在「甲」之后', async () => {
+test('相邻 strong 合并：后继 strong 下 10 万个子元素并入不触发平方级搬移，耗时在绝对上限内且子元素按原序接在「甲」之后', async (t) => {
     // Arrange：后继 strong 的全部子元素一次并入前一个；改写之前 append 对搬移的每个节点在旧父节点上 indexOf + splice
     const items = '<i>x</i>'.repeat(STRONG_MOVE_CHILDREN);
     const html = `<p><strong>甲</strong><strong>${items}</strong></p>`;
@@ -1328,7 +1330,9 @@ test('相邻 strong 合并：后继 strong 下 10 万个子元素并入不触发
     assert.equal(strong[0].children.length, STRONG_MOVE_CHILDREN + 1, 'strong 下应为「甲」加全部 i');
     assert.equal(strong[0].children[0].data, '甲', '首个子节点应为原有的「甲」');
     assert.ok($.html() === `<p><strong>甲${items}</strong></p>`, 'i 应按原序接在「甲」之后');
-    assert.ok(ms < STRONG_MOVE_BUDGET_MS, `合并实测 ${ms.toFixed(1)} 毫秒，超出上限 ${STRONG_MOVE_BUDGET_MS} 毫秒`);
+    const budget = budgetMs(STRONG_MOVE_BUDGET_MS);
+    t.diagnostic(`合并实测 ${ms.toFixed(1)} 毫秒，上限 ${budget} 毫秒`);
+    assert.ok(ms < budget, `合并实测 ${ms.toFixed(1)} 毫秒，超出上限 ${budget} 毫秒（${STRONG_MOVE_BUDGET_MS} 毫秒 × 系数 ${BUDGET_FACTOR}）`);
 });
 
 // 改写之前的 tidyEmptySpans、mergeAdjacentStrong 及其常量（照抄 url.js），仅作短输入的差分参照：其中 .find()、.remove()、
@@ -1587,20 +1591,23 @@ const STRESS_PAGE_URL = 'https://example.com/article';
 //
 // 10 万个段落：改写之前 12619.1、12515.7、10830.4 ms，最快一次是上限 1000 ms 的 10.8 倍；改写之后全量测试中
 // 84.4–124.3 ms，冷启动 93.3–98.8 ms，冷启动且并行 100.2–166.4 ms，最慢一次 166.4 ms 不到上限的 1/6
+// CI 上按 test/helpers/timing-budget.js 的系数放宽：CI 三平台上计时区间的估计最大值为 710 ms，放宽后余量 5.6 倍
 const IMAGE_LIST_STRESS_COUNT = 100000;
 const IMAGE_LIST_STRESS_BUDGET_MS = 1000;
 // 16 万个段落：规模取到载入稳定落在慢态的区间。改写之前 34354.7、24957.4、26475.2 ms，最快一次是上限 1500 ms 的 16.6 倍；
 // 只把载入退回原生写法、根级查询保持线性时，同一步骤独立进程实测 12697.0、11988.9、11338.0 ms，最快一次仍是上限的
 // 7.6 倍，故只剩载入一处平方级时本用例同样失败。改写之后全量测试中 143.9–196.6 ms，冷启动 142.1–153.9 ms，冷启动且
 // 并行 147.8–186.6 ms，最慢一次 196.6 ms 不到上限的 1/7
+// CI 上按 test/helpers/timing-budget.js 的系数放宽：CI 三平台上计时区间的估计最大值为 1244 ms，放宽后余量 4.8 倍
 const FRAGMENT_LOAD_STRESS_COUNT = 160000;
 const FRAGMENT_LOAD_STRESS_BUDGET_MS = 1500;
 // 6 万个段落：改写之前 17031.7、18284.3、19399.0 ms，最快一次是上限 1500 ms 的 11.4 倍；改写之后全量测试中
 // 107.1–142.5 ms，冷启动 107.9–108.7 ms，冷启动且并行 115.1–143.2 ms，最慢一次 143.2 ms 不到上限的 1/10
+// CI 上按 test/helpers/timing-budget.js 的系数放宽：CI 三平台上计时区间的估计最大值为 1267 ms（macOS），放宽后余量 4.7 倍
 const PREPROCESS_STRESS_COUNT = 60000;
 const PREPROCESS_STRESS_BUDGET_MS = 1500;
 
-test('只读图片清单：顶层 10 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变、清单为空', async () => {
+test('只读图片清单：顶层 10 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变、清单为空', async (t) => {
     // Arrange：载荷在用例内现场构造，不与其他用例共用
     const html = STRESS_PARAGRAPH.repeat(IMAGE_LIST_STRESS_COUNT);
 
@@ -1610,10 +1617,12 @@ test('只读图片清单：顶层 10 万个并列段落不触发平方级的片�
     // Assert：先验结果正确，以免「快」来自少做了事——没有图片，清单为空，HTML 原样返回
     assert.deepEqual(result.images, [], '载荷里没有图片，清单应为空');
     assert.ok(result.html === html, '整段 HTML 应逐字不变');
-    assert.ok(ms < IMAGE_LIST_STRESS_BUDGET_MS, `提取实测 ${ms.toFixed(1)} 毫秒，超出上限 ${IMAGE_LIST_STRESS_BUDGET_MS} 毫秒`);
+    const budget = budgetMs(IMAGE_LIST_STRESS_BUDGET_MS);
+    t.diagnostic(`提取实测 ${ms.toFixed(1)} 毫秒，上限 ${budget} 毫秒`);
+    assert.ok(ms < budget, `提取实测 ${ms.toFixed(1)} 毫秒，超出上限 ${budget} 毫秒（${IMAGE_LIST_STRESS_BUDGET_MS} 毫秒 × 系数 ${BUDGET_FACTOR}）`);
 });
 
-test('只读图片清单：顶层 16 万个并列段落使片段载入落在慢态，改写后耗时在绝对上限内且 HTML 逐字不变、清单为空', async () => {
+test('只读图片清单：顶层 16 万个并列段落使片段载入落在慢态，改写后耗时在绝对上限内且 HTML 逐字不变、清单为空', async (t) => {
     // Arrange
     const html = STRESS_PARAGRAPH.repeat(FRAGMENT_LOAD_STRESS_COUNT);
 
@@ -1623,10 +1632,12 @@ test('只读图片清单：顶层 16 万个并列段落使片段载入落在慢�
     // Assert：先验结果正确
     assert.deepEqual(result.images, [], '载荷里没有图片，清单应为空');
     assert.ok(result.html === html, '整段 HTML 应逐字不变');
-    assert.ok(ms < FRAGMENT_LOAD_STRESS_BUDGET_MS, `提取实测 ${ms.toFixed(1)} 毫秒，超出上限 ${FRAGMENT_LOAD_STRESS_BUDGET_MS} 毫秒`);
+    const budget = budgetMs(FRAGMENT_LOAD_STRESS_BUDGET_MS);
+    t.diagnostic(`提取实测 ${ms.toFixed(1)} 毫秒，上限 ${budget} 毫秒`);
+    assert.ok(ms < budget, `提取实测 ${ms.toFixed(1)} 毫秒，超出上限 ${budget} 毫秒（${FRAGMENT_LOAD_STRESS_BUDGET_MS} 毫秒 × 系数 ${BUDGET_FACTOR}）`);
 });
 
-test('HTML 预处理：顶层 6 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变', async () => {
+test('HTML 预处理：顶层 6 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变', async (t) => {
     // Arrange
     const html = STRESS_PARAGRAPH.repeat(PREPROCESS_STRESS_COUNT);
 
@@ -1635,7 +1646,9 @@ test('HTML 预处理：顶层 6 万个并列段落不触发平方级的片段载
 
     // Assert：先验结果正确——段落无样式、无缩进空白，预处理不改动任何节点
     assert.ok(output === html, '整段 HTML 应逐字不变');
-    assert.ok(ms < PREPROCESS_STRESS_BUDGET_MS, `预处理实测 ${ms.toFixed(1)} 毫秒，超出上限 ${PREPROCESS_STRESS_BUDGET_MS} 毫秒`);
+    const budget = budgetMs(PREPROCESS_STRESS_BUDGET_MS);
+    t.diagnostic(`预处理实测 ${ms.toFixed(1)} 毫秒，上限 ${budget} 毫秒`);
+    assert.ok(ms < budget, `预处理实测 ${ms.toFixed(1)} 毫秒，超出上限 ${budget} 毫秒（${PREPROCESS_STRESS_BUDGET_MS} 毫秒 × 系数 ${BUDGET_FACTOR}）`);
 });
 
 test('尖括号写法页面：字面的标签与字符引用写法逐字进入 IR，零宽字符删除后仍不成立，裸网址的查询串不多出反斜杠', async (t) => {

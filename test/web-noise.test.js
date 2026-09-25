@@ -10,6 +10,7 @@ const assert = require('node:assert/strict');
 
 const { cleanNoise, tokensOf } = require('../converters/web/noise');
 const { normalizeMarkdown } = require('../converters/web/normalize');
+const { BUDGET_FACTOR, budgetMs } = require('./helpers/timing-budget');
 
 // 正文段落：长到足以让安全阀不触发（清洗对象须占比不超过一半）
 const BODY = '<p>正文段落，内容足够长，用来充当被保留的主体部分，避免触发整体误删的安全阀。'
@@ -344,6 +345,8 @@ const EMPTY_STRESS_BREAK_PAIRS = 30000;
 // 9.0、7.8、8.8 倍；改写之后同一载荷各实测 9 次，最慢一次为 A 98 ms、B 133 ms、C 51 ms，余量分别为 10.2、7.5、
 // 19.6 倍，故慢机以及 node --test 多文件并行抢占 CPU 时都不会误报。直接调用 removeEmptyElements、计时区间只包
 // 这一次调用：cheerio.load 与 cleanNoise 的其余三步不计入，两侧余量只反映本函数
+// 本节只有 A、B 两例在 CI 上按 test/helpers/timing-budget.js 的系数放宽：二者在 CI 三平台上计时区间的估计最大值为
+// A 373 ms、B 521 ms，放宽后余量分别为 10.7、7.7 倍；C 的估计最大值不到本上限的 13%，CI 上仍按本值断言
 const EMPTY_STRESS_BUDGET_MS = 1000;
 
 // 载入片段并只对 removeEmptyElements 一次调用计时；每个用例各自新构造输入、重新载入
@@ -354,7 +357,7 @@ function timedRemoveEmptyElements(html) {
     return [$, elapsedMsSince(started)];
 }
 
-test('空元素清理：span 下 10 万个只含不换行空格的并列子元素不触发平方级扫描，耗时在绝对上限内且结构原样保留', () => {
+test('空元素清理：span 下 10 万个只含不换行空格的并列子元素不触发平方级扫描，耗时在绝对上限内且结构原样保留', (t) => {
     // Arrange：span 的文本只有不换行空格，按规则保留；改写之前判定它有无内容后代的一次 .find() 即平方级
     const html = `<p>甲x<span>${'<i>&nbsp;</i>'.repeat(EMPTY_STRESS_CHILDREN)}</span>y乙</p>`;
 
@@ -368,10 +371,12 @@ test('空元素清理：span 下 10 万个只含不换行空格的并列子元�
     const text = $('p').text();
     assert.ok(text.startsWith('甲x') && text.endsWith('y乙'), '载荷两端的可见文字应保留');
     assert.ok($.html() === html, '整段 HTML 应逐字不变');
-    assert.ok(elapsedMs < EMPTY_STRESS_BUDGET_MS, `清理实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${EMPTY_STRESS_BUDGET_MS} ms`);
+    const budget = budgetMs(EMPTY_STRESS_BUDGET_MS);
+    t.diagnostic(`清理实测 ${elapsedMs.toFixed(1)} ms，上限 ${budget} ms`);
+    assert.ok(elapsedMs < budget, `清理实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${budget} ms（${EMPTY_STRESS_BUDGET_MS} ms × 系数 ${BUDGET_FACTOR}）`);
 });
 
-test('空元素清理：同一段落下 10 万个只含空格的 span 逐个删除不触发平方级拼接，耗时在绝对上限内且两端文字相连', () => {
+test('空元素清理：同一段落下 10 万个只含空格的 span 逐个删除不触发平方级拼接，耗时在绝对上限内且两端文字相连', (t) => {
     // Arrange：每个 span 只含 ASCII 空格且不含 br，按规则删除；改写之前逐个 .remove() 即平方级
     const html = `<p>甲${'<span> </span>'.repeat(EMPTY_STRESS_CHILDREN)}乙</p>`;
 
@@ -381,7 +386,9 @@ test('空元素清理：同一段落下 10 万个只含空格的 span 逐个删�
     // Assert：先验结果正确——span 全部删除，段落里只剩两端文字
     assert.equal($('span').length, 0, 'span 应全部删除');
     assert.equal($.html(), '<p>甲乙</p>');
-    assert.ok(elapsedMs < EMPTY_STRESS_BUDGET_MS, `清理实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${EMPTY_STRESS_BUDGET_MS} ms`);
+    const budget = budgetMs(EMPTY_STRESS_BUDGET_MS);
+    t.diagnostic(`清理实测 ${elapsedMs.toFixed(1)} ms，上限 ${budget} ms`);
+    assert.ok(elapsedMs < budget, `清理实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${budget} ms（${EMPTY_STRESS_BUDGET_MS} ms × 系数 ${BUDGET_FACTOR}）`);
 });
 
 test('空元素清理：只含换行的 span 下 3 万组 br 与空 i 拆包不触发平方级扫描，耗时在绝对上限内且子元素按原序留在段落下', () => {
@@ -548,9 +555,11 @@ const NOISE_STRESS_COUNT = 80000;
 // （node --test 多文件并行）中的用例耗时（含构造载荷与断言，是计时区间的上界）9 次为 195.1–245.9 ms，同一载荷、同一
 // 计时区间的独立进程冷启动 3 次为 151.1–156.0 ms，冷启动且与全量测试并行 3 次为 160.6–200.6 ms，最慢一次 245.9 ms
 // 不到它的 1/6。直接调用 cleanNoise、计时区间只包这一次调用，片段载入在函数之内一并计时
+// CI 上按 test/helpers/timing-budget.js 的系数放宽：CI 三平台上计时区间的估计最大值为 1533.2 ms（2026-09-23 Windows
+// 实测，已超出本上限），放宽后余量 3.9 倍
 const NOISE_STRESS_BUDGET_MS = 1500;
 
-test('噪声清洗：顶层 8 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变', () => {
+test('噪声清洗：顶层 8 万个并列段落不触发平方级的片段载入与根级查询，耗时在绝对上限内且 HTML 逐字不变', (t) => {
     // Arrange：载荷在用例内现场构造，不与其他用例共用
     const html = '<p>段</p>'.repeat(NOISE_STRESS_COUNT);
 
@@ -561,5 +570,7 @@ test('噪声清洗：顶层 8 万个并列段落不触发平方级的片段载�
 
     // Assert：先验结果正确，以免「快」来自少做了事
     assert.ok(result === html, '整段 HTML 应逐字不变');
-    assert.ok(elapsedMs < NOISE_STRESS_BUDGET_MS, `清洗实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${NOISE_STRESS_BUDGET_MS} ms`);
+    const budget = budgetMs(NOISE_STRESS_BUDGET_MS);
+    t.diagnostic(`清洗实测 ${elapsedMs.toFixed(1)} ms，上限 ${budget} ms`);
+    assert.ok(elapsedMs < budget, `清洗实测 ${elapsedMs.toFixed(1)} ms，超出上限 ${budget} ms（${NOISE_STRESS_BUDGET_MS} ms × 系数 ${BUDGET_FACTOR}）`);
 });
