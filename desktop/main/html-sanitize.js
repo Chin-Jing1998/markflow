@@ -17,6 +17,7 @@
  *      assetBase + 相对路径，越界或扩展名不合一律丢 src 留 alt；其余元素的 URL 属性（src/poster/
  *      background/data/xlink:href）一律删除；
  *   5. style 属性与 <style> 正文里的 url(...) 除 data: 外一律替换为 none，避免样式通道外发请求。
+ * 载入之前先把孤立代理项换成 U+FFFD（理由见 sanitizeHtml 内的注释）。
  *
  * 被删元素与被拦图片计入返回值，界面据此提示「已拦截 N 张远程图片」一类信息。
  */
@@ -60,7 +61,10 @@ const emptyStats = () => ({ script: 0, iframe: 0, object: 0, embed: 0, form: 0, 
  * @returns {{ html: string, warnings: string[], removed: object, images: object, links: object }}
  */
 function sanitizeHtml(html, { baseDir = null, assetBase = null, allowedExts = ASSET_EXTENSIONS } = {}) {
-    const $ = load(String(html == null ? '' : html));
+    // parse5 7.3.0 遇到「低位代理项后紧跟低位代理项」即抛 RangeError: Invalid code point。预览来源栏的 mammoth 直转
+    // （xmldom 0.8 把 &#xDC00; 一类字符引用原样解码）与页面 <title> 里的会话标题（md front matter 的双引号转义、专利 XML
+    // 的字符引用）都可能带入孤立代理项，故载入前经 toWellFormed 换成 U+FFFD；良构输入内容不变，耗时线性于输入长度
+    const $ = load(String(html == null ? '' : html).toWellFormed());
     const removed = emptyStats();
     const images = { local: 0, remote: 0, blocked: 0 };
     const links = { external: 0, stripped: 0 };

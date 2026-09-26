@@ -4,7 +4,8 @@
  *       各行内格式、script / style / 注释连内容丢弃、图片占位与 warning、嵌套表格展开与 warning）、
  *       标记只注入顶层表格的首个单元格、
  *       回收后 grid 挂到正确的表格节点（含中间表格被丢弃的错位场景）、兜底清理后整棵 IR 不含标记、
- *       入参不变，以及合成 docx 经 parsers/docx 的端到端跨度与非 patent 目标零回归
+ *       入参不变，以及合成 docx 经 parsers/docx 的端到端跨度与非 patent 目标零回归；
+ *       单元格文字含相邻两个低位代理项时不抛错（HTML 直入与 document.xml 字符引用经 parsers/docx 两条路径）
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -367,4 +368,47 @@ test('端到端：md 产物不含标记，表格输出与引入 grid 之前一�
         '结尾',
         '',
     ].join('\n'));
+});
+
+// ============================================================
+// 孤立代理项：parse5 7.3.0 遇到「低位代理项后紧跟低位代理项」抛 RangeError: Invalid code point
+// ============================================================
+
+/** 代理项与替换字符以码点生成，源码不出现孤立代理项的字面量或转义序列 */
+const LOW_SURROGATE = String.fromCharCode(0xDC00);
+const REPLACEMENT = String.fromCharCode(0xFFFD);
+
+test('grid：单元格文字含相邻两个低位代理项时不抛错，grid 里各换成 U+FFFD', () => {
+    // Arrange：mammoth 的输出可含孤立代理项（xmldom 0.8 把 document.xml 的 &#xDC00; 原样解码），parse5 载入即抛错
+    const html = `<table><tr><td>甲${LOW_SURROGATE}${LOW_SURROGATE}乙</td><td>丁</td></tr></table>`;
+
+    // Act
+    const collected = collectTableGrids(html);
+
+    // Assert
+    const cells = cellsOf(collected.grids.get(1), 0);
+    assert.deepEqual(cells[0].paragraphs.map(textOf), [`甲${REPLACEMENT}${REPLACEMENT}乙`]);
+    assert.deepEqual(cells[1].paragraphs.map(textOf), ['丁']);
+    assert.ok(MARKER_RE.test(collected.html), '标记照常注入');
+    assert.deepEqual(collected.warnings, []);
+});
+
+test('端到端：document.xml 的表格单元格以字符引用写入两个低位代理项时，parsers/docx 不抛错且该格进入 grid', async () => {
+    // Arrange：取表格夹具，把「丙」所在单元格改写为「丙&#xDC00;&#xDC00;」
+    const JSZip = require('jszip');
+    const zip = await JSZip.loadAsync(await buildTableSample());
+    const xml = await zip.file('word/document.xml').async('string');
+    assert.equal(xml.split('>丙<').length, 2, '夹具里「丙」须恰好出现一次');
+    zip.file('word/document.xml', xml.replace('>丙<', '>丙&#xDC00;&#xDC00;<'));
+    const buffer = await zip.generateAsync({ type: 'nodebuffer' });
+
+    // Act
+    const doc = await parse({ buffer }, { sourceName: 'table-sample.docx' });
+
+    // Assert
+    const tables = findTables(doc.ir);
+    assert.equal(tables.length, 2);
+    assert.deepEqual(tables[0].data.grid.rows[2].cells[1].paragraphs.map(textOf), [`丙${REPLACEMENT}${REPLACEMENT}`]);
+    assert.equal(tables[1].data.grid.rows.length, 1, '第二张表也拿到自己的 grid');
+    assertNoMarker(doc.ir, '孤立代理项端到端');
 });

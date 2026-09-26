@@ -9,7 +9,8 @@
  *       真实转换内核下专利预览的图片地址逐一可经 mf-asset 协议解析；export 落盘后写入文件库记录；
  *       close 撤销 mf-asset 授权并删除会话临时目录；
  *       网页来源 open/render 走通且全程不经路径展开；
- *       MinerU 令牌注入 buildOptions 却不出现在任何回包与会话选项里。
+ *       MinerU 令牌注入 buildOptions 却不出现在任何回包与会话选项里；
+ *       会话标题含相邻两个低位代理项时，来源栏 mammoth 直转与产物栏 docx 反读经 html-sanitize 不抛错。
  */
 const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -649,4 +650,33 @@ test('非 bundle 目标调编辑接口报错', async () => {
     await assert.rejects(h.preview.renderMarkdown({ sessionId: opened.sessionId }), /只有「MD 包」目标的产物可以编辑/);
     await assert.rejects(h.preview.saveMarkdown({ sessionId: opened.sessionId, text: 'x' }), /只有「MD 包」目标的产物可以编辑/);
     await assert.rejects(h.preview.renderMarkdown({ sessionId: 'nope' }), /预览会话不存在/);
+});
+
+// ============================================================
+// 孤立代理项
+// ============================================================
+
+test('会话标题含相邻两个低位代理项：来源栏 mammoth 直转与产物栏 docx 反读都经 html-sanitize 换成 U+FFFD，open 不抛错', async () => {
+    // Arrange：md 的 front matter 双引号转义与专利 XML 的数字字符引用都能让解析标题含孤立代理项，标题经页面 <title>
+    // 进入 html-sanitize，parse5 7.3.0 遇到「低位代理项后紧跟低位代理项」抛 RangeError。代理项以码点生成
+    const low = String.fromCharCode(0xDC00);
+    const title = `题${low}${low}名`;
+    const replacedTitle = `<title>题${String.fromCharCode(0xFFFD).repeat(2)}名</title>`;
+    const h = makeHarness({
+        coreOverrides: (core) => {
+            const parseDocument = core.parseDocument;
+            return { parseDocument: async (args) => ({ ...(await parseDocument(args)), title }) };
+        },
+    });
+
+    // Act
+    const docxOpened = await openDocx(h);
+    const xmlOpened = await h.preview.open({ path: SOURCE_DOCX, type: 'xml', target: 'docx' });
+
+    // Assert
+    assert.ok(docxOpened.sourceView.html.includes(replacedTitle), `来源栏标题未按预期替换：${docxOpened.sourceView.html}`);
+    assert.ok(docxOpened.sourceView.html.isWellFormed(), '来源栏不应再含孤立代理项');
+    assert.equal(xmlOpened.product.view.kind, 'html');
+    assert.ok(xmlOpened.product.view.html.includes(replacedTitle), `产物栏标题未按预期替换：${xmlOpened.product.view.html}`);
+    assert.ok(xmlOpened.product.view.html.isWellFormed(), '产物栏不应再含孤立代理项');
 });
