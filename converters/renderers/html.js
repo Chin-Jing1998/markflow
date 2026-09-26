@@ -19,6 +19,11 @@
  *     其余 default-src 'none' 与 style-src 'unsafe-inline' 不变，从浏览器侧再封一道外发通道。
  *   - 样式来自 renderers/html-themes：:root 变量（字体、字号、行高、栏宽、间距）+ 主题 CSS，
  *     不引用任何远程资源。省略 options 时按打印场景取值（print 主题 + file 寻址），与 v2 行为一致。
+ *   - 填空横线（只含空白的 underline / delete 节点，docx 解析器由带下划线或删除线的空格串产出）里的半角空格改写为 U+00A0
+ *     再交给 remark-rehype：浏览器按 CSS 空白处理把连续半角空格折成一个、块首块尾的整段删除，<u>      </u> 在段中只剩
+ *     一个空格宽的横线、在段首段尾整个不见；U+00A0 不属可折叠空白，六个即六个字宽，且不在其中换行。只改半角空格
+ *     （全角空格与 U+00A0 本就不折叠，制表符已由 applyTextLayout 换成两个 U+3000），只改只含空白的节点（有文字的下划线
+ *     其内部空白照常折叠，与正文一致）。IR 不改动，只影响 html 与由它生成的 pdf 产物（见 hardenBlankFormats）。
  */
 const { pathToFileURL } = require('url');
 const { stripHtml } = require('../ir/util');
@@ -43,6 +48,12 @@ const URL_SCHEME_RE = /^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\//;
 const IMAGE_MIME_RE = /^image\/[a-z0-9.+-]+$/;
 const PX_RE = /^\d{1,5}$/;
 const MAX_PERCENT = 100;
+// 填空横线：空白在这两种格式之下有可见的横线（见文件头）；不可见字符以码点生成，源码不出现看不见的字面量
+const BLANK_FORMAT_TYPES = new Set(['underline', 'delete']);
+const SPACE = ' ';
+const NBSP = String.fromCharCode(0xa0);
+// 只含空白的子树允许出现的节点类型：文本与六种行内格式；换行、图片等一律使子树不算填空
+const INLINE_FORMAT_TYPES = new Set(['strong', 'emphasis', 'delete', 'underline', 'superscript', 'subscript']);
 
 // ============================================================
 // 入口
@@ -61,8 +72,9 @@ async function render(doc, options, context = {}) {
     const resolveSrc = createImageResolver(doc, mode);
 
     const { unified, remarkRehype, rehypeStringify } = await loadUnified();
-    // 残留标记兜底剥除；段首缩进与制表符按 md 渲染器的同一约定落为全角空格（HTML 不折叠 U+3000）
-    const root = downgradeCustomNodes(applyTextLayout(stripMarkersTree(doc.ir || { type: 'root', children: [] })));
+    // 残留标记兜底剥除；段首缩进与制表符按 md 渲染器的同一约定落为全角空格（HTML 不折叠 U+3000）；
+    // 填空横线里的半角空格改写为 U+00A0（HTML 折叠连续半角空格，见文件头）
+    const root = hardenBlankFormats(downgradeCustomNodes(applyTextLayout(stripMarkersTree(doc.ir || { type: 'root', children: [] }))));
 
     const hast = await unified()
         .use(remarkRehype, {
@@ -175,6 +187,45 @@ function imageMime(value) {
 function encodeAssetPath(name) {
     if (!name) return '';
     return name.split('/').map(encodeURIComponent).join('/');
+}
+
+// ============================================================
+// 填空横线：只含空白的 underline / delete 子树里的半角空格 → U+00A0
+// ============================================================
+
+/**
+ * 返回新树，不改动入参；无可改写的节点时返回原引用。只在子树只含文本与行内格式、文本全为空白且至少有一个半角空格时改写：
+ * 有文字的下划线、夹着换行或图片的帧、没有半角空格的填空（全角空格、U+00A0）都原样返回。
+ * 线性：每个节点访问一次；命中的子树在判定与改写时各再遍历一次，两者只覆盖该子树
+ */
+function hardenBlankFormats(node) {
+    if (!node || typeof node !== 'object' || !Array.isArray(node.children)) return node;
+    if (BLANK_FORMAT_TYPES.has(node.type) && isBlankFormat(node)) return withNbsp(node);
+    const children = node.children.map(hardenBlankFormats);
+    return children.some((child, i) => child !== node.children[i]) ? { ...node, children } : node;
+}
+
+/** 子树只含空白文本与行内格式节点，且至少一个半角空格 */
+function isBlankFormat(node) {
+    const state = { spaceSeen: false };
+    return blankOnly(node, state) && state.spaceSeen;
+}
+
+function blankOnly(node, state) {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'text') {
+        const value = String(node.value == null ? '' : node.value);
+        if (/\S/.test(value)) return false;
+        if (value.includes(SPACE)) state.spaceSeen = true;
+        return true;
+    }
+    if (!INLINE_FORMAT_TYPES.has(node.type) || !Array.isArray(node.children)) return false;
+    return node.children.every((child) => blankOnly(child, state));
+}
+
+function withNbsp(node) {
+    if (node.type === 'text') return { ...node, value: String(node.value).split(SPACE).join(NBSP) };
+    return { ...node, children: node.children.map(withNbsp) };
 }
 
 // ============================================================
