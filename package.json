@@ -1,6 +1,6 @@
 {
   "name": "markflow",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "main": "desktop/main/index.js",
   "description": "MarkFlow - 知识库文件转换工具（桌面端 + CLI + MCP）：办公文档/PDF/网页 → Markdown+JSON+图片、HTML、XML（含专利 XML 五书）；Markdown → DOCX/PDF/HTML/XML",
   "bin": {
