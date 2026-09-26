@@ -50,8 +50,11 @@ before(async () => {
 });
 
 after(async () => {
-    if (client) await client.close();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    try {
+        if (client) await client.close();
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
 });
 
 const makeOutDir = (prefix) => fs.mkdtempSync(path.join(tmpDir, prefix));
