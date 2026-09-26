@@ -509,6 +509,19 @@ describe('runConversion 的产物名登记', () => {
         assert.equal(second.results[0].outputPath, first.results[0].outputPath);
         assert.deepEqual(fs.readdirSync(outputDir), ['sample']);
     });
+
+    test('orderBase 大于 0 而未传 nameRegistry 时抛错：新建的登记表里没有更早的序号，首项登记只会永远排队', async () => {
+        // Arrange
+        const [input] = seedInputs('base-in-', ['sample.docx']);
+        const outputDir = fs.mkdtempSync(path.join(root, 'base-out-'));
+        const tasks = service.planTasks([input], 'bundle', ROOT);
+
+        // Act & Assert
+        await assert.rejects(service.runConversion({ tasks, outputDir, orderBase: 1 }), /orderBase 大于 0 时须同时传入 nameRegistry/);
+        await assert.rejects(service.runConversion({ tasks, outputDir, orderBase: -1 }), /orderBase 须为非负整数/);
+        await assert.rejects(service.runConversion({ tasks, outputDir, orderBase: 1.5 }), /orderBase 须为非负整数/);
+        assert.deepEqual(fs.readdirSync(outputDir), [], '拒收时不得落盘');
+    });
 });
 
 // ============================================================

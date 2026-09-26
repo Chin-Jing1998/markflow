@@ -22,7 +22,10 @@
  *                       默认值不同逐段列出，取值不同则逐段列范围与默认；未知路径抛中文错误
  * planTasks(raws, requestedTarget, cwd, hints?) → [{ raw, input, target }]，任一项不合法即抛中文错误；
  *                       hints.bundles 为 scan.expandInputs 判定出的专利五书目录（绝对路径），这些输入是目录而非文件
- * runConversion({ tasks, outputDir, concurrency, onEvent, options }) → { ok, outputDir, results, errors }
+ * runConversion({ tasks, outputDir, concurrency, onEvent, options, nameRegistry?, orderBase? })
+ *                     → { ok, outputDir, results, errors }；后两个参数供把一轮转换拆成多次调用的入口
+ *                       （桌面端逐任务入队）共用同一张产物名登记表与同一套批内序号
+ * createNameRegistry() → 该登记表；一轮转换建一张，用完即弃（跨轮仍是同名产物直接覆盖）
  * extractArticle({ url, maxChars }) → { url, finalUrl, title, author?, publishedAt?, siteName?, excerpt?, lang?,
  *                       wordCount, extraction, markdown, truncated, images }：网页只读提取，不落盘、不下载图片（图片只列
  *                       原始地址）；markdown 超过 maxChars（缺省或非正整数时取 DEFAULT_EXTRACT_MAX_CHARS）即截断并置
@@ -371,23 +374,34 @@ function planTasks(raws, requestedTarget, cwd, { bundles } = {}) {
  * 执行批量转换并生成各入口共用的结果信封；options 原样透传 convert（省略即全默认）。
  * signal（AbortSignal）中止后不再领取新任务，已在运行的跑完；未领取的以「已取消」记入 errors 并带 cancelled: true。
  * clean 与 skipExisting 为写盘策略（非用户 options），原样透传 convert：非布尔值由 convert 拒绝并记入 errors。
+ *
+ * nameRegistry 与 orderBase 供「一轮转换拆成多次调用」的入口使用（桌面端逐个任务入队、可并发、可中途
+ * 失败，故每个任务单独调本函数）：整轮共用一张登记表并以任务在本轮中的序号作 orderBase，同名产物才会
+ * 依次改名而非互相覆盖，与 CLI 单次调用的结果一致。省略两者即本次调用的 tasks 自成一批。
+ * 共用登记表时，没有交到本函数手上执行的序号（signal 中止后未领取的任务，以及调用本函数之前即已取消或失败的
+ * 任务）由调用方自行 release，否则后续序号会一直等在登记排队上；桌面端在每个任务收尾时无条件放行。
+ * orderBase 大于 0 而未传 nameRegistry 时抛错：新建的登记表里没有序号 0..orderBase-1，调用方也无从放行，
+ * 首项登记只会永远排队。
  */
 async function runConversion({
     tasks, outputDir, concurrency = DEFAULT_CONCURRENCY, onEvent, options, signal, clean, skipExisting,
+    nameRegistry, orderBase = 0,
 } = {}) {
+    if (!Number.isInteger(orderBase) || orderBase < 0) throw new Error('runConversion: orderBase 须为非负整数');
+    if (orderBase > 0 && !nameRegistry) throw new Error('runConversion: orderBase 大于 0 时须同时传入 nameRegistry');
     // 每批一张产物名登记表：批内派生出同名产物的任务依次改名（sample、sample (pptx)、sample (2)），
     // 不再互相覆盖；登记表不跨批次留存，故单独重复转换同一输入仍覆盖同名产物、保持幂等
-    const nameRegistry = createNameRegistry();
-    // 批内序号：runBatch 同步领号后随即调用任务函数，故第 k 次调用对应 tasks[k]，计数器即任务序。
-    // 登记按该序号排队，最终名与各任务解析完成的先后无关；任务失败时放行后续，避免整批卡住
-    let nextOrder = 0;
+    const registry = nameRegistry || createNameRegistry();
+    // 批内序号：runBatch 同步领号后随即调用任务函数，故第 k 次调用对应 tasks[k]，计数器即任务序，
+    // 起点为 orderBase。登记按该序号排队，最终名与各任务解析完成的先后无关；任务失败时放行后续，避免整批卡住
+    let nextOrder = orderBase;
     const runTask = (task, onProgress) => {
         const order = nextOrder;
         nextOrder += 1;
         return convert({
-            input: task.input, target: task.target, outputDir, onProgress, options, nameRegistry, order, clean, skipExisting,
+            input: task.input, target: task.target, outputDir, onProgress, options, nameRegistry: registry, order, clean, skipExisting,
         }).catch((error) => {
-            nameRegistry.release(order);
+            registry.release(order);
             throw error;
         });
     };
@@ -466,6 +480,6 @@ function pickStrings(source, keys) {
 
 module.exports = {
     probeCapabilities, describeFormats, buildOptions, describeOptionSpec, describeOptionHint,
-    planTasks, runConversion, extractArticle, DEFAULT_CONCURRENCY, DEFAULT_EXTRACT_MAX_CHARS,
+    planTasks, runConversion, createNameRegistry, extractArticle, DEFAULT_CONCURRENCY, DEFAULT_EXTRACT_MAX_CHARS,
     _setValidatorProbe, _resetProbeCache,
 };
