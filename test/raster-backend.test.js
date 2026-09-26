@@ -45,7 +45,7 @@ function isSpawnBlocked(err) {
  * 记录被测调用自己建出的栅格工作目录。
  * 不数 os.tmpdir() 下的同前缀目录总数：该命名空间由全仓共享（converters/raster/backend.js 的
  * markflow-raster-、desktop/main/chromium-jobs.js 的 markflow-raster-app-，以及各后端模块加载时
- * 的残留回收器），npm test 又以每文件一进程并发跑 58 个套件，前后两次计数会被无关进程的
+ * 的残留回收器），npm test 又以每文件一进程并发跑全部套件，前后两次计数会被无关进程的
  * 建/删动作改写，与本用例是否清理无关。改为在调用期间挂 mkdtemp 探针，直接拿到本次调用的目录路径。
  * @returns {{ created: string[], restore: () => void }} created 为本次调用建出的工作目录绝对路径
  */
