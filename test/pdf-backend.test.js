@@ -239,10 +239,15 @@ test('工作进程超时被强制结束并抛出超时错误', async () => {
     assert.equal(child.killed, true, '超时后应 kill 子进程');
 });
 
-test('backend 清理超过 1 天的 markflow-pdf-* 残留目录，保留新目录', async () => {
-    // Arrange
-    const stale = fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-pdf-stale-'));
-    const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-pdf-fresh-'));
+test('backend 清理超过 1 天的 markflow-pdf-* 残留目录，保留新目录', async (t) => {
+    // Arrange：两个目录建在本例私有的根目录下，并令 os.tmpdir() 返回该根目录。
+    // os.tmpdir() 全机共享：并行运行的其他测试进程或同机其他会话加载 pdf/backend.js 时，模块加载阶段的清理
+    // 会回收其中过期的 markflow-pdf-* 目录，可能抢在本例之前删掉 stale，删除计数随之为 0；
+    // 只跑本例时（如 --test-name-pattern），本进程模块加载阶段的那次清理可能尚未结束，同样会抢先删除
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-stale-cleanup-'));
+    t.mock.method(os, 'tmpdir', () => root);
+    const stale = fs.mkdtempSync(path.join(root, 'markflow-pdf-stale-'));
+    const fresh = fs.mkdtempSync(path.join(root, 'markflow-pdf-fresh-'));
     const twoDaysAgo = new Date(Date.now() - 2 * ONE_DAY_MS);
     fs.utimesSync(stale, twoDaysAgo, twoDaysAgo);
 
@@ -255,8 +260,7 @@ test('backend 清理超过 1 天的 markflow-pdf-* 残留目录，保留新目�
         assert.equal(fs.existsSync(stale), false, '过期目录应被删除');
         assert.equal(fs.existsSync(fresh), true, '新目录应保留');
     } finally {
-        fs.rmSync(stale, { recursive: true, force: true });
-        fs.rmSync(fresh, { recursive: true, force: true });
+        fs.rmSync(root, { recursive: true, force: true });
     }
 });
 
