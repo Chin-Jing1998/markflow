@@ -45,13 +45,15 @@
  *   - 两段行内代码在输出中相邻（含只隔着产物为空的元素、注释或零宽字符）时，两段之间写入空 HTML 注释 <!---->，
  *     与 renderers/md 分隔相邻 inlineCode 的写法相同：两段的反引号围栏首尾相接会并成一个更长的反引号串，remark
  *     重新解析时配对错位；注释解析为 html 节点，由各渲染器剥除（见下方「相邻行内代码段的分隔」块注释）
+ *   - 文本节点以零宽字符开头（其间可夹半角空格与不换行空格）时，turndown 的行首转义越过这段前导字符、锚定在其后的
+ *     记号上：parsers/url 的 normalizeMarkdown 删去零宽字符后记号落在行首（见 escapeAfterZeroWidth 的块注释）
  *
  * 表格规则 convertTableToMarkdown 为本文件内部函数，不再在其他文件重复实现。
  */
 const TurndownService = require('turndown');
 const { MARKERS } = require('./markers');
-// 零宽字符码点：web/normalize 不依赖本模块，引入不成环
-const { ZERO_WIDTH_CODE_POINTS } = require('../web/normalize');
+// 零宽字符与不换行空格的码点：web/normalize 不依赖本模块，引入不成环
+const { ZERO_WIDTH_CODE_POINTS, NBSP_CODE_POINTS } = require('../web/normalize');
 
 const BASE_OPTIONS = {
     headingStyle: 'atx',
@@ -83,6 +85,12 @@ const CHAR_REF_BODY_MAX = 31;
 const ASCII_ALNUM_RE = /[0-9A-Za-z]/;
 // 零宽字符在 parsers/url 的 normalizeMarkdown 里会被删除，判定字符引用时须当它不存在
 const ZERO_WIDTH_CHARS = new Set(ZERO_WIDTH_CODE_POINTS.map((cp) => String.fromCodePoint(cp)));
+// 行首前导段的两类字符（见 escapeAfterZeroWidth），按码元比对、不逐字符切取子串：零宽字符；半角空格与 normalizeMarkdown
+// 归一为半角空格的不换行空格
+const ZERO_WIDTH_CODES = new Set(ZERO_WIDTH_CODE_POINTS);
+const LEADING_SPACE_CODES = new Set([0x20, ...NBSP_CODE_POINTS]);
+// CommonMark 块记号允许的最大缩进列数：引用、列表、ATX 与 setext 标题、分隔线、围栏均至多缩进 3 列
+const MAX_BLOCK_INDENT = 3;
 
 // CSS font-weight 视为加粗的取值：bold、600-999、1000
 const BOLD_STYLE_RE = /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i;
@@ -868,6 +876,53 @@ function mayStartCharRef(text, from) {
     return true;
 }
 
+/*
+ * url profile：零宽字符之后的行首记号。
+ * 成因：turndown 的转义表里有七条以 ^ 锚定的规则（^-、^\+ 、^(=+)、^(#{1,6}) 、^~~~、^>、^(\d+)\. ），锚定的是 escape 的
+ * 入参即单个文本节点的开头。文本节点以零宽字符开头时七条都不命中，parsers/url 的 normalizeMarkdown 随后删去零宽字符，
+ * 其后的记号落在段首或硬换行之后的行首，被 remark 解析为引用块、列表、ATX 标题、分隔线或 setext 标题的下划线
+ * （「<p>（U+200B）&gt; 甲</p>」解析为引用块「甲」）。零宽字符还把紧随其后的半角空格挡在 turndown 的空白折叠之外（折叠
+ * 只删行首的 ASCII 空白，零宽字符不算空白），不换行空格本不在折叠之列；二者在删去零宽字符、归一为半角空格之后成为
+ * 行首缩进，而块记号允许至多 3 列缩进，照样生效。七条中只有 ^~~~ 不受影响：escapeTildes 把文本中的每个「~」都转义。
+ * 修法：包装实例的 escape，文本节点以「零宽字符、半角空格、不换行空格」组成的前导段开头、且该段含零宽字符时，前导段
+ * 原样保留，其余部分交上游转义，七条行首规则由此锚定在前导段之后的记号上。上游其余各条逐字符替换，前导段里没有它们
+ * 替换的字符，拆开转义与整段转义结果相同；七条行首规则在整段上不命中（前导段首字符不是记号），故产物与原写法相比只多
+ * 出行首规则补上的一个反斜杠。该反斜杠恒在 ASCII 标点之前，是合法的反斜杠转义：前导段不在行首时（行中的文本节点）
+ * 多转义不改变 IR 文本，与上游对行中文本节点开头的记号照样转义同理。
+ *   - 前导段须含零宽字符：只由半角空格组成的前导段出现在行中（turndown 已删去行首的 ASCII 空白），或在 void 元素之后
+ *     （turndown 保留 void 元素之后的空白），后者与零宽字符无关；只由不换行空格组成的前导段同理，均不在本修复之内。
+ *   - 前导段的半角空格与不换行空格合计超过 MAX_BLOCK_INDENT 个时不改：该行删去零宽字符后缩进 4 列以上，块记号不再生效，
+ *     行首起为缩进代码块或段落续行，补上的反斜杠在前者中会成为代码文本。
+ *   - 只接在 url profile：零宽字符只在 parsers/url 的 normalizeMarkdown 中删除，word 与 basic profile 的管线保留零宽字符，
+ *     记号不会落到行首。工厂层随后在本包装之外再包「~」与「<」「&」的转义，二者逐字符判定，与前导段无关。
+ * 耗时线性于文本长度：前导段逐字符扫描一次，其余部分交上游，上游各条规则均为单遍替换。
+ */
+function escapeAfterZeroWidthIn(service) {
+    const escapeUpstream = service.escape.bind(service);
+    service.escape = (text) => escapeAfterZeroWidth(text, escapeUpstream);
+}
+
+/** 文本以含零宽字符的前导段开头、且段内空格不超过 MAX_BLOCK_INDENT 个时，前导段原样保留、其余部分交上游转义 */
+function escapeAfterZeroWidth(text, escapeUpstream) {
+    let end = 0;
+    let spaces = 0;
+    let zeroWidth = false;
+    for (; end < text.length; end += 1) {
+        const code = text.charCodeAt(end);
+        if (ZERO_WIDTH_CODES.has(code)) {
+            zeroWidth = true;
+        } else if (LEADING_SPACE_CODES.has(code)) {
+            spaces += 1;
+            // 缩进已达 4 列：其后不论还有什么，该行都不以块记号开头，整段交上游、不必扫完前导段
+            if (spaces > MAX_BLOCK_INDENT) return escapeUpstream(text);
+        } else {
+            break;
+        }
+    }
+    if (!zeroWidth || end === text.length) return escapeUpstream(text);
+    return `${text.slice(0, end)}${escapeUpstream(text.slice(end))}`;
+}
+
 // [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整。
 // 上下标排在表首、优先级最低：带 line-through 等样式的 <sup>/<sub> 仍归后面的样式规则接管
 const URL_WRAP_RULES = [
@@ -909,6 +964,8 @@ function configureUrl(service) {
     });
     addTableRule(service);
     service.remove(URL_REMOVED_TAGS);
+    // 文本节点以零宽字符开头时，行首转义锚定在零宽字符之后的记号上（见 escapeAfterZeroWidth）
+    escapeAfterZeroWidthIn(service);
 }
 
 const PROFILE_BUILDERS = { basic: configureBasic, word: configureWord, url: configureUrl };
