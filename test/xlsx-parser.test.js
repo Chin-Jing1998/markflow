@@ -16,7 +16,7 @@ const { parse } = require('../converters/parsers/xlsx');
 // 测试夹具：用 exceljs 现场生成两个 sheet 的工作簿
 // ============================================================
 
-// makeWorkbookFile 建在 os.tmpdir() 下的临时目录逐一登记，全部用例结束后统一删除
+// 用例建在 os.tmpdir() 下的临时目录逐一登记，全部用例结束后统一删除
 const tempDirs = [];
 
 after(() => {
@@ -182,6 +182,7 @@ test('meta.author 取 docProps/core.xml 的 dc:creator；无作者时 meta 不�
     // Arrange：exceljs 写出时总会填 dc:creator（缺省 Unknown），无作者的样本改写 core.xml 得到
     const JSZip = require('jszip');
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-xlsx-author-')));
+    tempDirs.push(dir);
     const withAuthor = path.join(dir, '有作者.xlsx');
     const wb = new ExcelJS.Workbook();
     wb.creator = ' 周八 ';
