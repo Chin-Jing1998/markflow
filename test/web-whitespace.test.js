@@ -6,7 +6,8 @@
  *
  * 覆盖四类语义：① 属性值逐段独立截断；② 文本节点按「是否可被 turndown 折叠」区分成本；
  * ③ 跨文本节点累计（相邻的空白在输出里会并成一段，逐节点各自截断挡不住）；
- * ④ 不产出任何可见字符的子树既不计数也不清零。另有两条回归用例：常规文档零改动，
+ * ④ 不产出任何可见字符的子树既不计数也不清零——只有 template 与 turndown 移除的标签属此列，
+ *    表格的 caption 不在其中：表题文字由表格规则输出为独立段落，照常计数与清零。另有两条回归用例：常规文档零改动，
  * 以及截断后经真实 turndown('url') 转换，输出中最长的空白段不超过上限。
  */
 const { test } = require('node:test');
@@ -173,15 +174,32 @@ test('跳过子树：被 turndown 移除的标签内的文字不清零，两侧�
     assert.equal(countOf($('p').text(), NBSP), MAX_WHITESPACE_RUN);
 });
 
-test('跳过子树：template 与仅含 caption 的表格无须传参即被跳过', () => {
+test('跳过子树：template 无须传参即被跳过', () => {
     // Act
     const tpl = cap(`<p>甲${NBSP.repeat(200)}<template>x</template>${NBSP.repeat(200)}乙</p>`);
-    const cap1 = cap(`<p>甲${NBSP.repeat(200)}</p><table><caption>x</caption></table>`
-        + `<p>${NBSP.repeat(200)}乙</p>`);
 
     // Assert
     assert.equal(countOf(tpl.root().text(), NBSP), MAX_WHITESPACE_RUN);
-    assert.equal(countOf(cap1.root().text(), NBSP), MAX_WHITESPACE_RUN);
+});
+
+test('caption 不属被跳过的子树：表题的可见文字照常清零，两侧各 200 个不换行空格全部保留', () => {
+    // Arrange：表题文字由表格规则输出为紧邻表格之前的独立段落，会进入 turndown 输出
+    const html = `<p>甲${NBSP.repeat(200)}</p><table><caption>x</caption></table>`
+        + `<p>${NBSP.repeat(200)}乙</p>`;
+
+    // Act
+    const $ = cap(html);
+
+    // Assert
+    assert.equal(countOf($.root().text(), NBSP), 400);
+});
+
+test('caption 内的超长不可折叠空白照常截为上限', () => {
+    // Act
+    const $ = cap(`<table><caption>甲x${NBSP.repeat(OVER_LIMIT)}y乙</caption><tr><td>a</td></tr></table>`);
+
+    // Assert
+    assert.equal(countOf($('caption').text(), NBSP), MAX_WHITESPACE_RUN);
 });
 
 test('跳过子树：未把 script 列为移除标签时，其内文字照常清零', () => {
@@ -245,6 +263,12 @@ const ADVERSARIAL_CASES = [
     ['void 元素隔开的空格', `<p>甲x${'<wbr> '.repeat(ADVERSARIAL_N)}y乙</p>`],
     ['不换行空格与 script 交替', `<p>甲x${`${NBSP}<script>s</script>`.repeat(ADVERSARIAL_N)}y乙</p>`],
     ['不换行空格与 ASCII 空格交替', `<p>甲x${`${NBSP} `.repeat(ADVERSARIAL_N)}y乙</p>`],
+    ['caption 内不换行空格', `<table><caption>甲x${NBSP.repeat(ADVERSARIAL_N)}y乙</caption><tr><td>a</td></tr></table>`],
+    [
+        '纯空白 caption 夹在两段之间',
+        `<p>甲x${NBSP.repeat(ADVERSARIAL_N)}</p><table><caption>${NBSP.repeat(ADVERSARIAL_N)}</caption></table>`
+        + `<p>${NBSP.repeat(ADVERSARIAL_N)}y乙</p>`,
+    ],
 ];
 
 for (const [name, html] of ADVERSARIAL_CASES) {

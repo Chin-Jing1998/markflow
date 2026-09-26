@@ -17,6 +17,7 @@ const { MARKERS, indentMarker } = require('../converters/ir/markers');
 const { LEAF_BLOCK_SELECTOR, NESTED_BLOCK_SELECTOR, NESTED_BLOCK_TAGS } = require('../converters/web/indent');
 const { _setLookup } = require('../converters/net/fetch-guard');
 const mdRenderer = require('../converters/renderers/md');
+const { buildContentList } = require('../converters/renderers/content-list');
 const { BUDGET_FACTOR, budgetMs } = require('./helpers/timing-budget');
 
 // 按真实公众号文章裁剪的结构夹具（section 嵌套、小字图注、相邻 strong、单双 br、text-indent、段首 NBSP）
@@ -124,6 +125,18 @@ const RANGE_PAGE = `<!doctype html>
 <p>疗程3~5天，有效率10~20%</p>
 <p>R<sup>2</sup>、C<sub>1</sub>的烷基</p>
 <p>原价<del>3~5元</del>，现价<s>作废</s>两元</p>
+</article>
+</body></html>`;
+
+// 网页表格的表题：GFM 没有表题语法，<caption> 的文字曾被表格规则整段丢弃、进不了 IR
+const TABLE_CAPTION_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><title>表题写法</title></head><body>
+<article>
+<h1>表题写法</h1>
+<p>下表列出各组收率，供后文引用。</p>
+<table><caption>表 1 各组收率（10~20℃、30~40℃，*为显著）</caption>
+<tr><th>组别</th><th>收率</th></tr><tr><td>甲</td><td>90%</td></tr></table>
+<p>由上表可见，甲组收率最高。</p>
 </article>
 </body></html>`;
 
@@ -261,6 +274,10 @@ function startServer() {
             case '/range':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(RANGE_PAGE);
+                return;
+            case '/table-caption':
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(TABLE_CAPTION_PAGE);
                 return;
             case '/escape':
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -736,6 +753,44 @@ test('区间号页面：「~」逐字进入 IR，delete 只来自 <del>/<s>，<s
     // Assert：md 产物中区间号不再是删除线，上下标以 HTML 标签落地
     assert.ok(!markdown.includes('~~C30'), markdown);
     assert.ok(markdown.includes('<sup>2</sup>') && markdown.includes('<sub>1</sub>'), markdown);
+});
+
+test('表题页面：<caption> 成紧邻表格之前的独立段落，「~」「*」逐字进入 IR，content_list 的 table_caption 收下表题', async (t) => {
+    // Arrange
+    const server = await startServer();
+    t.after(() => server.close());
+    const captionText = '表 1 各组收率（10~20℃、30~40℃，*为显著）';
+
+    // Act
+    const doc = await parse({ url: `${server.base}/table-caption` }, { allowPrivateNetwork: true });
+    const markdown = await mdRenderer.render(doc);
+    const lines = markdown.split('\n');
+
+    // Assert：顶层恰有一个表题段落，其下一个兄弟是表格，文字与源文逐字相等
+    const top = doc.ir.children;
+    const captionAt = top.findIndex((n) => n.type === 'paragraph' && n.data && n.data.role === 'table_caption');
+    const roles = JSON.stringify(top.map((n) => [n.type, (n.data && n.data.role) || null]));
+    assert.equal(top.filter((n) => n.data && n.data.role === 'table_caption').length, 1, roles);
+    assert.equal(plainText(top[captionAt]), captionText, roles);
+    assert.equal(top[captionAt + 1].type, 'table', roles);
+
+    // Assert：表题里的成对「~」与星号未被误解析
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'delete'), []);
+    assert.deepEqual(collect(doc.ir, (n) => n.type === 'emphasis'), []);
+
+    // Assert：md 产物里表题行紧排在表头行之前，二者之间只隔一个空行，且无私用区标记残留
+    // 「为显著」只出现在表题里；「各组收率」正文段也有，不能用来定位
+    const captionLine = lines.findIndex((line) => line.includes('为显著'));
+    const headerLine = lines.findIndex((line) => line.startsWith('|') && line.includes('组别'));
+    assert.ok(captionLine >= 0 && headerLine >= 0, markdown);
+    assert.equal(lines[captionLine + 1], '', markdown);
+    assert.equal(headerLine, captionLine + 2, markdown);
+    assert.ok(!MARKER_RE.test(markdown), markdown);
+
+    // Assert：content_list 的 table 块收下表题
+    const tables = buildContentList(doc).filter((block) => block.type === 'table');
+    assert.equal(tables.length, 1);
+    assert.deepEqual(tables[0].table_caption, [captionText]);
 });
 
 test('转义写法页面：表格单元格与图片 alt 的「~」「*」逐字进入 IR，md 产物中不出现删除线', async (t) => {

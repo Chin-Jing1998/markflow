@@ -36,7 +36,9 @@
  *                          md / html / docx 渲染器不读该键，带角色的图片按普通图片输出
  *   image.data.sourcePath       来源包内的原始路径（MinerU 的 images/<sha256>.jpg），附属 JSON 的路径改写据此进行
  *   paragraph.data.indent = n   段首缩进的全角字数；段落文本本身不带全角空格，由 md 渲染器插入
- *   paragraph.data.role   = 'caption' | 'image_footnote'   图注 / 图片脚注；与图片靠「紧随其后」对应，不存图片名
+ *   paragraph.data.role   = 'caption' | 'image_footnote' | 'table_caption'
+ *                          图注 / 图片脚注与图片靠「紧随其后」对应；表题（HTML 的 <caption>）与表格靠
+ *                          「紧邻其前」对应，多个表题逐个成段。三者均不存所属对象的名称
  *   paragraph.data.splitGroup = <正整数>   ir/captions 的大图拆段把一个原段落拆成多块时，给各块写同一个分组号
  *                          （同组同值、按文档顺序递增，未被拆的段落不写该键）。patent profile 的渲染层据此在权利要求书、
  *                          说明书、摘要三本书里把相邻的同组块并回一个段落（renderers/xml/blocks 的 mergeSplitGroups），

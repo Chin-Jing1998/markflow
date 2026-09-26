@@ -4,9 +4,11 @@
  * 按阅读顺序输出块，字段与 MinerU 结果包的 *_content_list.json 对齐：
  *   heading          → { type: 'text', text, text_level }
  *   paragraph        → { type: 'text', text }
+ *                      role 为 table_caption 的段落并入其后紧邻的 table 块，其后紧邻的不是表格时按普通文本块输出
  *   image            → { type: 'image', img_path, image_caption: [], image_footnote: [], content: '', display? }
  *                      role 为 caption / image_footnote 的段落并入前一个 image 块，不单独成块
  *   table            → { type: 'table', img_path: '', table_caption: [], table_footnote: [], table_body: '<table>…' }
+ *                      table_caption 收其前紧邻的表题段落（按序，可多条）；来源为 table 节点与带 data.safeTable 的 html 节点
  *   块级公式          → { type: 'equation', text: '$$…$$', text_format: 'latex' }
  *   list             → { type: 'list', sub_type: 'text', list_items }（嵌套列表的条目按序拍平；条目里的图片紧随其后各成 image 块）
  *   code             → { type: 'code', sub_type: 'code', code_body, code_caption: [] }
@@ -21,6 +23,7 @@ const { stripMarkersTree } = require('../ir/markers');
 
 const JSON_INDENT = 4;
 const CAPTION_FIELDS = Object.freeze({ caption: 'image_caption', image_footnote: 'image_footnote' });
+const TABLE_CAPTION_ROLE = 'table_caption';
 
 async function render(doc) {
     if (!doc || typeof doc !== 'object') throw new Error('renderers/content-list 需要 MarkFlowDocument 对象');
@@ -34,8 +37,48 @@ function buildContentList(doc) {
     return ctx.blocks;
 }
 
+/**
+ * 同一兄弟序列内按阅读顺序出块。表题段落须等到下一个兄弟才能定去向，故先暂存：
+ * 下一个兄弟是表格就并入其 table_caption，否则回落为普通文本块（序列走完亦然）。
+ */
 function walkBlocks(nodes, ctx) {
-    for (const node of nodes) emitBlock(node, ctx);
+    let captions = [];
+    const flush = () => {
+        for (const text of captions) push(ctx, { type: 'text', text });
+        captions = [];
+    };
+    for (const node of nodes) {
+        const caption = tableCaptionText(node);
+        if (caption !== null) {
+            if (caption) captions.push(caption);
+            continue;
+        }
+        if (captions.length > 0 && isTableNode(node)) {
+            emitBlock(node, ctx);
+            // 表格块恒为 emitBlock 刚推入的最后一块；逐个推入而不展开实参，表题多达十余万个时不致超出调用栈
+            const tableCaption = ctx.blocks[ctx.blocks.length - 1].table_caption;
+            for (const caption of captions) tableCaption.push(caption);
+            captions = [];
+            continue;
+        }
+        flush();
+        emitBlock(node, ctx);
+    }
+    flush();
+}
+
+// 表题段落的文字（可能为空串）；非表题段落返回 null
+function tableCaptionText(node) {
+    if (!node || node.type !== 'paragraph') return null;
+    if (!node.data || node.data.role !== TABLE_CAPTION_ROLE) return null;
+    return inlineText(node.children).trim();
+}
+
+// 出 table 块的两种节点：table 节点与带 data.safeTable 的 html 片段（二者都经 tableBlock 产出）
+function isTableNode(node) {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'table') return true;
+    return node.type === 'html' && Boolean(node.data) && node.data.safeTable === true;
 }
 
 const push = (ctx, block) => ctx.blocks.push({ ...block, page_idx: ctx.page });

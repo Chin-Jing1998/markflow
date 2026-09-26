@@ -15,7 +15,7 @@
  *     网页的「疗程3~5天」），而 remark-gfm 默认 singleTilde，成对的单个「~」会被解析成 delete 节点、
  *     波浪号连同区间含义一起丢失。转义只发生在 HTML → Markdown 这一侧，Markdown 输入的 ~删除线~ 语义不受影响。
  *     不经 turndown 文本节点处理的两条通道另行接入同一个 service.escape，转义的是全部 Markdown 记号而不止
- *     「~」：表格单元格由 cellText 直接取 cell.textContent，折叠空白后先 escape、再转义竖线；图片 alt 由内置
+ *     「~」：表格规则由 flatText 取单元格与表题的 textContent，折叠空白后 escape，单元格另转义竖线；图片 alt 由内置
  *     image 规则处理，该规则调用的是 turndown 模块私有的 escapeMarkdown（星号、方括号与反斜杠已转义），工厂层
  *     补在实例 escape 上的「~」转义对它不生效，故由 addImageAltRule 接管内置规则、只替换其中的 alt 一段，
  *     并把 alt 内的换行折叠为空格
@@ -45,6 +45,15 @@
  *   - 两段行内代码在输出中相邻（含只隔着产物为空的元素、注释或零宽字符）时，两段之间写入空 HTML 注释 <!---->，
  *     与 renderers/md 分隔相邻 inlineCode 的写法相同：两段的反引号围栏首尾相接会并成一个更长的反引号串，remark
  *     重新解析时配对错位；注释解析为 html 节点，由各渲染器剥除（见下方「相邻行内代码段的分隔」块注释）
+ *
+ * 表格规则的输出约定（word 与 url 两个 profile 共用，与 ir/markers 配套）：
+ *   - 表题（<caption>）输出为紧邻表格之前、TABLE_CAPTION 标记开头的独立段落，由 ir/markers 还原为
+ *     data.role = 'table_caption'：GFM 没有表题语法，不另成段则表题文字整个丢失
+ *   - 不沿用图注的 CAPTION 标记：'caption' 角色按「紧随图片之后」与图片对应，表题落在图片与表格之间时
+ *     会被 renderers/content-list 并入前一张图
+ *   - 表题取纯文本，其中的上下标、链接与 <br> 同单元格一样被拍平
+ *   - 多个 caption 按 DOM 顺序逐个成段；只有表题而无数据行的表格只输出表题段落
+ *   - web/whitespace 的成本模型以「表题文字进入输出」为前提，本节规则变更时须同步该文件
  *
  * 表格规则 convertTableToMarkdown 为本文件内部函数，不再在其他文件重复实现。
  */
@@ -914,9 +923,22 @@ function configureUrl(service) {
 const PROFILE_BUILDERS = { basic: configureBasic, word: configureWord, url: configureUrl };
 
 // ---------- HTML 表格 → GFM 表格（源自 旧版 word.js:164）----------
-// 单元格取纯文本；折叠换行后经 service.escape 转义，再转义竖线，避免破坏 GFM 表格结构
+// 单元格取纯文本；折叠换行后经 service.escape 转义，再转义竖线，避免破坏 GFM 表格结构。
+// 表题（caption）同样取纯文本，成紧邻表格之前的独立段落（约定见文件头「表格规则的输出约定」）
 
 function convertTableToMarkdown(tableNode, escape) {
+    // 表题在前、表格本体在末；折叠后为空的表题不成段，块数为 0 时整表无输出
+    const blocks = ownCaptions(tableNode)
+        .map((caption) => flatText(caption, escape))
+        .filter(Boolean)
+        .map((text) => `${MARKERS.TABLE_CAPTION}${text}`);
+    const body = tableBody(tableNode, escape);
+    if (body) blocks.push(body);
+    if (blocks.length === 0) return '';
+    return `\n\n${blocks.join('\n\n')}\n\n`;
+}
+
+function tableBody(tableNode, escape) {
     const rows = ownRows(tableNode);
     if (rows.length === 0) return '';
     const matrix = rows.map((row) => ownCells(row).map((cell) => cellText(cell, escape)));
@@ -928,7 +950,13 @@ function convertTableToMarkdown(tableNode, escape) {
         return `| ${padded.join(' | ')} |`;
     });
     const separator = `| ${Array.from({ length: columnCount }, () => '---').join(' | ')} |`;
-    return `\n\n${[lines[0], separator, ...lines.slice(1)].join('\n')}\n\n`;
+    return [lines[0], separator, ...lines.slice(1)].join('\n');
+}
+
+// caption 经 domino 解析后恒为 table 的直接子节点（写在 tr 之内或数据行之后的都会被提升到此），
+// 取直接子节点即可天然排除嵌套表格的表题
+function ownCaptions(tableNode) {
+    return Array.from(tableNode.children || []).filter((el) => el.nodeName === 'CAPTION');
 }
 
 // querySelectorAll 会连嵌套表格的行一并取回，须按「最近的 table 祖先」筛出直属本表格的行
@@ -949,6 +977,11 @@ function closestByName(node, nodeName) {
     return null;
 }
 
+// 元素的纯文本：折叠空白 → escape。单元格与表题共用的前两步（顺序见 cellText）
+function flatText(node, escape) {
+    return escape(node.textContent.replace(/\s+/g, ' ').trim());
+}
+
 /**
  * 单元格纯文本：折叠空白 → escape → 转义竖线。三步顺序不可调换：
  *   - escape 须先于竖线转义。escape 会把字面反斜杠加倍，此后每个竖线的前导反斜杠必为偶数个，再补一个即成
@@ -956,9 +989,10 @@ function closestByName(node, nodeName) {
  *     反过来先转义竖线，补上的那个反斜杠会被随后的 escape 一并加倍而失效。
  *   - 折叠须先于 escape。turndown 转义表里的 ^- 、^> 、^(\d+). 等只锚定字符串开头，先 trim 可使其是否
  *     触发不取决于源 HTML 的前导空白；这些转义在单元格内虽非必需，但均为合法转义，IR 文本不变。
+ * 表题落在段落里，其中的竖线是字面量，故只用前两步、不转义竖线。
  */
 function cellText(cell, escape) {
-    return escape(cell.textContent.replace(/\s+/g, ' ').trim()).replace(/\|/g, '\\|');
+    return flatText(cell, escape).replace(/\|/g, '\\|');
 }
 
 module.exports = { createTurndownService, URL_REMOVED_TAGS };

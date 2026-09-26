@@ -13,6 +13,7 @@
  *   - collapseWhitespace 只折叠 [ \r\n\t]，且只跳过 <pre>（本项目未开 preformattedCode）。
  *     故 pre 之外、只含这四种字符的一段空白至多折出 1 个空格，成本记 1；含不换行空格、
  *     全角空格等其他 \s 字符的，以及 pre 之内的，逐字进入输出，成本为其长度。
+ *   - 表格规则取单元格与表题的纯文本并把 \s+ 折叠为单个空格，其成本不高于按普通文本的估计，不另设分支。
  *   - 属性值不经空白折叠，一律按长度截断；各属性独立计数（属性之间在输出里必有
  *     「![」「](」引号等可见字符隔开，不会并成一段）。
  *   - 文本节点须跨节点累计：<i>&nbsp;</i> 重复 n 次在输出里就是 n 个相连的不换行空格，
@@ -28,9 +29,12 @@ const COLLAPSIBLE_ONLY_RE = /^[ \t\r\n]+$/;
 
 // 内部文字不进入 turndown('url') 输出、自身也不产出任何可见字符的元素：整棵子树既不计数
 // 也不清零，其属性亦不处理。让这类文字清零会使两侧空白在输出里重新并成一段，上限即被绕过。
-// template 的内容不在 turndown 所见的 childNodes 中；表格规则只取行内单元格，caption 不进输出。
+// template 的内容不在 turndown 所见的 childNodes 中，故属此列；表格的 caption 不属此列——
+// 表格规则把表题输出为紧邻表格之前的独立段落（见 ir/turndown 的 convertTableToMarkdown），
+// 其文字进入输出，须照常计数与清零。单元格与表题的文字经 \s+ 折叠为单个空格，实际成本不高于
+// 按普通文本的估计，故不另设分支。
 // 调用方另经 droppedTags 传入 turndown service.remove 掉的标签（见 ir/turndown 的 URL_REMOVED_TAGS）
-const NEVER_RENDERED_TAGS = Object.freeze(['template', 'caption']);
+const NEVER_RENDERED_TAGS = Object.freeze(['template']);
 
 /** @param {import('cheerio').CheerioAPI} $ @param {string[]} droppedTags turndown 移除的标签 */
 function capWhitespaceRuns($, droppedTags = []) {
