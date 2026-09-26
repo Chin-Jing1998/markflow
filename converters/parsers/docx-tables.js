@@ -12,6 +12,7 @@
  *
  * 安全：document.xml 与 mammoth 产出的 HTML 均属不可信内容。grid 里只存文本与节点类型，不存任何 HTML
  * 字符串；片段页（raster/fragment.js）据此重建 HTML 并逐字转义，源文档的标记进不了片段页。
+ * 表格片段交 parse5 之前先把孤立代理项换成 U+FFFD（见 tableToGrid），grid 文本因此不含孤立代理项。
  *
  * 契约：
  *   collectTableGrids(html) → { html, grids, warnings }
@@ -127,8 +128,13 @@ function applyEdits(html, edits) {
 // HTML 表格 → grid
 // ============================================================
 
+/**
+ * 片段先经 toWellFormed 把孤立代理项换成 U+FFFD 再交 parse5：mammoth 所用的 xmldom 0.8 把 document.xml 里
+ * &#xDC00; 一类数字字符引用原样解码成孤立代理项，parse5 7.3.0 遇到「低位代理项后紧跟低位代理项」即抛
+ * RangeError: Invalid code point。良构片段经 toWellFormed 内容不变，耗时线性于片段长度
+ */
 function tableToGrid(fragment, warnings) {
-    const table = cheerio.load(fragment, null, false)('table').first()[0];
+    const table = cheerio.load(fragment.toWellFormed(), null, false)('table').first()[0];
     if (!table) return null;
     const rows = tableRows(table).map((row) => rowToData(row, warnings));
     return rows.length > 0 ? { rows } : null;

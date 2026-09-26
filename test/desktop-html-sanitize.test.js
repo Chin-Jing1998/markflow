@@ -4,7 +4,8 @@
  *       a 的 javascript: 与 data:text/html 去除、http(s) 加 noopener 与 target；
  *       style 属性与 <style> 正文里的 url() 外链替换、data: 保留；
  *       相对图改写为 mf-asset（含子目录与百分号编码）、越界与非白名单扩展名只留 alt、远程图只留 alt；
- *       缺少 baseDir / assetBase 时不改写任何图片；非 img 元素的 URL 属性一律删除。
+ *       缺少 baseDir / assetBase 时不改写任何图片；非 img 元素的 URL 属性一律删除；
+ *       相邻两个低位代理项（正文、属性值、title）不抛错且换成 U+FFFD。
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -166,4 +167,21 @@ test('空输入与非字符串输入不抛错', () => {
     assert.equal(typeof sanitizeHtml('').html, 'string');
     assert.equal(typeof sanitizeHtml(null).html, 'string');
     assert.equal(typeof sanitizeHtml(undefined).html, 'string');
+});
+
+test('相邻两个低位代理项出现在正文、属性值与 title 里时不抛错，一律换成 U+FFFD', () => {
+    // Arrange：parse5 7.3.0 遇到「低位代理项后紧跟低位代理项」抛 RangeError: Invalid code point；
+    // 代理项与替换字符以码点生成，源码不出现孤立代理项的字面量或转义序列
+    const low = String.fromCharCode(0xDC00);
+    const pair = `${low}${low}`;
+    const replaced = String.fromCharCode(0xFFFD).repeat(2);
+    const html = `<!DOCTYPE html><html><head><title>题${pair}名</title></head><body><p title="${pair}">甲${pair}乙</p></body></html>`;
+
+    // Act
+    const result = sanitizeHtml(html);
+
+    // Assert
+    assert.ok(result.html.isWellFormed(), '清洗结果不应再含孤立代理项');
+    assert.ok(result.html.includes(`<title>题${replaced}名</title>`), `title 未按预期替换：${result.html}`);
+    assert.ok(result.html.includes(`<p title="${replaced}">甲${replaced}乙</p>`), `正文或属性值未按预期替换：${result.html}`);
 });
