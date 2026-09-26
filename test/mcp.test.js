@@ -50,8 +50,11 @@ before(async () => {
 });
 
 after(async () => {
-    if (client) await client.close();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    try {
+        if (client) await client.close();
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
 });
 
 const makeOutDir = (prefix) => fs.mkdtempSync(path.join(tmpDir, prefix));
@@ -544,7 +547,13 @@ test('extract_article 返回正文与元数据，图片只列地址不下载，�
     const server = await startPageServer();
     const workDir = fs.mkdtempSync(path.join(tmpDir, 'extract-'));
     const extractClient = await startExtractClient(workDir);
-    t.after(async () => { await extractClient.close(); await server.close(); });
+    t.after(async () => {
+        try {
+            await extractClient.close();
+        } finally {
+            await server.close();
+        }
+    });
 
     // Act
     const result = await extractClient.callTool({
@@ -589,7 +598,13 @@ test('extract_article 的 maxChars 生效：超长时截断并置 truncated', as
     const server = await startPageServer();
     const workDir = fs.mkdtempSync(path.join(tmpDir, 'extract-trunc-'));
     const extractClient = await startExtractClient(workDir);
-    t.after(async () => { await extractClient.close(); await server.close(); });
+    t.after(async () => {
+        try {
+            await extractClient.close();
+        } finally {
+            await server.close();
+        }
+    });
 
     // Act
     const truncatedResult = await extractClient.callTool({
@@ -800,7 +815,13 @@ test('returnContent 正文超过 20 万字符时截断并置 contentTruncated', 
     const workDir = fs.mkdtempSync(path.join(tmpDir, 'long-'));
     const outputDir = makeOutDir('long-out-');
     const extractClient = await startExtractClient(workDir);
-    t.after(async () => { await extractClient.close(); await server.close(); });
+    t.after(async () => {
+        try {
+            await extractClient.close();
+        } finally {
+            await server.close();
+        }
+    });
 
     // Act
     const result = await extractClient.callTool({
@@ -888,7 +909,13 @@ test('请求取消后不再领取新任务：已开始的照常写出，服务�
     const workDir = fs.mkdtempSync(path.join(tmpDir, 'cancel-'));
     const outputDir = makeOutDir('cancel-out-');
     const cancelClient = await startExtractClient(workDir);
-    t.after(async () => { await cancelClient.close(); await server.close(); });
+    t.after(async () => {
+        try {
+            await cancelClient.close();
+        } finally {
+            await server.close();
+        }
+    });
     const urls = Array.from({ length: 6 }, () => `${server.base}/slow`);
     const controller = new AbortController();
 
