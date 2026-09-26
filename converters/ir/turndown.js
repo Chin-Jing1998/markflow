@@ -39,12 +39,18 @@
  *   - <sup>/<sub> 原样输出：Markdown 没有对应语法，网页的化学式（「C<sub>1</sub>的烷基」）与脚注标号
  *     （「<sup>[1]</sup>」）不加标签就会塌成同级文本，由 ir/inline-html 提升为 superscript / subscript 节点
  *   - <section> 按块级输出（\n\n…\n\n）：微信正文全由 section 构成，透传会使整篇塌成一段
- *   - <br> 输出 BR 标记，由 parsers/url 的 collapseBreakMarkers 折叠：双 BR 分段、单 BR 转硬换行
+ *   - <br> 输出 BR 标记，由 parsers/url 的 collapseBreakMarkers 折叠：双 BR 分段、单 BR 转硬换行。行内格式元素与链接的
+ *     内容含分段 BR 时按段各自包裹（<em>乙</em> BR BR <em>丙</em>、[乙](地址) BR BR [丙](地址)），开闭标签与「[…](…)」
+ *     不跨段（见下方「行内格式元素内的分段 BR」块注释）
  *   - 图注（figcaption、微信小字图注）输出 CAPTION 标记开头的独立段落，由 ir/markers 还原为 data.role
  *   - 带 data-mf-display 的 <img> 输出 <img src alt width>，由 ir/inline-html 还原为带 data.display 的 image 节点
  *   - 两段行内代码在输出中相邻（含只隔着产物为空的元素、注释或零宽字符）时，两段之间写入空 HTML 注释 <!---->，
  *     与 renderers/md 分隔相邻 inlineCode 的写法相同：两段的反引号围栏首尾相接会并成一个更长的反引号串，remark
  *     重新解析时配对错位；注释解析为 html 节点，由各渲染器剥除（见下方「相邻行内代码段的分隔」块注释）
+ *   - 文本节点以零宽字符开头（其间可夹半角空格与不换行空格）时，turndown 的行首转义越过这段前导字符、锚定在其后的
+ *     记号上：parsers/url 的 normalizeMarkdown 删去零宽字符后记号落在行首（见 escapeAfterZeroWidth 的块注释）
+ *   - 代码值首尾的 ASCII 空白被 turndown 判定为邻居已有而舍弃、却未 trim 时，从代码值中去掉，不留在反引号围栏之内
+ *     （见「代码值首尾被舍弃的空白」块注释）
  *
  * 表格规则的输出约定（word 与 url 两个 profile 共用，与 ir/markers 配套）：
  *   - 表题（<caption>）输出为紧邻表格之前、TABLE_CAPTION 标记开头的独立段落，由 ir/markers 还原为
@@ -59,8 +65,8 @@
  */
 const TurndownService = require('turndown');
 const { MARKERS } = require('./markers');
-// 零宽字符码点：web/normalize 不依赖本模块，引入不成环
-const { ZERO_WIDTH_CODE_POINTS } = require('../web/normalize');
+// 零宽字符与不换行空格的码点：web/normalize 不依赖本模块，引入不成环
+const { ZERO_WIDTH_CODE_POINTS, NBSP_CODE_POINTS } = require('../web/normalize');
 
 const BASE_OPTIONS = {
     headingStyle: 'atx',
@@ -92,6 +98,12 @@ const CHAR_REF_BODY_MAX = 31;
 const ASCII_ALNUM_RE = /[0-9A-Za-z]/;
 // 零宽字符在 parsers/url 的 normalizeMarkdown 里会被删除，判定字符引用时须当它不存在
 const ZERO_WIDTH_CHARS = new Set(ZERO_WIDTH_CODE_POINTS.map((cp) => String.fromCodePoint(cp)));
+// 行首前导段的两类字符（见 escapeAfterZeroWidth），按码元比对、不逐字符切取子串：零宽字符；半角空格与 normalizeMarkdown
+// 归一为半角空格的不换行空格
+const ZERO_WIDTH_CODES = new Set(ZERO_WIDTH_CODE_POINTS);
+const LEADING_SPACE_CODES = new Set([0x20, ...NBSP_CODE_POINTS]);
+// CommonMark 块记号允许的最大缩进列数：引用、列表、ATX 与 setext 标题、分隔线、围栏均至多缩进 3 列
+const MAX_BLOCK_INDENT = 3;
 
 // CSS font-weight 视为加粗的取值：bold、600-999、1000
 const BOLD_STYLE_RE = /font-weight\s*:\s*(bold|[6-9]\d{2}|1000)/i;
@@ -134,16 +146,16 @@ function wrapTrimmed(content, marker) {
 
 /**
  * 以 HTML 标签包裹：内容含空行（块级内容）时逐块包裹，Markdown 块语法开头的块不包，
- * 避免开闭标签落在不同段落里失配
+ * 避免开闭标签落在不同段落里失配；每块之内再按分段 BR 段切分包裹（见 wrapAroundParagraphBreaks）
  */
 function wrapHtml(content, open, close) {
     const text = content.trim();
     if (!text) return '';
-    if (!/\n\s*\n/.test(text)) return `${open}${text}${close}`;
+    if (!/\n\s*\n/.test(text)) return wrapAroundParagraphBreaks(text, open, close);
     return text.split(/\n\s*\n/)
         .map((chunk) => chunk.trim())
         .filter(Boolean)
-        .map((chunk) => (BLOCK_SYNTAX_RE.test(chunk) ? chunk : `${open}${chunk}${close}`))
+        .map((chunk) => (BLOCK_SYNTAX_RE.test(chunk) ? chunk : wrapAroundParagraphBreaks(chunk, open, close)))
         .join('\n\n');
 }
 
@@ -761,7 +773,8 @@ function codePointBefore(text, at) {
  * 写法：与 renderers/md 分隔相邻 inlineCode 的做法相同，在两段之间写入空 HTML 注释 <!---->（各版 CommonMark 都认作 HTML
  * 注释的最短写法），重新解析为代码段、html 节点、代码段，各段的值与段数不变；html、docx、xml、content-list 渲染器均剥除
  * 该注释。规则内看不到此前已拼出的输出，按 DOM 判定相邻须复刻 turndown 的空白折叠、空产物与透传判定，故分两步：
- * inlineCode 规则接管内置 code 规则，产物逐字不变，只把闭围栏的末一个反引号换成哨兵；configureUrl 包装 service.turndown，
+ * inlineCode 规则接管内置 code 规则，产物逐字不变（首尾被舍弃的空白另行去掉，见「代码值首尾被舍弃的空白」块注释），
+ * 只把闭围栏的末一个反引号换成哨兵；configureUrl 包装 service.turndown，
  * 由 separateAdjacentCode 在整篇输出上把每个哨兵换回反引号，哨兵之后隔着零宽字符若干紧跟反引号的，在换回的反引号之后
  * 写入注释。
  *   - 哨兵之后紧跟的反引号只能是下一段行内代码的开围栏：turndown 把文本中的反引号转义为「\`」（反斜杠在前）；代码块的
@@ -791,14 +804,18 @@ const CODE_GAP_CODES = new Set(ZERO_WIDTH_CODE_POINTS);
 // 定位哨兵之后首个非零宽字符：否定字符类，无量词；配合 lastIndex 从哨兵之后起找
 const NOT_CODE_GAP_RE = new RegExp(`[^${ZERO_WIDTH_CODE_POINTS.map(fromCode).join('')}]`, 'g');
 
-/** 接管内置 code 规则：产物逐字不变，只把闭围栏的末一个反引号换成哨兵（说明见上方块注释） */
+/**
+ * 接管内置 code 规则：先去掉 turndown 漏 trim 的首尾空白（见 trimAbandonedWhitespace），产物其余逐字不变，只把闭围栏的
+ * 末一个反引号换成哨兵（说明见上方块注释）；处在另一段 code 之内的 code 两者都不做
+ */
 function addInlineCodeRule(service) {
     const builtinCode = service.options.rules.code;
     service.addRule('inlineCode', {
         filter: builtinCode.filter,
         replacement: (content, node, options) => {
-            const code = builtinCode.replacement(content, node, options);
-            if (!code || isInsideCode(node)) return code;
+            const inside = isInsideCode(node);
+            const code = builtinCode.replacement(inside ? content : trimAbandonedWhitespace(content, node), node, options);
+            if (!code || inside) return code;
             return `${code.slice(0, -1)}${CODE_END}`;
         },
     });
@@ -833,6 +850,108 @@ function separateAdjacentCode(markdown) {
     }
     parts.push(raw.slice(copied));
     return parts.join('');
+}
+
+// ---------- url profile：代码值首尾被舍弃的空白 ----------
+
+/*
+ * 成因：turndown 的 flankingWhitespace 按元素 textContent 首尾的 ASCII 空白计算应移到元素之外的空白，左邻（右邻）兄弟的
+ * 文本以空格结尾（开头）时，判定这一侧已被空白夹住而舍弃该侧（isFlankedByWhitespace）；replacementForNode 只在移出的
+ * leading 或 trailing 非空时才 trim 内容。两侧都被舍弃、或一侧被舍弃而另一侧本无空白时，内容原样交给 code 规则，被舍弃的
+ * 空白留在反引号围栏之内、重新解析为代码值的一部分：「甲<code>x </code><samp><img> 乙</samp>」输出「甲`x ` 乙」，值为
+ * 「x 」。邻居的文本能以空格开头或结尾，是因为 collapseWhitespace 不删 void 元素（img、wbr 等）之后的空白，代码值末尾的
+ * 空格与邻居里 void 元素之后的空格因此各留一份；首部同理（「<samp>甲 <img></samp><code> x</code>」的值为「 x」）。
+ * 修法：inlineCode 规则在调用内置 code 规则之前补做 turndown 漏掉的 trim。flankingWhitespace 两侧皆空、而 textContent 在某侧
+ * 以 ASCII 空白开头或结尾时，该侧空白必是被舍弃的：未被舍弃时 leading 或 trailing 非空，turndown 已 trim；被舍弃而其内侧
+ * 还有非 ASCII 空白时，leading 或 trailing 取那段非 ASCII 空白，同样非空。故只在这一情形下去掉内容这一侧的 ASCII 空白；
+ * 内容的该侧不是 ASCII 空白时（如末个子节点是带 src 的图片）不动。
+ *   - 被舍弃的空白按 turndown 的判定由邻居提供，围栏之外不另补：产物只有代码值变化，代码段之外逐字不变。另补一份（视同
+ *     该侧未被夹住）可保住邻居产物不以空白开头时的间隔，但邻居为透传元素时与其空白重复，与 url profile 对 em、strong 等
+ *     元素只留一份的既有处理也不一致，不取。
+ *   - 以 textContent 判定而不只看内容：内容的首尾可能是块级子元素写出的换行，与 turndown 的空白判定无关，不应去掉。
+ *     textContent 只在两侧皆空、且内容首或尾为 ASCII 空白时才取，常规情形不增加开销。
+ *   - 处在另一段 code 之内的 code 不做：其产物是外层代码段的原文，去掉空白会改变外层的值（调用处判定）。
+ * 耗时线性于代码段长度：textContent 与首尾空白段各扫描一次。
+ */
+// turndown 判定首尾空白所用的 ASCII 空白（其 edgeWhitespace 的 [ \t\r\n]）
+const ASCII_SPACE_CODES = new Set([0x20, 0x09, 0x0d, 0x0a]);
+
+/** 去掉内容首尾被 turndown 舍弃、却未 trim 掉的 ASCII 空白；不属此情形时原样返回 */
+function trimAbandonedWhitespace(content, node) {
+    const { leading, trailing } = node.flankingWhitespace;
+    if (!content || leading || trailing) return content;
+    const trimStart = ASCII_SPACE_CODES.has(content.charCodeAt(0));
+    const trimEnd = ASCII_SPACE_CODES.has(content.charCodeAt(content.length - 1));
+    if (!trimStart && !trimEnd) return content;
+    const text = node.textContent;
+    let start = 0;
+    let end = content.length;
+    if (trimStart && ASCII_SPACE_CODES.has(text.charCodeAt(0))) {
+        while (start < end && ASCII_SPACE_CODES.has(content.charCodeAt(start))) start += 1;
+    }
+    if (trimEnd && ASCII_SPACE_CODES.has(text.charCodeAt(text.length - 1))) {
+        while (end > start && ASCII_SPACE_CODES.has(content.charCodeAt(end - 1))) end -= 1;
+    }
+    return content.slice(start, end);
+}
+
+// ---------- url profile：行内格式元素内的分段 BR ----------
+
+/*
+ * 成因：url profile 把 <br> 写成 BR 标记，交由 parsers/url 的 collapseBreakMarkers 折叠，连续两个及以上折叠为分段
+ * （\n\n）。行内格式元素的产物是「开标签 + 内容 + 闭标签」（strong、em、del、sup、sub）或「[内容](地址)」（带 href 的 a），
+ * 内容里的分段 BR 折叠之后开闭标签分落两段：remark 逐段解析，ir/inline-html 在段内配不成对，开标签删标签留内容、闭标签
+ * 删除，格式丢失——「甲<em>乙<br><br>丙</em>丁」重新解析为段落「甲乙」与「丙丁」；链接的「[」与「](地址)」分落两段后成为
+ * 字面文本，地址被 remark-gfm 识别为裸网址，紧跟在「)」之后的文本一并计入地址。
+ *
+ * 修法：写出标签之前按分段 BR 段切分内容，每段各自包裹（链接每段用同一地址与 title），BR 段本身原样留在两段之间——与
+ * wrapHtml 对含空行的内容逐块包裹的既有做法一致（「甲<em>乙<div>丙</div>丁</em>戊」本就输出
+ * 「<em>乙</em>\n\n<em>丙</em>\n\n<em>丁</em>戊」）。
+ *   - 分段 BR 段的分组与 collapseBreakMarkers 的 BREAK_RUN_RE 相同：BR 之间只隔行内空白与换行；夹着零宽字符或不换行空格的
+ *     两个 BR 在那里也不是一段，仍各自折叠为硬换行，格式不受影响，故这里同样不切分。折叠结果由此与无格式时一致：处于行中
+ *     的 BR 段写成分段，处于行首或行尾的删除（切分后 BR 段落在行首或行尾时，其一侧的空段不写标签）。
+ *   - 单个 BR 不切分，仍折叠为格式之内的硬换行；嵌套的格式由内向外逐层切分，每层只切自己的标签。
+ *   - 各段 trim 之后再包裹，紧邻 BR 段的行内空白随之去掉：折叠时该空白本就并入 BR 段（其前的由回看并入，其后的由
+ *     BREAK_RUN_RE 的尾部吃掉）；全为空白的段不写标签。
+ *   - BR 段两侧的内容仍是行内内容，不再按 Markdown 块语法判定：块级产物前后带空行，已由 wrapHtml 先按空行切开；
+ *     BR 之后的文本是新的文本节点，其开头的块语法记号（- 、# 、> 、1. 等）已由 turndown 的 escape 转义。
+ *   - 表格单元格与图片 alt 不经此处：单元格取纯文本，alt 折叠换行，二者都不含 BR 标记；mark 写成「==」，remark 不识别
+ *     该记号，两侧本就是字面文本，不切分。
+ * 耗时线性于内容长度：PARAGRAPH_BREAK_RE 的首字符是必需的 BR，非 BR 位置一步即弃；BR 之后的空白段只被紧邻其前的那个
+ * BR 扫过一次，其后若不是 BR 则整段放弃、不再回退重试（回退到段内任一位置都接不上必需的 BR），每个字符至多被看常数次。
+ * 不含分段 BR 的内容 split 只得一段，产物与切分之前逐字相同。
+ */
+
+// 分段 BR 段：连续两个及以上的 BR 标记，其间只隔行内空白与换行（与 parsers/url 的 BREAK_RUN_RE 同一分组）；
+// 捕获组使 split 把 BR 段本身留在奇数位
+const PARAGRAPH_BREAK_RE = new RegExp(`(${MARKERS.BR}(?:[ \\t\\n]*${MARKERS.BR})+)`);
+
+/**
+ * 以开闭标签包裹一段行内内容：含分段 BR 段时按段各自包裹，BR 段原样留在两段之间（说明见上方块注释）。
+ * 不含分段 BR 时产物为「开标签 + 内容 + 闭标签」，与直接包裹逐字相同
+ */
+function wrapAroundParagraphBreaks(text, open, close) {
+    return joinAroundParagraphBreaks(text, (chunk) => `${open}${chunk}${close}`);
+}
+
+/** 按分段 BR 段切分 text，偶数位的各段 trim 后交 wrap 写出（空段不写），奇数位的 BR 段原样保留，依原序拼接 */
+function joinAroundParagraphBreaks(text, wrap) {
+    const pieces = text.split(PARAGRAPH_BREAK_RE);
+    if (pieces.length === 1) return wrap(text);
+    return pieces.map((piece, index) => {
+        if (index % 2 === 1) return piece;
+        const chunk = piece.trim();
+        return chunk ? wrap(chunk) : '';
+    }).join('');
+}
+
+/** 接管内置 inlineLink 规则：内容含分段 BR 段时每段各自写成链接（同一地址与 title），其余产物逐字不变 */
+function addLinkBreakRule(service) {
+    const builtinLink = service.options.rules.inlineLink;
+    service.addRule('inlineLink', {
+        filter: builtinLink.filter,
+        replacement: (content, node, options) => joinAroundParagraphBreaks(content, (chunk) => builtinLink.replacement(chunk, node, options)),
+    });
 }
 
 // ---------- 各 profile 配置 ----------
@@ -928,6 +1047,53 @@ function mayStartCharRef(text, from) {
     return true;
 }
 
+/*
+ * url profile：零宽字符之后的行首记号。
+ * 成因：turndown 的转义表里有七条以 ^ 锚定的规则（^-、^\+ 、^(=+)、^(#{1,6}) 、^~~~、^>、^(\d+)\. ），锚定的是 escape 的
+ * 入参即单个文本节点的开头。文本节点以零宽字符开头时七条都不命中，parsers/url 的 normalizeMarkdown 随后删去零宽字符，
+ * 其后的记号落在段首或硬换行之后的行首，被 remark 解析为引用块、列表、ATX 标题、分隔线或 setext 标题的下划线
+ * （「<p>（U+200B）&gt; 甲</p>」解析为引用块「甲」）。零宽字符还把紧随其后的半角空格挡在 turndown 的空白折叠之外（折叠
+ * 只删行首的 ASCII 空白，零宽字符不算空白），不换行空格本不在折叠之列；二者在删去零宽字符、归一为半角空格之后成为
+ * 行首缩进，而块记号允许至多 3 列缩进，照样生效。七条中只有 ^~~~ 不受影响：escapeTildes 把文本中的每个「~」都转义。
+ * 修法：包装实例的 escape，文本节点以「零宽字符、半角空格、不换行空格」组成的前导段开头、且该段含零宽字符时，前导段
+ * 原样保留，其余部分交上游转义，七条行首规则由此锚定在前导段之后的记号上。上游其余各条逐字符替换，前导段里没有它们
+ * 替换的字符，拆开转义与整段转义结果相同；七条行首规则在整段上不命中（前导段首字符不是记号），故产物与原写法相比只多
+ * 出行首规则补上的一个反斜杠。该反斜杠恒在 ASCII 标点之前，是合法的反斜杠转义：前导段不在行首时（行中的文本节点）
+ * 多转义不改变 IR 文本，与上游对行中文本节点开头的记号照样转义同理。
+ *   - 前导段须含零宽字符：只由半角空格组成的前导段出现在行中（turndown 已删去行首的 ASCII 空白），或在 void 元素之后
+ *     （turndown 保留 void 元素之后的空白），后者与零宽字符无关；只由不换行空格组成的前导段同理，均不在本修复之内。
+ *   - 前导段的半角空格与不换行空格合计超过 MAX_BLOCK_INDENT 个时不改：该行删去零宽字符后缩进 4 列以上，块记号不再生效，
+ *     行首起为缩进代码块或段落续行，补上的反斜杠在前者中会成为代码文本。
+ *   - 只接在 url profile：零宽字符只在 parsers/url 的 normalizeMarkdown 中删除，word 与 basic profile 的管线保留零宽字符，
+ *     记号不会落到行首。工厂层随后在本包装之外再包「~」与「<」「&」的转义，二者逐字符判定，与前导段无关。
+ * 耗时线性于文本长度：前导段逐字符扫描一次，其余部分交上游，上游各条规则均为单遍替换。
+ */
+function escapeAfterZeroWidthIn(service) {
+    const escapeUpstream = service.escape.bind(service);
+    service.escape = (text) => escapeAfterZeroWidth(text, escapeUpstream);
+}
+
+/** 文本以含零宽字符的前导段开头、且段内空格不超过 MAX_BLOCK_INDENT 个时，前导段原样保留、其余部分交上游转义 */
+function escapeAfterZeroWidth(text, escapeUpstream) {
+    let end = 0;
+    let spaces = 0;
+    let zeroWidth = false;
+    for (; end < text.length; end += 1) {
+        const code = text.charCodeAt(end);
+        if (ZERO_WIDTH_CODES.has(code)) {
+            zeroWidth = true;
+        } else if (LEADING_SPACE_CODES.has(code)) {
+            spaces += 1;
+            // 缩进已达 4 列：其后不论还有什么，该行都不以块记号开头，整段交上游、不必扫完前导段
+            if (spaces > MAX_BLOCK_INDENT) return escapeUpstream(text);
+        } else {
+            break;
+        }
+    }
+    if (!zeroWidth || end === text.length) return escapeUpstream(text);
+    return `${text.slice(0, end)}${escapeUpstream(text.slice(end))}`;
+}
+
 // [规则名, filter, 开标签, 闭标签]；turndown 后注册的规则优先级更高，顺序不可调整。
 // 上下标排在表首、优先级最低：带 line-through 等样式的 <sup>/<sub> 仍归后面的样式规则接管
 const URL_WRAP_RULES = [
@@ -942,7 +1108,10 @@ const URL_WRAP_RULES = [
 ];
 
 function configureUrl(service) {
-    // 最先注册、优先级最低：带样式的 section（加粗、图注）由后注册的规则接管
+    // 最先注册、优先级最低。链接规则接管内置 inlineLink 且排在全部自定义规则之后，与内置规则的相对次序一致：带删除线
+    // 样式的 <a> 仍归 inlineStrikethrough；内置规则里排在 inlineLink 之前的都不匹配 <a>
+    addLinkBreakRule(service);
+    // 带样式的 section（加粗、图注）由后注册的规则接管
     service.addRule('sectionBlock', { filter: 'section', replacement: (content) => `\n\n${content}\n\n` });
     service.addRule('lineBreak', { filter: 'br', replacement: () => MARKERS.BR });
     // 先于样式规则注册、优先级低于它们，与内置 code 规则的相对次序一致：带删除线样式的 code 仍归 inlineStrikethrough。
@@ -969,6 +1138,8 @@ function configureUrl(service) {
     });
     addTableRule(service);
     service.remove(URL_REMOVED_TAGS);
+    // 文本节点以零宽字符开头时，行首转义锚定在零宽字符之后的记号上（见 escapeAfterZeroWidth）
+    escapeAfterZeroWidthIn(service);
 }
 
 const PROFILE_BUILDERS = { basic: configureBasic, word: configureWord, url: configureUrl };
