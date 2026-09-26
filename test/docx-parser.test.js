@@ -102,8 +102,10 @@ async function buildDocx({ withHeading = true } = {}) {
     return Packer.toBuffer(document);
 }
 
-function makeTempDir() {
-    return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-docx-parser-')));
+function makeTempDir(t) {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-docx-parser-')));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    return dir;
 }
 
 function listFiles(dir) {
@@ -147,7 +149,7 @@ function captureConsole(t) {
 
 test('解析出 H1、加粗、图片与表格；图片进入 assets；执行期间不写盘、不打印', async (t) => {
     // Arrange
-    const dir = makeTempDir();
+    const dir = makeTempDir(t);
     const docxPath = path.join(dir, '示例文档.docx');
     fs.writeFileSync(docxPath, await buildDocx());
     const before = listFiles(dir);

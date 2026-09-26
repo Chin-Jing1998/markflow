@@ -3,7 +3,7 @@
  * 覆盖：{ path } 契约、多 sheet → sheetSection + table、单元格取值规则（公式/日期/富文本）、
  *       kind/meta/data 快照、assets 为空、meta.author（dc:creator）
  */
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -16,8 +16,18 @@ const { parse } = require('../converters/parsers/xlsx');
 // 测试夹具：用 exceljs 现场生成两个 sheet 的工作簿
 // ============================================================
 
+// 用例建在 os.tmpdir() 下的临时目录逐一登记，全部用例结束后统一删除
+const tempDirs = [];
+
+after(() => {
+    for (const dir of tempDirs) {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 async function makeWorkbookFile(fileName = '季度数据.xlsx') {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-xlsx-parser-')));
+    tempDirs.push(dir);
     const filePath = path.join(dir, fileName);
 
     const wb = new ExcelJS.Workbook();
@@ -172,6 +182,7 @@ test('meta.author 取 docProps/core.xml 的 dc:creator；无作者时 meta 不�
     // Arrange：exceljs 写出时总会填 dc:creator（缺省 Unknown），无作者的样本改写 core.xml 得到
     const JSZip = require('jszip');
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-xlsx-author-')));
+    tempDirs.push(dir);
     const withAuthor = path.join(dir, '有作者.xlsx');
     const wb = new ExcelJS.Workbook();
     wb.creator = ' 周八 ';

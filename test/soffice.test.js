@@ -16,8 +16,12 @@ const soffice = require('../converters/soffice');
 
 const FAKE_SOFFICE = '/fake/bin/soffice';
 
+// makeTempDir 建的临时目录逐一登记，每个用例结束后删除
+const tempDirs = [];
+
 afterEach(() => {
     soffice._reset();
+    for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 // ============================================================
@@ -25,7 +29,9 @@ afterEach(() => {
 // ============================================================
 
 function makeTempDir(prefix = 'markflow-soffice-test-') {
-    return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+    tempDirs.push(dir);
+    return dir;
 }
 
 function makeInputFile(name = '旧文档.doc') {

@@ -5,7 +5,7 @@
  *
  * 测试用 pptx 由 jszip 现场构造，不引入二进制测试资源。
  */
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -149,6 +149,15 @@ function contentTypesXml() {
     );
 }
 
+// 用例建在 os.tmpdir() 下的临时目录逐一登记，全部用例结束后统一删除
+const tempDirs = [];
+
+after(() => {
+    for (const dir of tempDirs) {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 /**
  * @param {object} spec
  * @param {Array} spec.slides 每页 { title?, subTitle?, bodies?, picRids?, rels?, notes?, notesFile? }
@@ -205,6 +214,7 @@ async function makePptxFile({ slides, coreTitle, coreCreator, fileName = '产品
 
     const buffer = await zip.generateAsync({ type: 'nodebuffer' });
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-pptx-parser-')));
+    tempDirs.push(dir);
     const filePath = path.join(dir, fileName);
     fs.writeFileSync(filePath, buffer);
     return { dir, filePath };
@@ -533,6 +543,7 @@ test('包内没有 slide 时抛出中文错误', async () => {
     const zip = new JSZip();
     zip.file('[Content_Types].xml', contentTypesXml());
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-pptx-parser-')));
+    tempDirs.push(dir);
     const filePath = path.join(dir, 'empty.pptx');
     fs.writeFileSync(filePath, await zip.generateAsync({ type: 'nodebuffer' }));
 
