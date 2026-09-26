@@ -6,7 +6,7 @@
  *      键值合并进 meta，其中 title 显式给出时优先于首个 H1；
  *   2) 端到端 md → docx —— DOCX 正文里不含任何 YAML 残留。
  */
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -42,8 +42,19 @@ function collect(node, predicate, out = []) {
 
 const allLiterals = (ir) => collect(ir, (n) => typeof n.value === 'string').map((n) => n.value).join('\n');
 
+// makeTempDir 建的临时目录逐一登记，全部用例结束后统一删除
+const tempDirs = [];
+
+after(() => {
+    for (const dir of tempDirs) {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 function makeTempDir(prefix) {
-    return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+    tempDirs.push(dir);
+    return dir;
 }
 
 // ============================================================

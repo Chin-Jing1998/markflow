@@ -2,7 +2,7 @@
  * converters/parsers/md.js 单元测试
  * 覆盖：GFM 扩展、宽松标题预处理、CRLF 归一、meta 字段、本地/远程图片资源
  */
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -84,8 +84,18 @@ const MD_LINES = [
     '',
 ];
 
+// 用例建在 os.tmpdir() 下的临时目录逐一登记，全部用例结束后统一删除
+const tempDirs = [];
+
+after(() => {
+    for (const dir of tempDirs) {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 function makeFixture() {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-md-parser-')));
+    tempDirs.push(dir);
     fs.mkdirSync(path.join(dir, 'images'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'images', 'pic.png'), makePng(8, 8));
     const lfPath = path.join(dir, 'doc.md');
@@ -168,6 +178,7 @@ test('meta 取首个 H1 为 title，baseDir 为源文件所在目录', async () 
 test('无 H1 时 title 回退为去扩展名的文件名', async () => {
     // Arrange
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'markflow-md-parser-')));
+    tempDirs.push(dir);
     const target = path.join(dir, '知识库笔记.md');
     fs.writeFileSync(target, '## 二级标题\n\n正文\n', 'utf8');
 
