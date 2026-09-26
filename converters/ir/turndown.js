@@ -3,9 +3,9 @@
  *
  * profile 取值与行为来源：
  *   'basic' — 通用 HTML：基础选项 + 移除 script/style/noscript（源自 ir/util.js:78）
- *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img + 保留 <u>/<sup>/<sub>
- *             （<u> 由 mammoth 经 styleMap 'u => u' 产出，<sup>/<sub> 由 w:vertAlign 默认产出；
- *             三者均由 ir/inline-html 提升为 underline / superscript / subscript 节点）
+ *   'word'  — mammoth 输出：基础选项 + 表格转 GFM + 移除空 img + 保留 <u>/<sup>/<sub>/<s>
+ *             （<u> 由 mammoth 经 styleMap 'u => u' 产出，<sup>/<sub> 由 w:vertAlign 默认产出，<s> 由 w:strike 默认产出；
+ *             四者均由 ir/inline-html 提升为 underline / superscript / subscript / delete 节点）
  *   'url'   — 网页正文：基础选项 + 内联样式识别 + figure/figcaption + section 块级 + 保留 <sup>/<sub>
  *             + 移除 script/style/noscript/iframe/nav/footer/aside（源自 旧版 url.js:239）
  *             + 表格转 GFM（turndown 核心不含表格支持，缺失时网页表格退化为逐行纯文本，IR 得不到 table 节点）
@@ -242,6 +242,22 @@ function escapeAttr(value) {
  * 换行整个丢失。尾部的 <br> 前紧邻奇数个反斜杠时，「<」是被转义的字面文字（文本中的「<」转义为 \< 之后），剥离
  * 到此为止。
  *
+ * 删除线。成因：turndown 核心不含删除线规则（GFM 插件才有），mammoth 输出的 <s> 走默认规则、只留内容，段落中的删除线进入
+ * IR 后只剩纯文本（表格单元格由 parsers/docx-tables 另存为 delete 节点，不经此路）。写法：删除线规则把 <s> 写成 <s> 标签，
+ * 由 ir/inline-html 在 remark 解析后还原为 delete 节点，与 <u> / <sup> / <sub> 同一条路径；标签名沿用 mammoth 的 s，
+ * ir/inline-html 对 <s> 与 <del> 一视同仁。不写 GFM 的 ~~：删除线定界符与强调同受 flanking 规则约束（「依据~~《专利法》~~的」
+ * 不成立），文本中的「~」转义为「\~」后其反斜杠算作标点，删除线文字以「~」开头或结尾而外侧为汉字时同样失效，写定界符就须
+ * 把哨兵与判定扩到第三种；标签不受 flanking 规则约束，不必经哨兵，在加粗、斜体的判定中只是普通的标点字符。
+ * 标签只包住换行记号之间的文字：内容按「两个空格 + 换行」切段，逐段把首尾 <br> 与空白之外的部分包进标签，这些 <br> 与空白
+ * 留在标签之外、原样输出。「两个空格 + 换行」的去留：
+ *   - 标题内的换行都写成它，一律原样保留：标题的拆分与不带删除线时相同，拆开的两侧各自成对；
+ *   - 标题之外它只出现在所在块行内连续区的首尾（段中换行写 <br>），处在删除线首尾的不输出，与加粗、斜体一致——段首段尾的
+ *     本由 remark 按块边界舍弃，列表项以两个换行开头时留在输出里即成空项、内容变为缩进代码块。
+ * 不像 <u> 那样整段包裹：段首的换行会使 <s> 独占首行，按 CommonMark 第 7 类 HTML 块的起始条件整段成为 html 节点、文字随之
+ * 丢失；标题内的换行会使开闭标签分处标题与其后的段落而失配。也不沿用加粗、斜体的 wrapOutsideBreaks：它连标题内处在首尾的
+ * 换行一并舍弃，标题不再拆开、其后文字并入标题，拆分点随之移动，别处跨越拆分点的格式反而失配；换行旁的空白它也一并剥去，
+ * 标签不受 flanking 约束，无须如此。只含空白的 <s> 由 turndown 的空元素规则先行截住，产物与此前相同。
+ *
  * 耗时须线性于块长：一段内连写 n 个 <br> 时，逐个重扫兄弟节点即成平方级，故首次遇到某块时整块线性扫描一次，
  * 把其中每个 <br> 的归类写入 WeakMap，同块其余 <br> 直接查表。剥离一律按下标手工扫描，不写「量词 + 行尾锚」或
  * 「前导量词 + 必需字符」形态的正则：长串换行记号位于中段时，这类正则从每个起点逐位回溯，耗时随长度平方增长。
@@ -295,6 +311,9 @@ const TURNDOWN_BLOCK_TAGS = new Set([
 ]);
 const HEADING_TAGS = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 const HTML_BREAK = '<br>';
+// 删除线的开闭标签（说明见上方块注释「删除线」一段）
+const STRIKE_OPEN = '<s>';
+const STRIKE_CLOSE = '</s>';
 // 与 turndown 折叠空白所用的字符集一致：只由这四种字符构成的文本节点不算内容
 const CONTENT_CHAR_RE = /[^ \t\r\n]/;
 // 单个空白字符，与 String.prototype.trim 去除的字符同集
@@ -331,7 +350,7 @@ const FORM_DELIMITER = 'delimiter';
 const FORM_HTML = 'html';
 const FORM_DROP = 'drop';
 
-/** word profile 的换行规则与加粗、斜体规则（说明见上方块注释） */
+/** word profile 的换行规则与加粗、斜体、删除线规则（说明见上方块注释） */
 function addBreakRules(service) {
     // <br> 节点 → 是否在所在块的行内连续区中前后都有内容。每次 turndown 调用都解析出新的 DOM，键不会串用
     const midBreaks = new WeakMap();
@@ -347,6 +366,11 @@ function addBreakRules(service) {
     service.addRule('wordEmphasis', {
         filter: ['em', 'i'],
         replacement: (content, node, options) => wrapOutsideBreaks(content, EM_OPEN, EM_CLOSE, `${options.br}\n`),
+    });
+    // 删除线直接写标签、不经哨兵，按换行记号切段逐段包裹
+    service.addRule('wordStrikethrough', {
+        filter: 's',
+        replacement: (content, node, options) => wrapStrikethrough(content, node, `${options.br}\n`),
     });
 }
 
@@ -427,6 +451,33 @@ function wrapOutsideBreaks(content, open, close, lineBreak) {
     const htmlBreaks = (tokens) => tokens.filter((token) => token === HTML_BREAK).join('');
     if (!core) return htmlBreaks([...head.tokens, ...tail.tokens]);
     return `${htmlBreaks(head.tokens)}${open}${core}${close}${htmlBreaks(tail.tokens)}`;
+}
+
+/**
+ * 删除线：内容按「两个空格 + 换行」切段，逐段包裹（说明见上方块注释「删除线」一段）。标题内的记号一律原样保留；标题之外，
+ * 首个写了标签的段之前与末个写了标签的段之后的记号不输出，其间的原样保留。各段都没有可包的文字时一个标签也不写
+ */
+function wrapStrikethrough(content, node, lineBreak) {
+    const inHeading = HEADING_TAGS.has(enclosingBlock(node).nodeName);
+    const pieces = content.split(lineBreak).map((piece) => strikePiece(piece, lineBreak));
+    const first = pieces.findIndex((piece) => piece.struck);
+    let last = pieces.length - 1;
+    while (last > first && !pieces[last].struck) last -= 1;
+    const parts = [];
+    pieces.forEach((piece, index) => {
+        if (index > 0 && (inHeading || (index > first && index <= last))) parts.push(lineBreak);
+        parts.push(piece.text);
+    });
+    return parts.join('');
+}
+
+/** 不含「两个空格 + 换行」的一段：首尾的 <br> 与空白之外若有文字，把它包进 <s> 标签；struck 为是否写了标签 */
+function strikePiece(piece, lineBreak) {
+    const head = leadingBreaks(piece, lineBreak);
+    const tail = trailingBreaks(piece, head.end, lineBreak);
+    if (tail.start === head.end) return { text: piece, struck: false };
+    const core = piece.slice(head.end, tail.start);
+    return { text: `${piece.slice(0, head.end)}${STRIKE_OPEN}${core}${STRIKE_CLOSE}${piece.slice(tail.start)}`, struck: true };
 }
 
 /** 自串首起连续的换行记号与空白：返回其终点与其中的换行记号（按原序） */
