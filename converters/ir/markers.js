@@ -8,6 +8,7 @@
  *   INDENT    段首缩进；其后紧跟一个计数码点（COUNT_BASE + n），n 为段首全角字数（1–15）
  *   CAPTION   段首 → paragraph.data.role = 'caption'（图注）
  *   FOOTNOTE  段首 → paragraph.data.role = 'image_footnote'（图片脚注，如「来源：…」）
+ *   TABLE_CAPTION 段首 → paragraph.data.role = 'table_caption'（表题，HTML 的 <caption>；与其后紧邻的表格对应）
  *   BR        网页 <br>：url 解析器在 remark 之前经 collapseBreakMarkers 折叠，进入 IR 的残留删除
  *   TAB       制表符 → '\t'（mammoth 与 turndown 会把真正的 \t 折叠成空格，故先以标记代替）
  *
@@ -16,7 +17,7 @@
  *   indentMarker(n)         INDENT + 计数码点；n 取整并钳制到 1–15，非正数返回空串
  *   stripMarkers(text)      删除字符串中的全部标记码点（TAB 一并删除）；字数统计等场景用
  *   hasMarkers(text)        字符串中是否含任何标记码点
- *   restoreMarkers(ir)      返回新树：段首 INDENT / CAPTION / FOOTNOTE → data.indent / data.role，
+ *   restoreMarkers(ir)      返回新树：段首 INDENT / CAPTION / FOOTNOTE / TABLE_CAPTION → data.indent / data.role，
  *                           TAB → '\t'，其余位置的标记删除，删空的文本节点移除，只剩空白的段落移除；不改动入参
  *   stripMarkersTree(ir)    渲染器入口的兜底清理：删除残留标记（TAB → '\t'），无残留时原样返回同一引用
  *   applyTextLayout(ir)     文本类渲染器（md / html）用：data.indent → 段首 n 个 U+3000，
@@ -33,6 +34,7 @@ const MARKERS = Object.freeze({
     FOOTNOTE: fromCode(0xEF02),
     BR: fromCode(0xEF03),
     TAB: fromCode(0xEF04),
+    TABLE_CAPTION: fromCode(0xEF05),
 });
 const COUNT_BASE = 0xEF10;
 const MAX_INDENT = 15;
@@ -44,7 +46,11 @@ const HAS_MARKER_RE = new RegExp(MARKER_CLASS);
 const IDEOGRAPHIC_SPACE = fromCode(0x3000);
 const TAB_AS_SPACES = IDEOGRAPHIC_SPACE.repeat(2);
 
-const ROLE_BY_MARKER = Object.freeze({ [MARKERS.CAPTION]: 'caption', [MARKERS.FOOTNOTE]: 'image_footnote' });
+const ROLE_BY_MARKER = Object.freeze({
+    [MARKERS.CAPTION]: 'caption',
+    [MARKERS.FOOTNOTE]: 'image_footnote',
+    [MARKERS.TABLE_CAPTION]: 'table_caption',
+});
 // 段首标记可能落在这些行内容器的首个文本里（如整段加粗时的 <strong>INDENT…</strong>）
 const INLINE_CONTAINERS = new Set(['strong', 'emphasis', 'delete', 'underline', 'link', 'linkReference']);
 // 值为字符串、需要清理的节点字段

@@ -15,7 +15,7 @@
  *   - 不写盘、不打印；ctx.allowPrivateNetwork 透传给 fetch-guard（仅测试使用）
  *   - 成功下载的图片按文档顺序编号为 images/image_N.ext（N 从 1 起），与 assets 一一对应；
  *     取得到显示尺寸的图片节点带 data.display（见 converters/ir/schema.js）
- *   - 段首缩进进 paragraph.data.indent，图注进 paragraph.data.role；<br> 单个为硬换行、连续两个为分段
+ *   - 段首缩进进 paragraph.data.indent，图注与表题（<caption>）进 paragraph.data.role；<br> 单个为硬换行、连续两个为分段
  *   - 属性值与会进入输出的文本里，连续空白超过 256 个的部分在进入 turndown 前截断，不超过的逐字不动：
  *     turndown 的 postProcess 正则在长空白串上平方级回溯，而依赖不能改。下游的 BR 折叠与行尾空白清理
  *     自身线性于文本长度，不依赖这一截断

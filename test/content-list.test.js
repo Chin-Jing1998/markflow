@@ -1,7 +1,7 @@
 /**
  * converters/renderers/content-list.js 单元测试
  * 覆盖：阅读顺序与各块形状（text / text_level、image + display、图注与图片脚注并入前一个 image 块、
- *       table_body 转义、list 拍平嵌套、code、equation、blockquote 展开、分隔线跳过）、段内图片与文字拆块、
+ *       表题并入其后紧邻的 table 块、table_body 转义、list 拍平嵌套、code、equation、blockquote 展开、分隔线跳过）、段内图片与文字拆块、
  *       page_idx（幻灯片与工作表序号）、不输出 bbox、残留标记剥除、4 空格缩进、safeTable 片段原样作表格
  */
 const { test } = require('node:test');
@@ -127,6 +127,95 @@ test('不输出 bbox；残留标记剥除；前面没有图片的图注段按普
         { type: 'text', text: '行内文字', page_idx: 0 },
     ]);
     assert.ok(json.every((block) => !('bbox' in block)));
+});
+
+test('table_caption 段落并入其后紧邻的 table 块，不单独成块；连续两个表题按序并入', () => {
+    // Arrange：表题之前还有一张图片，表题不得并入图片的 image_caption
+    const ir = createRoot([
+        createParagraph([image('images/image_1.png', DISPLAY)]),
+        { type: 'paragraph', data: { role: 'table_caption' }, children: [text('表 1 各组收率')] },
+        { type: 'paragraph', data: { role: 'table_caption' }, children: [text('（续）')] },
+        { type: 'table', align: [null], children: [row('组别'), row('甲')] },
+    ]);
+
+    // Act
+    const blocks = buildContentList(createDocument({ ir }));
+
+    // Assert
+    assert.deepEqual(blocks.map((b) => b.type), ['image', 'table']);
+    assert.deepEqual(blocks[0].image_caption, []);
+    assert.deepEqual(blocks[1].table_caption, ['表 1 各组收率', '（续）']);
+});
+
+test('带 data.safeTable 的 html 表格片段同样接收其前紧邻的表题', () => {
+    // Arrange
+    const ir = createRoot([
+        { type: 'paragraph', data: { role: 'table_caption' }, children: [text('表 2 合并单元格')] },
+        { type: 'html', value: '<table><tr><td>合并</td></tr></table>', data: { safeTable: true } },
+    ]);
+
+    // Act
+    const blocks = buildContentList(createDocument({ ir }));
+
+    // Assert
+    assert.deepEqual(blocks.map((b) => b.type), ['table']);
+    assert.deepEqual(blocks[0].table_caption, ['表 2 合并单元格']);
+});
+
+test('其后不是表格的 table_caption 段落按普通文本块输出（后接普通段落、位于序列末尾各一例）', () => {
+    // Arrange
+    const ir = createRoot([
+        { type: 'paragraph', data: { role: 'table_caption' }, children: [text('表 1 孤立表题')] },
+        createParagraph('正文'),
+        { type: 'table', align: [null], children: [row('组别')] },
+        { type: 'paragraph', data: { role: 'table_caption' }, children: [text('表 2 末尾表题')] },
+    ]);
+
+    // Act
+    const blocks = buildContentList(createDocument({ ir }));
+
+    // Assert
+    assert.deepEqual(blocks.map((b) => [b.type, b.text || b.table_caption]), [
+        ['text', '表 1 孤立表题'],
+        ['text', '正文'],
+        ['table', []],
+        ['text', '表 2 末尾表题'],
+    ]);
+});
+
+test('表题之后紧跟空子节点时不抛错：空节点照旧跳过，表题回落为普通文本块', () => {
+    // Arrange：emitBlock 对空子节点一向容错，判定「下一个兄弟是否表格」时须同样容错
+    const ir = createRoot([
+        { type: 'paragraph', data: { role: 'table_caption' }, children: [text('表 1 各组收率')] },
+        null,
+        { type: 'table', align: [null], children: [row('组别')] },
+    ]);
+
+    // Act
+    const blocks = buildContentList(createDocument({ ir }));
+
+    // Assert：空节点隔在中间，表题与表格已不紧邻
+    assert.deepEqual(blocks.map((b) => [b.type, b.text || b.table_caption]), [
+        ['text', '表 1 各组收率'],
+        ['table', []],
+    ]);
+});
+
+test('同一表格之前的表题多达 20 万个时照常逐个并入，不因展开实参超出调用栈而抛错', () => {
+    // Arrange：网页中一张表格带 20 万个 <caption> 约 6 MB，在取页 20 MB 的上限之内
+    const CAPTION_COUNT = 200000;
+    const captions = Array.from({ length: CAPTION_COUNT }, (_, i) => (
+        { type: 'paragraph', data: { role: 'table_caption' }, children: [text(`表${i}`)] }
+    ));
+    const ir = createRoot([...captions, { type: 'table', align: [null], children: [row('组别')] }]);
+
+    // Act
+    const blocks = buildContentList(createDocument({ ir }));
+
+    // Assert
+    assert.deepEqual(blocks.map((b) => b.type), ['table']);
+    assert.equal(blocks[0].table_caption.length, CAPTION_COUNT);
+    assert.equal(blocks[0].table_caption[CAPTION_COUNT - 1], `表${CAPTION_COUNT - 1}`);
 });
 
 test('render 返回 4 空格缩进的 JSON 字符串；非对象入参抛中文错误', async () => {

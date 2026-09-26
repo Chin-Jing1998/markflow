@@ -1,6 +1,6 @@
 /**
  * converters/ir/turndown.js 单元测试
- * 覆盖：HTML 表格 → GFM 表格的列数判定（取各行最大值、短行补空单元格、排除嵌套表格的行）、
+ * 覆盖：HTML 表格 → GFM 表格的列数判定（取各行最大值、短行补空单元格、排除嵌套表格的行）与表题成段、
  *       各 profile 的「~」转义（含超长反斜杠串上的线性耗时、与线性化之前实现的差分等价）、
  *       url profile 的保真约定（HTML 标签、标记、图注、上下标），
  *       表格单元格与图片 alt 接入 service.escape（转义顺序、换行折叠、src 与 title 沿用内置规则），
@@ -13,7 +13,7 @@ const assert = require('node:assert/strict');
 
 const TurndownService = require('turndown');
 const { createTurndownService } = require('../converters/ir/turndown');
-const { MARKERS } = require('../converters/ir/markers');
+const { MARKERS, restoreMarkers } = require('../converters/ir/markers');
 const { loadUnified } = require('../converters/ir/unified-loader');
 const { liftInlineHtml } = require('../converters/ir/inline-html');
 const { normalizeMarkdown } = require('../converters/web/normalize');
@@ -293,6 +293,138 @@ test('表格单元格：换行折叠与竖线转义的既有行为不变；行�
         );
         assert.deepEqual(rowCells(markers.ir), [['项'], ['-5'], ['1. 项'], ['# 题'], ['>90%']], profile);
     }
+});
+
+// ============================================================
+// 表题（caption）：输出为紧邻表格之前、TABLE_CAPTION 标记开头的独立段落
+// ============================================================
+
+// 表题段落的段首标记；GFM 没有表题语法，标记由 ir/markers 还原为 data.role = 'table_caption'
+const TABLE_CAPTION_MARK = MARKERS.TABLE_CAPTION;
+// 不可见字符以码点生成，源码不出现看不见的字面量
+const NBSP = String.fromCharCode(0x00a0);
+
+test('表题：输出为紧邻表格之前、TABLE_CAPTION 标记开头的独立段落', () => {
+    // Arrange
+    const html = '<table><caption>表 1 各组收率</caption>'
+        + '<tr><th>组别</th><th>收率</th></tr><tr><td>甲</td><td>90%</td></tr></table>';
+
+    // Act & Assert：表格规则挂在 word 与 url 两个 profile 上，行为应一致
+    for (const profile of PROFILES_WITH_TABLE) {
+        assert.equal(
+            toMarkdown(html, profile),
+            `${TABLE_CAPTION_MARK}表 1 各组收率\n\n| 组别 | 收率 |\n| --- | --- |\n| 甲 | 90% |`,
+            profile,
+        );
+    }
+});
+
+test('表题：只有表题的表格只输出表题段落；空表题不产出段落，表格本体与无表题时逐字相同', () => {
+    // Arrange
+    const body = '<tr><th>项</th></tr><tr><td>甲</td></tr>';
+
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        // Assert：只有表题、没有数据行
+        assert.equal(
+            toMarkdown('<table><caption>表 1 各组收率</caption></table>', profile),
+            `${TABLE_CAPTION_MARK}表 1 各组收率`,
+            profile,
+        );
+
+        // Assert：空表题与纯空白表题（含不换行空格）都不产出段落，表格本体逐字不变
+        const bare = toMarkdown(`<table>${body}</table>`, profile);
+        assert.equal(toMarkdown(`<table><caption></caption>${body}</table>`, profile), bare, profile);
+        assert.equal(toMarkdown(`<table><caption> ${NBSP}\n</caption>${body}</table>`, profile), bare, profile);
+
+        // Assert：既无表题也无数据行时输出空串
+        assert.equal(toMarkdown(`<table><caption> ${NBSP}</caption></table>`, profile), '', profile);
+    }
+});
+
+test('表题：经 service.escape 转义而竖线不转义，全链路后成 role 为 table_caption 的段落', async () => {
+    // Arrange：区间号、强调星号、下划线、反引号、方括号与竖线
+    const captionText = '表 1 10~20℃与30~40℃的*收率*，_a_ 与 `b` 与 [c](d)，a|b';
+    const escaped = '表 1 10\\~20℃与30\\~40℃的\\*收率\\*，\\_a\\_ 与 \\`b\\` 与 \\[c\\](d)，a|b';
+    const html = `<table><caption>${captionText}</caption><tr><td>甲</td></tr></table>`;
+
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        const { md, ir } = await toIr(html, profile);
+        const restored = restoreMarkers(ir);
+
+        // Assert：Markdown 记号已转义；段落里的竖线是字面量，不转义
+        assert.equal(md.split('\n')[0], TABLE_CAPTION_MARK + escaped, profile);
+
+        // Assert：根的子节点依次为表题段落与表格，段落文本与源文字逐字相等
+        const [caption, table] = restored.children;
+        assert.equal(caption.type, 'paragraph', profile);
+        assert.deepEqual(caption.data, { role: 'table_caption' }, profile);
+        assert.equal(plainText(caption), captionText, profile);
+        assert.equal(table.type, 'table', profile);
+
+        // Assert：删除线、强调、行内代码与链接一个都不应出现
+        for (const type of INLINE_TYPES) {
+            assert.deepEqual(textsOfType(restored, type), [], `${profile} 不应出现 ${type} 节点`);
+        }
+
+        // Assert：行首记号作表题时经 escape 带上反斜杠，IR 文本逐字不变，不生成 list / heading 节点
+        for (const lead of ['1. 概述', '# 题', '- 项']) {
+            const marked = await toIr(`<table><caption>${lead}</caption><tr><td>甲</td></tr></table>`, profile);
+            const [leadCaption] = restoreMarkers(marked.ir).children;
+            assert.equal(plainText(leadCaption), lead, `${profile}: ${lead}`);
+            assert.deepEqual(collect(marked.ir, (n) => n.type === 'list' || n.type === 'heading'), [], `${profile}: ${lead}`);
+        }
+    }
+});
+
+test('表题：换行、制表符、连续空格与不换行空格折叠为单个空格，首尾空白去除', () => {
+    // Arrange
+    const html = `<table><caption>  表 1\n\t各组${NBSP}${NBSP}收率   （甲）  </caption><tr><td>甲</td></tr></table>`;
+
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        assert.equal(toMarkdown(html, profile).split('\n')[0], `${TABLE_CAPTION_MARK}表 1 各组 收率 （甲）`, profile);
+    }
+});
+
+test('表题：多个 caption 逐个成段且顺序与 DOM 一致；写在行之后的与嵌套表格的各按其表归属', () => {
+    // Act & Assert
+    for (const profile of PROFILES_WITH_TABLE) {
+        // Assert：两个 caption 按 DOM 顺序各成一段，排在表格本体之前
+        assert.equal(
+            toMarkdown('<table><caption>表 1 甲</caption><caption>续表 1</caption><tr><td>x</td></tr></table>', profile),
+            `${TABLE_CAPTION_MARK}表 1 甲\n\n${TABLE_CAPTION_MARK}续表 1\n\n| x |\n| --- |`,
+            profile,
+        );
+
+        // Assert：写在数据行之后的 caption（domino 解析后 DOM 顺序为 TBODY,CAPTION）仍输出在表格之前
+        assert.equal(
+            toMarkdown('<table><tr><td>x</td></tr><caption>表 1 甲</caption></table>', profile),
+            `${TABLE_CAPTION_MARK}表 1 甲\n\n| x |\n| --- |`,
+            profile,
+        );
+
+        // Assert：内层表题不计入外层——标记只出现一次，其文字随单元格纯文本落在外层单元格内
+        const nested = toMarkdown('<table><caption>外题</caption><tr><td>外层'
+            + '<table><caption>内题</caption><tr><td>内甲</td></tr></table>'
+            + '</td></tr></table>', profile);
+        assert.equal(nested.split(TABLE_CAPTION_MARK).length - 1, 1, `${profile}: ${JSON.stringify(nested)}`);
+        assert.equal(nested, `${TABLE_CAPTION_MARK}外题\n\n| 外层内题内甲 |\n| --- |`, profile);
+    }
+});
+
+test('url profile：加粗 section 内的表题随块级粗体逐块包裹，全链路后仍带 table_caption 角色', async () => {
+    // Arrange
+    const html = '<section style="font-weight: bold"><table><caption>表 1</caption><tr><td>a</td></tr></table></section>';
+
+    // Act
+    const { md, ir } = await toIr(html, 'url');
+    const [caption] = restoreMarkers(ir).children;
+
+    // Assert：表格本体属块语法、不套 <strong>，表题段落照常包裹
+    assert.equal(md, `<strong>${TABLE_CAPTION_MARK}表 1</strong>\n\n| a |\n| --- |`);
+    assert.deepEqual(caption.data, { role: 'table_caption' });
 });
 
 // ============================================================

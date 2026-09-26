@@ -455,7 +455,7 @@ MinerU 结果包按文档名改名后与主产物平铺在同一目录：`*_cont
 
 图片默认统一为 JPG：png、bmp、tiff、webp 与静态 gif 解码后铺白合成，以 `--jpeg-quality`（默认 90）控制压缩质量，并以 `--jpeg-ppi`（默认 330 PPI）写入 JFIF 密度；已是 JPEG 的只补写密度、不重编码。svg、wmf 与动图 gif 保持原格式并告警；emf 只在 `patent` profile 下转为 JPG（见本节的「EMF 图元转 JPG」），其余 profile 同样保持原格式并告警。`--image-format keep` 关闭整条归一链路。
 
-`bundle` 目标例外：`images/` 存与原件逐字节一致的原图（不转码、不改 JFIF 密度），归一与上述选项只作用于 html、xml 等其它目标；tiff、emf、wmf 原样保留并告警「多数 Markdown 查看器无法显示」。Markdown 中的图片取得到原文档或原网页的显示尺寸时写成 `<img src="images/image_N.ext" width="W" alt="…">`（docx 取 `wp:extent`；以 VML 承载的图片——典型如 OLE 对象的预览图——取所属 `v:shape` 的 `style` 尺寸，其替换文字与化学式角色一并取回；pptx 取形状 `a:ext`、网页取 width 属性或样式、MinerU 取 `bbox`），段首缩进写为全角空格，图注为紧随图片的独立段落。
+`bundle` 目标例外：`images/` 存与原件逐字节一致的原图（不转码、不改 JFIF 密度），归一与上述选项只作用于 html、xml 等其它目标；tiff、emf、wmf 原样保留并告警「多数 Markdown 查看器无法显示」。Markdown 中的图片取得到原文档或原网页的显示尺寸时写成 `<img src="images/image_N.ext" width="W" alt="…">`（docx 取 `wp:extent`；以 VML 承载的图片——典型如 OLE 对象的预览图——取所属 `v:shape` 的 `style` 尺寸，其替换文字与化学式角色一并取回；pptx 取形状 `a:ext`、网页取 width 属性或样式、MinerU 取 `bbox`），段首缩进写为全角空格，图注为紧随图片的独立段落，网页表格的表题（`<caption>`）为紧邻表格之前的独立段落。
 
 护栏与降级：默认按 `raster.maxWidth`（1600 px）等比缩小；`patent` profile 不设该上限，改按每幅图在 Word 中的显示尺寸重采样——目标像素为「显示毫米 ÷ 25.4 × `--jpeg-ppi`」，该 profile 的 `--jpeg-ppi` 缺省取 300 而非通用的 330，故重采样结果与官方工具的出图像素一致；取不到显示尺寸，或目标像素超过 4000 万、单边超过 20000 px 时，保留嵌入像素并告警。像素数超过 8000 万或字节数超过 200 MB 的图片保留原图并告警；多页 TIFF 取首页；单张失败只降级为告警，不影响整份转换。
 

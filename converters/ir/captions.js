@@ -13,7 +13,8 @@
  * markCaptions(ir) → 新树：先 splitImageParagraphs，再在块级兄弟序列里给紧随「只含图片的段落」的段落定角色：
  *   ≤ 60 字且匹配 ^(图|附图|Fig\.?|Figure)\s*序号、^图\s*[|｜:：]、^[▲△↑] → data.role = 'caption'；
  *   匹配 ^(注|来源|图源|图片来源|资料来源)[:：] → 'image_footnote'；
- *   一张图后最多连续认 3 段；已带 role 的段落（解析器标记的图注）保持不变。
+ *   一张图后最多连续认 3 段；已带 role 的段落（解析器标记的图注）保持不变，带其他角色的段落
+ *   （如表题 table_caption）同样保持不变，并中断图注链。
  * 图注与图片只靠「紧邻」对应，不在 IR 里记图片名。两者均不改动入参。
  */
 const { collectText } = require('./util');
@@ -148,7 +149,8 @@ function markSiblings(children) {
             chain += 1;
             return child;
         }
-        const role = captionRole(child);
+        // 已带其他角色（如表题）的段落不改判，并中断图注链
+        const role = existing ? null : captionRole(child);
         if (!role) {
             chain = -1;
             return child;

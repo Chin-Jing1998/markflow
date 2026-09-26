@@ -1,9 +1,11 @@
 /**
- * converters/ir/captions.js 的大图拆段分组标记单元测试
+ * converters/ir/captions.js 单元测试：大图拆段分组标记与图注角色守卫
  * 覆盖：splitImageParagraphs 给同一原段落拆出的各块写同值 data.splitGroup、按文档顺序递增、未被拆的段落不写该键、
  *       入参不变；markCaptions 经同一条拆段，图注识别不受影响且图注段不带该键；
  *       md / html / docx 三个渲染器对「带与不带 splitGroup」的同一棵树产出相同（docx 只有内含生成时刻的
- *       docProps/core.xml 一项随时间变化，其余条目逐字节相同）。
+ *       docProps/core.xml 一项随时间变化，其余条目逐字节相同）；
+ *       markCaptions 的角色守卫——已带非图注角色的段落（表题 table_caption，来自 ir/turndown 的表格规则）
+ *       紧随图片时不被改判，并中断图注链；以及没有表题介入时图注与图片脚注的既有识别不受影响。
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -147,4 +149,52 @@ test('md / html / docx：带与不带 splitGroup 的同一棵树产出相同', a
     const a = await stableEntries(await docxRenderer.render(makeDoc(withGroup), options));
     const b = await stableEntries(await docxRenderer.render(makeDoc(without), options));
     assert.deepEqual(a, b);
+});
+
+// ============================================================
+// 角色守卫：已带非图注角色的段落不改判，并中断图注链
+// ============================================================
+
+const imageParagraph = () => paragraph({ type: 'image', url: 'images/image_1.png', alt: '' });
+const tableCaption = (value) => ({ type: 'paragraph', data: { role: 'table_caption' }, children: [text(value)] });
+
+test('已带 table_caption 角色的段落紧随图片也不被改判为图注或图片脚注', () => {
+    // Arrange：两段文字分别命中 FOOTNOTE_RE 与 CAPTION_RE，无守卫时会被改判为 image_footnote / caption
+    const footnoteLike = tableCaption('来源：国家统计局');
+    const captionLike = tableCaption('图 2 对比');
+    const ir = root(imageParagraph(), footnoteLike, imageParagraph(), captionLike);
+
+    // Act
+    const marked = markCaptions(ir);
+
+    // Assert：角色不变，且节点原样返回（未生成改写后的副本）
+    assert.deepEqual(marked.children[1].data, { role: 'table_caption' });
+    assert.deepEqual(marked.children[3].data, { role: 'table_caption' });
+    assert.equal(marked.children[1], footnoteLike);
+    assert.equal(marked.children[3], captionLike);
+});
+
+test('表题段落中断图注链：其后的「图 1 示意」不再被认作图注', () => {
+    // Arrange：图片 → 表题 → 形如图注的普通段落。表题文字取会命中 CAPTION_RE 的写法：无守卫时它被改判为
+    // caption、图注链得以延续，第三段随之被认作图注
+    const ir = root(imageParagraph(), tableCaption('图 2 对比'), paragraph(text('图 1 示意')));
+
+    // Act
+    const [, caption, following] = markCaptions(ir).children;
+
+    // Assert
+    assert.deepEqual(caption.data, { role: 'table_caption' });
+    assert.equal(following.data, undefined);
+});
+
+test('没有表题介入时，图片后的「图 1 示意」与「来源：夹具」仍分别得到 caption 与 image_footnote', () => {
+    // Arrange
+    const ir = root(imageParagraph(), paragraph(text('图 1 示意')), paragraph(text('来源：夹具')));
+
+    // Act
+    const [, caption, footnote] = markCaptions(ir).children;
+
+    // Assert
+    assert.deepEqual(caption.data, { role: 'caption' });
+    assert.deepEqual(footnote.data, { role: 'image_footnote' });
 });

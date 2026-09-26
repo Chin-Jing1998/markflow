@@ -1,6 +1,6 @@
 /**
  * converters/ir/markers.js 单元测试
- * 覆盖：indentMarker 编码与钳制、restoreMarkers（段首 INDENT/CAPTION/FOOTNOTE → data、TAB → \t、残留清除、
+ * 覆盖：indentMarker 编码与钳制、restoreMarkers（段首 INDENT/CAPTION/FOOTNOTE/TABLE_CAPTION → data、TAB → \t、残留清除、
  *       深入行内容器取段首标记、只剩标记的段落移除、入参不变）、stripMarkersTree（无残留时同一引用）、
  *       applyTextLayout（缩进与制表符落为全角空格、纯图片段与代码不受影响）、stripMarkers
  */
@@ -48,6 +48,26 @@ test('restoreMarkers：段首 INDENT → data.indent，CAPTION / FOOTNOTE → da
     assert.deepEqual(footnote.data, { role: 'image_footnote' });
     assert.deepEqual(fallback.data, { indent: 2 });
     assert.ok(!MARKER_RE.test(JSON.stringify(restored)));
+});
+
+test('restoreMarkers：段首 TABLE_CAPTION → data.role = table_caption，文本不再带标记', () => {
+    // Arrange：表题由 ir/turndown 的表格规则写在紧邻表格之前的独立段落段首
+    const ir = root(paragraph(text(`${MARKERS.TABLE_CAPTION}表 1 各组收率`)));
+
+    // Act
+    const [caption] = restoreMarkers(ir).children;
+
+    // Assert
+    assert.deepEqual(caption.data, { role: 'table_caption' });
+    assert.equal(caption.children[0].value, '表 1 各组收率');
+    assert.ok(!MARKER_RE.test(JSON.stringify(caption)));
+});
+
+test('MARKERS.TABLE_CAPTION 取私用区的 U+EF05，与既有标记不重码', () => {
+    // Assert：码点落在 MARKER_CLASS 覆盖的 U+EF00–U+EF1F 内，且与 INDENT/CAPTION/FOOTNOTE/BR/TAB 均不同
+    assert.equal(MARKERS.TABLE_CAPTION.charCodeAt(0), 0xEF05);
+    const others = [MARKERS.INDENT, MARKERS.CAPTION, MARKERS.FOOTNOTE, MARKERS.BR, MARKERS.TAB];
+    assert.ok(!others.includes(MARKERS.TABLE_CAPTION), '表题标记不得与既有标记重码');
 });
 
 test('restoreMarkers：段首标记落在行内容器首个文本里也能取到；容器被掏空时继续看下一个兄弟', () => {
