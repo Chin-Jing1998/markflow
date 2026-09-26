@@ -47,6 +47,8 @@
  *     重新解析时配对错位；注释解析为 html 节点，由各渲染器剥除（见下方「相邻行内代码段的分隔」块注释）
  *   - 文本节点以零宽字符开头（其间可夹半角空格与不换行空格）时，turndown 的行首转义越过这段前导字符、锚定在其后的
  *     记号上：parsers/url 的 normalizeMarkdown 删去零宽字符后记号落在行首（见 escapeAfterZeroWidth 的块注释）
+ *   - 代码值首尾的 ASCII 空白被 turndown 判定为邻居已有而舍弃、却未 trim 时，从代码值中去掉，不留在反引号围栏之内
+ *     （见「代码值首尾被舍弃的空白」块注释）
  *
  * 表格规则 convertTableToMarkdown 为本文件内部函数，不再在其他文件重复实现。
  */
@@ -709,7 +711,8 @@ function codePointBefore(text, at) {
  * 写法：与 renderers/md 分隔相邻 inlineCode 的做法相同，在两段之间写入空 HTML 注释 <!---->（各版 CommonMark 都认作 HTML
  * 注释的最短写法），重新解析为代码段、html 节点、代码段，各段的值与段数不变；html、docx、xml、content-list 渲染器均剥除
  * 该注释。规则内看不到此前已拼出的输出，按 DOM 判定相邻须复刻 turndown 的空白折叠、空产物与透传判定，故分两步：
- * inlineCode 规则接管内置 code 规则，产物逐字不变，只把闭围栏的末一个反引号换成哨兵；configureUrl 包装 service.turndown，
+ * inlineCode 规则接管内置 code 规则，产物逐字不变（首尾被舍弃的空白另行去掉，见「代码值首尾被舍弃的空白」块注释），
+ * 只把闭围栏的末一个反引号换成哨兵；configureUrl 包装 service.turndown，
  * 由 separateAdjacentCode 在整篇输出上把每个哨兵换回反引号，哨兵之后隔着零宽字符若干紧跟反引号的，在换回的反引号之后
  * 写入注释。
  *   - 哨兵之后紧跟的反引号只能是下一段行内代码的开围栏：turndown 把文本中的反引号转义为「\`」（反斜杠在前）；代码块的
@@ -739,14 +742,18 @@ const CODE_GAP_CODES = new Set(ZERO_WIDTH_CODE_POINTS);
 // 定位哨兵之后首个非零宽字符：否定字符类，无量词；配合 lastIndex 从哨兵之后起找
 const NOT_CODE_GAP_RE = new RegExp(`[^${ZERO_WIDTH_CODE_POINTS.map(fromCode).join('')}]`, 'g');
 
-/** 接管内置 code 规则：产物逐字不变，只把闭围栏的末一个反引号换成哨兵（说明见上方块注释） */
+/**
+ * 接管内置 code 规则：先去掉 turndown 漏 trim 的首尾空白（见 trimAbandonedWhitespace），产物其余逐字不变，只把闭围栏的
+ * 末一个反引号换成哨兵（说明见上方块注释）；处在另一段 code 之内的 code 两者都不做
+ */
 function addInlineCodeRule(service) {
     const builtinCode = service.options.rules.code;
     service.addRule('inlineCode', {
         filter: builtinCode.filter,
         replacement: (content, node, options) => {
-            const code = builtinCode.replacement(content, node, options);
-            if (!code || isInsideCode(node)) return code;
+            const inside = isInsideCode(node);
+            const code = builtinCode.replacement(inside ? content : trimAbandonedWhitespace(content, node), node, options);
+            if (!code || inside) return code;
             return `${code.slice(0, -1)}${CODE_END}`;
         },
     });
@@ -781,6 +788,49 @@ function separateAdjacentCode(markdown) {
     }
     parts.push(raw.slice(copied));
     return parts.join('');
+}
+
+// ---------- url profile：代码值首尾被舍弃的空白 ----------
+
+/*
+ * 成因：turndown 的 flankingWhitespace 按元素 textContent 首尾的 ASCII 空白计算应移到元素之外的空白，左邻（右邻）兄弟的
+ * 文本以空格结尾（开头）时，判定这一侧已被空白夹住而舍弃该侧（isFlankedByWhitespace）；replacementForNode 只在移出的
+ * leading 或 trailing 非空时才 trim 内容。两侧都被舍弃、或一侧被舍弃而另一侧本无空白时，内容原样交给 code 规则，被舍弃的
+ * 空白留在反引号围栏之内、重新解析为代码值的一部分：「甲<code>x </code><samp><img> 乙</samp>」输出「甲`x ` 乙」，值为
+ * 「x 」。邻居的文本能以空格开头或结尾，是因为 collapseWhitespace 不删 void 元素（img、wbr 等）之后的空白，代码值末尾的
+ * 空格与邻居里 void 元素之后的空格因此各留一份；首部同理（「<samp>甲 <img></samp><code> x</code>」的值为「 x」）。
+ * 修法：inlineCode 规则在调用内置 code 规则之前补做 turndown 漏掉的 trim。flankingWhitespace 两侧皆空、而 textContent 在某侧
+ * 以 ASCII 空白开头或结尾时，该侧空白必是被舍弃的：未被舍弃时 leading 或 trailing 非空，turndown 已 trim；被舍弃而其内侧
+ * 还有非 ASCII 空白时，leading 或 trailing 取那段非 ASCII 空白，同样非空。故只在这一情形下去掉内容这一侧的 ASCII 空白；
+ * 内容的该侧不是 ASCII 空白时（如末个子节点是带 src 的图片）不动。
+ *   - 被舍弃的空白按 turndown 的判定由邻居提供，围栏之外不另补：产物只有代码值变化，代码段之外逐字不变。另补一份（视同
+ *     该侧未被夹住）可保住邻居产物不以空白开头时的间隔，但邻居为透传元素时与其空白重复，与 url profile 对 em、strong 等
+ *     元素只留一份的既有处理也不一致，不取。
+ *   - 以 textContent 判定而不只看内容：内容的首尾可能是块级子元素写出的换行，与 turndown 的空白判定无关，不应去掉。
+ *     textContent 只在两侧皆空、且内容首或尾为 ASCII 空白时才取，常规情形不增加开销。
+ *   - 处在另一段 code 之内的 code 不做：其产物是外层代码段的原文，去掉空白会改变外层的值（调用处判定）。
+ * 耗时线性于代码段长度：textContent 与首尾空白段各扫描一次。
+ */
+// turndown 判定首尾空白所用的 ASCII 空白（其 edgeWhitespace 的 [ \t\r\n]）
+const ASCII_SPACE_CODES = new Set([0x20, 0x09, 0x0d, 0x0a]);
+
+/** 去掉内容首尾被 turndown 舍弃、却未 trim 掉的 ASCII 空白；不属此情形时原样返回 */
+function trimAbandonedWhitespace(content, node) {
+    const { leading, trailing } = node.flankingWhitespace;
+    if (!content || leading || trailing) return content;
+    const trimStart = ASCII_SPACE_CODES.has(content.charCodeAt(0));
+    const trimEnd = ASCII_SPACE_CODES.has(content.charCodeAt(content.length - 1));
+    if (!trimStart && !trimEnd) return content;
+    const text = node.textContent;
+    let start = 0;
+    let end = content.length;
+    if (trimStart && ASCII_SPACE_CODES.has(text.charCodeAt(0))) {
+        while (start < end && ASCII_SPACE_CODES.has(content.charCodeAt(start))) start += 1;
+    }
+    if (trimEnd && ASCII_SPACE_CODES.has(text.charCodeAt(text.length - 1))) {
+        while (end > start && ASCII_SPACE_CODES.has(content.charCodeAt(end - 1))) end -= 1;
+    }
+    return content.slice(start, end);
 }
 
 // ---------- 各 profile 配置 ----------
