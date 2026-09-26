@@ -39,7 +39,9 @@
  *   - <sup>/<sub> 原样输出：Markdown 没有对应语法，网页的化学式（「C<sub>1</sub>的烷基」）与脚注标号
  *     （「<sup>[1]</sup>」）不加标签就会塌成同级文本，由 ir/inline-html 提升为 superscript / subscript 节点
  *   - <section> 按块级输出（\n\n…\n\n）：微信正文全由 section 构成，透传会使整篇塌成一段
- *   - <br> 输出 BR 标记，由 parsers/url 的 collapseBreakMarkers 折叠：双 BR 分段、单 BR 转硬换行
+ *   - <br> 输出 BR 标记，由 parsers/url 的 collapseBreakMarkers 折叠：双 BR 分段、单 BR 转硬换行。行内格式元素与链接的
+ *     内容含分段 BR 时按段各自包裹（<em>乙</em> BR BR <em>丙</em>、[乙](地址) BR BR [丙](地址)），开闭标签与「[…](…)」
+ *     不跨段（见下方「行内格式元素内的分段 BR」块注释）
  *   - 图注（figcaption、微信小字图注）输出 CAPTION 标记开头的独立段落，由 ir/markers 还原为 data.role
  *   - 带 data-mf-display 的 <img> 输出 <img src alt width>，由 ir/inline-html 还原为带 data.display 的 image 节点
  *   - 两段行内代码在输出中相邻（含只隔着产物为空的元素、注释或零宽字符）时，两段之间写入空 HTML 注释 <!---->，
@@ -135,16 +137,16 @@ function wrapTrimmed(content, marker) {
 
 /**
  * 以 HTML 标签包裹：内容含空行（块级内容）时逐块包裹，Markdown 块语法开头的块不包，
- * 避免开闭标签落在不同段落里失配
+ * 避免开闭标签落在不同段落里失配；每块之内再按分段 BR 段切分包裹（见 wrapAroundParagraphBreaks）
  */
 function wrapHtml(content, open, close) {
     const text = content.trim();
     if (!text) return '';
-    if (!/\n\s*\n/.test(text)) return `${open}${text}${close}`;
+    if (!/\n\s*\n/.test(text)) return wrapAroundParagraphBreaks(text, open, close);
     return text.split(/\n\s*\n/)
         .map((chunk) => chunk.trim())
         .filter(Boolean)
-        .map((chunk) => (BLOCK_SYNTAX_RE.test(chunk) ? chunk : `${open}${chunk}${close}`))
+        .map((chunk) => (BLOCK_SYNTAX_RE.test(chunk) ? chunk : wrapAroundParagraphBreaks(chunk, open, close)))
         .join('\n\n');
 }
 
@@ -833,6 +835,65 @@ function trimAbandonedWhitespace(content, node) {
     return content.slice(start, end);
 }
 
+// ---------- url profile：行内格式元素内的分段 BR ----------
+
+/*
+ * 成因：url profile 把 <br> 写成 BR 标记，交由 parsers/url 的 collapseBreakMarkers 折叠，连续两个及以上折叠为分段
+ * （\n\n）。行内格式元素的产物是「开标签 + 内容 + 闭标签」（strong、em、del、sup、sub）或「[内容](地址)」（带 href 的 a），
+ * 内容里的分段 BR 折叠之后开闭标签分落两段：remark 逐段解析，ir/inline-html 在段内配不成对，开标签删标签留内容、闭标签
+ * 删除，格式丢失——「甲<em>乙<br><br>丙</em>丁」重新解析为段落「甲乙」与「丙丁」；链接的「[」与「](地址)」分落两段后成为
+ * 字面文本，地址被 remark-gfm 识别为裸网址，紧跟在「)」之后的文本一并计入地址。
+ *
+ * 修法：写出标签之前按分段 BR 段切分内容，每段各自包裹（链接每段用同一地址与 title），BR 段本身原样留在两段之间——与
+ * wrapHtml 对含空行的内容逐块包裹的既有做法一致（「甲<em>乙<div>丙</div>丁</em>戊」本就输出
+ * 「<em>乙</em>\n\n<em>丙</em>\n\n<em>丁</em>戊」）。
+ *   - 分段 BR 段的分组与 collapseBreakMarkers 的 BREAK_RUN_RE 相同：BR 之间只隔行内空白与换行；夹着零宽字符或不换行空格的
+ *     两个 BR 在那里也不是一段，仍各自折叠为硬换行，格式不受影响，故这里同样不切分。折叠结果由此与无格式时一致：处于行中
+ *     的 BR 段写成分段，处于行首或行尾的删除（切分后 BR 段落在行首或行尾时，其一侧的空段不写标签）。
+ *   - 单个 BR 不切分，仍折叠为格式之内的硬换行；嵌套的格式由内向外逐层切分，每层只切自己的标签。
+ *   - 各段 trim 之后再包裹，紧邻 BR 段的行内空白随之去掉：折叠时该空白本就并入 BR 段（其前的由回看并入，其后的由
+ *     BREAK_RUN_RE 的尾部吃掉）；全为空白的段不写标签。
+ *   - BR 段两侧的内容仍是行内内容，不再按 Markdown 块语法判定：块级产物前后带空行，已由 wrapHtml 先按空行切开；
+ *     BR 之后的文本是新的文本节点，其开头的块语法记号（- 、# 、> 、1. 等）已由 turndown 的 escape 转义。
+ *   - 表格单元格与图片 alt 不经此处：单元格取纯文本，alt 折叠换行，二者都不含 BR 标记；mark 写成「==」，remark 不识别
+ *     该记号，两侧本就是字面文本，不切分。
+ * 耗时线性于内容长度：PARAGRAPH_BREAK_RE 的首字符是必需的 BR，非 BR 位置一步即弃；BR 之后的空白段只被紧邻其前的那个
+ * BR 扫过一次，其后若不是 BR 则整段放弃、不再回退重试（回退到段内任一位置都接不上必需的 BR），每个字符至多被看常数次。
+ * 不含分段 BR 的内容 split 只得一段，产物与切分之前逐字相同。
+ */
+
+// 分段 BR 段：连续两个及以上的 BR 标记，其间只隔行内空白与换行（与 parsers/url 的 BREAK_RUN_RE 同一分组）；
+// 捕获组使 split 把 BR 段本身留在奇数位
+const PARAGRAPH_BREAK_RE = new RegExp(`(${MARKERS.BR}(?:[ \\t\\n]*${MARKERS.BR})+)`);
+
+/**
+ * 以开闭标签包裹一段行内内容：含分段 BR 段时按段各自包裹，BR 段原样留在两段之间（说明见上方块注释）。
+ * 不含分段 BR 时产物为「开标签 + 内容 + 闭标签」，与直接包裹逐字相同
+ */
+function wrapAroundParagraphBreaks(text, open, close) {
+    return joinAroundParagraphBreaks(text, (chunk) => `${open}${chunk}${close}`);
+}
+
+/** 按分段 BR 段切分 text，偶数位的各段 trim 后交 wrap 写出（空段不写），奇数位的 BR 段原样保留，依原序拼接 */
+function joinAroundParagraphBreaks(text, wrap) {
+    const pieces = text.split(PARAGRAPH_BREAK_RE);
+    if (pieces.length === 1) return wrap(text);
+    return pieces.map((piece, index) => {
+        if (index % 2 === 1) return piece;
+        const chunk = piece.trim();
+        return chunk ? wrap(chunk) : '';
+    }).join('');
+}
+
+/** 接管内置 inlineLink 规则：内容含分段 BR 段时每段各自写成链接（同一地址与 title），其余产物逐字不变 */
+function addLinkBreakRule(service) {
+    const builtinLink = service.options.rules.inlineLink;
+    service.addRule('inlineLink', {
+        filter: builtinLink.filter,
+        replacement: (content, node, options) => joinAroundParagraphBreaks(content, (chunk) => builtinLink.replacement(chunk, node, options)),
+    });
+}
+
 // ---------- 各 profile 配置 ----------
 
 function configureBasic(service) {
@@ -987,7 +1048,10 @@ const URL_WRAP_RULES = [
 ];
 
 function configureUrl(service) {
-    // 最先注册、优先级最低：带样式的 section（加粗、图注）由后注册的规则接管
+    // 最先注册、优先级最低。链接规则接管内置 inlineLink 且排在全部自定义规则之后，与内置规则的相对次序一致：带删除线
+    // 样式的 <a> 仍归 inlineStrikethrough；内置规则里排在 inlineLink 之前的都不匹配 <a>
+    addLinkBreakRule(service);
+    // 带样式的 section（加粗、图注）由后注册的规则接管
     service.addRule('sectionBlock', { filter: 'section', replacement: (content) => `\n\n${content}\n\n` });
     service.addRule('lineBreak', { filter: 'br', replacement: () => MARKERS.BR });
     // 先于样式规则注册、优先级低于它们，与内置 code 规则的相对次序一致：带删除线样式的 code 仍归 inlineStrikethrough。
